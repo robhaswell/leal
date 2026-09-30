@@ -63,6 +63,11 @@ there are no pull requests and no long-lived branches.
   Justify any new dependency in the task notes.
 - No `unsafe` outside `source` (mmap) and `leal-ffi`, and each `unsafe` block
   has a `// SAFETY:` comment.
+- **Never send synthetic input to the system.** No AppleScript/System Events
+  keystrokes, `cliclick`, CGEvent posting or similar: whatever app is frontmost
+  (possibly one of Rob's) receives it. Drive the app from inside itself
+  (launch arguments, test hooks, XCTest/XCUITest), and quit anything you
+  launch.
 
 ## Commands
 
