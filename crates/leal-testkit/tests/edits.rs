@@ -3,12 +3,13 @@
 
 mod oracle;
 
+use leal_testkit::diagnostics::{self, DiagnosticKind};
 use leal_testkit::dialect::{
-    Bom, Delimiter, Encoding, decode_value, expected_encoding, reopen_encoding,
+    Bom, Delimiter, Encoding, decode_value, encode_value, expected_encoding, reopen_encoding,
 };
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
-use leal_testkit::save::{Document, Edit, SaveError};
+use leal_testkit::save::{Document, Edit, Fix, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, csv_file, csv_file_utf16};
 use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for};
 use proptest::collection::vec;
@@ -84,7 +85,8 @@ proptest! {
                 prop_assert!(!cells.is_empty());
                 let values = final_values(&case);
                 for &(r, c) in cells {
-                    prop_assert!(values[r][c].contains('😀'), "{:?}", values[r][c]);
+                    let unencodable = encode_value(&values[r][c], Encoding::Windows1252).is_err();
+                    prop_assert!(unencodable, "{:?}", values[r][c]);
                 }
             }
             Err(e) => prop_assert!(false, "unexpected {}", e),
@@ -308,8 +310,8 @@ proptest! {
             let last = parsed.layout.rows.last().and_then(|r| r.fields.last());
             prop_assert!(last.is_some_and(|f| f.unterminated));
             // It swallows exactly the bytes it swallowed before: nothing was
-            // added inside it. (Row counts elsewhere can still change; see
-            // `deleting_a_row_can_join_cr_and_lf` in src/save.rs.)
+            // added inside it. (Row structure elsewhere is checked by
+            // `reopening_a_saved_file_gives_the_same_structure`.)
             let raw = |b: &[u8], f: Option<&leal_testkit::layout::FieldLayout>| {
                 f.map(|f| b[f.span.clone()].to_vec())
             };
@@ -370,13 +372,12 @@ proptest! {
         prop_assert_eq!(Bom::detect(&saved.bytes), Bom::detect(&case.file.bytes));
         // ADR-0004 decision 11: reopening *with* the saved encoding hint gives
         // exactly the document's encoding. No flip is allowed. The hint is
-        // written only when it is needed (the file had none to update).
+        // written when it is needed, or to update one the file already had.
         let guess = expected_encoding(&saved.bytes);
-        prop_assert_eq!(
-            saved.encoding_hint,
-            (guess != case.file.encoding).then_some(case.file.encoding)
-        );
-        prop_assert_eq!(reopen_encoding(&saved.bytes, saved.encoding_hint), case.file.encoding);
+        let needed = guess != case.file.encoding || case.existing_hint.is_some();
+        prop_assert_eq!(saved.encoding_hint, needed.then_some(case.file.encoding));
+        let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint);
+        prop_assert_eq!(reopened, case.file.encoding);
 
         let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
         let endings: Vec<_> = parsed.layout.rows.iter().map(|r| r.line_ending).collect();
@@ -388,6 +389,13 @@ proptest! {
             .map(|r| r.fields.iter().map(|f| decode_value(&f.value, case.file.encoding)).collect())
             .collect();
         prop_assert_eq!(got, values);
+
+        // A UTF-8 hint is honoured even over invalid bytes; those get the
+        // usual invalid-encoding warning (ADR-0004 decision 11).
+        if reopened == Encoding::Utf8 && std::str::from_utf8(&saved.bytes).is_err() {
+            let diagnostics = diagnostics::derive(&parsed.layout, &saved.bytes, reopened);
+            prop_assert!(diagnostics.iter().any(|d| d.kind == DiagnosticKind::InvalidEncoding));
+        }
     }
 }
 
@@ -431,6 +439,25 @@ fn encoding_can_flip_on_reopen() {
         .copied()
         .collect::<Vec<u8>>();
     assert_eq!(flip(&utf8, 0), (Encoding::Utf8, Encoding::Windows1252));
+    // With the hint it reopens as UTF-8 again, and its invalid bytes get the
+    // usual warning rather than overriding the hint.
+    let layout = oracle::analyze(&utf8, Delimiter::Comma, Encoding::Utf8).layout;
+    let mut doc = Document::new(&utf8, &layout, Delimiter::Comma, Encoding::Utf8);
+    let clear = Edit::SetCell {
+        row: 0,
+        column: 0,
+        value: String::new(),
+    };
+    doc.apply(&clear).unwrap();
+    let saved = doc.save().unwrap();
+    let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint);
+    let reparsed = oracle::analyze(&saved.bytes, Delimiter::Comma, reopened).layout;
+    let found = diagnostics::derive(&reparsed, &saved.bytes, reopened);
+    assert!(
+        found
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::InvalidEncoding)
+    );
     // Windows-1252 whose only non-UTF-8 byte is edited away, leaving bytes
     // that happen to be valid UTF-8 (C3 A9 is "Ã©" in Windows-1252) → UTF-8.
     // The remaining cell now reads as é.
@@ -438,4 +465,115 @@ fn encoding_can_flip_on_reopen() {
         flip(b"\xC3\xA9\n\x80\n", 1),
         (Encoding::Windows1252, Encoding::Utf8)
     );
+}
+
+/// ADR-0004 decision 4: a file whose last row is an unterminated quote has
+/// no final line ending (the trailing LF is inside the quote), so deleting
+/// that row leaves the new last row without one: `a\n"b\nc\n` → `a`.
+#[test]
+fn deleting_an_unterminated_last_row_drops_the_line_ending_before_it() {
+    let bytes = b"a\n\"b\nc\n";
+    let layout = oracle::analyze(bytes, Delimiter::Comma, Encoding::Utf8).layout;
+    assert!(layout.rows[1].fields[0].unterminated);
+    assert!(!layout.trailing_newline());
+    let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+    doc.apply(&Edit::DeleteRow { row: 1 }).unwrap();
+    let saved = doc.save().unwrap();
+    assert_eq!(saved.bytes, b"a");
+    assert_eq!(apply_changes(bytes, &saved.changes), saved.bytes);
+    assert_eq!(saved.line_endings, vec![None]);
+}
+
+/// Coverage over a fixed-seed sample: each ADR-0004 structure fix and each
+/// edge operation must happen in at least ~1% of generated edit cases, so
+/// the properties above really exercise them.
+#[test]
+fn every_save_rule_and_edge_operation_is_exercised() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+
+    const N: usize = 3000;
+    let mut runner = TestRunner::deterministic();
+    let strategy = edit_case(CsvConfig::messy());
+    let cases: Vec<EditCase> = (0..N)
+        .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+        .collect();
+
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for case in &cases {
+        let mut seen: Vec<&str> = Vec::new();
+        if let Ok(saved) = &case.saved {
+            for fix in &saved.fixes {
+                seen.push(match fix {
+                    Fix::EmptyRowQuoted { .. } => "fix: empty row written as \"\"",
+                    Fix::CrSplit { .. } => "fix: CR/LF split",
+                    Fix::BomLikeQuoted => "fix: BOM-like first field quoted",
+                });
+            }
+            if saved.encoding_hint.is_some() {
+                seen.push("encoding hint written");
+            }
+        }
+        // Replay, looking at the document just before each edit.
+        let mut doc = case.file.document();
+        for e in &case.edits {
+            let rows = doc.row_count();
+            let cols = doc.max_row_len();
+            match e {
+                Edit::SetCell { row, .. } if rows == 1 && *row == 0 => {
+                    seen.push("edit: the only row")
+                }
+                Edit::SetCell { row, .. } if doc.row_len(*row) == 1 => {
+                    seen.push("edit: the only column")
+                }
+                Edit::DeleteRow { .. } if rows == 1 => seen.push("delete: the only row"),
+                Edit::DeleteRow { row } if *row == 0 => seen.push("delete: first row"),
+                Edit::DeleteRow { row } if *row + 1 == rows => seen.push("delete: last row"),
+                Edit::InsertRow { at, .. } if *at == 0 => seen.push("insert: first row"),
+                Edit::InsertRow { at, .. } if *at == rows => {
+                    seen.push("insert: after the last row")
+                }
+                Edit::DeleteColumn { .. } if cols == 1 => seen.push("delete: the only column"),
+                Edit::DeleteColumn { column } if *column == 0 => seen.push("delete: first column"),
+                Edit::DeleteColumn { column } if *column + 1 == cols => {
+                    seen.push("delete: last column")
+                }
+                Edit::InsertColumn { at, .. } if *at == 0 => seen.push("insert: first column"),
+                Edit::InsertColumn { at, .. } if *at == cols => {
+                    seen.push("insert: after the last column")
+                }
+                _ => {}
+            }
+            doc.apply(e).unwrap();
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        for s in seen {
+            *counts.entry(s).or_default() += 1;
+        }
+    }
+
+    let expected = [
+        "fix: empty row written as \"\"",
+        "fix: CR/LF split",
+        "fix: BOM-like first field quoted",
+        "encoding hint written",
+        "edit: the only row",
+        "edit: the only column",
+        "delete: the only row",
+        "delete: first row",
+        "delete: last row",
+        "insert: first row",
+        "insert: after the last row",
+        "delete: the only column",
+        "delete: first column",
+        "delete: last column",
+        "insert: first column",
+        "insert: after the last column",
+    ];
+    let report = format!("{counts:#?}");
+    for name in expected {
+        let n = counts.get(name).copied().unwrap_or(0);
+        assert!(n * 100 >= N, "{name}: {n} of {N} cases, under 1%\n{report}");
+    }
 }

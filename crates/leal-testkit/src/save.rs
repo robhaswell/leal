@@ -214,6 +214,31 @@ pub struct SavedFile {
     /// `com.apple.TextEncoding` extended attribute; reopen with
     /// [`crate::dialect::reopen_encoding`].
     pub encoding_hint: Option<Encoding>,
+    /// The extra changes the save had to make to keep the file's structure
+    /// (ADR-0004 decisions 6, 7 and 10), in the order they were made. Tests
+    /// can compare these with the serializer's, and coverage tests use them
+    /// to check that each rule is exercised.
+    pub fixes: Vec<Fix>,
+}
+
+/// An extra change a save makes so that the file reopens with the same
+/// structure (ADR-0004 decisions 6, 7 and 10). Rows are output rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    /// A row that would have had no bytes is written as `""` (decision 6).
+    EmptyRowQuoted {
+        /// The output row.
+        row: usize,
+    },
+    /// A blank row after a lone CR gets a CR line ending instead of LF, so
+    /// the two don't read as one CRLF (decision 10).
+    CrSplit {
+        /// The output row whose line ending changed.
+        row: usize,
+    },
+    /// The first field was quoted because it would start with BOM-like
+    /// bytes (decisions 7 and 10).
+    BomLikeQuoted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +254,13 @@ struct DocRow {
     /// The original row, or `None` for an inserted row.
     source: Option<usize>,
     cells: Vec<Cell>,
+}
+
+impl DocRow {
+    /// An original blank line whose one (empty) cell hasn't been edited.
+    fn is_blank_line(&self, layout: &Layout) -> bool {
+        self.source.is_some_and(|s| layout.rows[s].is_blank()) && self.cells == [Cell::Original(0)]
+    }
 }
 
 /// A file being edited: the original bytes plus the edits so far.
@@ -425,8 +457,11 @@ impl<'a> Document<'a> {
                 if *at > self.max_row_len() {
                     return Err(invalid());
                 }
+                let layout = self.layout;
                 for r in &mut self.rows {
-                    if r.cells.len() >= *at {
+                    // ADR-0004 decision 5: a blank line is too short for
+                    // every column, so it never gains one.
+                    if r.cells.len() >= *at && !r.is_blank_line(layout) {
                         let cell = Cell::Edited {
                             field: None,
                             value: value.clone(),
@@ -439,8 +474,9 @@ impl<'a> Document<'a> {
                 if *column >= self.max_row_len() {
                     return Err(invalid());
                 }
+                let layout = self.layout;
                 for r in &mut self.rows {
-                    if r.cells.len() > *column {
+                    if r.cells.len() > *column && !r.is_blank_line(layout) {
                         r.cells.remove(*column);
                     }
                 }
@@ -514,6 +550,8 @@ impl<'a> Document<'a> {
             })
             .collect();
 
+        let mut fixes = Vec::new();
+
         // ADR-0004 decision 6: a row with no bytes becomes `""`, unless it was
         // an original blank row (and still has a line ending, so it survives).
         for (i, (content, untouched)) in contents.iter_mut().enumerate() {
@@ -526,6 +564,7 @@ impl<'a> Document<'a> {
             if !was_blank || endings[i].is_none() {
                 *content = b"\"\"".to_vec();
                 *untouched = false;
+                fixes.push(Fix::EmptyRowQuoted { row: i });
             }
         }
 
@@ -540,6 +579,7 @@ impl<'a> Document<'a> {
                 && endings[i] == Some(LineEnding::Lf)
             {
                 endings[i] = Some(LineEnding::Cr);
+                fixes.push(Fix::CrSplit { row: i });
             }
         }
 
@@ -557,16 +597,23 @@ impl<'a> Document<'a> {
             let rest = content[first.len()..].to_vec();
             *content = [quote(&first), rest].concat();
             *untouched = false;
+            fixes.push(Fix::BomLikeQuoted);
         }
 
-        // Serialize each row, then express the output as splices.
+        // Serialize each row. The output is written out directly (BOM, then
+        // every row), independently of the splices, so that tests can check
+        // `apply_changes(original, changes) == bytes` for real.
         let serialized: Vec<Vec<u8>> = contents
             .iter()
             .zip(&endings)
             .map(|((c, _), e)| [c.as_slice(), e.map_or(&b""[..], LineEnding::bytes)].concat())
             .collect();
+        let bytes: Vec<u8> = std::iter::once(&self.bytes[..self.layout.bom_len])
+            .chain(serialized.iter().map(Vec::as_slice))
+            .flatten()
+            .copied()
+            .collect();
         let changes = self.changes(&serialized, &contents, &endings);
-        let bytes = apply_changes(self.bytes, &changes);
         // ADR-0004 decision 11: record the encoding when a reopen would
         // otherwise guess differently, or when the file already had a hint.
         let guess_differs = expected_encoding(&bytes) != self.encoding;
@@ -577,6 +624,7 @@ impl<'a> Document<'a> {
             bytes,
             line_endings: endings,
             encoding_hint,
+            fixes,
         })
     }
 
@@ -760,7 +808,10 @@ mod tests {
         for e in edits {
             doc.apply(e)?;
         }
-        doc.save()
+        let saved = doc.save()?;
+        // `bytes` and `changes` are built separately; they must agree.
+        assert_eq!(apply_changes(bytes, &saved.changes), saved.bytes);
+        Ok(saved)
     }
 
     fn set(row: usize, column: usize, value: &str) -> Edit {
@@ -860,6 +911,38 @@ mod tests {
         );
         let r = save(b"a\nb\n", &[], &[Edit::DeleteRow { row: 0 }]).unwrap();
         assert_eq!(r.changes, vec![Change::delete(0..2)]);
+    }
+
+    #[test]
+    fn blank_lines_never_gain_or_lose_a_column() {
+        // ADR-0004 decision 5: a blank line is too short for every column.
+        let ins = Edit::InsertColumn {
+            at: 0,
+            value: "N".into(),
+        };
+        assert_eq!(out(save(b"a,b\n\nc,d\n", &[], &[ins])), "N,a,b\n\nN,c,d\n");
+        let end = Edit::InsertColumn {
+            at: 1,
+            value: "N".into(),
+        };
+        assert_eq!(out(save(b"a\n\nc\n", &[], &[end])), "a,N\n\nc,N\n");
+        let del = Edit::DeleteColumn { column: 0 };
+        let r = save(b"a,b\n\nc,d\n", &[], &[del]).unwrap();
+        assert_eq!(String::from_utf8(r.bytes).unwrap(), "b\n\nd\n");
+        assert!(r.fixes.is_empty(), "the blank line stays blank, untouched");
+        // Once its cell is edited, it is an ordinary one-field row again.
+        let edit_then_insert = [set(1, 0, "x"), end_column(1)];
+        assert_eq!(
+            out(save(b"a\n\nc\n", &[], &edit_then_insert)),
+            "a,N\nx,N\nc,N\n"
+        );
+    }
+
+    fn end_column(at: usize) -> Edit {
+        Edit::InsertColumn {
+            at,
+            value: "N".into(),
+        }
     }
 
     #[test]

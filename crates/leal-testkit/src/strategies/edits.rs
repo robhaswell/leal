@@ -27,13 +27,22 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::{Index, select};
 
+use crate::dialect::{Delimiter, Encoding, LineEnding};
 use crate::save::{Edit, SaveError, SavedFile};
-use crate::strategies::csv::{CsvConfig, GeneratedCsv, csv_file};
+use crate::strategies::csv::{
+    CsvConfig, CsvModel, GeneratedCsv, LineEndings, ModelDialect, ModelField, ModelRow,
+    QuotingStyle, csv_file,
+};
 
 /// Values the edit strategy writes: plain text, every character that forces
-/// quoting, leading and trailing spaces, the empty string, and text that
-/// Windows-1252 can (é, €) and can't (😀) encode.
-pub const EDIT_VALUES: [&str; 18] = [
+/// quoting, leading and trailing spaces, the empty string, text that
+/// Windows-1252 can (é, €) and can't (😀) encode, and BOM-like starts
+/// (ADR-0004 decisions 7 and 10): U+FEFF, and "ÿþ" and "ï»¿", which are the
+/// bytes `FF FE` and `EF BB BF` in Windows-1252.
+pub const EDIT_VALUES: [&str; 21] = [
+    "\u{FEFF}x",
+    "\u{FF}\u{FE}",
+    "\u{EF}\u{BB}\u{BF}",
     "",
     "x",
     "new value",
@@ -59,6 +68,10 @@ pub const EDIT_VALUES: [&str; 18] = [
 pub struct EditCase {
     /// The original file.
     pub file: GeneratedCsv,
+    /// The encoding hint the file had when opened (ADR-0004 decision 11):
+    /// sometimes `Some(file.encoding)`, as if an earlier save had written it.
+    /// Replay with `file.document().with_existing_hint(existing_hint)`.
+    pub existing_hint: Option<Encoding>,
     /// The edits, in order, in logical coordinates. Every one is valid when
     /// applied in turn.
     pub edits: Vec<Edit>,
@@ -100,6 +113,11 @@ enum RawEdit {
         /// Also set the cell back to its original value afterwards (F3).
         revert: bool,
     },
+    /// Set the file's first cell, often to a BOM-like value, so that
+    /// ADR-0004 decisions 7 and 10 (quoting BOM-like first fields) fire.
+    SetFirst {
+        value: RawValue,
+    },
     InsertRow {
         at: Index,
         values: [RawValue; 4],
@@ -127,6 +145,11 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
     prop_oneof![
         6 => (any::<Index>(), any::<Index>(), raw_value(), prop::bool::weighted(0.25))
             .prop_map(|(row, column, value, revert)| RawEdit::Set { row, column, value, revert }),
+        1 => prop_oneof![
+            select(&EDIT_VALUES[..3]).prop_map(RawValue::Literal), // the BOM-like values
+            raw_value(),
+        ]
+        .prop_map(|value| RawEdit::SetFirst { value }),
         1 => (any::<Index>(), [raw_value(), raw_value(), raw_value(), raw_value()])
             .prop_map(|(at, values)| RawEdit::InsertRow { at, values }),
         1 => any::<Index>().prop_map(|row| RawEdit::DeleteRow { row }),
@@ -136,8 +159,50 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
 }
 
 /// Edit cases over files from [`csv_file`]`(config)`: up to 6 edits each.
+///
+/// If `config` allows mixed line endings and blank lines, three files in ten
+/// is instead a run of `x CR`, `y LF`, blank `LF` rows, so that deleting a
+/// `y` row puts a lone CR before a blank LF row (the CR/LF split, ADR-0004
+/// decision 10) often enough to test.
 pub fn edit_case(config: CsvConfig) -> impl Strategy<Value = EditCase> {
-    edits_for(csv_file(config), 6)
+    let m = config.messiness;
+    let files = if m.mixed_line_endings && m.blank_lines {
+        prop_oneof![7 => csv_file(config), 3 => cr_then_blank_lf_file()].boxed()
+    } else {
+        csv_file(config).boxed()
+    };
+    edits_for(files, 6)
+}
+
+/// Blocks of `x CR`, `y LF`, blank `LF`, one to four times.
+fn cr_then_blank_lf_file() -> impl Strategy<Value = GeneratedCsv> {
+    (
+        select(&Delimiter::ALL[..]),
+        vec(select(&["a", "b", "c", "long value"][..]), 1..=4),
+    )
+        .prop_map(|(delimiter, words)| {
+            let row = |v: &str, le| ModelRow {
+                fields: vec![ModelField::Unquoted(v.as_bytes().to_vec())],
+                line_ending: Some(le),
+            };
+            let rows = words
+                .iter()
+                .flat_map(|w| {
+                    [
+                        row(w, LineEnding::Cr),
+                        row(w, LineEnding::Lf),
+                        row("", LineEnding::Lf),
+                    ]
+                })
+                .collect();
+            let dialect = ModelDialect {
+                delimiter,
+                line_endings: LineEndings::Mixed,
+                bom: false,
+                quoting: QuotingStyle::Minimal,
+            };
+            GeneratedCsv::from_model(CsvModel { dialect, rows })
+        })
 }
 
 /// Edit cases over files from any strategy (for example
@@ -147,12 +212,20 @@ pub fn edits_for(
     files: impl Strategy<Value = GeneratedCsv>,
     max_edits: usize,
 ) -> impl Strategy<Value = EditCase> {
-    (files, vec(raw_edit(), 0..=max_edits)).prop_map(|(file, raw)| resolve(file, &raw))
+    (
+        files,
+        vec(raw_edit(), 0..=max_edits),
+        prop::bool::weighted(0.2),
+    )
+        .prop_map(|(file, raw, hinted)| resolve(file, &raw, hinted))
 }
 
 /// Resolves raw edits against the document as it evolves, and saves.
-fn resolve(file: GeneratedCsv, raw: &[RawEdit]) -> EditCase {
-    let mut doc = file.document();
+/// `hinted` gives the file an existing encoding hint, where one can exist.
+fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
+    let existing_hint = (hinted && matches!(file.encoding, Encoding::Utf8 | Encoding::Windows1252))
+        .then_some(file.encoding);
+    let mut doc = file.document().with_existing_hint(existing_hint);
     let mut edits = Vec::new();
     for r in raw {
         let mut step = Vec::new();
@@ -185,6 +258,20 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit]) -> EditCase {
                         value: original,
                     });
                 }
+            }
+            RawEdit::SetFirst { value } => {
+                if doc.row_len(0) == 0 {
+                    continue;
+                }
+                let value = match value {
+                    RawValue::Literal(s) => s.to_owned(),
+                    RawValue::Original => doc.original_value(0, 0).unwrap_or_default(),
+                };
+                step.push(Edit::SetCell {
+                    row: 0,
+                    column: 0,
+                    value,
+                });
             }
             RawEdit::InsertRow { at, values } => {
                 let at = at.index(doc.row_count() + 1);
@@ -228,5 +315,10 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit]) -> EditCase {
         }
     }
     let saved = doc.save();
-    EditCase { file, edits, saved }
+    EditCase {
+        file,
+        existing_hint,
+        edits,
+        saved,
+    }
 }

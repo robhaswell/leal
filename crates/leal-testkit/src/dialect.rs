@@ -237,11 +237,12 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
 /// writes real attributes.
 ///
 /// - A BOM always decides; a hint can't contradict it.
-/// - Otherwise a UTF-8 or Windows-1252 hint beats the guess. Windows-1252
-///   decodes every byte, and UTF-8 bytes that aren't valid get the usual
-///   invalid-encoding warning, so the bytes always "decode under it".
-/// - A UTF-16 hint without a UTF-16 BOM "disagrees badly" with the bytes
-///   (v1 never writes one), so the guess applies.
+/// - Otherwise a UTF-8 or Windows-1252 hint is **always honoured**, whatever
+///   the bytes. Invalid bytes under a UTF-8 hint are reported as
+///   `invalid_encoding` in the usual way: pass the result to
+///   [`crate::diagnostics::derive`], which checks UTF-8 validity whenever the
+///   encoding is UTF-8.
+/// - A UTF-16 hint on a file without a UTF-16 BOM is ignored.
 /// - With no hint, the guess applies ([`expected_encoding`]).
 #[must_use]
 pub fn reopen_encoding(bytes: &[u8], hint: Option<Encoding>) -> Encoding {
@@ -333,8 +334,15 @@ mod tests {
             reopen_encoding(e, Some(Encoding::Windows1252)),
             Encoding::Windows1252
         );
+        // A UTF-8 hint is honoured even when the bytes aren't valid UTF-8
+        // (the guess would say Windows-1252); they get invalid_encoding.
+        assert_eq!(expected_encoding(b"\xE9"), Encoding::Windows1252);
         assert_eq!(
             reopen_encoding(b"\xE9", Some(Encoding::Utf8)),
+            Encoding::Utf8
+        );
+        assert_eq!(
+            reopen_encoding(b"\xFF\xFF\xFFa", Some(Encoding::Utf8)),
             Encoding::Utf8
         );
         // A BOM wins, and a UTF-16 hint without a BOM is ignored.
