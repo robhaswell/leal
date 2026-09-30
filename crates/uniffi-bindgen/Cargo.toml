@@ -13,9 +13,10 @@ name = "uniffi-bindgen"
 path = "src/main.rs"
 
 [dependencies]
-# The `cli` feature adds the command-line generator. Only this tool needs it;
-# leal-ffi depends on plain `uniffi`.
-uniffi = { workspace = true, features = ["cli"] }
+# `cli` adds the command-line generator, and `cargo-metadata` lets library
+# mode find each crate's (optional) `uniffi.toml`. Only this tool needs them;
+# leal-ffi depends on `uniffi` without either.
+uniffi = { workspace = true, features = ["cli", "cargo-metadata"] }
 
 [lints]
 workspace = true

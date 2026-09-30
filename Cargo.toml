@@ -14,8 +14,11 @@ publish = false
 [workspace.dependencies]
 leal-core = { path = "crates/leal-core" }
 # Swift bindings for leal-ffi (task 0.3). `crates/uniffi-bindgen` must use the
-# same version, which it does by inheriting this line.
-uniffi = "0.32.2"
+# same version, which it does by inheriting this line. The default feature
+# (`cargo-metadata`) is only for the bindings generator, so it is off here and
+# `crates/uniffi-bindgen` turns it back on; the library built into the app
+# doesn't compile `cargo_metadata` and `serde_json`.
+uniffi = { version = "0.32.2", default-features = false }
 
 # Every crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]
