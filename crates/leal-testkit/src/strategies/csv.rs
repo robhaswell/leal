@@ -4,10 +4,10 @@
 //! each field unquoted, quoted (optionally with text after the closing
 //! quote) or unterminated. It then serializes the model to bytes and records
 //! the [`Layout`] a parser must find: every row and field span, whether each
-//! field is quoted, and its unescaped value. Tests use the layout as the
+//! field is quoted, and its display value. Tests use the layout as the
 //! oracle for the real parser.
 //!
-//! # Serialization rules (DESIGN §3.4)
+//! # Serialization rules (DESIGN §3.4, ADR-0003)
 //!
 //! - Fields are separated by the delimiter byte; rows end with LF, CRLF or a
 //!   lone CR. The last row may have no line ending.
@@ -17,8 +17,9 @@
 //! - A quoted field is `"`, the value with each `"` doubled, `"`, then any
 //!   text after the closing quote. That text never contains the delimiter,
 //!   CR or LF, and never *starts* with `"` (the parser would read `""` as an
-//!   escaped quote). A `"` later in it is literal (`"a"b"c` has the text
-//!   `b"c` after its closing quote).
+//!   escaped quote). A `"` later in it is literal (`"a"b"c",` has the text
+//!   `b"c"` after its closing quote). Such a field's display value is its
+//!   raw bytes, `"a"b"c"`.
 //! - An unterminated field is `"` and the value with each `"` doubled, to
 //!   the end of the file. It is only ever the last field of the last row,
 //!   and that row has no line ending of its own (any newline is inside it).
@@ -46,7 +47,9 @@ use proptest::sample::select;
 use proptest::strategy::Union;
 
 use crate::diagnostics::{self, Diagnostic};
-use crate::dialect::{Delimiter, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM};
+use crate::dialect::{
+    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, expected_encoding,
+};
 use crate::layout::{FieldLayout, Layout, RowLayout};
 use crate::strategies::bytes::{INVALID_UTF8, MULTIBYTE_UTF8};
 
@@ -193,13 +196,35 @@ pub enum ModelField {
 }
 
 impl ModelField {
-    /// The field's unescaped value, as [`FieldLayout::value`] defines it.
+    /// The field's display value, as [`FieldLayout::value`] defines it. A
+    /// quoted field with text after its closing quote shows its raw bytes.
     #[must_use]
     pub fn value(&self) -> Vec<u8> {
         match self {
             ModelField::Unquoted(v) | ModelField::Unterminated(v) => v.clone(),
-            ModelField::Quoted { value, trailing } => [value.as_slice(), trailing].concat(),
+            ModelField::Quoted { value, trailing } if trailing.is_empty() => value.clone(),
+            ModelField::Quoted { .. } => self.raw(),
         }
+    }
+
+    /// The field's bytes as written to the file.
+    #[must_use]
+    pub fn raw(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            ModelField::Unquoted(v) => out.extend_from_slice(v),
+            ModelField::Quoted { value, trailing } => {
+                out.push(b'"');
+                push_escaped(&mut out, value);
+                out.push(b'"');
+                out.extend_from_slice(trailing);
+            }
+            ModelField::Unterminated(v) => {
+                out.push(b'"');
+                push_escaped(&mut out, v);
+            }
+        }
+        out
     }
 }
 
@@ -266,24 +291,14 @@ impl CsvModel {
                     out.push(delimiter);
                 }
                 let start = out.len();
+                out.extend_from_slice(&field.raw());
                 let (quoted, text_after_quote, unterminated) = match field {
-                    ModelField::Unquoted(v) => {
-                        out.extend_from_slice(v);
-                        (false, None, false)
-                    }
-                    ModelField::Quoted { value, trailing } => {
-                        out.push(b'"');
-                        push_escaped(&mut out, value);
-                        out.push(b'"');
-                        let after = out.len();
-                        out.extend_from_slice(trailing);
+                    ModelField::Unquoted(_) => (false, None, false),
+                    ModelField::Quoted { trailing, .. } => {
+                        let after = out.len() - trailing.len();
                         (true, (!trailing.is_empty()).then_some(after), false)
                     }
-                    ModelField::Unterminated(v) => {
-                        out.push(b'"');
-                        push_escaped(&mut out, v);
-                        (true, None, true)
-                    }
+                    ModelField::Unterminated(_) => (true, None, true),
                 };
                 fields.push(FieldLayout {
                     span: start..out.len(),
@@ -388,20 +403,28 @@ pub struct GeneratedCsv {
     pub bytes: Vec<u8>,
     /// Every row and field, with spans and values.
     pub layout: Layout,
+    /// The encoding ADR-0003 gives these bytes ([`expected_encoding`]):
+    /// UTF-8, or Windows-1252 if invalid bytes outnumber valid multibyte
+    /// sequences.
+    pub encoding: Encoding,
     /// The diagnostics a parser should report, from [`diagnostics::derive`].
+    /// `invalid_encoding` appears only if `encoding` is UTF-8.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl GeneratedCsv {
-    /// Serializes `model` and derives the expected layout and diagnostics.
+    /// Serializes `model` and derives the expected layout, encoding and
+    /// diagnostics.
     #[must_use]
     pub fn from_model(model: CsvModel) -> Self {
         let (bytes, layout) = model.serialize();
-        let diagnostics = diagnostics::derive(&layout, &bytes, true);
+        let encoding = expected_encoding(&bytes);
+        let diagnostics = diagnostics::derive(&layout, &bytes, encoding == Encoding::Utf8);
         GeneratedCsv {
             model,
             bytes,
             layout,
+            encoding,
             diagnostics,
         }
     }
@@ -421,6 +444,7 @@ impl fmt::Debug for GeneratedCsv {
         f.debug_struct("GeneratedCsv")
             .field("bytes", &format_args!("b\"{}\"", self.bytes.escape_ascii()))
             .field("dialect", &self.model.dialect)
+            .field("encoding", &self.encoding)
             .field("rows", &self.model.rows)
             .field("diagnostics", &kinds)
             .finish()
@@ -783,7 +807,10 @@ mod tests {
         assert_eq!(f[0].span, 3..6);
         assert_eq!(f[1].span, 7..17);
         assert_eq!(f[1].value, b"x,\"y\"\n");
-        assert_eq!(f[2].value, b"qt\"u");
+        assert_eq!(
+            f[2].value, b"\"q\"t\"u",
+            "text after a closing quote shows raw"
+        );
         assert_eq!(f[2].span, 18..24);
         assert_eq!(f[2].text_after_quote, Some(21));
         assert!(layout.rows[1].is_blank());

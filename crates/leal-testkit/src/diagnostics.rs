@@ -1,5 +1,9 @@
 //! Diagnostics (DESIGN §3.5): what counts as one occurrence, and where it is.
 //!
+//! The units follow ADR-0003 decision 4: per row (ragged rows, blank lines,
+//! mixed line endings), per field (text after a closing quote, invalid
+//! encoding, NUL bytes) and per file (unterminated quote, BOM).
+//!
 //! [`derive`] is the testkit's definition of the expected diagnostics for a
 //! [`Layout`]. The hand-written corpus sidecars are checked against it (via the
 //! reference parser in this crate's tests), and later tasks can compare the
@@ -28,12 +32,12 @@ pub enum DiagnosticKind {
     /// Warning. One occurrence per field with bytes between its closing quote
     /// and the next delimiter or line ending. Offset: the first such byte.
     TextAfterClosingQuote,
-    /// Warning. One occurrence per invalid sequence, counted as Rust's
-    /// `String::from_utf8_lossy` counts replacement characters (the WHATWG
-    /// "maximal subpart" rule). Only for UTF-8 files. Offset: the first byte
-    /// of the sequence.
+    /// Warning. One occurrence per field containing invalid UTF-8 (sequences
+    /// split as `String::from_utf8_lossy` splits them). Only for files whose
+    /// encoding is UTF-8. Offset: the first invalid byte in the field.
     InvalidEncoding,
-    /// Warning. One occurrence per NUL (`0x00`) byte. Offset: the byte.
+    /// Warning. One occurrence per field containing a NUL (`0x00`) byte.
+    /// Offset: the first NUL in the field.
     NulBytes,
     /// Info. One occurrence per row whose line ending differs from the most
     /// common line ending (ties go to the one seen first). Offset: the first
@@ -153,7 +157,6 @@ pub fn invalid_utf8_offsets(bytes: &[u8]) -> Vec<usize> {
 /// The result is sorted by kind, in [`DiagnosticKind::ALL`] order.
 #[must_use]
 pub fn derive(layout: &Layout, bytes: &[u8], utf8: bool) -> Vec<Diagnostic> {
-    let row_of = |offset: usize| layout.row_of_offset(offset).unwrap_or(0);
     let mut out = Vec::new();
     let mut push = |kind, locations| {
         if let Some(d) = Diagnostic::from_locations(kind, locations) {
@@ -205,24 +208,13 @@ pub fn derive(layout: &Layout, bytes: &[u8], utf8: bool) -> Vec<Diagnostic> {
     if utf8 {
         push(
             DiagnosticKind::InvalidEncoding,
-            invalid_utf8_offsets(bytes)
-                .into_iter()
-                .map(|offset| Location {
-                    row: row_of(offset),
-                    offset,
-                })
-                .collect(),
+            first_per_field(layout, invalid_utf8_offsets(bytes).into_iter()),
         );
     }
 
     push(
         DiagnosticKind::NulBytes,
-        positions_of(0, bytes)
-            .map(|offset| Location {
-                row: row_of(offset),
-                offset,
-            })
-            .collect(),
+        first_per_field(layout, positions_of(0, bytes)),
     );
 
     let dominant = mode(layout.rows.iter().filter_map(|r| r.line_ending));
@@ -264,6 +256,24 @@ pub fn derive(layout: &Layout, bytes: &[u8], utf8: bool) -> Vec<Diagnostic> {
     out
 }
 
+/// One location per field: the first of `offsets` (which must be in
+/// increasing order) that falls in each field. An offset outside every field
+/// (which a structural ASCII byte can't produce) counts on its own.
+fn first_per_field(layout: &Layout, offsets: impl Iterator<Item = usize>) -> Vec<Location> {
+    let mut out = Vec::new();
+    let mut last_field = None;
+    for offset in offsets {
+        let field = layout.field_of_offset(offset);
+        if field.is_some() && field == last_field {
+            continue;
+        }
+        last_field = field;
+        let row = field.map_or_else(|| layout.row_of_offset(offset).unwrap_or(0), |(r, _)| r);
+        out.push(Location { row, offset });
+    }
+    out
+}
+
 fn positions_of(needle: u8, haystack: &[u8]) -> impl Iterator<Item = usize> + '_ {
     haystack
         .iter()
@@ -295,6 +305,61 @@ mod tests {
             assert_eq!(invalid_utf8_offsets(bytes).len(), expected, "{bytes:?}");
         }
         assert_eq!(invalid_utf8_offsets(b"a\xC3,b\xFF"), vec![1, 4]);
+    }
+
+    #[test]
+    fn nul_and_invalid_bytes_count_once_per_field() {
+        use crate::dialect::Delimiter;
+        // A hand-built layout: `\0x\0,\xFF\xFE\n\0` has fields 0..3 and 4..6
+        // in row 0, then 7..8 in row 1.
+        let bytes = b"\0x\0,\xFF\xFE\n\0";
+        let field = |span: std::ops::Range<usize>| crate::layout::FieldLayout {
+            value: bytes[span.clone()].to_vec(),
+            span,
+            quoted: false,
+            text_after_quote: None,
+            unterminated: false,
+        };
+        let layout = Layout {
+            bom_len: 0,
+            rows: vec![
+                crate::layout::RowLayout {
+                    span: 0..6,
+                    line_ending: Some(crate::dialect::LineEnding::Lf),
+                    fields: vec![field(0..3), field(4..6)],
+                },
+                crate::layout::RowLayout {
+                    span: 7..8,
+                    line_ending: None,
+                    fields: vec![field(7..8)],
+                },
+            ],
+        };
+        assert_eq!(layout.check_tiles(bytes, Delimiter::Comma), Ok(()));
+        let d = derive(&layout, bytes, true);
+        let nul = d
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::NulBytes)
+            .unwrap();
+        assert_eq!(nul.count, 2);
+        assert_eq!(
+            nul.first,
+            vec![
+                Location { row: 0, offset: 0 },
+                Location { row: 1, offset: 7 }
+            ]
+        );
+        let bad = d
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::InvalidEncoding)
+            .unwrap();
+        assert_eq!(bad.count, 1);
+        assert_eq!(bad.first, vec![Location { row: 0, offset: 4 }]);
+        assert!(
+            derive(&layout, bytes, false)
+                .iter()
+                .all(|d| d.kind != DiagnosticKind::InvalidEncoding)
+        );
     }
 
     #[test]

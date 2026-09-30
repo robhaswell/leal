@@ -100,11 +100,11 @@ case("dialect/encoding-utf8-bom.csv", BOM_UTF8 + text.encode("utf-8"),
      rows=4, fields=[2] * 4, bom="utf-8", diagnostics=[bom_present()],
      cells=[(0, 0, "city", False), (2, 0, "Kraków", False)])
 case("dialect/encoding-utf16le-bom.csv", BOM_UTF16LE + text.encode("utf-16-le"),
-     "UTF-16 LE with a BOM (read-only in v1). Only counts are compared, not offsets.",
+     "UTF-16 LE with a BOM (read-only in v1). Offsets are into the file as stored.",
      rows=4, fields=[2] * 4, bom="utf-16le", encoding="utf-16le",
      diagnostics=[bom_present()], cells=[(3, 0, "東京", False)])
 case("dialect/encoding-utf16be-bom.csv", BOM_UTF16BE + text.encode("utf-16-be"),
-     "UTF-16 BE with a BOM (read-only in v1). Only counts are compared, not offsets.",
+     "UTF-16 BE with a BOM (read-only in v1). Offsets are into the file as stored.",
      rows=4, fields=[2] * 4, bom="utf-16be", encoding="utf-16be",
      diagnostics=[bom_present()], cells=[(1, 0, "Zürich", False)])
 
@@ -182,34 +182,46 @@ case("diagnostics/ragged-rows.csv", d, "One short row and one long row.",
      rows=5, fields=[3, 3, 2, 4, 3],
      diagnostics=[("ragged_rows", [(2, at(d, b"4,5")), (3, at(d, b"6,7"))])])
 
-d = b'id,name\n1,"Ada"x\n2,"Bob" \n3,"Cy"d"e\n'
+# UTF-16 offsets are byte offsets into the file as stored (ADR-0003 decision 6).
+# "😀" is a surrogate pair (4 bytes), so a wrong offset mapping shows up here.
+d = BOM_UTF16LE + "name,qty\nÄpfel 😀,1\npear\nplum,3\n".encode("utf-16-le")
+case("diagnostics/ragged-rows-utf16le.csv", d,
+     "A short row in UTF-16 LE, after a surrogate pair. The location is a byte offset "
+     "into the file as stored, BOM included.",
+     rows=4, fields=[2, 2, 1, 2], bom="utf-16le", encoding="utf-16le",
+     diagnostics=[("ragged_rows", [(2, at(d, "pear".encode("utf-16-le")))]),
+                  bom_present()],
+     cells=[(1, 0, "Äpfel 😀", False), (2, 0, "pear", False)])
+
+d = b'id,name,n\n1,"Ada"x,1\n2,"Bob" ,2\n3,"a"b"c",3\n'
 case("diagnostics/text-after-closing-quote.csv", d,
-     "Text after a closing quote is kept in the field. A quote in that text is literal.",
-     rows=4, fields=[2] * 4,
+     "Text after a closing quote is kept in the field, which displays raw (ADR-0003). "
+     'A quote in that text is literal: "a"b"c" is one field.',
+     rows=4, fields=[3] * 4,
      diagnostics=[("text_after_closing_quote", [
          (1, at(d, b'"Ada"', plus=5)),
          (2, at(d, b'"Bob"', plus=5)),
-         (3, at(d, b'"Cy"', plus=4)),
+         (3, at(d, b'"a"', plus=3)),
      ])],
-     cells=[(1, 1, "Adax", True), (2, 1, "Bob ", True), (3, 1, 'Cyd"e', True)])
+     cells=[(1, 1, '"Ada"x', True), (2, 1, '"Bob" ', True), (3, 1, '"a"b"c"', True),
+            (3, 2, "3", False)])
 
 d = ("name,city,visits\nJosé,Málaga,3\n".encode("utf-8") + b"Ren\xe9,Paris,5\n"
      + "Zoë,Köln,2\n".encode("utf-8") + b"bad\xff\xfe,x,1\n")
 case("diagnostics/invalid-utf8.csv", d,
-     "Mostly valid UTF-8 (so detected as UTF-8) with three invalid bytes: a Latin-1 é, "
-     "then 0xFF 0xFE (each its own invalid sequence).",
+     "UTF-8 by ADR-0003 (4 valid multibyte sequences outnumber 3 invalid bytes). Two "
+     "fields hold invalid bytes: a Latin-1 é, and 0xFF 0xFE. One occurrence per field.",
      rows=5, fields=[3] * 5,
-     diagnostics=[("invalid_encoding", [
-         (2, at(d, b"\xe9")), (4, at(d, b"\xff")), (4, at(d, b"\xfe")),
-     ])],
+     diagnostics=[("invalid_encoding", [(2, at(d, b"\xe9")), (4, at(d, b"\xff"))])],
      cells=[(2, 0, "Ren�", False), (4, 0, "bad��", False),
             (1, 1, "Málaga", False)])
 
-d = b"id,value\n1,ab\x00cd\n2,\x00\n3,ok\n"
-case("diagnostics/nul-bytes.csv", d, "Two NUL bytes inside fields.",
+d = b"id,value\n1,ab\x00c\x00d\n2,\x00\n3,ok\n"
+case("diagnostics/nul-bytes.csv", d,
+     "Three NUL bytes in two fields: one occurrence per field, at its first NUL.",
      rows=4, fields=[2] * 4,
-     diagnostics=[("nul_bytes", [(1, at(d, b"\x00")), (2, at(d, b"\x00", nth=1))])],
-     cells=[(1, 1, "ab\x00cd", False)])
+     diagnostics=[("nul_bytes", [(1, at(d, b"\x00")), (2, at(d, b"\x00", nth=2))])],
+     cells=[(1, 1, "ab\x00c\x00d", False)])
 
 d = b"id,v\n1,a\r\n2,b\n3,c\r4,d\n"
 case("diagnostics/mixed-line-endings.csv", d,
@@ -249,11 +261,20 @@ d = BOM_UTF8 + ("Name,Amount,Date,Notes\r\n"
                 'José Núñez,-12,04/01/2026,"Line one\nLine two"\r\n'
                 ",0,05/01/2026,\r\n").encode("utf-8")
 case("exports/imitation-excel-utf8-bom.csv", d,
-     'Imitation of Excel "CSV UTF-8": BOM, CRLF rows, LF inside quoted cells, minimal '
-     "quoting, empty cells unquoted.",
+     'Imitation of Excel for Windows "CSV UTF-8": BOM, CRLF rows, LF inside quoted '
+     "cells, minimal quoting, empty cells unquoted.",
      rows=4, fields=[4] * 4, line_ending="crlf", bom="utf-8", diagnostics=[bom_present()],
      cells=[(1, 3, 'Said "hello"', True), (2, 3, "Line one\nLine two", True),
             (3, 0, "", False), (2, 0, "José Núñez", False)])
+
+d = BOM_UTF8 + ("Name,Amount,Notes\r"
+                "Ada Lovelace,1234.5,first\r"
+                'José Núñez,-12,"a, b"\r').encode("utf-8")
+case("exports/imitation-excel-mac-utf8-bom.csv", d,
+     'Imitation of Excel for Mac "CSV UTF-8", which users report ends rows with a lone '
+     "CR (Microsoft Q&A, \"CSV Line Endings\"). BOM, CR rows.",
+     rows=3, fields=[3] * 3, line_ending="cr", bom="utf-8", diagnostics=[bom_present()],
+     cells=[(2, 2, "a, b", True), (2, 0, "José Núñez", False)])
 
 d = ("Name,Amount,Notes\r\n"
      "Café Crème,3.5,“special”\r\n"

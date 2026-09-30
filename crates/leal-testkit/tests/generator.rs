@@ -5,7 +5,7 @@
 mod oracle;
 
 use leal_testkit::diagnostics::{self, DiagnosticKind};
-use leal_testkit::dialect::{Delimiter, LineEnding, UTF8_BOM};
+use leal_testkit::dialect::{Delimiter, Encoding, LineEnding, UTF8_BOM, expected_encoding};
 use leal_testkit::fidelity::check_identical;
 use leal_testkit::strategies::bytes::{INVALID_UTF8, MULTIBYTE_UTF8, SIGNIFICANT_BYTES, csv_bytes};
 use leal_testkit::strategies::csv::{
@@ -19,6 +19,7 @@ use proptest::test_runner::TestRunner;
 /// The generator's promise, checked against the independent oracle.
 fn check_round_trip(file: &GeneratedCsv) -> Result<(), TestCaseError> {
     prop_assert_eq!(file.model.check(), Ok(()));
+    prop_assert_eq!(file.encoding, expected_encoding(&file.bytes));
     prop_assert_eq!(
         file.layout.check_tiles(&file.bytes, file.delimiter()),
         Ok(())
@@ -59,7 +60,7 @@ fn check_round_trip(file: &GeneratedCsv) -> Result<(), TestCaseError> {
         prop_assert!(dominant.is_none() || dominant == Some(le));
     }
     prop_assert_eq!(
-        diagnostics::derive(&parsed, &file.bytes, true),
+        diagnostics::derive(&parsed, &file.bytes, file.encoding == Encoding::Utf8),
         file.diagnostics.clone()
     );
     Ok(())
@@ -120,6 +121,8 @@ proptest! {
     #[test]
     fn clean_files_round_trip(file in csv_file(CsvConfig::clean())) {
         check_round_trip(&file)?;
+        // Clean files are valid UTF-8 (ASCII counts as UTF-8).
+        prop_assert_eq!(file.encoding, Encoding::Utf8);
         // A clean file has at most the BOM info diagnostic.
         let k = kinds(&file);
         prop_assert!(k.is_empty() || k == vec![DiagnosticKind::BomPresent], "{:?}", k);
@@ -188,6 +191,11 @@ fn messy_generator_reaches_every_construct() {
             "no generated file has {kind:?}"
         );
     }
+    // Invalid bytes sometimes outnumber multibyte text (ADR-0003 decision 1).
+    assert!(
+        has(&|f| f.encoding == Encoding::Windows1252),
+        "no Windows-1252 file"
+    );
     let fields = |f: &GeneratedCsv| {
         f.layout
             .rows

@@ -45,11 +45,15 @@ pub struct FieldLayout {
     pub span: Range<usize>,
     /// True if the field's first byte is `"`.
     pub quoted: bool,
-    /// The unescaped value as raw bytes, before decoding. For a quoted field
-    /// this is the text between the quotes with `""` turned into `"`,
-    /// followed by any text after the closing quote, verbatim. For an
-    /// unterminated field it is everything after the opening quote, with
-    /// `""` turned into `"`.
+    /// The display value as bytes, before decoding:
+    ///
+    /// - unquoted: the raw bytes;
+    /// - quoted: the text between the quotes, with `""` turned into `"`;
+    /// - quoted with text after the closing quote (`"a"b`): the raw bytes,
+    ///   exactly as written, so `"a"b` (ADR-0002 question 6, ADR-0003
+    ///   decision 2);
+    /// - unterminated: everything after the opening quote, with `""`
+    ///   turned into `"`.
     pub value: Vec<u8>,
     /// Offset of the first byte after the closing quote, if the field has
     /// text between its closing quote and the next delimiter or line ending
@@ -107,6 +111,18 @@ impl Layout {
         let r = &self.rows[row];
         let end = r.span.end + r.line_ending.map_or(0, LineEnding::byte_len);
         (offset < end).then_some(row)
+    }
+
+    /// The `(row, field)` whose span contains byte `offset`. `None` for
+    /// delimiters, line endings, the BOM and offsets past the end.
+    #[must_use]
+    pub fn field_of_offset(&self, offset: usize) -> Option<(usize, usize)> {
+        let row = self.row_of_offset(offset)?;
+        let field = self.rows[row]
+            .fields
+            .iter()
+            .position(|f| f.span.contains(&offset))?;
+        Some((row, field))
     }
 
     /// Checks the structural invariants every parse must satisfy: rows and
@@ -270,6 +286,17 @@ mod tests {
         assert_eq!(l.row_of_offset(5), Some(1)); // its LF
         assert_eq!(l.row_of_offset(6), Some(2));
         assert_eq!(l.row_of_offset(7), None);
+    }
+
+    #[test]
+    fn field_of_offset_skips_delimiters_and_line_endings() {
+        let l = sample();
+        assert_eq!(l.field_of_offset(0), Some((0, 0)));
+        assert_eq!(l.field_of_offset(1), None); // the comma
+        assert_eq!(l.field_of_offset(2), Some((0, 1)));
+        assert_eq!(l.field_of_offset(3), None); // the LF
+        assert_eq!(l.field_of_offset(4), None); // a blank row's field has no bytes
+        assert_eq!(l.field_of_offset(6), Some((2, 0)));
     }
 
     #[test]

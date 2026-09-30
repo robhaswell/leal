@@ -15,8 +15,9 @@
 //! 3. In a quoted field, `""` is one literal `"`; any other `"` closes the
 //!    field. Delimiters, CR and LF inside are literal.
 //! 4. Bytes from the closing quote to the next delimiter, CR or LF are part
-//!    of the field (its raw span and its value), and are flagged as text
-//!    after the closing quote. A `"` among them is literal.
+//!    of the field's raw span, and are flagged as text after the closing
+//!    quote. A `"` among them is literal. Such a field's display value is
+//!    its raw bytes (ADR-0003 decisions 2 and 3).
 //! 5. A quoted field with no closing quote runs to the end of the file.
 //! 6. Outside quotes, CRLF, a lone CR and a lone LF each end a row. A line
 //!    ending at the very end of the file ends the last row, and does not
@@ -129,16 +130,31 @@ fn parse_field(bytes: &[u8], start: usize, d: u8) -> FieldLayout {
     }
     let after = pos;
     while pos < bytes.len() && !is_end(bytes[pos]) {
-        value.push(bytes[pos]);
         pos += 1;
+    }
+    let text_after_quote = (pos > after).then_some(after);
+    if text_after_quote.is_some() {
+        // ADR-0003 decision 2: such a field displays raw.
+        value = bytes[start..pos].to_vec();
     }
     FieldLayout {
         span: start..pos,
         quoted: true,
         value,
-        text_after_quote: (pos > after).then_some(after),
+        text_after_quote,
         unterminated: false,
     }
+}
+
+/// Undoes `""` escaping.
+fn unescape(inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        out.push(inner[i]);
+        i += if inner[i] == b'"' { 2 } else { 1 };
+    }
+    out
 }
 
 /// Rebuilds model rows from a parse, to check the generator's round trip.
@@ -154,12 +170,16 @@ pub fn to_model_rows(layout: &Layout, bytes: &[u8]) -> Vec<ModelRow> {
                 .map(|f| {
                     if f.unterminated {
                         ModelField::Unterminated(f.value.clone())
-                    } else if f.quoted {
-                        let trailing = f
-                            .text_after_quote
-                            .map_or(Vec::new(), |t| bytes[t..f.span.end].to_vec());
-                        let value = f.value[..f.value.len() - trailing.len()].to_vec();
+                    } else if let Some(t) = f.text_after_quote {
+                        // Between the opening quote and the closing quote at t - 1.
+                        let value = unescape(&bytes[f.span.start + 1..t - 1]);
+                        let trailing = bytes[t..f.span.end].to_vec();
                         ModelField::Quoted { value, trailing }
+                    } else if f.quoted {
+                        ModelField::Quoted {
+                            value: f.value.clone(),
+                            trailing: Vec::new(),
+                        }
                     } else {
                         ModelField::Unquoted(f.value.clone())
                     }
@@ -171,19 +191,17 @@ pub fn to_model_rows(layout: &Layout, bytes: &[u8]) -> Vec<ModelRow> {
 
 /// A parse of a corpus file in its declared encoding.
 pub struct Analysis {
-    /// The layout. For UTF-16 files its offsets are into `parsed`, not the
-    /// file.
+    /// The layout. Offsets are always into the file as stored, including for
+    /// UTF-16 (ADR-0003 decision 6). For UTF-16 the values are UTF-8.
     pub layout: Layout,
-    /// The bytes that were parsed: the file itself, or for UTF-16 the file
-    /// transcoded to UTF-8 without its BOM.
-    pub parsed: Vec<u8>,
-    /// True for UTF-16: offsets in `layout` and `diagnostics` are not file
-    /// offsets, so only counts are comparable.
-    pub transcoded: bool,
-    /// Diagnostics per `leal_testkit::diagnostics::derive`.
+    /// Diagnostics per `leal_testkit::diagnostics::derive`, with file offsets.
     pub diagnostics: Vec<Diagnostic>,
     /// The encoding used to decode values.
     pub encoding: Encoding,
+    /// What was actually parsed: the file itself, or for UTF-16 the file
+    /// transcoded to UTF-8 (without its BOM), with that text's own layout.
+    parsed: Vec<u8>,
+    parsed_layout: Layout,
 }
 
 /// Parses a corpus file with the delimiter and encoding its sidecar gives.
@@ -195,20 +213,49 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
             let layout = parse(bytes, delimiter);
             let diagnostics = diagnostics::derive(&layout, bytes, encoding == Encoding::Utf8);
             Analysis {
+                parsed_layout: layout.clone(),
                 layout,
-                parsed: bytes.to_vec(),
-                transcoded: false,
                 diagnostics,
                 encoding,
+                parsed: bytes.to_vec(),
             }
         }
         Encoding::Utf16Le | Encoding::Utf16Be => {
-            let bom = Bom::detect(bytes);
-            let body = &bytes[bom.bytes().len()..];
-            let parsed = decode_utf16(body, encoding == Encoding::Utf16Le).into_bytes();
-            let layout = parse(&parsed, delimiter);
-            let mut diagnostics = diagnostics::derive(&layout, &parsed, false);
-            if bom != Bom::None {
+            // Parse the UTF-8 transcoding, then map every offset back to the
+            // file. Structural characters are single code units, so every
+            // span boundary is a character boundary and maps exactly.
+            let bom_len = Bom::detect(bytes).bytes().len();
+            let (text, map) = decode_utf16(bytes, bom_len, encoding == Encoding::Utf16Le);
+            let parsed = text.into_bytes();
+            let parsed_layout = parse(&parsed, delimiter);
+            let at = |o: usize| map[o];
+            let layout = Layout {
+                bom_len,
+                rows: parsed_layout
+                    .rows
+                    .iter()
+                    .map(|r| RowLayout {
+                        span: at(r.span.start)..at(r.span.end),
+                        line_ending: r.line_ending,
+                        fields: r
+                            .fields
+                            .iter()
+                            .map(|f| FieldLayout {
+                                span: at(f.span.start)..at(f.span.end),
+                                text_after_quote: f.text_after_quote.map(at),
+                                ..f.clone()
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            let mut diagnostics = diagnostics::derive(&parsed_layout, &parsed, false);
+            for d in &mut diagnostics {
+                for l in &mut d.first {
+                    l.offset = at(l.offset);
+                }
+            }
+            if bom_len > 0 {
                 diagnostics.push(Diagnostic {
                     kind: DiagnosticKind::BomPresent,
                     count: 1,
@@ -217,10 +264,10 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
             }
             Analysis {
                 layout,
-                parsed,
-                transcoded: true,
                 diagnostics,
                 encoding,
+                parsed,
+                parsed_layout,
             }
         }
     }
@@ -240,20 +287,43 @@ impl Analysis {
     pub fn quoted(&self, row: usize, field: usize) -> Option<bool> {
         Some(self.layout.rows.get(row)?.fields.get(field)?.quoted)
     }
+
+    /// Checks that the parse tiles the text that was parsed.
+    pub fn check_tiles(&self, delimiter: Delimiter) -> Result<(), String> {
+        self.parsed_layout.check_tiles(&self.parsed, delimiter)
+    }
 }
 
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let units = bytes.chunks(2).map(|c| {
-        let pair = [c[0], c.get(1).copied().unwrap_or(0)];
-        if little_endian {
-            u16::from_le_bytes(pair)
-        } else {
-            u16::from_be_bytes(pair)
-        }
-    });
-    char::decode_utf16(units)
-        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect()
+/// Decodes UTF-16 after a `bom_len`-byte BOM. Returns the text and, for each
+/// byte offset into its UTF-8 form (plus one past the end), the file offset
+/// of the character it belongs to.
+fn decode_utf16(bytes: &[u8], bom_len: usize, little_endian: bool) -> (String, Vec<usize>) {
+    let units: Vec<u16> = bytes[bom_len..]
+        .chunks(2)
+        .map(|c| {
+            let pair = [c[0], c.get(1).copied().unwrap_or(0)];
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        })
+        .collect();
+    let mut text = String::new();
+    let mut map = Vec::new();
+    let mut unit = 0;
+    for r in char::decode_utf16(units.iter().copied()) {
+        let (c, width) = match r {
+            Ok(c) => (c, c.len_utf16()),
+            Err(_) => (char::REPLACEMENT_CHARACTER, 1),
+        };
+        let file_offset = bom_len + 2 * unit;
+        map.extend(std::iter::repeat_n(file_offset, c.len_utf8()));
+        text.push(c);
+        unit += width;
+    }
+    map.push(bytes.len());
+    (text, map)
 }
 
 /// Windows-1252 as the WHATWG Encoding Standard defines it: 0x80–0x9F map

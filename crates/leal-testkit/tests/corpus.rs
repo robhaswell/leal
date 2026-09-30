@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use leal_testkit::corpus::{self, CorpusCase, SIDECAR_SUFFIX};
 use leal_testkit::diagnostics::DiagnosticKind;
-use leal_testkit::dialect::{Bom, Delimiter, Encoding, LineEnding};
+use leal_testkit::dialect::{Bom, Delimiter, Encoding, LineEnding, expected_encoding};
 
 fn cases() -> Vec<CorpusCase> {
     corpus::load().unwrap_or_else(|e| panic!("{e}"))
@@ -69,7 +69,7 @@ fn check_case(case: &CorpusCase, problems: &mut Vec<String>) {
     let a = oracle::analyze(&case.bytes, s.dialect.delimiter, s.dialect.encoding);
     let layout = &a.layout;
 
-    if let Err(e) = layout.check_tiles(&a.parsed, s.dialect.delimiter) {
+    if let Err(e) = a.check_tiles(s.dialect.delimiter) {
         fail(format!("layout does not tile: {e}"));
     }
     if layout.rows.len() != s.rows.count {
@@ -116,8 +116,8 @@ fn check_case(case: &CorpusCase, problems: &mut Vec<String>) {
                         g.count, e.count
                     ));
                 }
-                // UTF-16 offsets are into the transcoded text; only counts compare.
-                if !a.transcoded && !g.first.starts_with(&e.first) {
+                // Offsets are file offsets for every encoding (ADR-0003).
+                if !g.first.starts_with(&e.first) {
                     fail(format!(
                         "{kind:?} at {:?}, sidecar says {:?}",
                         g.first, e.first
@@ -141,25 +141,15 @@ fn check_case(case: &CorpusCase, problems: &mut Vec<String>) {
         }
     }
 
-    // Encoding claims that don't need a detector.
-    match s.dialect.encoding {
-        Encoding::Utf8 => {
-            let valid = std::str::from_utf8(&case.bytes).is_ok();
-            let flagged = s.diagnostic(DiagnosticKind::InvalidEncoding).is_some();
-            if valid == flagged {
-                fail("a UTF-8 file must be valid UTF-8 unless it expects invalid_encoding".into());
-            }
-        }
-        Encoding::Windows1252 => {
-            if std::str::from_utf8(&case.bytes).is_ok() {
-                fail("a Windows-1252 file that is valid UTF-8 would be detected as UTF-8".into());
-            }
-        }
-        Encoding::Utf16Le | Encoding::Utf16Be => {
-            if !case.bytes.len().is_multiple_of(2) {
-                fail("a UTF-16 file has an even number of bytes".into());
-            }
-        }
+    // The encoding follows ADR-0003 decision 1.
+    let rule = expected_encoding(&case.bytes);
+    if rule != s.dialect.encoding {
+        fail(format!("ADR-0003 gives encoding {rule:?}"));
+    }
+    if matches!(s.dialect.encoding, Encoding::Utf16Le | Encoding::Utf16Be)
+        && !case.bytes.len().is_multiple_of(2)
+    {
+        fail("a UTF-16 file has an even number of bytes".into());
     }
 }
 

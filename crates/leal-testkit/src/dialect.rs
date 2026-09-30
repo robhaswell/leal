@@ -168,9 +168,108 @@ impl Encoding {
     }
 }
 
+/// Counts of valid multibyte UTF-8 sequences and of invalid bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Utf8Census {
+    /// Valid sequences of 2 to 4 bytes (U+FEFF included).
+    pub multibyte: usize,
+    /// Bytes that are part of no valid sequence.
+    pub invalid_bytes: usize,
+}
+
+impl Utf8Census {
+    /// Counts `bytes`. Invalid sequences are split as `from_utf8_lossy`
+    /// splits them; every byte of each one counts.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        let mut census = Utf8Census::default();
+        let mut rest = bytes;
+        loop {
+            let (valid, next) = match std::str::from_utf8(rest) {
+                Ok(s) => (s, None),
+                Err(e) => {
+                    let valid_len = e.valid_up_to();
+                    let bad = e.error_len().unwrap_or(rest.len() - valid_len);
+                    census.invalid_bytes += bad;
+                    // The prefix was just checked, so this cannot fail.
+                    let valid = std::str::from_utf8(&rest[..valid_len]).unwrap_or_default();
+                    (valid, Some(valid_len + bad))
+                }
+            };
+            census.multibyte += valid.chars().filter(|c| c.len_utf8() > 1).count();
+            match next {
+                Some(n) => rest = &rest[n..],
+                None => return census,
+            }
+        }
+    }
+}
+
+/// The encoding ADR-0003 (decision 1) says a file has. This is the
+/// testkit's statement of the rule, not the product's detector (task 1.2).
+///
+/// - A BOM decides: UTF-8, UTF-16 LE or UTF-16 BE.
+/// - Pure ASCII is UTF-8.
+/// - A file with at least one valid multibyte UTF-8 sequence, and more of
+///   them than invalid bytes, is UTF-8 (with an invalid-encoding warning if
+///   any bytes are invalid).
+/// - Anything else is Windows-1252, the single-byte default.
+#[must_use]
+pub fn expected_encoding(bytes: &[u8]) -> Encoding {
+    match Bom::detect(bytes) {
+        Bom::Utf8 => return Encoding::Utf8,
+        Bom::Utf16Le => return Encoding::Utf16Le,
+        Bom::Utf16Be => return Encoding::Utf16Be,
+        Bom::None => {}
+    }
+    let census = Utf8Census::of(bytes);
+    let ascii = census.multibyte == 0 && census.invalid_bytes == 0;
+    if ascii || (census.multibyte >= 1 && census.multibyte > census.invalid_bytes) {
+        Encoding::Utf8
+    } else {
+        Encoding::Windows1252
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_census_counts_sequences_and_bytes() {
+        assert_eq!(Utf8Census::of(b""), Utf8Census::default());
+        assert_eq!(
+            Utf8Census::of("aé€😀".as_bytes()),
+            Utf8Census {
+                multibyte: 3,
+                invalid_bytes: 0
+            }
+        );
+        // A truncated "€" (2 bytes), then "é", then a stray 0xFF.
+        assert_eq!(
+            Utf8Census::of(b"\xE2\x82x\xC3\xA9\xFF"),
+            Utf8Census {
+                multibyte: 1,
+                invalid_bytes: 3
+            }
+        );
+    }
+
+    #[test]
+    fn expected_encoding_follows_adr_0003() {
+        assert_eq!(expected_encoding(b""), Encoding::Utf8);
+        assert_eq!(expected_encoding(b"a,b\n"), Encoding::Utf8);
+        assert_eq!(expected_encoding("é,ü\n".as_bytes()), Encoding::Utf8);
+        // Two valid multibyte sequences outnumber one invalid byte.
+        assert_eq!(expected_encoding(b"\xC3\xA9\xC3\xBC\xE9"), Encoding::Utf8);
+        // A tie is not "outnumber".
+        assert_eq!(expected_encoding(b"\xC3\xA9\xE9"), Encoding::Windows1252);
+        // High bytes with no valid multibyte sequence at all.
+        assert_eq!(expected_encoding(b"Caf\xE9"), Encoding::Windows1252);
+        assert_eq!(expected_encoding(b"\xEF\xBB\xBF\xFF"), Encoding::Utf8);
+        assert_eq!(expected_encoding(b"\xFF\xFEa\0"), Encoding::Utf16Le);
+        assert_eq!(expected_encoding(b"\xFE\xFF\0a"), Encoding::Utf16Be);
+    }
 
     #[test]
     fn delimiter_bytes_round_trip() {

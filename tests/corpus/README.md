@@ -32,10 +32,16 @@ later under names starting with `real-`.
 
 ## Conventions
 
+These follow DESIGN §3.4–§3.5 as clarified by ADR-0003.
+
 - **Rows** are *physical rows* (records), numbered from 0. A newline inside a
   quoted field does not start a row.
 - **Offsets** are byte offsets into the file as stored on disk, from 0,
-  **including the BOM**. In a file with a UTF-8 BOM, row 0 starts at offset 3.
+  **including the BOM**, for every encoding, UTF-16 included. In a file with
+  a UTF-8 BOM, row 0 starts at offset 3; with a UTF-16 BOM, at offset 2.
+- **Text after a closing quote** (`"a"b`) is part of the field, and the field
+  displays raw: its value is `"a"b`. Quotes in that text are literal, so
+  `"a"b"c",` is one field with raw bytes `"a"b"c"`.
 - **BOM.** A BOM belongs to no row. A quote straight after it opens a quoted
   first field.
 - **End of file.** A line ending at the very end ends the last row; it does
@@ -46,7 +52,9 @@ later under names starting with `real-`.
   newline, because that newline is inside the field.
 - **Blank lines.** A row with no bytes before its line ending is a blank line,
   with one empty field. Blank lines are reported as `blank_lines` wherever
-  they are (including at the end), and are never counted as ragged.
+  they are (including at the end), and are never counted as ragged. The
+  final line ending is not a blank line: `a\nb\n` has two rows, `a\nb\n\n`
+  three, the last blank.
 - **Line ending** in the sidecar is the most common one; ties go to the one
   seen first. `none` means no row has a line ending.
 - **Field-count mode** (for ragged rows) is the most common field count among
@@ -54,9 +62,11 @@ later under names starting with `real-`.
 - **Delimiter.** A file with no delimiter at all (one column, or empty)
   expects the default, `,`.
 - **Header.** A single row, or rows that all look alike, have no header.
-- **UTF-16.** Offsets in UTF-16 files are not compared yet (DESIGN does not
-  say whether they are file offsets or offsets into transcoded text), so their
-  sidecars list only the BOM diagnostic, whose location is 0 either way.
+- **Encoding.** A BOM decides. Otherwise pure ASCII is UTF-8; a file with at
+  least one valid multibyte UTF-8 sequence, and more of them than invalid
+  bytes, is UTF-8 (with `invalid_encoding` if any bytes are invalid);
+  anything else is Windows-1252. The corpus tests check every sidecar's
+  `encoding` against this rule (`leal_testkit::dialect::expected_encoding`).
 - **Windows-1252** follows the WHATWG mapping: every byte decodes, so
   Windows-1252 files never expect `invalid_encoding`.
 
@@ -111,16 +121,17 @@ Unknown keys are errors, so typos are caught.
 
 ### Diagnostic kinds
 
-What counts as one occurrence, and which byte its offset points at. The
-definitions live in `leal_testkit::diagnostics::DiagnosticKind`.
+What counts as one occurrence (ADR-0003 decision 4), and which byte its
+offset points at. The definitions live in
+`leal_testkit::diagnostics::DiagnosticKind`.
 
 | Kind | One occurrence per | Offset |
 |---|---|---|
-| `unterminated_quote` | the field whose quote never closes (at most one) | the opening quote |
+| `unterminated_quote` | file (the field whose quote never closes) | the opening quote |
 | `ragged_rows` | non-blank row whose field count differs from the mode | row start |
 | `text_after_closing_quote` | field with bytes after its closing quote | first such byte |
-| `invalid_encoding` | invalid UTF-8 sequence, counted as `String::from_utf8_lossy` counts `�` | first byte |
-| `nul_bytes` | NUL byte | the byte |
+| `invalid_encoding` | field containing invalid UTF-8 (UTF-8 files only) | first invalid byte in the field |
+| `nul_bytes` | field containing a NUL byte | first NUL in the field |
 | `mixed_line_endings` | row whose line ending differs from the most common | first byte of that line ending |
 | `blank_lines` | blank row | row start |
 | `bom_present` | file with a BOM (at most one) | 0 (row 0) |
