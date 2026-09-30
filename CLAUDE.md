@@ -9,9 +9,36 @@ user didn't edit. Rust core (`crates/`) + thin Swift/AppKit app (`app/`).
 - `docs/PLAN.md` — the task list. Work the next unticked task unless told otherwise.
 - `docs/adr/` — decisions that changed or refined the design.
 
+## How the build is run
+
+An orchestrating Claude session runs the build and assigns each PLAN task to
+an implementer sub-agent working in its own git worktree.
+
+```
+task/<id>-<slug>  ──PR──►  phase/<n>  ──phase PR──►  main
+```
+
+- **Task PRs target the phase branch** (`phase/0`, `phase/1`, …), never
+  `main`. A fresh reviewer agent reviews each task PR, and the orchestrator
+  merges it once review findings are fixed and CI is green.
+- **Phase PRs target `main`.** They merge only after the phase-end review
+  (parallel reviewers for fidelity/correctness, Rust quality, performance,
+  test strength with `cargo-mutants`, and Swift/AppKit; each finding verified
+  before it is fixed) and **Rob's approval**.
+- **Rob approves phase gates and ADRs only.** Everything else is reviewed by
+  agents.
+- **Implementers never merge, and never push to `main` or a phase branch.**
+- **When blocked, stop and report.** If a task needs a design change, a weaker
+  fidelity test or a missed performance budget, write an ADR and report back
+  instead of working around it.
+- **Report back briefly** (about 150 words): status, PR link, test results,
+  benchmark results, deviations from the design, and open questions. Details
+  go in the PR, not the report.
+
 ## Working rules
 
-- **One task per branch and PR**: `task/<id>-<slug>`. Keep PRs to that task.
+- **One task per branch and PR**: `task/<id>-<slug>`, branched from and
+  targeting `phase/<n>`. Keep PRs to that task.
 - **Tests first.** For core work, write the failing tests (including fidelity
   property tests where relevant) before the implementation.
 - **Never weaken a fidelity test** (DESIGN §5) to make a change pass. If the
@@ -37,10 +64,11 @@ user didn't edit. Rust core (`crates/`) + thin Swift/AppKit app (`app/`).
 
 ## Rob is new to Rust
 
-Rob reviews every PR. In each PR description, add a short **"Rust notes"**
-section explaining any Rust concepts the change relies on (ownership,
-lifetimes, traits, `Arc`, async, `unsafe`, etc.) in plain terms, with pointers
-to the relevant code. Keep code straightforward over clever.
+In each PR description, add a short **"Rust notes"** section explaining any
+Rust concepts the change relies on (ownership, lifetimes, traits, `Arc`,
+async, `unsafe`, etc.) in plain terms, with pointers to the relevant code.
+These are collected into the phase report Rob reads at each phase gate. Keep
+code straightforward over clever.
 
 ## PR checklist
 
@@ -49,3 +77,4 @@ to the relevant code. Keep code straightforward over clever.
 - [ ] Tests added (and fidelity tests, if the change touches parsing or saving)
 - [ ] Benchmarks included if a hot path changed
 - [ ] Rust notes for Rob
+- [ ] UI changes: screenshots of the running app next to the approved mockup

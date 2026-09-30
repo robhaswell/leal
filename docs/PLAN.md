@@ -5,14 +5,20 @@ explains what each task is for.
 
 **How to use this file**
 
-- Work on one task at a time, in order unless a task says otherwise.
+- Tasks run in order, except that independent tasks may run in parallel.
 - Each task is one branch and one pull request, named `task/<id>-<slug>`
-  (e.g. `task/1.3-row-index`).
+  (e.g. `task/1.3-row-index`), targeting the phase branch `phase/<n>`.
+  See `CLAUDE.md` for the full review and merge process.
 - Tick the box in the PR that completes the task.
-- A task is done only when every acceptance criterion holds and
-  `just check` passes locally and in CI.
+- A task is done only when every acceptance criterion holds,
+  `just check` passes locally and in CI, and its review findings are fixed.
+- A phase is done when its phase-end review is complete and Rob has approved
+  the phase PR into `main`.
 - If a task turns out to need a design change, stop and write an ADR in
   `docs/adr/` for Rob to approve before continuing.
+
+**Prerequisite:** building starts only after Rob approves the UI mockups
+(recorded as an ADR, with images in `docs/mockups/`).
 
 Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 
