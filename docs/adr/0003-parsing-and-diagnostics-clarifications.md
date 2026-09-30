@@ -52,6 +52,12 @@ diagnostic locations and test sidecars) are **byte offsets into the file as
 stored**. That includes UTF-16 files; transcoding is for display only. Row
 and field numbers are 0-based physical positions.
 
+**7. UTF-16 diagnostics.** In a UTF-16 file, a NUL is a U+0000 code unit,
+not a 0x00 byte (every ASCII character in UTF-16 contains a 0x00 byte). An
+unpaired surrogate is reported as `invalid_encoding`, once per field, and is
+shown as U+FFFD, the same as invalid UTF-8. In both cases the location is
+the byte offset of the code unit's first byte.
+
 ## Consequences
 
 - DESIGN §3.2, §3.4 and §3.5 get these rules written into them once this
