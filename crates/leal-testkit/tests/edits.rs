@@ -3,7 +3,9 @@
 
 mod oracle;
 
-use leal_testkit::dialect::{Bom, Delimiter, Encoding, decode_value, expected_encoding};
+use leal_testkit::dialect::{
+    Bom, Delimiter, Encoding, decode_value, expected_encoding, reopen_encoding,
+};
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
 use leal_testkit::save::{Document, Edit, SaveError};
@@ -164,6 +166,13 @@ fn edit_strategy_reaches_every_kind_of_edit() {
         cases
             .iter()
             .any(|c| matches!(c.saved, Err(SaveError::Unencodable(_))))
+    );
+    // Some saves need an encoding hint (ADR-0004 decision 11), so the reopen
+    // property really tests it.
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.saved.as_ref().is_ok_and(|s| s.encoding_hint.is_some()))
     );
     // Some saves change exactly one field.
     assert!(
@@ -359,19 +368,15 @@ proptest! {
             .collect();
 
         prop_assert_eq!(Bom::detect(&saved.bytes), Bom::detect(&case.file.bytes));
-        // KNOWN OPEN CASE (docs/tasks/0.2.md, "Reopen invariant"): without a
-        // BOM, the encoding is a whole-file heuristic (ADR-0003 decision 1),
-        // so an edit anywhere can flip it between UTF-8 and Windows-1252, and
-        // no splice can prevent that. `encoding_can_flip_on_reopen` pins the
-        // three ways found. Only that flip is allowed here; everything else
-        // (BOM, rows, line endings, bytes) must still match.
-        let reopened = expected_encoding(&saved.bytes);
-        let flip = reopened != case.file.encoding;
-        if flip {
-            let heuristic = [Encoding::Utf8, Encoding::Windows1252];
-            prop_assert_eq!(Bom::detect(&saved.bytes), Bom::None);
-            prop_assert!(heuristic.contains(&reopened) && heuristic.contains(&case.file.encoding));
-        }
+        // ADR-0004 decision 11: reopening *with* the saved encoding hint gives
+        // exactly the document's encoding. No flip is allowed. The hint is
+        // written only when it is needed (the file had none to update).
+        let guess = expected_encoding(&saved.bytes);
+        prop_assert_eq!(
+            saved.encoding_hint,
+            (guess != case.file.encoding).then_some(case.file.encoding)
+        );
+        prop_assert_eq!(reopen_encoding(&saved.bytes, saved.encoding_hint), case.file.encoding);
 
         let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
         let endings: Vec<_> = parsed.layout.rows.iter().map(|r| r.line_ending).collect();
@@ -382,17 +387,15 @@ proptest! {
             .iter()
             .map(|r| r.fields.iter().map(|f| decode_value(&f.value, case.file.encoding)).collect())
             .collect();
-        // Decoded in the document's encoding, the values always match. After a
-        // flip, a reader using the new encoding may see different text: that
-        // is the open case.
-        prop_assert_eq!(got, values, "flip: {:?}", flip);
+        prop_assert_eq!(got, values);
     }
 }
 
-/// KNOWN OPEN CASE, not covered by ADR-0004: the three ways an edit can
-/// flip the reopened encoding of a BOM-less file (found by the reopen
-/// property). Each edit clears one cell. If a decision changes this (for
-/// example, warning before such a save), these expectations change with it.
+/// What happens *without* the encoding hint, for example in another app
+/// that doesn't read `com.apple.TextEncoding`, or after the file travels by
+/// email or git: the three ways an edit can flip the guessed encoding of a
+/// BOM-less file (found by the reopen property). Each edit clears one cell.
+/// With the hint (ADR-0004 decision 11), each reopens in its own encoding.
 #[test]
 fn encoding_can_flip_on_reopen() {
     let flip = |bytes: &[u8], row: usize| {
@@ -405,8 +408,12 @@ fn encoding_can_flip_on_reopen() {
             value: String::new(),
         };
         doc.apply(&clear).unwrap();
-        let saved = doc.save().unwrap().bytes;
-        (enc, expected_encoding(&saved))
+        let saved = doc.save().unwrap();
+        // The save asks for a hint, and with it the reopen is right.
+        assert_eq!(saved.encoding_hint, Some(enc));
+        assert_eq!(reopen_encoding(&saved.bytes, saved.encoding_hint), enc);
+        // Without it, the guess flips.
+        (enc, reopen_encoding(&saved.bytes, None))
     };
     // Windows-1252 with one high byte (€) → pure ASCII → UTF-8. The text
     // decodes the same either way; only future edits would encode

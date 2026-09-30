@@ -231,6 +231,29 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
     }
 }
 
+/// The encoding a reopen uses, given the file's bytes and its encoding hint
+/// (ADR-0004 decision 11). The hint models the macOS
+/// `com.apple.TextEncoding` extended attribute; the testkit never reads or
+/// writes real attributes.
+///
+/// - A BOM always decides; a hint can't contradict it.
+/// - Otherwise a UTF-8 or Windows-1252 hint beats the guess. Windows-1252
+///   decodes every byte, and UTF-8 bytes that aren't valid get the usual
+///   invalid-encoding warning, so the bytes always "decode under it".
+/// - A UTF-16 hint without a UTF-16 BOM "disagrees badly" with the bytes
+///   (v1 never writes one), so the guess applies.
+/// - With no hint, the guess applies ([`expected_encoding`]).
+#[must_use]
+pub fn reopen_encoding(bytes: &[u8], hint: Option<Encoding>) -> Encoding {
+    if Bom::detect(bytes) != Bom::None {
+        return expected_encoding(bytes);
+    }
+    match hint {
+        Some(h @ (Encoding::Utf8 | Encoding::Windows1252)) => h,
+        _ => expected_encoding(bytes),
+    }
+}
+
 /// Windows-1252 bytes 0x80–0x9F, as the WHATWG Encoding Standard maps them.
 /// The five unassigned bytes map to the C1 control of the same value; every
 /// other byte maps to the code point of the same value.
@@ -295,6 +318,35 @@ pub fn encode_value(text: &str, encoding: Encoding) -> Result<Vec<u8>, char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hint_beats_the_guess_but_not_a_bom() {
+        let ascii = b"a,b\n";
+        assert_eq!(reopen_encoding(ascii, None), Encoding::Utf8);
+        assert_eq!(
+            reopen_encoding(ascii, Some(Encoding::Windows1252)),
+            Encoding::Windows1252
+        );
+        // "é" in UTF-8 is "Ã©" in Windows-1252; the hint decides which.
+        let e = "é".as_bytes();
+        assert_eq!(
+            reopen_encoding(e, Some(Encoding::Windows1252)),
+            Encoding::Windows1252
+        );
+        assert_eq!(
+            reopen_encoding(b"\xE9", Some(Encoding::Utf8)),
+            Encoding::Utf8
+        );
+        // A BOM wins, and a UTF-16 hint without a BOM is ignored.
+        assert_eq!(
+            reopen_encoding(b"\xEF\xBB\xBFa", Some(Encoding::Windows1252)),
+            Encoding::Utf8
+        );
+        assert_eq!(
+            reopen_encoding(ascii, Some(Encoding::Utf16Le)),
+            Encoding::Utf8
+        );
+    }
 
     #[test]
     fn windows_1252_round_trips_every_byte() {

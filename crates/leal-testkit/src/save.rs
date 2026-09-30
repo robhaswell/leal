@@ -48,8 +48,8 @@
 //! Rules 8, 9 and 11 are the "smallest extra change next to the edit" that
 //! keeps ADR-0004 decision 10: reopening the saved file gives the same
 //! rows, BOM and line endings. [`SavedFile::line_endings`] says which rows
-//! a reopen must find. The one exception is the encoding heuristic; see
-//! "Reopen invariant" in `docs/tasks/0.2.md`.
+//! a reopen must find. The encoding is kept by the encoding hint
+//! ([`SavedFile::encoding_hint`], ADR-0004 decision 11).
 //!
 //! How these map to ADR-0004 (provisional until Rob accepts it): rule 3 is
 //! decisions 1 and 3 (decision 2, per-column quoting, is not in yet: see
@@ -60,7 +60,8 @@
 use std::fmt;
 
 use crate::dialect::{
-    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value, encode_value,
+    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value,
+    encode_value, expected_encoding,
 };
 use crate::fidelity::{Change, apply_changes};
 use crate::layout::Layout;
@@ -206,6 +207,13 @@ pub struct SavedFile {
     /// Each output row's line ending, as the output is written. Reopening
     /// the output must find exactly these rows (ADR-0004 decision 10).
     pub line_endings: Vec<Option<LineEnding>>,
+    /// The encoding hint the save must write (ADR-0004 decision 11): the
+    /// document's encoding, when a reopen of `bytes` would otherwise guess a
+    /// different one, or when the file already had a hint (which is then
+    /// updated). `None` means write no hint. This models the macOS
+    /// `com.apple.TextEncoding` extended attribute; reopen with
+    /// [`crate::dialect::reopen_encoding`].
+    pub encoding_hint: Option<Encoding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,10 +238,21 @@ pub struct Document<'a> {
     layout: &'a Layout,
     delimiter: Delimiter,
     encoding: Encoding,
+    /// The encoding hint the file had when it was opened, if any.
+    existing_hint: Option<Encoding>,
     rows: Vec<DocRow>,
 }
 
 impl<'a> Document<'a> {
+    /// Records that the file had an encoding hint when opened, so saving
+    /// updates it (ADR-0004 decision 11). `encoding` passed to
+    /// [`Document::new`] is the encoding the open chose, hint included.
+    #[must_use]
+    pub fn with_existing_hint(mut self, hint: Option<Encoding>) -> Self {
+        self.existing_hint = hint;
+        self
+    }
+
     /// A document over `bytes`, whose parse is `layout`, with no edits.
     #[must_use]
     pub fn new(
@@ -256,6 +275,7 @@ impl<'a> Document<'a> {
             layout,
             delimiter,
             encoding,
+            existing_hint: None,
             rows,
         }
     }
@@ -547,10 +567,16 @@ impl<'a> Document<'a> {
             .collect();
         let changes = self.changes(&serialized, &contents, &endings);
         let bytes = apply_changes(self.bytes, &changes);
+        // ADR-0004 decision 11: record the encoding when a reopen would
+        // otherwise guess differently, or when the file already had a hint.
+        let guess_differs = expected_encoding(&bytes) != self.encoding;
+        let encoding_hint =
+            (guess_differs || self.existing_hint.is_some()).then_some(self.encoding);
         Ok(SavedFile {
             changes,
             bytes,
             line_endings: endings,
+            encoding_hint,
         })
     }
 
@@ -982,6 +1008,32 @@ mod tests {
         // Elsewhere it is ordinary text.
         let r = save(bytes, &[], &[set(0, 1, "9")]).unwrap();
         assert_eq!(String::from_utf8(r.bytes).unwrap(), "x,9\n\u{FEFF}y,2\n");
+    }
+
+    /// ADR-0004 decision 11.
+    #[test]
+    fn an_encoding_hint_is_written_only_when_the_guess_would_differ() {
+        let hint = |bytes: &[u8], enc, existing, edits: &[Edit]| {
+            let layout = simple_layout(bytes, &[]);
+            let mut doc =
+                Document::new(bytes, &layout, Delimiter::Comma, enc).with_existing_hint(existing);
+            for e in edits {
+                doc.apply(e).unwrap();
+            }
+            doc.save().unwrap().encoding_hint
+        };
+        let w1252 = Encoding::Windows1252;
+        // Clearing the only high byte leaves ASCII, which would reopen as
+        // UTF-8, so the hint records Windows-1252.
+        assert_eq!(
+            hint(b"a\n\x80\n", w1252, None, &[set(1, 0, "")]),
+            Some(w1252)
+        );
+        // Nothing would change: no hint.
+        assert_eq!(hint(b"a\n\x80\n", w1252, None, &[set(0, 0, "b")]), None);
+        assert_eq!(hint(b"a\n", Encoding::Utf8, None, &[set(0, 0, "é")]), None);
+        // A file that already had a hint keeps (updates) it.
+        assert_eq!(hint(b"a\n", w1252, Some(w1252), &[]), Some(w1252));
     }
 
     #[test]
