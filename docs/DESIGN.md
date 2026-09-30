@@ -354,6 +354,8 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Go to row | ⌘L |
 | Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste) |
 | Insert / delete row | ⌘↩ / ⌘⌫ |
+| Show / hide cell inspector | ⌘I |
+| Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |
 
 ### 4.3 Documents
 
@@ -447,10 +449,20 @@ leal/
 
 ---
 
-## 8. Open questions
+## 8. Decisions and open questions
 
-1. **License.** Draft assumes MIT OR Apache-2.0 (the Rust convention).
-2. **Minimum macOS.** Draft assumes 14 Sonoma.
-3. **Mac App Store** as well as direct download? The design keeps it possible.
-4. **Header row default:** trust the heuristic, or always treat row 1 as a
-   header?
+The approved UI is recorded in ADR-0002, with mockups in `docs/mockups/`.
+Where a mockup and this document disagree, the ADR wins and this document is
+updated.
+
+Decided:
+
+1. **License:** MIT OR Apache-2.0. The repo is public.
+2. **Header row:** trust the detection. When no header is detected, the
+   header shows 1, 2, 3… in grey, and a "Header row" toggle in the status bar
+   switches it (ADR-0002, question 13).
+
+Open:
+
+3. **Minimum macOS.** Draft assumes 14 Sonoma.
+4. **Mac App Store** as well as direct download? The design keeps it possible.

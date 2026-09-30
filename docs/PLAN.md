@@ -52,6 +52,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - `NSTableView` over a synthetic 1M × 200 data source.
   - Measure scroll smoothness and memory with Instruments at 12, 50 and 200
     columns.
+  - Include the per-cell styling the approved mockups need (ADR-0002):
+    active-cell ring, edited-cell corner triangle, hatched ragged cells,
+    find highlights and an in-cell editor. Measure with these switched on.
   - Acceptance: **ADR-0001** chooses `NSTableView` or a custom grid, with
     measurements. Rob approves before phase 1 UI work.
 
