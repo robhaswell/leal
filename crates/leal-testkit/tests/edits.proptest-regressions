@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3fd234af0d6f83dcbfbac2325ec4d6cef0088b7719788650388f61ec6dc32965 # shrinks to case = EditCase { file: GeneratedCsv { bytes: b",\n\xef\xbb\xbf,", dialect: ModelDialect { delimiter: Comma, line_endings: Uniform(Lf), bom: false, quoting: Minimal }, encoding: Utf8, rows: [ModelRow { fields: [Unquoted(""), Unquoted("")], line_ending: Some(Lf) }, ModelRow { fields: [Unquoted("\xef\xbb\xbf"), Unquoted("")], line_ending: None }], diagnostics: [] }, edits: [DeleteRow { row: 0 }], saved: Ok(b"\xef\xbb\xbf,") }

@@ -1,0 +1,751 @@
+//! The expected result of editing and saving a file (DESIGN §3.6, §3.7 and
+//! fidelity rules F2–F6).
+//!
+//! This is an independent statement of the save rules for tasks 2.1–2.4, so
+//! that the serializer is never tested against its own quoting code.
+//!
+//! - [`expected_field_bytes`] is §3.7 rule 2 for one edited field.
+//! - [`Document`] replays [`Edit`]s against a parsed file, then
+//!   [`Document::save`] gives the exact expected output, as a list of
+//!   [`Change`]s to the original (for `assert_only_changed`) and as bytes.
+//!
+//! # The rules, as implemented
+//!
+//! 1. An untouched row is copied byte for byte, line ending included.
+//! 2. A row with any change is rebuilt: untouched fields keep their raw
+//!    bytes, edited fields are written by [`expected_field_bytes`], and the
+//!    delimiters and line ending are the row's own.
+//! 3. A new row uses the most common line ending (LF if the file has none)
+//!    and the file's quoting style: every field quoted if the file quotes
+//!    every field, otherwise only fields that need it.
+//! 4. The trailing newline is kept as it was. If the file had none, the last
+//!    row of the output has none, and a row that used to be last but no
+//!    longer is gets the most common line ending.
+//! 5. Setting a cell to its original display value removes the edit, so its
+//!    original bytes come back (§3.6).
+//! 6. Column insert and delete apply to every row that has that position:
+//!    an insert at `c` needs at least `c` fields, a delete at `c` needs more
+//!    than `c`. Shorter (ragged) rows are left alone.
+//! 7. If an edited value can't be encoded, saving fails naming the cells
+//!    (§3.7, F5). UTF-16 files are read-only in v1, so saving them fails.
+//!
+//! Where §3.7 leaves a choice open, the choice is listed in
+//! `docs/tasks/0.2.md` ("Save oracle: open questions").
+
+use std::fmt;
+
+use crate::dialect::{Delimiter, Encoding, LineEnding, decode_value, encode_value};
+use crate::fidelity::{Change, apply_changes};
+use crate::layout::Layout;
+
+/// Whether a value must be quoted wherever it is written: it contains the
+/// delimiter, `"`, CR or LF (§3.7). Checked on the encoded bytes; the
+/// structural bytes are ASCII in every editable encoding.
+#[must_use]
+pub fn needs_quotes(value: &[u8], delimiter: Delimiter) -> bool {
+    value
+        .iter()
+        .any(|&b| b == delimiter.byte() || b == b'"' || b == b'\r' || b == b'\n')
+}
+
+/// The bytes §3.7 rule 2 writes for an edited field: `value` encoded in the
+/// file's encoding, quoted if it needs quotes, or the original field was
+/// quoted, or the file quotes every field. Embedded quotes are doubled.
+///
+/// ```
+/// use leal_testkit::dialect::{Delimiter, Encoding};
+/// use leal_testkit::save::expected_field_bytes;
+///
+/// let bytes = |v, quoted, all| {
+///     expected_field_bytes(v, Encoding::Utf8, Delimiter::Comma, quoted, all).unwrap()
+/// };
+/// assert_eq!(bytes("plain", false, false), b"plain");
+/// assert_eq!(bytes("a,b", false, false), b"\"a,b\"");
+/// assert_eq!(bytes("say \"hi\"", false, false), b"\"say \"\"hi\"\"\"");
+/// assert_eq!(bytes("plain", true, false), b"\"plain\"");
+/// assert_eq!(bytes("", false, true), b"\"\"");
+/// ```
+///
+/// # Errors
+///
+/// Returns the first character the encoding can't represent (and any
+/// character for UTF-16, which is read-only in v1).
+pub fn expected_field_bytes(
+    value: &str,
+    encoding: Encoding,
+    delimiter: Delimiter,
+    original_quoted: bool,
+    file_quotes_every_field: bool,
+) -> Result<Vec<u8>, char> {
+    let encoded = encode_value(value, encoding)?;
+    if !(needs_quotes(&encoded, delimiter) || original_quoted || file_quotes_every_field) {
+        return Ok(encoded);
+    }
+    let mut out = Vec::with_capacity(encoded.len() + 2);
+    out.push(b'"');
+    for b in encoded {
+        if b == b'"' {
+            out.push(b'"');
+        }
+        out.push(b);
+    }
+    out.push(b'"');
+    Ok(out)
+}
+
+/// One editing command, in logical coordinates (0-based, as the document is
+/// *after* every earlier edit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Edit {
+    /// Set a cell's value.
+    SetCell {
+        /// Row.
+        row: usize,
+        /// Column, less than the row's field count.
+        column: usize,
+        /// The new display value.
+        value: String,
+    },
+    /// Insert a new row before row `at` (`at` = row count appends).
+    InsertRow {
+        /// Position.
+        at: usize,
+        /// The new row's values; at least one.
+        values: Vec<String>,
+    },
+    /// Delete a row.
+    DeleteRow {
+        /// Row.
+        row: usize,
+    },
+    /// Insert a column before column `at`, with `value` in every row that
+    /// has at least `at` fields.
+    InsertColumn {
+        /// Position.
+        at: usize,
+        /// The value for every affected row.
+        value: String,
+    },
+    /// Delete column `column` from every row that has it.
+    DeleteColumn {
+        /// Column.
+        column: usize,
+    },
+}
+
+/// Why an edit or a save failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaveError {
+    /// An edit's coordinates don't exist in the document.
+    InvalidEdit(Edit),
+    /// These cells (final logical row, column) hold characters the file's
+    /// encoding can't represent (F5).
+    Unencodable(Vec<(usize, usize)>),
+    /// UTF-16 files are read-only in v1.
+    ReadOnly,
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SaveError::InvalidEdit(e) => write!(f, "edit {e:?} is out of range"),
+            SaveError::Unencodable(cells) => write!(f, "cells {cells:?} can't be encoded"),
+            SaveError::ReadOnly => f.write_str("UTF-16 files are read-only"),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+/// The expected output of a save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFile {
+    /// The splices that turn the original into the output: per field for
+    /// cell edits within an otherwise unchanged row, per row otherwise.
+    pub changes: Vec<Change>,
+    /// The complete expected output.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cell {
+    /// The original field with this index in the source row.
+    Original(usize),
+    /// A new value, replacing original field `field` if there was one.
+    Edited { field: Option<usize>, value: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocRow {
+    /// The original row, or `None` for an inserted row.
+    source: Option<usize>,
+    cells: Vec<Cell>,
+}
+
+/// A file being edited: the original bytes plus the edits so far.
+#[derive(Clone, Debug)]
+pub struct Document<'a> {
+    bytes: &'a [u8],
+    layout: &'a Layout,
+    delimiter: Delimiter,
+    encoding: Encoding,
+    rows: Vec<DocRow>,
+}
+
+impl<'a> Document<'a> {
+    /// A document over `bytes`, whose parse is `layout`, with no edits.
+    #[must_use]
+    pub fn new(
+        bytes: &'a [u8],
+        layout: &'a Layout,
+        delimiter: Delimiter,
+        encoding: Encoding,
+    ) -> Self {
+        let rows = layout
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| DocRow {
+                source: Some(i),
+                cells: (0..r.fields.len()).map(Cell::Original).collect(),
+            })
+            .collect();
+        Document {
+            bytes,
+            layout,
+            delimiter,
+            encoding,
+            rows,
+        }
+    }
+
+    /// Number of rows now.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Number of fields in row `row` now (0 if there is no such row).
+    #[must_use]
+    pub fn row_len(&self, row: usize) -> usize {
+        self.rows.get(row).map_or(0, |r| r.cells.len())
+    }
+
+    /// The most fields any row has now.
+    #[must_use]
+    pub fn max_row_len(&self) -> usize {
+        self.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    }
+
+    /// The most common row length now (ties go to the first seen), or 1.
+    #[must_use]
+    pub fn typical_row_len(&self) -> usize {
+        crate::layout::mode(self.rows.iter().map(|r| r.cells.len()))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The display value of a cell now.
+    #[must_use]
+    pub fn value(&self, row: usize, column: usize) -> Option<String> {
+        let r = self.rows.get(row)?;
+        Some(match r.cells.get(column)? {
+            Cell::Original(f) => self.field_display(r.source?, *f),
+            Cell::Edited { value, .. } => value.clone(),
+        })
+    }
+
+    /// The original display value behind a cell, if it came from the file.
+    #[must_use]
+    pub fn original_value(&self, row: usize, column: usize) -> Option<String> {
+        let r = self.rows.get(row)?;
+        let field = match r.cells.get(column)? {
+            Cell::Original(f) => Some(*f),
+            Cell::Edited { field, .. } => *field,
+        }?;
+        Some(self.field_display(r.source?, field))
+    }
+
+    fn field_display(&self, row: usize, field: usize) -> String {
+        decode_value(&self.layout.rows[row].fields[field].value, self.encoding)
+    }
+
+    /// Applies one edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SaveError::InvalidEdit`] if its coordinates don't exist
+    /// (the document is unchanged).
+    pub fn apply(&mut self, edit: &Edit) -> Result<(), SaveError> {
+        let invalid = || SaveError::InvalidEdit(edit.clone());
+        match edit {
+            Edit::SetCell { row, column, value } => {
+                let source = self.rows.get(*row).ok_or_else(invalid)?.source;
+                let original = self.original_value(*row, *column);
+                let cell = self
+                    .rows
+                    .get_mut(*row)
+                    .and_then(|r| r.cells.get_mut(*column))
+                    .ok_or_else(invalid)?;
+                let field = match cell {
+                    Cell::Original(f) => Some(*f),
+                    Cell::Edited { field, .. } => *field,
+                };
+                *cell = match (field, source) {
+                    // §3.6: back to the original display value removes the edit.
+                    (Some(f), Some(_)) if original.as_deref() == Some(value.as_str()) => {
+                        Cell::Original(f)
+                    }
+                    _ => Cell::Edited {
+                        field,
+                        value: value.clone(),
+                    },
+                };
+            }
+            Edit::InsertRow { at, values } => {
+                if *at > self.rows.len() || values.is_empty() {
+                    return Err(invalid());
+                }
+                let cells = values
+                    .iter()
+                    .map(|v| Cell::Edited {
+                        field: None,
+                        value: v.clone(),
+                    })
+                    .collect();
+                self.rows.insert(
+                    *at,
+                    DocRow {
+                        source: None,
+                        cells,
+                    },
+                );
+            }
+            Edit::DeleteRow { row } => {
+                if *row >= self.rows.len() {
+                    return Err(invalid());
+                }
+                self.rows.remove(*row);
+            }
+            Edit::InsertColumn { at, value } => {
+                if *at > self.max_row_len() {
+                    return Err(invalid());
+                }
+                for r in &mut self.rows {
+                    if r.cells.len() >= *at {
+                        let cell = Cell::Edited {
+                            field: None,
+                            value: value.clone(),
+                        };
+                        r.cells.insert(*at, cell);
+                    }
+                }
+            }
+            Edit::DeleteColumn { column } => {
+                if *column >= self.max_row_len() {
+                    return Err(invalid());
+                }
+                for r in &mut self.rows {
+                    if r.cells.len() > *column {
+                        r.cells.remove(*column);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The expected output of saving now.
+    ///
+    /// # Errors
+    ///
+    /// [`SaveError::ReadOnly`] for UTF-16; [`SaveError::Unencodable`] naming
+    /// every cell whose value the encoding can't represent.
+    pub fn save(&self) -> Result<SavedFile, SaveError> {
+        if matches!(self.encoding, Encoding::Utf16Le | Encoding::Utf16Be) {
+            return Err(SaveError::ReadOnly);
+        }
+        let quote_all = self.layout.quotes_every_field();
+        let dominant = self.layout.line_endings().0.unwrap_or(LineEnding::Lf);
+        let trailing_newline = self.layout.trailing_newline();
+
+        // Each row's content bytes, and whether it is byte-for-byte original.
+        let mut bad = Vec::new();
+        let mut contents: Vec<(Vec<u8>, bool)> = Vec::with_capacity(self.rows.len());
+        for (ri, row) in self.rows.iter().enumerate() {
+            let untouched = row.source.is_some_and(|s| {
+                row.cells.len() == self.layout.rows[s].fields.len()
+                    && row
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .all(|(i, c)| *c == Cell::Original(i))
+            });
+            let mut content = Vec::new();
+            if untouched {
+                let span = self.layout.rows[row.source.unwrap_or(0)].span.clone();
+                content.extend_from_slice(&self.bytes[span]);
+            } else {
+                for (ci, cell) in row.cells.iter().enumerate() {
+                    if ci > 0 {
+                        content.push(self.delimiter.byte());
+                    }
+                    match self.cell_bytes(row, cell, quote_all) {
+                        Ok(b) => content.extend_from_slice(&b),
+                        Err(()) => bad.push((ri, ci)),
+                    }
+                }
+            }
+            contents.push((content, untouched));
+        }
+        if !bad.is_empty() {
+            return Err(SaveError::Unencodable(bad));
+        }
+
+        // Line endings, then rule 4 for the end of the file.
+        let last = self.rows.len().saturating_sub(1);
+        let endings: Vec<Option<LineEnding>> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let own = r
+                    .source
+                    .map_or(Some(dominant), |s| self.layout.rows[s].line_ending);
+                if i == last && !trailing_newline {
+                    None
+                } else {
+                    own.or(Some(dominant))
+                }
+            })
+            .collect();
+
+        // Serialize each row, then express the output as splices.
+        let serialized: Vec<Vec<u8>> = contents
+            .iter()
+            .zip(&endings)
+            .map(|((c, _), e)| [c.as_slice(), e.map_or(&b""[..], LineEnding::bytes)].concat())
+            .collect();
+        let changes = self.changes(&serialized, &contents, &endings);
+        let bytes = apply_changes(self.bytes, &changes);
+        Ok(SavedFile { changes, bytes })
+    }
+
+    fn cell_bytes(&self, row: &DocRow, cell: &Cell, quote_all: bool) -> Result<Vec<u8>, ()> {
+        match cell {
+            Cell::Original(f) => {
+                let s = row.source.ok_or(())?;
+                Ok(self.bytes[self.layout.rows[s].fields[*f].span.clone()].to_vec())
+            }
+            Cell::Edited { field, value } => {
+                let original_quoted = match (row.source, field) {
+                    (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted,
+                    _ => false,
+                };
+                expected_field_bytes(
+                    value,
+                    self.encoding,
+                    self.delimiter,
+                    original_quoted,
+                    quote_all,
+                )
+                .map_err(|_| ())
+            }
+        }
+    }
+
+    /// Splices from the original to the output. Rows keep their order, so
+    /// the original rows that survive appear in the output in order, with
+    /// inserted rows between them.
+    fn changes(
+        &self,
+        serialized: &[Vec<u8>],
+        contents: &[(Vec<u8>, bool)],
+        endings: &[Option<LineEnding>],
+    ) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let mut pending: Vec<u8> = Vec::new(); // inserted rows not yet placed
+        let mut j = 0;
+        for (i, orig) in self.layout.rows.iter().enumerate() {
+            let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
+            let range = orig.span.start..end;
+            while j < self.rows.len() && self.rows[j].source.is_none() {
+                pending.extend_from_slice(&serialized[j]);
+                j += 1;
+            }
+            if !pending.is_empty() {
+                changes.push(Change::insert(range.start, std::mem::take(&mut pending)));
+            }
+            if j < self.rows.len() && self.rows[j].source == Some(i) {
+                if serialized[j] != self.bytes[range.clone()] {
+                    self.row_changes(
+                        i,
+                        j,
+                        &serialized[j],
+                        contents[j].1,
+                        endings[j],
+                        &mut changes,
+                    );
+                }
+                j += 1;
+            } else {
+                changes.push(Change::delete(range));
+            }
+        }
+        while j < self.rows.len() {
+            pending.extend_from_slice(&serialized[j]);
+            j += 1;
+        }
+        if !pending.is_empty() {
+            changes.push(Change::insert(self.bytes.len(), pending));
+        }
+        changes
+    }
+
+    /// Changes for surviving original row `i` (document row `j`): one per
+    /// edited field if only cells changed, otherwise the whole row.
+    fn row_changes(
+        &self,
+        i: usize,
+        j: usize,
+        serialized: &[u8],
+        untouched: bool,
+        ending: Option<LineEnding>,
+        changes: &mut Vec<Change>,
+    ) {
+        let orig = &self.layout.rows[i];
+        let same_shape = !untouched
+            && ending == orig.line_ending
+            && self.rows[j].cells.len() == orig.fields.len()
+            && self.rows[j].cells.iter().enumerate().all(|(k, c)| match c {
+                Cell::Original(f) => *f == k,
+                Cell::Edited { field, .. } => *field == Some(k),
+            });
+        if same_shape {
+            let quote_all = self.layout.quotes_every_field();
+            for (k, cell) in self.rows[j].cells.iter().enumerate() {
+                if let Cell::Edited { .. } = cell {
+                    let bytes = self
+                        .cell_bytes(&self.rows[j], cell, quote_all)
+                        .unwrap_or_default();
+                    let span = orig.fields[k].span.clone();
+                    if bytes != self.bytes[span.clone()] {
+                        changes.push(Change::replace(span, bytes));
+                    }
+                }
+            }
+            return;
+        }
+        let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
+        changes.push(Change::replace(orig.span.start..end, serialized.to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{FieldLayout, RowLayout};
+
+    /// A tiny unquoted-only parser for these tests (the full oracle lives
+    /// in the integration tests).
+    fn simple_layout(bytes: &[u8], quoted: &[(usize, usize)]) -> Layout {
+        let mut rows = Vec::new();
+        let mut start = 0;
+        for (ri, line) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
+            let has_lf = line.last() == Some(&b'\n');
+            let content = &line[..line.len() - usize::from(has_lf)];
+            let mut fields = Vec::new();
+            let mut fs = start;
+            for (fi, f) in content.split(|&b| b == b',').enumerate() {
+                let q = quoted.contains(&(ri, fi));
+                let value = if q {
+                    f[1..f.len() - 1].to_vec()
+                } else {
+                    f.to_vec()
+                };
+                fields.push(FieldLayout {
+                    span: fs..fs + f.len(),
+                    quoted: q,
+                    value,
+                    text_after_quote: None,
+                    unterminated: false,
+                });
+                fs += f.len() + 1;
+            }
+            rows.push(RowLayout {
+                span: start..start + content.len(),
+                line_ending: has_lf.then_some(LineEnding::Lf),
+                fields,
+            });
+            start += line.len();
+        }
+        Layout { bom_len: 0, rows }
+    }
+
+    fn save(
+        bytes: &[u8],
+        quoted: &[(usize, usize)],
+        edits: &[Edit],
+    ) -> Result<SavedFile, SaveError> {
+        let layout = simple_layout(bytes, quoted);
+        assert_eq!(layout.check_tiles(bytes, Delimiter::Comma), Ok(()));
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        for e in edits {
+            doc.apply(e)?;
+        }
+        doc.save()
+    }
+
+    fn set(row: usize, column: usize, value: &str) -> Edit {
+        Edit::SetCell {
+            row,
+            column,
+            value: value.to_owned(),
+        }
+    }
+
+    fn out(r: Result<SavedFile, SaveError>) -> String {
+        String::from_utf8(r.unwrap().bytes).unwrap()
+    }
+
+    #[test]
+    fn no_edits_is_identical() {
+        let r = save(b"a,b\n1,2\n", &[], &[]).unwrap();
+        assert!(r.changes.is_empty());
+        assert_eq!(r.bytes, b"a,b\n1,2\n");
+    }
+
+    #[test]
+    fn cell_edits_quote_only_when_needed() {
+        assert_eq!(
+            out(save(b"a,b\n1,2\n", &[], &[set(1, 0, "x")])),
+            "a,b\nx,2\n"
+        );
+        assert_eq!(
+            out(save(b"a,b\n1,2\n", &[], &[set(1, 0, "x,y")])),
+            "a,b\n\"x,y\",2\n"
+        );
+        assert_eq!(
+            out(save(b"a,b\n1,2\n", &[], &[set(1, 1, "\"")])),
+            "a,b\n1,\"\"\"\"\n"
+        );
+        assert_eq!(
+            out(save(b"a,b\n1,2\n", &[], &[set(1, 1, "l\nf")])),
+            "a,b\n1,\"l\nf\"\n"
+        );
+        // The original field was quoted, so the new value is too.
+        assert_eq!(
+            out(save(b"a,\"b\"\n", &[(0, 1)], &[set(0, 1, "c")])),
+            "a,\"c\"\n"
+        );
+    }
+
+    #[test]
+    fn a_cell_edit_is_one_field_change() {
+        let r = save(b"a,b\n1,2\n", &[], &[set(1, 1, "22")]).unwrap();
+        assert_eq!(r.changes, vec![Change::replace(6..7, "22")]);
+    }
+
+    #[test]
+    fn a_file_that_quotes_every_field_quotes_new_values() {
+        let q = [(0, 0), (0, 1)];
+        assert_eq!(
+            out(save(b"\"a\",\"b\"\n", &q, &[set(0, 0, "x")])),
+            "\"x\",\"b\"\n"
+        );
+        let r = save(
+            b"\"a\",\"b\"\n",
+            &q,
+            &[Edit::InsertRow {
+                at: 1,
+                values: vec!["1".into(), "".into()],
+            }],
+        );
+        assert_eq!(out(r), "\"a\",\"b\"\n\"1\",\"\"\n");
+    }
+
+    #[test]
+    fn reverting_restores_the_original_bytes() {
+        let edits = [set(0, 1, "x"), set(0, 1, "b")];
+        let r = save(b"a,\"b\"\n", &[(0, 1)], &edits).unwrap();
+        assert!(r.changes.is_empty());
+        assert_eq!(r.bytes, b"a,\"b\"\n");
+    }
+
+    #[test]
+    fn rows_insert_and_delete_with_the_trailing_newline_kept() {
+        let insert_end = Edit::InsertRow {
+            at: 2,
+            values: vec!["c".into()],
+        };
+        // No trailing newline: the old last row gains one, the new one has none.
+        assert_eq!(
+            out(save(b"a\nb", &[], std::slice::from_ref(&insert_end))),
+            "a\nb\nc"
+        );
+        assert_eq!(out(save(b"a\nb\n", &[], &[insert_end])), "a\nb\nc\n");
+        // Deleting the last row of a file with no trailing newline drops the
+        // new last row's line ending.
+        assert_eq!(out(save(b"a\nb", &[], &[Edit::DeleteRow { row: 1 }])), "a");
+        assert_eq!(
+            out(save(b"a\nb\nc\n", &[], &[Edit::DeleteRow { row: 1 }])),
+            "a\nc\n"
+        );
+        let r = save(b"a\nb\n", &[], &[Edit::DeleteRow { row: 0 }]).unwrap();
+        assert_eq!(r.changes, vec![Change::delete(0..2)]);
+    }
+
+    #[test]
+    fn columns_apply_to_rows_that_have_them() {
+        let bytes = b"a,b,c\n1,2\n";
+        let del = Edit::DeleteColumn { column: 2 };
+        assert_eq!(out(save(bytes, &[], &[del])), "a,b\n1,2\n");
+        let del0 = Edit::DeleteColumn { column: 0 };
+        assert_eq!(out(save(bytes, &[], &[del0])), "b,c\n2\n");
+        let ins = Edit::InsertColumn {
+            at: 3,
+            value: "n".into(),
+        };
+        // Row 1 has only 2 fields, so it is left alone.
+        assert_eq!(out(save(bytes, &[], &[ins])), "a,b,c,n\n1,2\n");
+        let ins0 = Edit::InsertColumn {
+            at: 0,
+            value: "x,y".into(),
+        };
+        assert_eq!(
+            out(save(bytes, &[], &[ins0])),
+            "\"x,y\",a,b,c\n\"x,y\",1,2\n"
+        );
+    }
+
+    #[test]
+    fn unencodable_and_read_only() {
+        let bytes = b"a\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
+        doc.apply(&set(0, 0, "€ ok")).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"\x80 ok\n");
+        doc.apply(&set(0, 0, "😀")).unwrap();
+        assert_eq!(doc.save(), Err(SaveError::Unencodable(vec![(0, 0)])));
+        let doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf16Le);
+        assert_eq!(doc.save(), Err(SaveError::ReadOnly));
+    }
+
+    #[test]
+    fn invalid_edits_are_rejected() {
+        let bytes = b"a\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        assert!(doc.apply(&set(0, 1, "x")).is_err());
+        assert!(doc.apply(&Edit::DeleteRow { row: 1 }).is_err());
+        assert!(
+            doc.apply(&Edit::InsertRow {
+                at: 0,
+                values: vec![]
+            })
+            .is_err()
+        );
+        assert!(doc.apply(&Edit::DeleteColumn { column: 1 }).is_err());
+        assert_eq!(doc.save().unwrap().bytes, b"a\n");
+    }
+}

@@ -231,9 +231,89 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
     }
 }
 
+/// Windows-1252 bytes 0x80–0x9F, as the WHATWG Encoding Standard maps them.
+/// The five unassigned bytes map to the C1 control of the same value; every
+/// other byte maps to the code point of the same value.
+const WINDOWS_1252_HIGH: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+];
+
+/// Decodes Windows-1252 (WHATWG). Every byte decodes.
+#[must_use]
+pub fn decode_windows_1252(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9F => WINDOWS_1252_HIGH[usize::from(b - 0x80)],
+            _ => char::from(b),
+        })
+        .collect()
+}
+
+/// Decodes bytes in an ASCII-compatible encoding for display: UTF-8 with
+/// invalid sequences as U+FFFD, or Windows-1252. For UTF-16 the bytes are
+/// taken as UTF-8, because the testkit stores UTF-16 values transcoded (see
+/// [`crate::layout::FieldLayout::value`]).
+#[must_use]
+pub fn decode_value(bytes: &[u8], encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Windows1252 => decode_windows_1252(bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Encodes `text` in `encoding` for writing into a file (DESIGN §3.7).
+///
+/// # Errors
+///
+/// Returns the first character Windows-1252 cannot represent. UTF-16 files
+/// are read-only in v1, so encoding into UTF-16 is always an error (with
+/// the first character, or U+0000 for empty text).
+pub fn encode_value(text: &str, encoding: Encoding) -> Result<Vec<u8>, char> {
+    match encoding {
+        Encoding::Utf8 => Ok(text.as_bytes().to_vec()),
+        Encoding::Windows1252 => text
+            .chars()
+            .map(|c| {
+                if let Some(i) = WINDOWS_1252_HIGH.iter().position(|&h| h == c) {
+                    // i < 32, so this cannot truncate.
+                    return u8::try_from(0x80 + i).map_err(|_| c);
+                }
+                match u32::from(c) {
+                    0x00..=0x7F | 0xA0..=0xFF => u8::try_from(u32::from(c)).map_err(|_| c),
+                    _ => Err(c),
+                }
+            })
+            .collect(),
+        Encoding::Utf16Le | Encoding::Utf16Be => Err(text.chars().next().unwrap_or('\0')),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_1252_round_trips_every_byte() {
+        let all: Vec<u8> = (0..=255).collect();
+        let text = decode_windows_1252(&all);
+        assert_eq!(text.chars().count(), 256);
+        assert_eq!(encode_value(&text, Encoding::Windows1252), Ok(all));
+        assert_eq!(
+            encode_value("€é", Encoding::Windows1252),
+            Ok(vec![0x80, 0xE9])
+        );
+        assert_eq!(encode_value("a😀", Encoding::Windows1252), Err('😀'));
+        assert_eq!(encode_value("Ā", Encoding::Windows1252), Err('Ā'));
+        assert_eq!(encode_value("x", Encoding::Utf16Le), Err('x'));
+        assert_eq!(
+            encode_value("é", Encoding::Utf8),
+            Ok("é".as_bytes().to_vec())
+        );
+    }
 
     #[test]
     fn utf8_census_counts_sequences_and_bytes() {

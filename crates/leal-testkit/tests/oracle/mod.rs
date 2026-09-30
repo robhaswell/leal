@@ -211,7 +211,7 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
     match encoding {
         Encoding::Utf8 | Encoding::Windows1252 => {
             let layout = parse(bytes, delimiter);
-            let diagnostics = diagnostics::derive(&layout, bytes, encoding == Encoding::Utf8);
+            let diagnostics = diagnostics::derive(&layout, bytes, encoding);
             Analysis {
                 parsed_layout: layout.clone(),
                 layout,
@@ -225,8 +225,9 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
             // file. Structural characters are single code units, so every
             // span boundary is a character boundary and maps exactly.
             let bom_len = Bom::detect(bytes).bytes().len();
-            let (text, map) = decode_utf16(bytes, bom_len, encoding == Encoding::Utf16Le);
-            let parsed = text.into_bytes();
+            let decoded = decode_utf16(bytes, bom_len, encoding == Encoding::Utf16Le);
+            let map = decoded.map;
+            let parsed = decoded.text.into_bytes();
             let parsed_layout = parse(&parsed, delimiter);
             let at = |o: usize| map[o];
             let layout = Layout {
@@ -249,19 +250,32 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
                     })
                     .collect(),
             };
-            let mut diagnostics = diagnostics::derive(&parsed_layout, &parsed, false);
-            for d in &mut diagnostics {
-                for l in &mut d.first {
-                    l.offset = at(l.offset);
+            // Structural kinds come from the shared definition, on the
+            // file-offset layout. NUL units and unpaired surrogates come from
+            // the oracle's own decoding (ADR-0003 decision 7).
+            let mut diagnostics: Vec<Diagnostic> = diagnostics::derive(&layout, bytes, encoding)
+                .into_iter()
+                .filter(|d| {
+                    !matches!(
+                        d.kind,
+                        DiagnosticKind::NulBytes | DiagnosticKind::InvalidEncoding
+                    )
+                })
+                .collect();
+            for (kind, offsets) in [
+                (DiagnosticKind::NulBytes, &decoded.nuls),
+                (DiagnosticKind::InvalidEncoding, &decoded.invalid),
+            ] {
+                let locations = first_in_each_field(&layout, offsets);
+                if !locations.is_empty() {
+                    diagnostics.push(Diagnostic {
+                        kind,
+                        count: locations.len(),
+                        first: locations,
+                    });
                 }
             }
-            if bom_len > 0 {
-                diagnostics.push(Diagnostic {
-                    kind: DiagnosticKind::BomPresent,
-                    count: 1,
-                    first: vec![Location { row: 0, offset: 0 }],
-                });
-            }
+            diagnostics.sort_by_key(|d| d.kind);
             Analysis {
                 layout,
                 diagnostics,
@@ -294,36 +308,102 @@ impl Analysis {
     }
 }
 
-/// Decodes UTF-16 after a `bom_len`-byte BOM. Returns the text and, for each
-/// byte offset into its UTF-8 form (plus one past the end), the file offset
-/// of the character it belongs to.
-fn decode_utf16(bytes: &[u8], bom_len: usize, little_endian: bool) -> (String, Vec<usize>) {
-    let units: Vec<u16> = bytes[bom_len..]
-        .chunks(2)
-        .map(|c| {
-            let pair = [c[0], c.get(1).copied().unwrap_or(0)];
-            if little_endian {
-                u16::from_le_bytes(pair)
+/// UTF-16 decoded for parsing.
+struct Utf16Text {
+    /// The text. Unpaired surrogates (and a final odd byte) become U+FFFD.
+    text: String,
+    /// For each byte offset into `text` (plus one past the end), the file
+    /// offset of the code unit its character starts at.
+    map: Vec<usize>,
+    /// File offsets of U+0000 code units.
+    nuls: Vec<usize>,
+    /// File offsets of unpaired surrogates, and of a final odd byte.
+    invalid: Vec<usize>,
+}
+
+/// Decodes UTF-16 after a `bom_len`-byte BOM, keeping file offsets.
+fn decode_utf16(bytes: &[u8], bom_len: usize, little_endian: bool) -> Utf16Text {
+    let mut out = Utf16Text {
+        text: String::new(),
+        map: Vec::new(),
+        nuls: Vec::new(),
+        invalid: Vec::new(),
+    };
+    let units: Vec<(usize, u16)> = bytes[bom_len..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let unit = if little_endian {
+                u16::from_le_bytes(*c)
             } else {
-                u16::from_be_bytes(pair)
-            }
+                u16::from_be_bytes(*c)
+            };
+            (bom_len + 2 * i, unit)
         })
         .collect();
-    let mut text = String::new();
-    let mut map = Vec::new();
-    let mut unit = 0;
-    for r in char::decode_utf16(units.iter().copied()) {
-        let (c, width) = match r {
-            Ok(c) => (c, c.len_utf16()),
-            Err(_) => (char::REPLACEMENT_CHARACTER, 1),
-        };
-        let file_offset = bom_len + 2 * unit;
-        map.extend(std::iter::repeat_n(file_offset, c.len_utf8()));
-        text.push(c);
-        unit += width;
+    let push = |out: &mut Utf16Text, offset: usize, c: char| {
+        out.map.extend(std::iter::repeat_n(offset, c.len_utf8()));
+        out.text.push(c);
+    };
+    let mut i = 0;
+    while i < units.len() {
+        let (offset, unit) = units[i];
+        let next = units.get(i + 1).map(|&(_, u)| u);
+        match (unit, next) {
+            (0xD800..=0xDBFF, Some(low @ 0xDC00..=0xDFFF)) => {
+                let code = 0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                push(&mut out, offset, char::from_u32(code).unwrap_or('\u{FFFD}'));
+                i += 2;
+                continue;
+            }
+            (0xD800..=0xDFFF, _) => {
+                out.invalid.push(offset);
+                push(&mut out, offset, char::REPLACEMENT_CHARACTER);
+            }
+            (0, _) => {
+                out.nuls.push(offset);
+                push(&mut out, offset, '\0');
+            }
+            _ => push(
+                &mut out,
+                offset,
+                char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'),
+            ),
+        }
+        i += 1;
     }
-    map.push(bytes.len());
-    (text, map)
+    if !(bytes.len() - bom_len).is_multiple_of(2) {
+        let offset = bytes.len() - 1;
+        out.invalid.push(offset);
+        push(&mut out, offset, char::REPLACEMENT_CHARACTER);
+    }
+    out.map.push(bytes.len());
+    out
+}
+
+/// One location per field, at the first of `offsets` in it (ADR-0003
+/// decision 4). The oracle's own grouping, independent of the testkit's.
+fn first_in_each_field(layout: &Layout, offsets: &[usize]) -> Vec<Location> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for &offset in offsets {
+        let key = layout.rows.iter().enumerate().find_map(|(ri, r)| {
+            r.fields
+                .iter()
+                .position(|f| f.span.contains(&offset))
+                .map(|fi| (ri, fi))
+        });
+        if let Some(k) = key {
+            if seen.contains(&k) {
+                continue;
+            }
+            seen.push(k);
+            out.push(Location { row: k.0, offset });
+        }
+    }
+    out
 }
 
 /// Windows-1252 as the WHATWG Encoding Standard defines it: 0x80–0x9F map

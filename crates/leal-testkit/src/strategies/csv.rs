@@ -51,6 +51,7 @@ use crate::dialect::{
     Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, expected_encoding,
 };
 use crate::layout::{FieldLayout, Layout, RowLayout};
+use crate::save::Document;
 use crate::strategies::bytes::{INVALID_UTF8, MULTIBYTE_UTF8};
 
 /// Which irregular constructs (DESIGN §3.5) the generator may produce. Each
@@ -419,7 +420,7 @@ impl GeneratedCsv {
     pub fn from_model(model: CsvModel) -> Self {
         let (bytes, layout) = model.serialize();
         let encoding = expected_encoding(&bytes);
-        let diagnostics = diagnostics::derive(&layout, &bytes, encoding == Encoding::Utf8);
+        let diagnostics = diagnostics::derive(&layout, &bytes, encoding);
         GeneratedCsv {
             model,
             bytes,
@@ -434,6 +435,88 @@ impl GeneratedCsv {
     pub fn delimiter(&self) -> Delimiter {
         self.model.dialect.delimiter
     }
+
+    /// A [`Document`] over this file with no edits, for the save oracle.
+    #[must_use]
+    pub fn document(&self) -> Document<'_> {
+        Document::new(&self.bytes, &self.layout, self.delimiter(), self.encoding)
+    }
+
+    /// The same model written as UTF-16 with a BOM. Spans and diagnostic
+    /// locations are byte offsets into the UTF-16 file (ADR-0003 decision
+    /// 6); field values stay UTF-8, as [`FieldLayout::value`] says. A UTF-8
+    /// BOM in the model is dropped, since the UTF-16 BOM replaces it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a value is not valid UTF-8 (generate with
+    /// `Messiness::invalid_utf8` off, as [`csv_file_utf16`] does).
+    #[must_use]
+    pub fn into_utf16(self, little_endian: bool) -> GeneratedCsv {
+        let mut model = self.model;
+        model.dialect.bom = false;
+        normalize(&mut model.rows, false, Messiness::ALL);
+        let (utf8, layout8) = model.serialize();
+        let text = std::str::from_utf8(&utf8).expect("UTF-16 models need valid UTF-8 values");
+        let (bom, encoding) = if little_endian {
+            (UTF16LE_BOM, Encoding::Utf16Le)
+        } else {
+            (UTF16BE_BOM, Encoding::Utf16Be)
+        };
+        let mut bytes = bom.to_vec();
+        let mut map = vec![0; utf8.len() + 1];
+        let mut units = [0u16; 2];
+        for (i, c) in text.char_indices() {
+            map[i..i + c.len_utf8()].fill(bytes.len());
+            for unit in c.encode_utf16(&mut units) {
+                let pair = if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+        }
+        map[utf8.len()] = bytes.len();
+        let at = |o: usize| map[o];
+        let layout = Layout {
+            bom_len: bom.len(),
+            rows: layout8
+                .rows
+                .iter()
+                .map(|r| RowLayout {
+                    span: at(r.span.start)..at(r.span.end),
+                    line_ending: r.line_ending,
+                    fields: r
+                        .fields
+                        .iter()
+                        .map(|f| FieldLayout {
+                            span: at(f.span.start)..at(f.span.end),
+                            text_after_quote: f.text_after_quote.map(at),
+                            ..f.clone()
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        let diagnostics = diagnostics::derive(&layout, &bytes, encoding);
+        GeneratedCsv {
+            model,
+            bytes,
+            layout,
+            encoding,
+            diagnostics,
+        }
+    }
+}
+
+/// Like [`csv_file`], but written as UTF-16 LE or BE with a BOM; see
+/// [`GeneratedCsv::into_utf16`]. `Messiness::invalid_utf8` is ignored (the
+/// corpus covers unpaired surrogates); NUL values become U+0000 code units.
+pub fn csv_file_utf16(config: CsvConfig) -> impl Strategy<Value = GeneratedCsv> {
+    let mut config = config;
+    config.messiness.invalid_utf8 = false;
+    (csv_file(config), any::<bool>()).prop_map(|(file, le)| file.into_utf16(le))
 }
 
 impl fmt::Debug for GeneratedCsv {

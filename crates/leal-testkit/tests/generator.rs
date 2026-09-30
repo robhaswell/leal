@@ -60,7 +60,7 @@ fn check_round_trip(file: &GeneratedCsv) -> Result<(), TestCaseError> {
         prop_assert!(dominant.is_none() || dominant == Some(le));
     }
     prop_assert_eq!(
-        diagnostics::derive(&parsed, &file.bytes, file.encoding == Encoding::Utf8),
+        diagnostics::derive(&parsed, &file.bytes, file.encoding),
         file.diagnostics.clone()
     );
     Ok(())
@@ -163,7 +163,7 @@ proptest! {
     ) {
         let layout = oracle::parse(&bytes, delimiter);
         prop_assert_eq!(layout.check_tiles(&bytes, delimiter), Ok(()));
-        let _ = diagnostics::derive(&layout, &bytes, true);
+        let _ = diagnostics::derive(&layout, &bytes, Encoding::Utf8);
     }
 }
 

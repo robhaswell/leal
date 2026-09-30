@@ -11,6 +11,7 @@
 
 use serde::Deserialize;
 
+use crate::dialect::Encoding;
 use crate::layout::{Layout, mode};
 
 /// The most locations a diagnostic records (DESIGN §3.5).
@@ -32,12 +33,15 @@ pub enum DiagnosticKind {
     /// Warning. One occurrence per field with bytes between its closing quote
     /// and the next delimiter or line ending. Offset: the first such byte.
     TextAfterClosingQuote,
-    /// Warning. One occurrence per field containing invalid UTF-8 (sequences
-    /// split as `String::from_utf8_lossy` splits them). Only for files whose
-    /// encoding is UTF-8. Offset: the first invalid byte in the field.
+    /// Warning. One occurrence per field containing invalid text: invalid
+    /// UTF-8 in a UTF-8 file (sequences split as `String::from_utf8_lossy`
+    /// splits them), or an unpaired surrogate in a UTF-16 file. Never in
+    /// Windows-1252. Offset: the first invalid byte (UTF-16: the first byte of
+    /// the code unit) in the field.
     InvalidEncoding,
-    /// Warning. One occurrence per field containing a NUL (`0x00`) byte.
-    /// Offset: the first NUL in the field.
+    /// Warning. One occurrence per field containing a NUL: a `0x00` byte, or
+    /// in UTF-16 a U+0000 code unit. Offset: the first NUL in the field (its
+    /// code unit's first byte in UTF-16).
     NulBytes,
     /// Info. One occurrence per row whose line ending differs from the most
     /// common line ending (ties go to the one seen first). Offset: the first
@@ -152,11 +156,60 @@ pub fn invalid_utf8_offsets(bytes: &[u8]) -> Vec<usize> {
     offsets
 }
 
-/// The diagnostics a parser should report for `bytes`, given their layout.
-/// `utf8` says whether to look for invalid UTF-8 (true for UTF-8 files).
-/// The result is sorted by kind, in [`DiagnosticKind::ALL`] order.
+/// Offsets of U+0000 code units and of unpaired surrogates in UTF-16 text
+/// that starts after a `bom_len`-byte BOM. Each offset is the code unit's
+/// first byte (ADR-0003 decision 7). A final odd byte is an incomplete code
+/// unit and counts as invalid.
 #[must_use]
-pub fn derive(layout: &Layout, bytes: &[u8], utf8: bool) -> Vec<Diagnostic> {
+pub fn utf16_nul_and_invalid_offsets(
+    bytes: &[u8],
+    bom_len: usize,
+    little_endian: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let unit_at = |offset: usize| {
+        let pair = [bytes[offset], bytes[offset + 1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    };
+    let (mut nuls, mut invalid) = (Vec::new(), Vec::new());
+    let mut pos = bom_len;
+    while pos + 1 < bytes.len() {
+        let unit = unit_at(pos);
+        match unit {
+            0 => nuls.push(pos),
+            0xD800..=0xDBFF => {
+                let next_is_low =
+                    pos + 3 < bytes.len() && (0xDC00..=0xDFFF).contains(&unit_at(pos + 2));
+                if next_is_low {
+                    pos += 4; // a valid pair
+                    continue;
+                }
+                invalid.push(pos);
+            }
+            0xDC00..=0xDFFF => invalid.push(pos),
+            _ => {}
+        }
+        pos += 2;
+    }
+    if pos < bytes.len() {
+        invalid.push(pos);
+    }
+    (nuls, invalid)
+}
+
+/// The diagnostics a parser should report for `bytes` in `encoding`, given
+/// their layout (with file offsets). The result is sorted by kind, in
+/// [`DiagnosticKind::ALL`] order.
+///
+/// - UTF-8: NUL is a 0x00 byte; invalid encoding is invalid UTF-8.
+/// - Windows-1252: NUL is a 0x00 byte; every byte is valid.
+/// - UTF-16: NUL is a U+0000 code unit; invalid encoding is an unpaired
+///   surrogate (ADR-0003 decision 7).
+#[must_use]
+pub fn derive(layout: &Layout, bytes: &[u8], encoding: Encoding) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let mut push = |kind, locations| {
         if let Some(d) = Diagnostic::from_locations(kind, locations) {
@@ -205,16 +258,23 @@ pub fn derive(layout: &Layout, bytes: &[u8], utf8: bool) -> Vec<Diagnostic> {
             .collect(),
     );
 
-    if utf8 {
-        push(
-            DiagnosticKind::InvalidEncoding,
-            first_per_field(layout, invalid_utf8_offsets(bytes).into_iter()),
-        );
-    }
-
+    let (nuls, invalid): (Vec<usize>, Vec<usize>) = match encoding {
+        Encoding::Utf8 => (
+            positions_of(0, bytes).collect(),
+            invalid_utf8_offsets(bytes),
+        ),
+        Encoding::Windows1252 => (positions_of(0, bytes).collect(), Vec::new()),
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            utf16_nul_and_invalid_offsets(bytes, layout.bom_len, encoding == Encoding::Utf16Le)
+        }
+    };
+    push(
+        DiagnosticKind::InvalidEncoding,
+        first_per_field(layout, invalid.into_iter()),
+    );
     push(
         DiagnosticKind::NulBytes,
-        first_per_field(layout, positions_of(0, bytes)),
+        first_per_field(layout, nuls.into_iter()),
     );
 
     let dominant = mode(layout.rows.iter().filter_map(|r| r.line_ending));
@@ -336,7 +396,7 @@ mod tests {
             ],
         };
         assert_eq!(layout.check_tiles(bytes, Delimiter::Comma), Ok(()));
-        let d = derive(&layout, bytes, true);
+        let d = derive(&layout, bytes, Encoding::Utf8);
         let nul = d
             .iter()
             .find(|d| d.kind == DiagnosticKind::NulBytes)
@@ -356,9 +416,35 @@ mod tests {
         assert_eq!(bad.count, 1);
         assert_eq!(bad.first, vec![Location { row: 0, offset: 4 }]);
         assert!(
-            derive(&layout, bytes, false)
+            derive(&layout, bytes, Encoding::Windows1252)
                 .iter()
                 .all(|d| d.kind != DiagnosticKind::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn utf16_nuls_are_units_and_lone_surrogates_are_invalid() {
+        // BOM, "a", U+0000, lone high surrogate, "b", a valid pair (😀),
+        // lone low surrogate, then one stray byte.
+        let le: Vec<u8> = [
+            0xFEFF_u16, 0x61, 0x0000, 0xD800, 0x62, 0xD83D, 0xDE00, 0xDC00,
+        ]
+        .iter()
+        .flat_map(|u| u.to_le_bytes())
+        .chain([0x41])
+        .collect();
+        let (nuls, invalid) = utf16_nul_and_invalid_offsets(&le, 2, true);
+        // "a" is 61 00: its 0x00 byte is not a NUL unit.
+        assert_eq!(nuls, vec![4]);
+        assert_eq!(invalid, vec![6, 14, 16]);
+
+        let be: Vec<u8> = [0xFEFF_u16, 0x0000, 0xDBFF]
+            .iter()
+            .flat_map(|u| u.to_be_bytes())
+            .collect();
+        assert_eq!(
+            utf16_nul_and_invalid_offsets(&be, 2, false),
+            (vec![2], vec![4])
         );
     }
 

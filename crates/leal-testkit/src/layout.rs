@@ -113,6 +113,15 @@ impl Layout {
         (offset < end).then_some(row)
     }
 
+    /// Whether "the file quotes every field" (DESIGN §3.7): it has at least
+    /// one non-blank row, and every field of every non-blank row is quoted.
+    /// Blank lines are ignored, since they have no field bytes to quote.
+    #[must_use]
+    pub fn quotes_every_field(&self) -> bool {
+        let mut rows = self.rows.iter().filter(|r| !r.is_blank()).peekable();
+        rows.peek().is_some() && rows.all(|r| r.fields.iter().all(|f| f.quoted))
+    }
+
     /// The `(row, field)` whose span contains byte `offset`. `None` for
     /// delimiters, line endings, the BOM and offsets past the end.
     #[must_use]

@@ -39,6 +39,20 @@ def at(data, needle, nth=0, plus=0):
     return pos + plus
 
 
+def at16(data, text, codec, nth=0):
+    """Offset of the nth occurrence of `text` encoded with `codec` in UTF-16
+    `data`, counting only matches that start on a code unit (even offset)."""
+    needle = text.encode(codec, "surrogatepass")
+    pos, found = -1, -1
+    while found < nth:
+        pos = data.find(needle, pos + 1)
+        if pos < 0:
+            raise ValueError(f"{text!r} occurrence {nth} not found")
+        if pos % 2 == 0:
+            found += 1
+    return pos
+
+
 def case(path, data, description, *, rows, fields, delimiter=",", line_ending="lf",
          mixed=False, bom="none", encoding="utf-8", trailing_newline=True, header=True,
          diagnostics=(), cells=()):
@@ -181,6 +195,33 @@ d = b"a,b,c\n1,2,3\n4,5\n6,7,8,9\n10,11,12\n"
 case("diagnostics/ragged-rows.csv", d, "One short row and one long row.",
      rows=5, fields=[3, 3, 2, 4, 3],
      diagnostics=[("ragged_rows", [(2, at(d, b"4,5")), (3, at(d, b"6,7"))])])
+
+# UTF-16 NUL is a U+0000 code unit, not a 0x00 byte (ADR-0003 decision 7): every
+# ASCII character here has a 0x00 byte, and none of those count.
+d = BOM_UTF16LE + "id,v\n1,a\0b\0\n2,\0\n3,ok\n".encode("utf-16-le")
+case("diagnostics/nul-utf16le.csv", d,
+     "UTF-16 LE with three U+0000 code units in two fields: one occurrence per field, "
+     "at the byte offset of the first unit. The 0x00 bytes of ASCII characters are "
+     "not NULs.",
+     rows=4, fields=[2] * 4, bom="utf-16le", encoding="utf-16le",
+     diagnostics=[("nul_bytes", [(1, at16(d, "\0", "utf-16-le")),
+                                 (2, at16(d, "\0", "utf-16-le", nth=2))]),
+                  bom_present()],
+     cells=[(1, 1, "a\0b\0", False), (2, 1, "\0", False)])
+
+# An unpaired surrogate is invalid_encoding, once per field, shown as U+FFFD.
+text = "id,v\n1,x\ud800y\udc00\n2,\udbff\n3,😀\n"
+d = BOM_UTF16BE + text.encode("utf-16-be", "surrogatepass")
+case("diagnostics/unpaired-surrogate-utf16be.csv", d,
+     "UTF-16 BE with three unpaired surrogates in two fields (a lone high, a lone low, "
+     "a lone high at a field's end), and a valid pair that is not flagged. One "
+     "occurrence per field, at the first unit's byte offset.",
+     rows=4, fields=[2] * 4, bom="utf-16be", encoding="utf-16be",
+     diagnostics=[("invalid_encoding", [(1, at16(d, "\ud800", "utf-16-be")),
+                                        (2, at16(d, "\udbff", "utf-16-be"))]),
+                  bom_present()],
+     cells=[(1, 1, "x�y�", False), (2, 1, "�", False),
+            (3, 1, "😀", False)])
 
 # UTF-16 offsets are byte offsets into the file as stored (ADR-0003 decision 6).
 # "😀" is a surrogate pair (4 bytes), so a wrong offset mapping shows up here.
