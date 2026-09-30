@@ -65,10 +65,30 @@ bytes as possible, and never change a value silently.
       would read back as one CRLF. The later row's line ending is changed to
       CR (for a blank row) so the two stay separate.
 
+11. **Remembering a guessed encoding.** Without a BOM, the encoding is a
+    guess from the whole file, so an edit anywhere can change what a
+    reopen guesses (for example, a Windows-1252 file whose remaining bytes
+    happen to be valid UTF-8, so `Ã©` would suddenly show as `é`). No change
+    next to the edit can prevent this. Leal records the encoding in the
+    standard macOS `com.apple.TextEncoding` extended attribute, as TextEdit
+    does, which changes the file's metadata but not its bytes:
+    - Leal writes the attribute on save when a reopen would otherwise guess
+      a different encoding, and updates it if the file already has one.
+    - On open, a valid attribute beats the guess, as long as the bytes
+      decode under it. For UTF-8, that means they are valid UTF-8, or the
+      usual invalid-encoding warning applies.
+    - If the attribute and the bytes disagree badly, Leal uses the guess
+      and says so in the status bar.
+    - The attribute doesn't travel everywhere (email, git, some cloud
+      drives). Elsewhere the guess applies again; that's a property of the
+      file, not something Leal can fix.
+
 ## Consequences
 
 - DESIGN §3.6 and §3.7 get these rules once the ADR is accepted.
 - Task 2.4 adds per-column quoting detection to the oracle (decision 2).
 - The app disables row and column insertion after an unterminated quote
   (decision 8, task 2.5).
-- The serializer's property tests include the reopen check (decision 10).
+- The serializer's property tests include the reopen check (decision 10),
+  with the encoding attribute modelled (decision 11).
+- Tasks 1.1/1.2 read the attribute on open; task 2.5 writes it on save.
