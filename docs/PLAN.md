@@ -48,7 +48,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     generates the Xcode project and launches the app.
   - Acceptance: works from a fresh clone with only the documented setup.
 
-- [ ] **0.4 Grid spike** (throwaway code in `spikes/`, deleted after the ADR)
+- [~] **0.4 Grid spike** (throwaway code in `spikes/`, deleted after the ADR)
   - `NSTableView` over a synthetic 1M × 200 data source.
   - Measure scroll smoothness and memory with Instruments at 12, 50 and 200
     columns.
