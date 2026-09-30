@@ -36,6 +36,8 @@ reopen quoting. For example, `"a"b"c",` is one field with raw bytes
   file), BOM present.
 - **Dominant field count** (for ragged rows) is the most common field count.
   A tie goes to the count that appears first in the file.
+  Blank lines are left out of this count and are never also reported as
+  ragged rows.
 - **Dominant line ending** is the most common one. A tie goes to the first
   one seen.
 - Locations are the first 1,000 occurrences in file order.
