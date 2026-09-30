@@ -41,9 +41,9 @@ columns, UTF-8, quoted fields containing some newlines.
 | Metric | Budget |
 |---|---|
 | Launch to empty window | < 300 ms |
-| Open to first rows visible | < 150 ms, before indexing finishes |
+| Open to first rows visible | < 150 ms, **independent of file size**, before indexing finishes |
 | Full index built | < 500 ms |
-| Scrolling | No dropped frames at 120 Hz |
+| Scrolling | No dropped frames at 120 Hz, **including while background work runs** |
 | Cell edit to screen | < 16 ms |
 | Filter with full scan | < 300 ms |
 | Sort on one column | < 1 s |
@@ -53,6 +53,11 @@ columns, UTF-8, quoted fields containing some newlines.
 
 These budgets are checked by benchmarks in CI (core) and Instruments runs
 before each release (app). A regression past a budget blocks release.
+
+**First paint and scrolling come first.** Reading the file always wins over
+preparing to filter, sort or analyse it. No background work may delay the
+first rows appearing or make scrolling stutter. See §3.10 for how this is
+enforced.
 
 ---
 
@@ -143,6 +148,11 @@ Detected from the first 64 KB plus samples from the middle and end of the file:
 
 Dialect is an *interpretation*. The user can change it (for example, "treat as
 semicolon-separated"), which re-indexes the file but never changes its bytes.
+
+For first paint, the dialect is decided from the **first 64 KB only**. The
+middle and end samples are checked afterwards in the background. If they
+disagree, Leal does not re-lay out the grid under the user; it shows a
+suggestion instead ("This file looks semicolon-separated — Switch").
 
 ### 3.3 Row index
 
@@ -250,7 +260,8 @@ of physical row numbers to show, in order.
 - **Sort:** by one or more columns, stable, with numeric-aware comparison when
   a column looks numeric.
 - Views are computed on background threads (`rayon`), are cancellable, and
-  stream partial results so the grid updates while a scan runs.
+  stream partial results so the grid updates while a scan runs. They follow
+  the priority rules in §3.10 and never delay viewing or scrolling.
 - Editing works in filtered and sorted views; edits map to physical rows. An
   edited row that no longer matches the filter stays visible, marked, until the
   filter is re-applied, so rows don't vanish mid-edit.
@@ -263,6 +274,58 @@ of physical row numbers to show, in order.
   exposed as Swift `async`), with progress callbacks and cancellation.
 - The main thread never waits on a long operation. While indexing, the row
   count is "rows indexed so far".
+
+### 3.10 First paint and work priority
+
+Opening a file starts several jobs. They run in a strict priority order, and
+lower-priority work must never delay higher-priority work.
+
+| Priority | Work | When | QoS |
+|---|---|---|---|
+| **P0** | Clone, map, detect dialect from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
+| **P1** | Row index (§3.3); parsing rows as the user scrolls | Straight after P0 | User-initiated |
+| **P2** | Diagnostics details, dialect check on later samples, refined column widths, number detection for alignment | Alongside or after P1 | Utility |
+| **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, lowered to background during scrolling |
+
+Rules:
+
+1. **First paint does not wait for the index.** P0 parses the first rows
+   directly from the start of the file. It touches only the first few pages of
+   the file.
+2. **Scrolling never waits for filter preparation.** Filter and sort
+   acceleration structures are never built during open. They are built
+   lazily, when the user first opens the filter bar or sorts, or in idle time
+   once P1 and P2 have finished.
+3. **Background work yields to the user.** While the user is scrolling or
+   editing, P3 jobs pause at their next chunk boundary and resume when input
+   has been idle for about 250 ms. Jobs work in chunks of at most ~5 ms so
+   they can pause quickly.
+4. **Separate thread pools.** The index runs on its own thread. P2 and P3 run
+   on a `rayon` pool limited to (performance cores − 1) threads, so the main
+   thread and the indexer always have a core free.
+5. **Scrolling before the index finishes.** The scrollbar is sized from an
+   estimated row count (file size ÷ average row length so far), refined as the
+   index grows. Scrolling within indexed rows is instant. Jumping past the
+   indexed region (⌘↓, go to row) moves the indexer to the front of the queue
+   and shows the target as soon as it's reached; at the 100 MB target that
+   is under half a second.
+6. **Filters work while indexing.** A filter applied before the index
+   finishes scans the rows indexed so far and keeps up as more arrive.
+7. **Acceleration structures are optional.** Every filter and sort works
+   correctly by plain scanning; acceleration only makes repeat operations
+   faster. They count toward the memory budget, and are dropped under memory
+   pressure and rebuilt on demand.
+
+**Filter and sort acceleration (P3).** Examples, each built per column and
+only for columns the user actually filters or sorts:
+- parsed numeric values, for numeric comparisons and sorting;
+- case-folded text, for case-insensitive contains/equals;
+- sort keys, for re-sorting after edits without a full re-parse.
+
+**Measuring it.** The core and app emit `os_signpost` intervals for P0 (open
+to first paint) and for every background job, so Instruments shows exactly
+what ran when. A CI benchmark opens the reference file with P1–P3 work forced
+to run concurrently and asserts first paint is still under 150 ms.
 
 ---
 

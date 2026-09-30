@@ -55,16 +55,23 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
 - [ ] **1.3 Row index** — quote-aware, progressive, `u32` offsets (§3.3).
   Benchmark: 100 MB reference file indexed in < 500 ms.
+- [ ] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
+  resume on user input, `os_signpost` intervals (§3.10). First-paint path
+  parses the first screen without waiting for the index. Benchmark: first
+  rows < 150 ms with P1–P3 work forced to run concurrently.
 - [ ] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
 - [ ] **1.5 Diagnostics** — all kinds in §3.5, collected during indexing.
 - [ ] **1.6 App: document and grid** — `NSDocument`, grid bound to the core,
-  gutter, header row, column sizing, status bar (§4.1).
+  gutter, header row, column sizing, status bar (§4.1). Grid appears from
+  the P0 first screen; scrollbar uses the estimated row count while
+  indexing (§3.10).
 - [ ] **1.7 App: diagnostics banner** — banner, details popover, navigation,
   gutter markers.
 - [ ] **1.8 App: find, go to row, copy, cell inspector.**
 - [ ] **1.9 External changes** — watch the original, Reload / Keep editing.
 - [ ] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
-  measured and recorded in `docs/perf.md`.
+  measured and recorded in `docs/perf.md`, including first paint and scroll
+  smoothness while background work runs.
 
 ## Phase 2 — Editing
 
@@ -82,7 +89,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 ## Phase 3 — Filter and sort
 
 - [ ] **3.1 View engine** — predicates, background execution, cancellation,
-  streamed results (§3.8).
+  streamed results (§3.8). Runs as P3 work: filters apply while indexing,
+  lazy per-column acceleration, dropped under memory pressure (§3.10).
+  Acceptance: scrolling stays smooth during a filter scan (Instruments).
 - [ ] **3.2 Sort** — multi-column, stable, numeric-aware.
 - [ ] **3.3 App: filter bar and quick search**, editing in filtered views.
 
