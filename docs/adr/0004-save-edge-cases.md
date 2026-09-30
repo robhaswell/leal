@@ -42,18 +42,33 @@ bytes as possible, and never change a value silently.
    field, which is the smallest change that keeps its value.
 8. **Rows after an unterminated quote.** An unterminated quote swallows the
    rest of the file into one field, so a row inserted after it would land
-   inside the quote. Leal doesn't allow it: inserting a row at or after that
-   point is disabled, with an explanation. Editing the swallowed cell itself
-   is allowed.
+   inside the quote. Leal doesn't allow it: inserting a row or column after
+   that field is disabled, with an explanation. Inserting a row before it
+   (at its own row index) is fine. Editing the swallowed cell itself is
+   allowed. Any edit sequence that would leave the unterminated field
+   anywhere but at the end of the file is rejected.
 9. **Setting a cell with invalid bytes to its displayed value.** §3.6 wins:
    an edit equal to the original display value is no edit, so the original
    bytes, invalid ones included, come back. This also makes pressing Return
    in an unchanged editor harmless. To actually replace the invalid bytes,
    the user types a different value, as the §3.5 editing notice explains.
 
+10. **Reopening gives the same file structure.** Opening a saved file must
+    give the same dialect, encoding, BOM and rows as the document had
+    before saving. Where the smallest splice would break this, the
+    serializer makes the smallest extra change next to the edit. Property
+    tests check this for every generated edit. Two known cases:
+    - A field that would put BOM-like bytes at the start of a file without
+      that BOM (U+FEFF, or `EF BB BF`, `FF FE` or `FE FF` in a single-byte
+      file) is quoted. This generalises decision 7.
+    - A row ending in a lone CR followed directly by a row starting with LF
+      would read back as one CRLF. The later row's line ending is changed to
+      CR (for a blank row) so the two stay separate.
+
 ## Consequences
 
 - DESIGN §3.6 and §3.7 get these rules once the ADR is accepted.
 - Task 2.4 adds per-column quoting detection to the oracle (decision 2).
-- The app disables row insertion after an unterminated quote (decision 8,
-  task 2.5).
+- The app disables row and column insertion after an unterminated quote
+  (decision 8, task 2.5).
+- The serializer's property tests include the reopen check (decision 10).
