@@ -15,6 +15,7 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 leal-core.workspace = true
+uniffi.workspace = true
 
 [lints]
 workspace = true

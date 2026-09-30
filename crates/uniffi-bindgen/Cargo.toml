@@ -1,0 +1,21 @@
+[package]
+name = "uniffi-bindgen"
+description = "UniFFI's bindings generator, built from this workspace. `just ffi` runs it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+# The `cli` feature adds the command-line generator. Only this tool needs it;
+# leal-ffi depends on plain `uniffi`.
+uniffi = { workspace = true, features = ["cli"] }
+
+[lints]
+workspace = true

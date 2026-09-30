@@ -1,5 +1,9 @@
 //! Leal's CSV engine: everything that matters for correctness and performance.
 
+mod inspect;
+
+pub use inspect::{FIRST_LINE_MAX_BYTES, FileSummary, inspect_file};
+
 /// Returns the version of `leal-core`, for example `"0.0.0"`.
 ///
 /// ```
