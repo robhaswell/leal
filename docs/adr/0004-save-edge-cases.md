@@ -78,7 +78,11 @@ bytes as possible, and never change a value silently.
       decode under it. For UTF-8, that means they are valid UTF-8, or the
       usual invalid-encoding warning applies.
     - If the attribute and the bytes disagree badly, Leal uses the guess
-      and says so in the status bar.
+      and says so in the status bar. "Badly" means: a UTF-8 attribute on
+      bytes that ADR-0003 rule 1 wouldn't accept as UTF-8 (invalid bytes
+      outnumber valid multibyte sequences). A Windows-1252 attribute can
+      always be honoured, since every byte decodes. A UTF-16 attribute on a
+      file without a UTF-16 BOM is ignored.
     - The attribute doesn't travel everywhere (email, git, some cloud
       drives). Elsewhere the guess applies again; that's a property of the
       file, not something Leal can fix.
