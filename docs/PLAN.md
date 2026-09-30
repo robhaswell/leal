@@ -26,7 +26,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ## Phase 0 — Foundations
 
-- [ ] **0.1 Workspace scaffold**
+- [~] **0.1 Workspace scaffold**
   - Cargo workspace with `leal-core`, `leal-ffi`, `leal-cli` (empty but building).
   - `justfile` with `check` (fmt check, clippy `-D warnings`, nextest), `test`,
     `fmt`, `bench`, `run`, `app`.

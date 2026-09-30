@@ -1,0 +1,76 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# Keep in step with the channel in rust-toolchain.toml.
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robhaswell/leal"
+publish = false
+
+[workspace.dependencies]
+leal-core = { path = "crates/leal-core" }
+
+# Every crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+# `unsafe` is allowed only in leal-core's `source` module (mmap) and in
+# leal-ffi (CLAUDE.md). This is `deny` rather than `forbid` so that those
+# tasks can add a narrow `#[allow(unsafe_code)]` on exactly that module or
+# crate; `forbid` could not be overridden.
+unsafe_code = "deny"
+# Only public items and the crate root need docs, so in practice this applies
+# to the library crates (leal-core, leal-ffi). For leal-cli it only asks for
+# the crate doc comment. `just check` runs clippy with `-D warnings`, so this
+# is enforced.
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# The default clippy lints (correctness, suspicious, style, complexity, perf).
+# Priority -1 lets the individual lints below override the group.
+all = { level = "warn", priority = -1 }
+
+# A selection from `clippy::pedantic`. The whole group is noisy (for example
+# `must_use_candidate`, `module_name_repetitions`, `doc_markdown`,
+# `similar_names`), so we enable only the lints that catch real bugs or real
+# costs in this kind of code: byte offsets, u32 indexes, FFI and hot loops.
+#
+# Numeric casts: the row index stores `u32` offsets (DESIGN §3.3). A silent
+# `as` truncation or sign change is a data bug, so make every lossy cast
+# explicit (`u32::try_from`) and every lossless one visible (`u64::from`).
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+checked_conversions = "warn"
+# Float comparison: numeric-aware sort and filters (DESIGN §3.8).
+float_cmp = "warn"
+# Pointer casts: leal-ffi and the mmap source.
+ptr_as_ptr = "warn"
+borrow_as_ptr = "warn"
+# Needless copies and moves on hot paths.
+needless_pass_by_value = "warn"
+trivially_copy_pass_by_ref = "warn"
+large_types_passed_by_value = "warn"
+large_stack_arrays = "warn"
+inefficient_to_string = "warn"
+implicit_clone = "warn"
+# `.csv` vs `.CSV`: file names come from users.
+case_sensitive_file_extension_comparisons = "warn"
+# Public API documentation for leal-core.
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+# Readability.
+wildcard_imports = "warn"
+unnecessary_wraps = "warn"
+unused_self = "warn"
+unused_async = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# `panic` stays at the default ("unwind"). UniFFI (task 0.3) catches Rust
+# panics at the FFI boundary and turns them into Swift errors; with
+# `panic = "abort"` it could not, and any panic would kill the app.

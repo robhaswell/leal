@@ -1,0 +1,20 @@
+[package]
+name = "leal-ffi"
+description = "Swift bindings for leal-core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# `staticlib` is the `.a` file linked into Leal.app. `lib` (an rlib) lets
+# Rust code, including this crate's own tests, use it as a normal crate.
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+leal-core.workspace = true
+
+[lints]
+workspace = true

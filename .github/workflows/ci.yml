@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: just check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the channel, components and targets in rust-toolchain.toml.
+      # Since rustup 1.28, `rustup show` alone no longer installs a missing
+      # toolchain, so install it explicitly, then print what is active.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Install just and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      # After the toolchain step, because the cache key includes the rustc version.
+      - uses: Swatinem/rust-cache@v2
+
+      - run: just check

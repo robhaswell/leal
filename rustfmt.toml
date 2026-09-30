@@ -1,0 +1,3 @@
+# Stable options only. Everything else is rustfmt's default style.
+edition = "2024"
+newline_style = "Unix"
