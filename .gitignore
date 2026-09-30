@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Xcode (project is generated from app/project.yml)
+/app/*.xcodeproj/
+/app/Generated/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+/build/
+
+# Fuzzing
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
+# macOS
+.DS_Store
+
+# Local Claude Code settings
+.claude/settings.local.json

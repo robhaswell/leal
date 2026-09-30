@@ -1,0 +1,2 @@
+# Test fixtures are byte-exact; git must never convert line endings or text
+tests/corpus/** -text -diff binary
