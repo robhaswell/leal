@@ -33,7 +33,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - GitHub Actions CI on macOS: `just check` on every push to `main` (and on outside contributors' PRs).
   - Acceptance: fresh clone → `just check` passes; CI green.
 
-- [~] **0.2 Test harness and corpus**
+- [x] **0.2 Test harness and corpus**
   - `tests/corpus/` with one small hand-made file per dialect and per
     diagnostic kind (DESIGN §3.5), each with a sidecar of expected results.
   - `proptest` strategies for arbitrary bytes and CSV-like files (DESIGN §5).
