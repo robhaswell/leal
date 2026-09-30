@@ -6,14 +6,14 @@ explains what each task is for.
 **How to use this file**
 
 - Tasks run in order, except that independent tasks may run in parallel.
-- Each task is one branch and one pull request, named `task/<id>-<slug>`
-  (e.g. `task/1.3-row-index`), targeting the phase branch `phase/<n>`.
-  See `CLAUDE.md` for the full review and merge process.
-- Tick the box in the PR that completes the task.
+- During the initial build, work is committed straight to `main`, with commit
+  messages starting with the task ID. See `CLAUDE.md` for the full review
+  process.
+- Tick the box once the task is reviewed and its findings are fixed.
 - A task is done only when every acceptance criterion holds,
   `just check` passes locally and in CI, and its review findings are fixed.
 - A phase is done when its phase-end review is complete and Rob has approved
-  the phase PR into `main`.
+  it. The approved commit is tagged `phase-<n>`.
 - If a task turns out to need a design change, stop and write an ADR in
   `docs/adr/` for Rob to approve before continuing.
 
@@ -30,7 +30,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Cargo workspace with `leal-core`, `leal-ffi`, `leal-cli` (empty but building).
   - `justfile` with `check` (fmt check, clippy `-D warnings`, nextest), `test`,
     `fmt`, `bench`, `run`, `app`.
-  - GitHub Actions CI on macOS: `just check` on every PR and on `main`.
+  - GitHub Actions CI on macOS: `just check` on every push to `main` (and on outside contributors' PRs).
   - Acceptance: fresh clone → `just check` passes; CI green.
 
 - [ ] **0.2 Test harness and corpus**
@@ -48,7 +48,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     generates the Xcode project and launches the app.
   - Acceptance: works from a fresh clone with only the documented setup.
 
-- [ ] **0.4 Grid spike** (throwaway code, on its own branch)
+- [ ] **0.4 Grid spike** (throwaway code in `spikes/`, deleted after the ADR)
   - `NSTableView` over a synthetic 1M × 200 data source.
   - Measure scroll smoothness and memory with Instruments at 12, 50 and 200
     columns.

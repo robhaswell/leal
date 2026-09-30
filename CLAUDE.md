@@ -12,33 +12,37 @@ user didn't edit. Rust core (`crates/`) + thin Swift/AppKit app (`app/`).
 ## How the build is run
 
 An orchestrating Claude session runs the build and assigns each PLAN task to
-an implementer sub-agent working in its own git worktree.
+an implementer sub-agent. During the initial build (until 1.0) **all work is
+committed directly to `main` and pushed**. There are no task or phase
+branches and no pull requests.
 
-```
-task/<id>-<slug>  ──PR──►  phase/<n>  ──phase PR──►  main
-```
-
-- **Task PRs target the phase branch** (`phase/0`, `phase/1`, …), never
-  `main`. A fresh reviewer agent reviews each task PR, and the orchestrator
-  merges it once review findings are fixed and CI is green.
-- **Phase PRs target `main`.** They merge only after the phase-end review
-  (parallel reviewers for fidelity/correctness, Rust quality, performance,
-  test strength with `cargo-mutants`, and Swift/AppKit; each finding verified
-  before it is fixed) and **Rob's approval**.
+- **One task at a time works in the main checkout.** When independent tasks
+  run in parallel, each extra agent works in a temporary git worktree, and the
+  orchestrator rebases its commits onto `main`. Worktree branches are local
+  only and deleted afterwards.
+- **Every task is reviewed.** After the implementer commits, a fresh reviewer
+  agent reviews that task's commits. Fixes are follow-up commits. A task is
+  ticked in `docs/PLAN.md` only after its review findings are fixed and CI on
+  `main` is green.
+- **Phase gates.** At the end of each phase, parallel reviewers cover
+  fidelity/correctness, Rust quality, performance, test strength
+  (`cargo-mutants`) and Swift/AppKit. Each finding is verified before it is
+  fixed. Rob reads the phase report and approves the phase; the approved
+  commit is tagged `phase-<n>`. The next phase starts after approval.
 - **Rob approves phase gates and ADRs only.** Everything else is reviewed by
   agents.
-- **Implementers never merge, and never push to `main` or a phase branch.**
+- **Commit messages** start with the task ID, e.g. `1.3: Build quote-aware
+  row index`. Keep each commit building and passing `just check`.
 - **When blocked, stop and report.** If a task needs a design change, a weaker
   fidelity test or a missed performance budget, write an ADR and report back
   instead of working around it.
-- **Report back briefly** (about 150 words): status, PR link, test results,
-  benchmark results, deviations from the design, and open questions. Details
-  go in the PR, not the report.
+- **Report back briefly** (about 150 words): status, commit range, test
+  results, benchmark results, deviations from the design, and open questions.
+  Put detail in commit messages and the task notes (below), not the report.
 
 ## Working rules
 
-- **One task per branch and PR**: `task/<id>-<slug>`, branched from and
-  targeting `phase/<n>`. Keep PRs to that task.
+- **Stay within the task.** Don't mix unrelated changes into a task's commits.
 - **Tests first.** For core work, write the failing tests (including fidelity
   property tests where relevant) before the implementation.
 - **Never weaken a fidelity test** (DESIGN §5) to make a change pass. If the
@@ -48,31 +52,35 @@ task/<id>-<slug>  ──PR──►  phase/<n>  ──phase PR──►  main
 - **Logic lives in `leal-core`.** Swift handles presentation and macOS
   integration only. `leal-ffi` only wraps.
 - **Performance budgets** in DESIGN §1 are requirements. Tasks that touch hot
-  paths include a benchmark result in the PR.
+  paths include a benchmark result in their task notes.
 - **Dependencies:** prefer well-maintained crates (`memchr`, `memmap2`,
   `encoding_rs`, `rayon`, `regex`, `uniffi`, `proptest`, `criterion`).
-  Justify any new dependency in the PR description.
+  Justify any new dependency in the task notes.
 - No `unsafe` outside `source` (mmap) and `leal-ffi`, and each `unsafe` block
   has a `// SAFETY:` comment.
 
 ## Commands
 
-- `just check` — fmt check, clippy (`-D warnings`), all tests. Must pass before a PR.
+- `just check` — fmt check, clippy (`-D warnings`), all tests. Must pass before every commit.
 - `just test` / `just bench` / `just run` (build and launch the app).
 - Rust toolchain is pinned in `rust-toolchain.toml`; the Xcode project is
   generated from `app/project.yml` by XcodeGen and is not committed.
 
 ## Rob is new to Rust
 
-In each PR description, add a short **"Rust notes"** section explaining any
+In each task's notes, add a short **"Rust notes"** section explaining any
 Rust concepts the change relies on (ownership, lifetimes, traits, `Arc`,
 async, `unsafe`, etc.) in plain terms, with pointers to the relevant code.
 These are collected into the phase report Rob reads at each phase gate. Keep
 code straightforward over clever.
 
-## PR checklist
+## Task notes and checklist
 
-- [ ] Acceptance criteria from `docs/PLAN.md` met; box ticked
+Each task writes `docs/tasks/<id>.md` with what was built, benchmark results,
+new dependencies, deviations, and Rust notes. The phase report is compiled
+from these.
+
+- [ ] Acceptance criteria from `docs/PLAN.md` met; box ticked after review
 - [ ] `just check` passes
 - [ ] Tests added (and fidelity tests, if the change touches parsing or saving)
 - [ ] Benchmarks included if a hot path changed
