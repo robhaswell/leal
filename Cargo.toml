@@ -72,5 +72,7 @@ unused_async = "warn"
 lto = "thin"
 codegen-units = 1
 # `panic` stays at the default ("unwind"). UniFFI (task 0.3) catches Rust
-# panics at the FFI boundary and turns them into Swift errors; with
-# `panic = "abort"` it could not, and any panic would kill the app.
+# panics at the FFI boundary. For exports that return `Result` (Swift
+# `throws`), a panic becomes a catchable Swift error; exports that can't fail
+# are called with `try!` and still crash. With `panic = "abort"` no panic
+# could be caught at all.
