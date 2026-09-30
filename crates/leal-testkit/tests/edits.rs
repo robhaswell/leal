@@ -3,9 +3,10 @@
 
 mod oracle;
 
-use leal_testkit::dialect::{Bom, Encoding, decode_value};
-use leal_testkit::fidelity::{apply_changes, check_identical};
-use leal_testkit::save::{Edit, SaveError};
+use leal_testkit::dialect::{Bom, Delimiter, Encoding, decode_value};
+use leal_testkit::fidelity::{Change, apply_changes, check_identical};
+use leal_testkit::layout::Layout;
+use leal_testkit::save::{Document, Edit, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, csv_file, csv_file_utf16};
 use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for};
 use proptest::collection::vec;
@@ -37,16 +38,14 @@ proptest! {
         let saved = case.saved.clone().map_err(|e| TestCaseError::fail(e.to_string()))?;
         prop_assert_eq!(&saved.bytes, &apply_changes(&case.file.bytes, &saved.changes));
         let values = final_values(&case);
-        // Skipped, as open questions for §3.7 (docs/tasks/0.2.md):
-        // - a row with no bytes (no cells, or one empty cell) reads back as a
-        //   blank line (one empty field), or at the very end as nothing;
-        // - deleting rows can bring a field that starts with U+FEFF to the
-        //   start of the file, where it reads as a BOM.
-        let empty_row = values.iter().any(|r| r.len() < 2 && r.first().is_none_or(String::is_empty));
-        let new_bom = Bom::detect(&saved.bytes) != Bom::detect(&case.file.bytes);
-        if empty_row || new_bom {
-            return Ok(());
-        }
+        // ADR-0004 decision 6: a row left with no cells is written as `""`,
+        // so it reads back as one empty field.
+        let values: Vec<Vec<String>> = values
+            .into_iter()
+            .map(|r| if r.is_empty() { vec![String::new()] } else { r })
+            .collect();
+        // ADR-0004 decision 7: edits never create (or remove) a BOM.
+        prop_assert_eq!(Bom::detect(&saved.bytes), Bom::detect(&case.file.bytes));
 
         let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
         prop_assert_eq!(parsed.check_tiles(case.file.delimiter()), Ok(()));
@@ -185,20 +184,158 @@ fn parse_back_property_checks_most_cases() {
     let strategy = edit_case(CsvConfig::clean());
     let checked = (0..500)
         .map(|_| strategy.new_tree(&mut runner).unwrap().current())
-        .filter(|c| {
-            let values = final_values(c);
-            let empty_row = values
-                .iter()
-                .any(|r| r.len() < 2 && r.first().is_none_or(String::is_empty));
-            let new_bom = c
-                .saved
-                .as_ref()
-                .is_ok_and(|s| Bom::detect(&s.bytes) != Bom::detect(&c.file.bytes));
-            !c.edits.is_empty() && !empty_row && !new_bom
-        })
+        .filter(|c| !c.edits.is_empty() && c.saved.is_ok())
         .count();
+    // Nothing is skipped any more; this guards against the strategy
+    // producing mostly empty edit lists.
     assert!(
-        checked >= 250,
-        "only {checked} of 500 edited cases are checked"
+        checked >= 350,
+        "only {checked} of 500 cases have edits to check"
+    );
+}
+
+/// A corpus case, parsed by the oracle.
+fn corpus_case(name: &str) -> (Vec<u8>, Layout, Delimiter, Encoding) {
+    let case = leal_testkit::corpus::load()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no corpus case {name}"));
+    let d = case.sidecar.dialect.delimiter;
+    let enc = case.sidecar.dialect.encoding;
+    let layout = oracle::analyze(&case.bytes, d, enc).layout;
+    (case.bytes, layout, d, enc)
+}
+
+fn insert_row(at: usize) -> Edit {
+    Edit::InsertRow {
+        at,
+        values: vec!["x".into(), "y".into()],
+    }
+}
+
+/// ADR-0004 decision 8, on `id,note\n1,ok\n2,"never closed\n3,lost\n`.
+#[test]
+fn nothing_can_be_inserted_inside_an_unterminated_quote() {
+    let (bytes, layout, d, enc) = corpus_case("diagnostics/unterminated-quote.csv");
+    let mut doc = Document::new(&bytes, &layout, d, enc);
+    assert_eq!(doc.unterminated(), Some((2, 1)));
+
+    // After the quote's row, or after its field: refused, nothing changes.
+    assert_eq!(
+        doc.apply(&insert_row(3)),
+        Err(SaveError::AfterUnterminatedQuote(insert_row(3)))
+    );
+    let col = Edit::InsertColumn {
+        at: 2,
+        value: "z".into(),
+    };
+    assert_eq!(
+        doc.apply(&col),
+        Err(SaveError::AfterUnterminatedQuote(col.clone()))
+    );
+    assert_eq!(doc.save().unwrap().bytes, bytes);
+
+    // Before it is fine: the new bytes land ahead of the opening quote.
+    doc.apply(&insert_row(2)).unwrap();
+    let col = Edit::InsertColumn {
+        at: 1,
+        value: "z".into(),
+    };
+    doc.apply(&col).unwrap();
+    assert_eq!(doc.unterminated(), Some((3, 2)));
+    assert_eq!(
+        doc.save().unwrap().bytes,
+        b"id,z,note\n1,z,ok\nx,z,y\n2,z,\"never closed\n3,lost\n"
+    );
+
+    // Editing the swallowed cell writes a closing quote, so rows can follow.
+    let fix = Edit::SetCell {
+        row: 3,
+        column: 2,
+        value: "fixed".into(),
+    };
+    doc.apply(&fix).unwrap();
+    assert_eq!(doc.unterminated(), None);
+    doc.apply(&insert_row(4)).unwrap();
+    assert_eq!(
+        doc.save().unwrap().bytes,
+        b"id,z,note\n1,z,ok\nx,z,y\n2,z,\"fixed\"\nx,y"
+    );
+
+    // Setting it back to its original value would reopen the quote over the
+    // row that now follows it, so that is refused too (found by proptest).
+    let revert = Edit::SetCell {
+        row: 3,
+        column: 2,
+        value: "never closed\n3,lost\n".into(),
+    };
+    assert_eq!(
+        doc.apply(&revert),
+        Err(SaveError::AfterUnterminatedQuote(revert.clone()))
+    );
+    // Once the row after it is gone, the revert is allowed again.
+    doc.apply(&Edit::DeleteRow { row: 4 }).unwrap();
+    doc.apply(&revert).unwrap();
+    assert_eq!(
+        doc.save().unwrap().bytes,
+        b"id,z,note\n1,z,ok\nx,z,y\n2,z,\"never closed\n3,lost\n"
+    );
+}
+
+proptest! {
+    /// ADR-0004 decision 8: generated edits never insert after an
+    /// unterminated quote (the oracle refuses them and the strategy drops
+    /// them), so the quote, if still there, is still the end of the file.
+    #[test]
+    fn edits_never_land_inside_an_unterminated_quote(case in edit_case(CsvConfig::messy())) {
+        let mut doc = case.file.document();
+        for e in &case.edits {
+            prop_assert!(doc.apply(e).is_ok(), "{:?} was generated but is refused", e);
+        }
+        if let (Some(_), Ok(saved)) = (doc.unterminated(), &case.saved) {
+            let original = case.file.layout.rows.last().and_then(|r| r.fields.last());
+            let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
+            let last = parsed.layout.rows.last().and_then(|r| r.fields.last());
+            prop_assert!(last.is_some_and(|f| f.unterminated));
+            // It swallows exactly the bytes it swallowed before: nothing was
+            // added inside it. (Row counts elsewhere can still change; see
+            // `deleting_a_row_can_join_cr_and_lf` in src/save.rs.)
+            let raw = |b: &[u8], f: Option<&leal_testkit::layout::FieldLayout>| {
+                f.map(|f| b[f.span.clone()].to_vec())
+            };
+            prop_assert_eq!(raw(&saved.bytes, last), raw(&case.file.bytes, original));
+        }
+    }
+}
+
+/// ADR-0004 decision 9, on `diagnostics/invalid-utf8.csv`: setting a cell
+/// with invalid bytes to its displayed value is no edit, so the invalid
+/// bytes come back. A different value replaces them.
+#[test]
+fn setting_the_displayed_value_keeps_invalid_bytes() {
+    let (bytes, layout, d, enc) = corpus_case("diagnostics/invalid-utf8.csv");
+    let mut doc = Document::new(&bytes, &layout, d, enc);
+    assert_eq!(doc.value(2, 0).as_deref(), Some("Ren\u{FFFD}"));
+    let same = Edit::SetCell {
+        row: 2,
+        column: 0,
+        value: "Ren\u{FFFD}".into(),
+    };
+    doc.apply(&same).unwrap();
+    let saved = doc.save().unwrap();
+    assert!(saved.changes.is_empty());
+    check_identical(&bytes, &saved.bytes).unwrap();
+
+    let different = Edit::SetCell {
+        row: 2,
+        column: 0,
+        value: "René".into(),
+    };
+    doc.apply(&different).unwrap();
+    let span = layout.rows[2].fields[0].span.clone();
+    assert_eq!(
+        doc.save().unwrap().changes,
+        vec![Change::replace(span, "René")]
     );
 }

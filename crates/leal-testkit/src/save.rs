@@ -28,13 +28,28 @@
 //!    than `c`. Shorter (ragged) rows are left alone.
 //! 7. If an edited value can't be encoded, saving fails naming the cells
 //!    (§3.7, F5). UTF-16 files are read-only in v1, so saving them fails.
+//! 8. A row whose bytes would be empty is written as `""`, unless it was an
+//!    original blank row, which stays blank (ADR-0004 decision 6). A blank
+//!    row that ends up last in a file with no trailing newline would vanish,
+//!    so it is written as `""` too.
+//! 9. If the output's first field would start with a UTF-8 BOM
+//!    (`EF BB BF`, U+FEFF) in a file without one, that field is written
+//!    quoted (ADR-0004 decision 7).
+//! 10. An original, unedited unterminated field must stay the last thing in
+//!     the file, or new bytes would land inside its quote (ADR-0004
+//!     decision 8). Any edit that breaks this is refused with
+//!     [`SaveError::AfterUnterminatedQuote`]: a row inserted after its row,
+//!     a column after it, or setting it back to its original value after
+//!     something was added behind it. Editing it closes the quote.
 //!
-//! Where §3.7 leaves a choice open, the choice is listed in
-//! `docs/tasks/0.2.md` ("Save oracle: open questions").
+//! How these map to ADR-0004 (provisional until Rob accepts it): rule 3 is
+//! decisions 1 and 3 (decision 2, per-column quoting, is not in yet: see
+//! `TODO(ADR-0004 #2)`); rule 4 is decision 4; rule 5 is decision 9; rule 6
+//! is decision 5; rules 8, 9 and 10 are decisions 6, 7 and 8.
 
 use std::fmt;
 
-use crate::dialect::{Delimiter, Encoding, LineEnding, decode_value, encode_value};
+use crate::dialect::{Delimiter, Encoding, LineEnding, UTF8_BOM, decode_value, encode_value};
 use crate::fidelity::{Change, apply_changes};
 use crate::layout::Layout;
 
@@ -81,16 +96,21 @@ pub fn expected_field_bytes(
     if !(needs_quotes(&encoded, delimiter) || original_quoted || file_quotes_every_field) {
         return Ok(encoded);
     }
-    let mut out = Vec::with_capacity(encoded.len() + 2);
+    Ok(quote(&encoded))
+}
+
+/// `"` + `value` with each `"` doubled + `"`.
+fn quote(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 2);
     out.push(b'"');
-    for b in encoded {
+    for &b in value {
         if b == b'"' {
             out.push(b'"');
         }
         out.push(b);
     }
     out.push(b'"');
-    Ok(out)
+    out
 }
 
 /// One editing command, in logical coordinates (0-based, as the document is
@@ -143,6 +163,9 @@ pub enum SaveError {
     Unencodable(Vec<(usize, usize)>),
     /// UTF-16 files are read-only in v1.
     ReadOnly,
+    /// The edit would put bytes inside an unterminated quote (ADR-0004
+    /// decision 8).
+    AfterUnterminatedQuote(Edit),
 }
 
 impl fmt::Display for SaveError {
@@ -151,6 +174,9 @@ impl fmt::Display for SaveError {
             SaveError::InvalidEdit(e) => write!(f, "edit {e:?} is out of range"),
             SaveError::Unencodable(cells) => write!(f, "cells {cells:?} can't be encoded"),
             SaveError::ReadOnly => f.write_str("UTF-16 files are read-only"),
+            SaveError::AfterUnterminatedQuote(e) => {
+                write!(f, "edit {e:?} would land inside an unterminated quote")
+            }
         }
     }
 }
@@ -266,17 +292,50 @@ impl<'a> Document<'a> {
         Some(self.field_display(r.source?, field))
     }
 
+    /// The (row, column) now of the original unterminated field, if it is
+    /// still in the document unedited. Once edited, it is written with a
+    /// closing quote, so nothing after it is swallowed.
+    #[must_use]
+    pub fn unterminated(&self) -> Option<(usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(ri, r)| {
+            let source = &self.layout.rows[r.source?];
+            r.cells
+                .iter()
+                .position(|c| matches!(c, Cell::Original(f) if source.fields[*f].unterminated))
+                .map(|ci| (ri, ci))
+        })
+    }
+
     fn field_display(&self, row: usize, field: usize) -> String {
         decode_value(&self.layout.rows[row].fields[field].value, self.encoding)
     }
 
-    /// Applies one edit.
+    /// Applies one edit. On error the document is unchanged.
     ///
     /// # Errors
     ///
-    /// Returns [`SaveError::InvalidEdit`] if its coordinates don't exist
-    /// (the document is unchanged).
+    /// Returns [`SaveError::InvalidEdit`] if its coordinates don't exist, and
+    /// [`SaveError::AfterUnterminatedQuote`] if afterwards an original
+    /// unterminated field would no longer be the last thing in the file, so
+    /// bytes would land inside its quote (ADR-0004 decision 8). That covers
+    /// inserting a row after its row, a column after it, and setting it back
+    /// to its original value once something has been added after it.
+    /// Inserting a row *at* its row index (before it) is allowed.
     pub fn apply(&mut self, edit: &Edit) -> Result<(), SaveError> {
+        let before = self.rows.clone();
+        self.apply_unchecked(edit)?;
+        let swallows_nothing = self
+            .unterminated()
+            .is_none_or(|(r, c)| r + 1 == self.rows.len() && c + 1 == self.row_len(r));
+        if swallows_nothing {
+            Ok(())
+        } else {
+            self.rows = before;
+            Err(SaveError::AfterUnterminatedQuote(edit.clone()))
+        }
+    }
+
+    fn apply_unchecked(&mut self, edit: &Edit) -> Result<(), SaveError> {
         let invalid = || SaveError::InvalidEdit(edit.clone());
         match edit {
             Edit::SetCell { row, column, value } => {
@@ -420,6 +479,35 @@ impl<'a> Document<'a> {
             })
             .collect();
 
+        // ADR-0004 decision 6: a row with no bytes becomes `""`, unless it was
+        // an original blank row (and still has a line ending, so it survives).
+        for (i, (content, untouched)) in contents.iter_mut().enumerate() {
+            if !content.is_empty() {
+                continue;
+            }
+            let was_blank = self.rows[i]
+                .source
+                .is_some_and(|s| self.layout.rows[s].is_blank());
+            if !was_blank || endings[i].is_none() {
+                *content = b"\"\"".to_vec();
+                *untouched = false;
+            }
+        }
+
+        // ADR-0004 decision 7: a first field that would read as a BOM is
+        // quoted. (Only U+FEFF; see "Save oracle" in docs/tasks/0.2.md.)
+        if self.layout.bom_len == 0
+            && let (Some(row), Some((content, untouched))) =
+                (self.rows.first(), contents.first_mut())
+            && content.starts_with(UTF8_BOM)
+            && let Some(cell) = row.cells.first()
+            && let Ok(first) = self.cell_bytes(row, cell, quote_all)
+        {
+            let rest = content[first.len()..].to_vec();
+            *content = [quote(&first), rest].concat();
+            *untouched = false;
+        }
+
         // Serialize each row, then express the output as splices.
         let serialized: Vec<Vec<u8>> = contents
             .iter()
@@ -438,6 +526,10 @@ impl<'a> Document<'a> {
                 Ok(self.bytes[self.layout.rows[s].fields[*f].span.clone()].to_vec())
             }
             Cell::Edited { field, value } => {
+                // TODO(ADR-0004 #2): a new field (inserted row or column, so
+                // `field` is `None`) should also be quoted when every existing
+                // non-empty field in its column is quoted. Task 2.4 adds that
+                // per-column check; for now only `quote_all` applies.
                 let original_quoted = match (row.source, field) {
                     (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted,
                     _ => false,
@@ -521,8 +613,10 @@ impl<'a> Document<'a> {
                 Cell::Original(f) => *f == k,
                 Cell::Edited { field, .. } => *field == Some(k),
             });
+        let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         if same_shape {
             let quote_all = self.layout.quotes_every_field();
+            let mut per_field = Vec::new();
             for (k, cell) in self.rows[j].cells.iter().enumerate() {
                 if let Cell::Edited { .. } = cell {
                     let bytes = self
@@ -530,13 +624,25 @@ impl<'a> Document<'a> {
                         .unwrap_or_default();
                     let span = orig.fields[k].span.clone();
                     if bytes != self.bytes[span.clone()] {
-                        changes.push(Change::replace(span, bytes));
+                        per_field.push(Change::replace(span, bytes));
                     }
                 }
             }
-            return;
+            // Use the per-field splices only if they reproduce the row
+            // exactly. Rules 8 and 9 (`""` rows, a quoted BOM-like first
+            // field) can change a row in ways no single edited cell explains.
+            let local: Vec<Change> = per_field
+                .iter()
+                .map(|c| {
+                    let r = c.range.start - orig.span.start..c.range.end - orig.span.start;
+                    Change::replace(r, c.replacement.clone())
+                })
+                .collect();
+            if apply_changes(&self.bytes[orig.span.start..end], &local) == serialized {
+                changes.extend(per_field);
+                return;
+            }
         }
-        let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         changes.push(Change::replace(orig.span.start..end, serialized.to_vec()));
     }
 }
@@ -729,6 +835,92 @@ mod tests {
         assert_eq!(doc.save(), Err(SaveError::Unencodable(vec![(0, 0)])));
         let doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf16Le);
         assert_eq!(doc.save(), Err(SaveError::ReadOnly));
+    }
+
+    /// ADR-0004 decision 6.
+    #[test]
+    fn rows_that_would_have_no_bytes_are_written_as_empty_quotes() {
+        // Clearing the only field of a one-column file.
+        assert_eq!(out(save(b"a\nb\n", &[], &[set(0, 0, "")])), "\"\"\nb\n");
+        // At the end of a file with no trailing newline, it would vanish.
+        assert_eq!(out(save(b"a\nb", &[], &[set(1, 0, "")])), "a\n\"\"");
+        // Deleting the only column.
+        let del = Edit::DeleteColumn { column: 0 };
+        assert_eq!(
+            out(save(b"a\nb\n", &[], std::slice::from_ref(&del))),
+            "\"\"\n\"\"\n"
+        );
+        // A new row with one empty value.
+        let ins = Edit::InsertRow {
+            at: 1,
+            values: vec![String::new()],
+        };
+        assert_eq!(out(save(b"a\nb\n", &[], &[ins])), "a\n\"\"\nb\n");
+        // An original blank row stays blank, even when its row is rebuilt.
+        assert_eq!(out(save(b"a\n\nb\n", &[], &[set(0, 0, "x")])), "x\n\nb\n");
+        assert_eq!(out(save(b"a\n\nb\n", &[], &[del])), "\"\"\n\n\"\"\n");
+        // ...unless it would become the last row of a file with no trailing
+        // newline, where it would vanish.
+        let drop_last = Edit::DeleteRow { row: 2 };
+        assert_eq!(out(save(b"a\n\nb", &[], &[drop_last])), "a\n\"\"");
+    }
+
+    /// Not covered by ADR-0004 (see "Save oracle" in docs/tasks/0.2.md):
+    /// deleting the row between a CR-terminated row and a blank LF row puts
+    /// CR and LF next to each other, and they read back as one CRLF. The
+    /// oracle writes the bytes §3.7 describes; the file then has one row
+    /// fewer than the document.
+    #[test]
+    fn deleting_a_row_can_join_cr_and_lf() {
+        let bytes = b"a\rb\n\nc\n";
+        let layout = Layout {
+            bom_len: 0,
+            rows: vec![
+                row_layout(0..1, LineEnding::Cr, b"a"),
+                row_layout(2..3, LineEnding::Lf, b"b"),
+                row_layout(4..4, LineEnding::Lf, b""),
+                row_layout(5..6, LineEnding::Lf, b"c"),
+            ],
+        };
+        assert_eq!(layout.check_tiles(bytes, Delimiter::Comma), Ok(()));
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        doc.apply(&Edit::DeleteRow { row: 1 }).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"a\r\nc\n");
+    }
+
+    fn row_layout(span: std::ops::Range<usize>, le: LineEnding, value: &[u8]) -> RowLayout {
+        RowLayout {
+            span: span.clone(),
+            line_ending: Some(le),
+            fields: vec![FieldLayout {
+                span,
+                quoted: false,
+                value: value.to_vec(),
+                text_after_quote: None,
+                unterminated: false,
+            }],
+        }
+    }
+
+    /// ADR-0004 decision 7.
+    #[test]
+    fn a_first_field_that_would_read_as_a_bom_is_quoted() {
+        let bytes = "x,1\n\u{FEFF}y,2\n".as_bytes();
+        let r = save(bytes, &[], &[Edit::DeleteRow { row: 0 }]).unwrap();
+        assert_eq!(String::from_utf8(r.bytes).unwrap(), "\"\u{FEFF}y\",2\n");
+        // Inserting a row with such a value at the start does the same.
+        let ins = Edit::InsertRow {
+            at: 0,
+            values: vec!["\u{FEFF}z".into(), "0".into()],
+        };
+        let r = save(b"x,1\n", &[], &[ins]).unwrap();
+        assert_eq!(
+            String::from_utf8(r.bytes).unwrap(),
+            "\"\u{FEFF}z\",0\nx,1\n"
+        );
+        // Elsewhere it is ordinary text.
+        let r = save(bytes, &[], &[set(0, 1, "9")]).unwrap();
+        assert_eq!(String::from_utf8(r.bytes).unwrap(), "x,9\n\u{FEFF}y,2\n");
     }
 
     #[test]
