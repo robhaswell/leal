@@ -133,6 +133,10 @@ opened, and asks before overwriting a file changed elsewhere.
 
 ### 3.2 Dialect and encoding detection
 
+> Exact rules for encoding choice and positions: ADR-0003 (§1, §6, §7) and
+> ADR-0004 §11 (the `com.apple.TextEncoding` attribute). The ADRs take
+> precedence over this section.
+
 Detected from the first 64 KB plus samples from the middle and end of the file:
 
 - **Delimiter:** `,` `;` `\t` `|`, chosen by the most consistent field count
@@ -170,6 +174,9 @@ pass is ~100 ms) and is deliberately left out; quoted newlines make it complex.
 
 ### 3.4 Rows and fields
 
+> Exact rules for text after a closing quote and quotes inside it: ADR-0003
+> (§2, §3). The ADR takes precedence over this section.
+
 A row is parsed only when needed, into a list of field spans:
 `(start, len, quoted)`. Parsing is lenient and precisely defined:
 
@@ -184,6 +191,9 @@ Display values are derived from raw bytes: unquote, unescape, decode. Parsed
 rows for the visible area are kept in a small LRU cache.
 
 ### 3.5 Diagnostics (messy input)
+
+> What counts as one occurrence, tie-breaks, blank lines and UTF-16 rules:
+> ADR-0003 (§4, §5, §7). The ADR takes precedence over this section.
 
 Leal's rule for irregular input: **show it faithfully, warn clearly, never fix
 it silently.**
@@ -212,6 +222,8 @@ field says so before the change is committed.
 
 ### 3.6 Edits
 
+> Reverting by value, including cells with invalid bytes: ADR-0004 §9.
+
 The original bytes are never modified. Edits live in an overlay:
 
 - **Cell edits:** map of `(physical row, column) → new value`.
@@ -227,6 +239,11 @@ Setting a cell back to exactly its original display value removes the edit,
 so the original bytes (including their quoting) come back.
 
 ### 3.7 Saving
+
+> Edge cases (quoting new fields, end-of-file line endings, ragged rows and
+> blank lines, empty rows, BOM-like starts, unterminated quotes, the reopen
+> guarantee and remembering guessed encodings): ADR-0004. The ADR takes
+> precedence over this section.
 
 Saving streams the document out:
 

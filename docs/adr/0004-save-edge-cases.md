@@ -1,6 +1,6 @@
 # 0004 — Save edge cases
 
-- Status: proposed (Rob decides at the phase 0 gate; implemented in phase 2)
+- Status: accepted (approved by Rob, 2026-09-30)
 - Date: 2026-09-30
 
 ## Context

@@ -1,6 +1,6 @@
 # 0003 — Parsing and diagnostics clarifications
 
-- Status: proposed (applied provisionally; Rob approves at the phase 0 gate)
+- Status: accepted (approved by Rob, 2026-09-30)
 - Date: 2026-09-30
 
 ## Context
