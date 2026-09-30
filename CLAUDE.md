@@ -12,18 +12,23 @@ user didn't edit. Rust core (`crates/`) + thin Swift/AppKit app (`app/`).
 ## How the build is run
 
 An orchestrating Claude session runs the build and assigns each PLAN task to
-an implementer sub-agent. During the initial build (until 1.0) **all work is
-committed directly to `main` and pushed**. There are no task or phase
-branches and no pull requests.
+an implementer sub-agent. Branches are used only where they help mechanically;
+there are no pull requests and no long-lived branches.
 
-- **One task at a time works in the main checkout.** When independent tasks
-  run in parallel, each extra agent works in a temporary git worktree, and the
-  orchestrator rebases its commits onto `main`. Worktree branches are local
-  only and deleted afterwards.
-- **Every task is reviewed.** After the implementer commits, a fresh reviewer
-  agent reviews that task's commits. Fixes are follow-up commits. A task is
-  ticked in `docs/PLAN.md` only after its review findings are fixed and CI on
-  `main` is green.
+- **Each task works on a local branch in its own git worktree** (`task/<id>`).
+  This isolates agents running in parallel, keeps `main` green while a task is
+  in progress, and gives the reviewer an exact diff (`main...task/<id>`).
+  Task branches are never pushed.
+- **Review before landing.** When the implementer is done, a fresh reviewer
+  agent reviews the branch diff and the implementer fixes the findings on the
+  branch. This happens before the task lands, so later tasks never build on
+  unreviewed code.
+- **Landing.** The orchestrator rebases the branch onto `main`, runs
+  `just check`, fast-forwards `main`, pushes, and deletes the branch and
+  worktree. CI runs on every push to `main`. The task is ticked in
+  `docs/PLAN.md` once CI is green.
+- **Docs-only changes** (ADRs, plan updates, mockups) are committed straight
+  to `main`.
 - **Phase gates.** At the end of each phase, parallel reviewers cover
   fidelity/correctness, Rust quality, performance, test strength
   (`cargo-mutants`) and Swift/AppKit. Each finding is verified before it is

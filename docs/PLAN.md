@@ -6,8 +6,8 @@ explains what each task is for.
 **How to use this file**
 
 - Tasks run in order, except that independent tasks may run in parallel.
-- During the initial build, work is committed straight to `main`, with commit
-  messages starting with the task ID. See `CLAUDE.md` for the full review
+- Each task is built on a local branch, reviewed, then landed on `main`, with
+  commit messages starting with the task ID. See `CLAUDE.md` for the full
   process.
 - Tick the box once the task is reviewed and its findings are fixed.
 - A task is done only when every acceptance criterion holds,
