@@ -3,7 +3,7 @@
 
 mod oracle;
 
-use leal_testkit::dialect::{Bom, Delimiter, Encoding, decode_value};
+use leal_testkit::dialect::{Bom, Delimiter, Encoding, decode_value, expected_encoding};
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
 use leal_testkit::save::{Document, Edit, SaveError};
@@ -337,5 +337,98 @@ fn setting_the_displayed_value_keeps_invalid_bytes() {
     assert_eq!(
         doc.save().unwrap().changes,
         vec![Change::replace(span, "René")]
+    );
+}
+
+proptest! {
+    /// ADR-0004 decision 10, the reopen invariant, on every generated edit
+    /// case (clean and messy): opening the saved file gives the same
+    /// encoding, BOM and rows (count, line endings and every value) as the
+    /// document had. The delimiter is the file's own; the testkit has no
+    /// delimiter or header detector, so those are left to task 1.2.
+    #[test]
+    fn reopening_a_saved_file_gives_the_same_structure(
+        case in prop_oneof![edit_case(CsvConfig::clean()), edit_case(CsvConfig::messy())]
+    ) {
+        let Ok(saved) = &case.saved else {
+            return Ok(()); // F5 failures and read-only files have no output
+        };
+        let values: Vec<Vec<String>> = final_values(&case)
+            .into_iter()
+            .map(|r| if r.is_empty() { vec![String::new()] } else { r })
+            .collect();
+
+        prop_assert_eq!(Bom::detect(&saved.bytes), Bom::detect(&case.file.bytes));
+        // KNOWN OPEN CASE (docs/tasks/0.2.md, "Reopen invariant"): without a
+        // BOM, the encoding is a whole-file heuristic (ADR-0003 decision 1),
+        // so an edit anywhere can flip it between UTF-8 and Windows-1252, and
+        // no splice can prevent that. `encoding_can_flip_on_reopen` pins the
+        // three ways found. Only that flip is allowed here; everything else
+        // (BOM, rows, line endings, bytes) must still match.
+        let reopened = expected_encoding(&saved.bytes);
+        let flip = reopened != case.file.encoding;
+        if flip {
+            let heuristic = [Encoding::Utf8, Encoding::Windows1252];
+            prop_assert_eq!(Bom::detect(&saved.bytes), Bom::None);
+            prop_assert!(heuristic.contains(&reopened) && heuristic.contains(&case.file.encoding));
+        }
+
+        let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
+        let endings: Vec<_> = parsed.layout.rows.iter().map(|r| r.line_ending).collect();
+        prop_assert_eq!(&endings, &saved.line_endings);
+        let got: Vec<Vec<String>> = parsed
+            .layout
+            .rows
+            .iter()
+            .map(|r| r.fields.iter().map(|f| decode_value(&f.value, case.file.encoding)).collect())
+            .collect();
+        // Decoded in the document's encoding, the values always match. After a
+        // flip, a reader using the new encoding may see different text: that
+        // is the open case.
+        prop_assert_eq!(got, values, "flip: {:?}", flip);
+    }
+}
+
+/// KNOWN OPEN CASE, not covered by ADR-0004: the three ways an edit can
+/// flip the reopened encoding of a BOM-less file (found by the reopen
+/// property). Each edit clears one cell. If a decision changes this (for
+/// example, warning before such a save), these expectations change with it.
+#[test]
+fn encoding_can_flip_on_reopen() {
+    let flip = |bytes: &[u8], row: usize| {
+        let enc = expected_encoding(bytes);
+        let layout = oracle::analyze(bytes, Delimiter::Comma, enc).layout;
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, enc);
+        let clear = Edit::SetCell {
+            row,
+            column: 0,
+            value: String::new(),
+        };
+        doc.apply(&clear).unwrap();
+        let saved = doc.save().unwrap().bytes;
+        (enc, expected_encoding(&saved))
+    };
+    // Windows-1252 with one high byte (€) → pure ASCII → UTF-8. The text
+    // decodes the same either way; only future edits would encode
+    // differently.
+    assert_eq!(
+        flip(b"a\n\x80\n", 1),
+        (Encoding::Windows1252, Encoding::Utf8)
+    );
+    // UTF-8 with 3 multibyte characters and 2 invalid bytes → 2 and 2, no
+    // longer "outnumber" → Windows-1252. The remaining é now reads as Ã©.
+    let utf8 = "é\néé,"
+        .as_bytes()
+        .iter()
+        .chain(b"\xE2\x82\n")
+        .copied()
+        .collect::<Vec<u8>>();
+    assert_eq!(flip(&utf8, 0), (Encoding::Utf8, Encoding::Windows1252));
+    // Windows-1252 whose only non-UTF-8 byte is edited away, leaving bytes
+    // that happen to be valid UTF-8 (C3 A9 is "Ã©" in Windows-1252) → UTF-8.
+    // The remaining cell now reads as é.
+    assert_eq!(
+        flip(b"\xC3\xA9\n\x80\n", 1),
+        (Encoding::Windows1252, Encoding::Utf8)
     );
 }

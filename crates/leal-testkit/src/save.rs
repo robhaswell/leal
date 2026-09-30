@@ -32,24 +32,36 @@
 //!    original blank row, which stays blank (ADR-0004 decision 6). A blank
 //!    row that ends up last in a file with no trailing newline would vanish,
 //!    so it is written as `""` too.
-//! 9. If the output's first field would start with a UTF-8 BOM
-//!    (`EF BB BF`, U+FEFF) in a file without one, that field is written
-//!    quoted (ADR-0004 decision 7).
+//! 9. If the output's first field would start with BOM-like bytes
+//!    (`EF BB BF`, which is U+FEFF, or `FF FE` or `FE FF`) in a file without
+//!    a BOM, that field is written quoted (ADR-0004 decisions 7 and 10).
 //! 10. An original, unedited unterminated field must stay the last thing in
 //!     the file, or new bytes would land inside its quote (ADR-0004
 //!     decision 8). Any edit that breaks this is refused with
 //!     [`SaveError::AfterUnterminatedQuote`]: a row inserted after its row,
 //!     a column after it, or setting it back to its original value after
 //!     something was added behind it. Editing it closes the quote.
+//! 11. A lone CR directly followed by a blank LF row would read back as one
+//!     CRLF, so the blank row's line ending becomes CR (ADR-0004
+//!     decision 10). Only a blank row can start with LF.
+//!
+//! Rules 8, 9 and 11 are the "smallest extra change next to the edit" that
+//! keeps ADR-0004 decision 10: reopening the saved file gives the same
+//! rows, BOM and line endings. [`SavedFile::line_endings`] says which rows
+//! a reopen must find. The one exception is the encoding heuristic; see
+//! "Reopen invariant" in `docs/tasks/0.2.md`.
 //!
 //! How these map to ADR-0004 (provisional until Rob accepts it): rule 3 is
 //! decisions 1 and 3 (decision 2, per-column quoting, is not in yet: see
 //! `TODO(ADR-0004 #2)`); rule 4 is decision 4; rule 5 is decision 9; rule 6
-//! is decision 5; rules 8, 9 and 10 are decisions 6, 7 and 8.
+//! is decision 5; rules 8, 9 and 10 are decisions 6, 7 and 8; rules 9 and
+//! 11 are decision 10.
 
 use std::fmt;
 
-use crate::dialect::{Delimiter, Encoding, LineEnding, UTF8_BOM, decode_value, encode_value};
+use crate::dialect::{
+    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value, encode_value,
+};
 use crate::fidelity::{Change, apply_changes};
 use crate::layout::Layout;
 
@@ -191,6 +203,9 @@ pub struct SavedFile {
     pub changes: Vec<Change>,
     /// The complete expected output.
     pub bytes: Vec<u8>,
+    /// Each output row's line ending, as the output is written. Reopening
+    /// the output must find exactly these rows (ADR-0004 decision 10).
+    pub line_endings: Vec<Option<LineEnding>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,7 +478,7 @@ impl<'a> Document<'a> {
 
         // Line endings, then rule 4 for the end of the file.
         let last = self.rows.len().saturating_sub(1);
-        let endings: Vec<Option<LineEnding>> = self
+        let mut endings: Vec<Option<LineEnding>> = self
             .rows
             .iter()
             .enumerate()
@@ -494,12 +509,28 @@ impl<'a> Document<'a> {
             }
         }
 
-        // ADR-0004 decision 7: a first field that would read as a BOM is
-        // quoted. (Only U+FEFF; see "Save oracle" in docs/tasks/0.2.md.)
+        // ADR-0004 decision 10: a lone CR directly followed by an LF would
+        // read back as one CRLF. Only a blank row can start with LF (every
+        // other row starts with a field byte, and an unquoted field never
+        // contains LF), so that blank row's line ending becomes CR. Going in
+        // order lets a run of blank LF rows after a CR all become CR.
+        for i in 1..endings.len() {
+            if endings[i - 1] == Some(LineEnding::Cr)
+                && contents[i].0.is_empty()
+                && endings[i] == Some(LineEnding::Lf)
+            {
+                endings[i] = Some(LineEnding::Cr);
+            }
+        }
+
+        // ADR-0004 decisions 7 and 10: in a file without a BOM, a first
+        // field that would start with BOM-like bytes is quoted.
         if self.layout.bom_len == 0
             && let (Some(row), Some((content, untouched))) =
                 (self.rows.first(), contents.first_mut())
-            && content.starts_with(UTF8_BOM)
+            && [UTF8_BOM, UTF16LE_BOM, UTF16BE_BOM]
+                .iter()
+                .any(|bom| content.starts_with(bom))
             && let Some(cell) = row.cells.first()
             && let Ok(first) = self.cell_bytes(row, cell, quote_all)
         {
@@ -516,7 +547,11 @@ impl<'a> Document<'a> {
             .collect();
         let changes = self.changes(&serialized, &contents, &endings);
         let bytes = apply_changes(self.bytes, &changes);
-        Ok(SavedFile { changes, bytes })
+        Ok(SavedFile {
+            changes,
+            bytes,
+            line_endings: endings,
+        })
     }
 
     fn cell_bytes(&self, row: &DocRow, cell: &Cell, quote_all: bool) -> Result<Vec<u8>, ()> {
@@ -865,27 +900,53 @@ mod tests {
         assert_eq!(out(save(b"a\n\nb", &[], &[drop_last])), "a\n\"\"");
     }
 
-    /// Not covered by ADR-0004 (see "Save oracle" in docs/tasks/0.2.md):
-    /// deleting the row between a CR-terminated row and a blank LF row puts
-    /// CR and LF next to each other, and they read back as one CRLF. The
-    /// oracle writes the bytes §3.7 describes; the file then has one row
-    /// fewer than the document.
+    /// ADR-0004 decision 10: deleting the row between a CR-terminated row
+    /// and blank LF rows would put CR and LF next to each other, which reads
+    /// back as one CRLF. The blank rows' line endings become CR instead.
     #[test]
-    fn deleting_a_row_can_join_cr_and_lf() {
-        let bytes = b"a\rb\n\nc\n";
+    fn a_lone_cr_never_joins_a_following_lf() {
+        let bytes = b"a\rb\n\n\nc\n";
         let layout = Layout {
             bom_len: 0,
             rows: vec![
                 row_layout(0..1, LineEnding::Cr, b"a"),
                 row_layout(2..3, LineEnding::Lf, b"b"),
                 row_layout(4..4, LineEnding::Lf, b""),
-                row_layout(5..6, LineEnding::Lf, b"c"),
+                row_layout(5..5, LineEnding::Lf, b""),
+                row_layout(6..7, LineEnding::Lf, b"c"),
             ],
         };
         assert_eq!(layout.check_tiles(bytes, Delimiter::Comma), Ok(()));
         let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
         doc.apply(&Edit::DeleteRow { row: 1 }).unwrap();
-        assert_eq!(doc.save().unwrap().bytes, b"a\r\nc\n");
+        let saved = doc.save().unwrap();
+        assert_eq!(saved.bytes, b"a\r\r\rc\n");
+        let cr = Some(LineEnding::Cr);
+        assert_eq!(saved.line_endings, vec![cr, cr, cr, Some(LineEnding::Lf)]);
+        // A non-blank row after the CR can't join it: it starts with a field
+        // byte, never LF.
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        doc.apply(&Edit::DeleteRow { row: 3 }).unwrap();
+        doc.apply(&Edit::DeleteRow { row: 2 }).unwrap();
+        doc.apply(&Edit::DeleteRow { row: 1 }).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"a\rc\n");
+    }
+
+    /// ADR-0004 decision 10: `FF FE` or `FE FF` at the start of a
+    /// single-byte file would be read as a UTF-16 BOM.
+    #[test]
+    fn utf16_bom_bytes_moved_to_the_start_are_quoted() {
+        let bytes = b"x\n\xFF\xFEy\n";
+        let layout = Layout {
+            bom_len: 0,
+            rows: vec![
+                row_layout(0..1, LineEnding::Lf, b"x"),
+                row_layout(2..5, LineEnding::Lf, b"\xFF\xFEy"),
+            ],
+        };
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
+        doc.apply(&Edit::DeleteRow { row: 0 }).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"\"\xFF\xFEy\"\n");
     }
 
     fn row_layout(span: std::ops::Range<usize>, le: LineEnding, value: &[u8]) -> RowLayout {
