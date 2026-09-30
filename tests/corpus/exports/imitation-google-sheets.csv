@@ -1,0 +1,4 @@
+Task,Owner,Done,Hours
+Write spec,Rob,TRUE,3
+"Review, then merge",Mark,FALSE,1.5
+Ship 🚀,Rob,FALSE,

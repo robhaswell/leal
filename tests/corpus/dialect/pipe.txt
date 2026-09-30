@@ -1,0 +1,3 @@
+sku|description|stock
+A-1|Blue mug|12
+A-2|Red mug, large|0

@@ -1,2 +1,7 @@
 # Test fixtures are byte-exact; git must never convert line endings or text
 tests/corpus/** -text -diff binary
+# ...except the corpus's own tooling and sidecars, which reviewers need to diff.
+# They stay -text, so git still never converts their line endings.
+tests/corpus/generate.py diff merge
+tests/corpus/README.md diff merge
+tests/corpus/**/*.expected.toml diff merge

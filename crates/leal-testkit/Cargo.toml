@@ -1,0 +1,22 @@
+[package]
+name = "leal-testkit"
+description = "Test-only helpers for Leal: fidelity assertions, proptest strategies and the corpus loader."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never published, and only ever used as a `[dev-dependencies]` entry, so it
+# stays out of normal and release builds of leal-core, leal-ffi and leal-cli.
+publish = false
+
+[dependencies]
+# Strategies are part of this crate's public API, so proptest is a normal
+# dependency here (it is still dev-only for every product crate).
+proptest.workspace = true
+# Sidecar parsing (`tests/corpus/**/*.expected.toml`).
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
+
+[lints]
+workspace = true

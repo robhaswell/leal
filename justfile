@@ -27,6 +27,10 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+# Run all tests with many more property-test cases (the default is 256 per test).
+test-deep cases="20000":
+    PROPTEST_CASES={{cases}} cargo nextest run --workspace
+
 # Format all code in place.
 fmt:
     cargo fmt --all

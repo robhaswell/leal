@@ -19,6 +19,11 @@ leal-core = { path = "crates/leal-core" }
 # `crates/uniffi-bindgen` turns it back on; the library built into the app
 # doesn't compile `cargo_metadata` and `serde_json`.
 uniffi = { version = "0.32.2", default-features = false }
+# Dev-only: add as `leal-testkit.workspace = true` under `[dev-dependencies]`.
+leal-testkit = { path = "crates/leal-testkit" }
+# Default features off: `fork` and `timeout` pull in `rusty-fork` and
+# `tempfile`, which nextest (one process per test) makes unnecessary.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 # Every crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]

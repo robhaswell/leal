@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 62e6436d21d8ccb328325ae7922af8eafecf1eae838f3a2cd0fa874217cc0c24 # shrinks to (i, file) = (2, GeneratedCsv { bytes: b",\n\"\"", dialect: ModelDialect { delimiter: Comma, line_endings: Uniform(Lf), bom: false, quoting: Minimal }, rows: [ModelRow { fields: [Unquoted(""), Unquoted("")], line_ending: Some(Lf) }, ModelRow { fields: [Quoted("")], line_ending: None }], diagnostics: [(RaggedRows, 1)] })
