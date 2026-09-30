@@ -58,13 +58,17 @@ ffi profile="debug":
         slices="$slices target/$target/{{ profile }}/libleal_ffi.a"
     done
 
-    # 2. Combine them into one universal library. Skip this when it is newer
-    #    than both slices, so an unchanged library doesn't make Xcode relink.
+    # 2. Combine them into one universal library. Skip this unless it is
+    #    missing or a slice is newer, so an unchanged library doesn't make
+    #    Xcode relink. (Not "universal newer than every slice": `lipo` often
+    #    finishes in the same second as the last slice, which would re-run it
+    #    on the next build.)
     universal="target/universal/{{ profile }}/libleal_ffi.a"
     mkdir -p "$(dirname "$universal")"
     stale=false
+    [ -e "$universal" ] || stale=true
     for slice in $slices; do
-        [ "$universal" -nt "$slice" ] || stale=true
+        if [ "$slice" -nt "$universal" ]; then stale=true; fi
     done
     if $stale; then
         lipo -create $slices -output "$universal"
@@ -96,7 +100,11 @@ app profile="debug": (ffi profile) xcodeproj
     configuration="$(just _configuration {{ profile }})"
     mkdir -p build
     log="build/xcodebuild-build.log"
-    xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
+    # LEAL_FFI_PREBUILT=1: `ffi` already ran, so the project's RustFFI
+    # phase (for IDE builds) skips it instead of running it again. It is an
+    # environment variable, not a build setting, so builds from `just` and
+    # from the IDE have identical settings and don't relink each other.
+    LEAL_FFI_PREBUILT=1 xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
         -configuration "$configuration" -derivedDataPath {{ derived_data }} \
         -destination "platform=macOS,arch=$(uname -m)" \
         build 2>&1 | tee "$log"
@@ -105,6 +113,20 @@ app profile="debug": (ffi profile) xcodeproj
 
 # Build and launch Leal.app (profile: debug or release).
 run profile="debug": (app profile)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # `open` only brings an already-running Leal to the front, which would
+    # show the old build. Quit it first and wait until it has exited.
+    if pkill -x Leal; then
+        for _ in $(seq 50); do
+            pgrep -x Leal > /dev/null || break
+            sleep 0.1
+        done
+        if pgrep -x Leal > /dev/null; then
+            echo "error: the running Leal didn't quit; quit it and try again" >&2
+            exit 1
+        fi
+    fi
     open "{{ derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
 
 # Run the app's XCTest suite, which calls Rust through the Swift bindings.
@@ -116,7 +138,8 @@ app-test: (ffi "debug") xcodeproj
     results="build/LealTests.xcresult"
     rm -rf "$results"
     status=0
-    xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
+    # LEAL_FFI_PREBUILT=1: see `app`.
+    LEAL_FFI_PREBUILT=1 xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
         -configuration Debug -derivedDataPath {{ derived_data }} \
         -destination "platform=macOS,arch=$(uname -m)" \
         -resultBundlePath "$results" \

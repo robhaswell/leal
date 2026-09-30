@@ -91,6 +91,17 @@ jobs:
 
       - run: just check-all
 
+      # `check-all` builds Debug for the runner's architecture only. Also
+      # build the universal (arm64 + x86_64) Release app, with the Rust
+      # release profile, so the shipping configuration is always checked.
+      - name: Build universal Release app
+        run: |
+          just app release
+          binary=build/DerivedData/Build/Products/Release/Leal.app/Contents/MacOS/Leal
+          lipo -info "$binary"
+          lipo "$binary" -verify_arch arm64
+          lipo "$binary" -verify_arch x86_64
+
       # On failure, keep the xcodebuild logs and test results for debugging.
       - name: Upload build logs
         if: failure()
