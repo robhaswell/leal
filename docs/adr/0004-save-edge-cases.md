@@ -29,9 +29,13 @@ bytes as possible, and never change a value silently.
    Appending a row to a file with no final line ending adds one to the old
    last row and none to the new one. Deleting the last row removes the line
    ending from the new last row. This is the line ending "directly next to"
-   the change, which F6 allows.
+   the change, which F6 allows. A file whose last row is an unterminated
+   quote counts as having no final line ending, since any trailing line
+   ending is inside the quoted field: `a\n"b\nc\n` with that row deleted
+   becomes `a`.
 5. **Column insert or delete with ragged rows.** Rows too short to have that
-   column are left untouched, not padded.
+   column are left untouched, not padded. Blank lines count as too short
+   for every column, so a column insert never turns a blank line into data.
 6. **A row whose bytes would become empty** (for example, clearing the only
    field in a single-column file) is written as `""`, so it stays a row with
    one empty field instead of turning into a blank line or vanishing. An
@@ -77,12 +81,13 @@ bytes as possible, and never change a value silently.
     - On open, a valid attribute beats the guess, as long as the bytes
       decode under it. For UTF-8, that means they are valid UTF-8, or the
       usual invalid-encoding warning applies.
-    - If the attribute and the bytes disagree badly, Leal uses the guess
-      and says so in the status bar. "Badly" means: a UTF-8 attribute on
-      bytes that ADR-0003 rule 1 wouldn't accept as UTF-8 (invalid bytes
-      outnumber valid multibyte sequences). A Windows-1252 attribute can
-      always be honoured, since every byte decodes. A UTF-16 attribute on a
-      file without a UTF-16 BOM is ignored.
+    - A UTF-8 or Windows-1252 attribute is always honoured. Overriding a
+      UTF-8 attribute because of invalid bytes would defeat it in exactly
+      the case it exists for (a file whose guess flipped after an edit).
+      Invalid bytes under a UTF-8 attribute get the usual §3.5 warning, and
+      the status bar says the encoding came from the file's attribute, with
+      **Reopen with encoding…** to override it.
+    - A UTF-16 attribute on a file without a UTF-16 BOM is ignored.
     - The attribute doesn't travel everywhere (email, git, some cloud
       drives). Elsewhere the guess applies again; that's a property of the
       file, not something Leal can fix.
