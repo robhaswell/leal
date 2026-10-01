@@ -391,12 +391,20 @@ impl RowIndex {
     }
 
     /// Row `row`'s span *excluding* its line ending, and the line ending, or
-    /// `None` if it isn't indexed (yet). `bytes` must be the bytes that
-    /// were indexed: the line ending is read from them, so the index stores
-    /// only one `u32` per row.
+    /// `None` if it isn't indexed (yet).
+    ///
+    /// `bytes` must be the whole file that was indexed: the line ending is
+    /// read from them, so the index stores only one `u32` per row. Bytes of
+    /// any other length, such as first paint's first 64 KB, give `None`
+    /// rather than spans read from the wrong bytes. (A slice of the right
+    /// length but different content can't be detected cheaply; callers pass
+    /// the same `Source`'s bytes.)
     #[must_use]
     pub fn row(&self, row: usize, bytes: &[u8]) -> Option<RowSpan> {
         let state = self.read();
+        if bytes.len() != state.len {
+            return None;
+        }
         let start = to_usize(*state.starts.get(row)?);
         let next = to_usize(*state.starts.get(row + 1)?);
         let is_last = state.status == Status::Complete && row + 2 == state.starts.len();

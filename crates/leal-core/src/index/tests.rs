@@ -371,6 +371,84 @@ fn reindexing_with_another_delimiter_changes_the_rows() {
     assert_eq!(semicolon.field_count_mode(), Some(2));
 }
 
+/// Re-indexing with another encoding (PLAN 1.3). A UTF-8 file with a BOM
+/// reopened as Windows-1252 has no BOM: its first three bytes are text
+/// (`ï»¿`), so the quote after them is mid-field and literal.
+#[test]
+fn reindexing_without_the_bom_changes_the_rows() {
+    let bytes = b"\xEF\xBB\xBF\"a\nb\",c\n";
+    let utf8_bom = RowIndex::build(
+        bytes,
+        IndexDialect {
+            bom_len: 3,
+            ..utf8(b',')
+        },
+    )
+    .unwrap();
+    let windows_1252 = RowIndex::build(bytes, utf8(b',')).unwrap();
+    assert_eq!(spans(&utf8_bom, bytes).len(), 1);
+    assert_eq!(utf8_bom.row(0, bytes).unwrap().span, 3..10);
+    assert_eq!(
+        spans(&windows_1252, bytes)
+            .into_iter()
+            .map(|r| r.span)
+            .collect::<Vec<_>>(),
+        [0..5, 6..10]
+    );
+    assert_eq!(windows_1252.field_count_mode(), Some(1));
+    assert_eq!(utf8_bom.field_count_mode(), Some(2));
+}
+
+/// Re-indexing with another code unit (PLAN 1.3). The same UTF-16 LE
+/// bytes, read as bytes, start with the 0x22 inside U+0A22, which opens a
+/// quote; read as UTF-16 BE, the LF isn't one.
+#[test]
+fn reindexing_with_another_code_unit_changes_the_rows() {
+    let bytes = utf16("\u{0A22}\u{0D2C}\na", true);
+    let as_utf16 = RowIndex::build(&bytes, utf16_dialect(true)).unwrap();
+    let as_bytes = RowIndex::build(
+        &bytes,
+        IndexDialect {
+            bom_len: 2,
+            ..utf8(b',')
+        },
+    )
+    .unwrap();
+    let span_list =
+        |index: &RowIndex| -> Vec<_> { spans(index, &bytes).into_iter().map(|r| r.span).collect() };
+    assert_eq!(span_list(&as_utf16), [2..6, 8..10]);
+    assert_eq!(as_utf16.field_count_mode(), Some(1));
+    // As bytes: FF FE | 22 0A | 2C 0D | 0A 00 | 61 00. The 0x22 at offset 2
+    // opens a quoted field that never closes.
+    assert_eq!(as_bytes.row_count(), 1);
+    assert_eq!(as_bytes.row(0, &bytes).unwrap().span, 2..10);
+    assert_eq!(as_bytes.unterminated_quote(), Some(2));
+    let big_endian = RowIndex::build(&bytes, utf16_dialect(false)).unwrap();
+    assert_ne!(span_list(&big_endian), span_list(&as_utf16));
+}
+
+/// `row` reads line endings from the bytes it is given, so bytes of
+/// another length (first paint's 64 KB, say) give `None` rather than
+/// wrong spans.
+#[test]
+fn rows_need_the_bytes_that_were_indexed() {
+    let bytes = b"a\r\nb\r\n";
+    let index = RowIndex::build(bytes, utf8(b',')).unwrap();
+    assert!(index.row(0, bytes).is_some());
+    assert_eq!(index.row(0, &bytes[..2]), None);
+    assert_eq!(index.row(0, b"a\r\nb\r\nc"), None);
+    // While indexing, too: the length is known from the start.
+    let (index, mut indexer) = RowIndex::start(utf8(b',')).unwrap();
+    indexer.chunk_bytes = 3;
+    let reader = Arc::clone(&index);
+    indexer
+        .run(bytes, &AtomicBool::new(false), |_| {
+            assert!(reader.row(0, bytes).is_some());
+            assert_eq!(reader.row(0, &bytes[..3]), None);
+        })
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // UTF-16
 
