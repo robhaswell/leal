@@ -142,7 +142,6 @@ final class CustomGrid: NSObject, GridImpl, NSTextFieldDelegate {
     var documentView: NSView { grid }
     var drewOnce: Bool { grid.drewOnce }
     var counters: [String: Int] { ["drawCalls": grid.drawCalls, "cellsDrawn": grid.cellsDrawn] }
-
     func install(in root: NSView, gutter: GutterView, gutterWidth gw: CGFloat) {
         let W = root.bounds.width, H = root.bounds.height
         let hh = Metrics.headerHeight, sh = Metrics.statusHeight

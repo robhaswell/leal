@@ -7,7 +7,7 @@ import AppKit
 // call exactly the same functions, so any cost here is paid equally.
 
 struct Config {
-    var impl = "custom"          // "table" (A) or "custom" (B)
+    var impl = "custom"          // table (A), table-lite (A-lite), table-rowdraw (C), custom (B)
     var cols = 12
     var rows = 1_000_000
     var bench = false            // run the scripted scroll and quit
@@ -20,8 +20,7 @@ struct Config {
     var flingRows = 50_000       // rows covered by the vertical flings
     var hold = false             // stay open after the bench (for `footprint`)
     var screen: Int?             // NSScreen.screens index; default: fastest refresh
-    var flatten = false          // A only: rows draw their cell views into one layer
-    var lite = false             // A only: cells draw their own text (no NSTextField)
+    var clampPrepare = false     // table impls: clamp NSTableView's overdraw to the visible rect
     var speed = 60_000.0         // initial fling velocity, pt/s
     var dark = false             // system appearance instead of forcing light
 
@@ -43,14 +42,14 @@ struct Config {
             case "--fling-rows": c.flingRows = Int(args.next() ?? "") ?? c.flingRows
             case "--hold": c.hold = true
             case "--dark": c.dark = true
-            case "--flatten": c.flatten = true
-            case "--lite": c.lite = true
+            case "--clamp-prepare": c.clampPrepare = true
             case "--speed": c.speed = Double(args.next() ?? "") ?? c.speed
             case "--screen": c.screen = Int(args.next() ?? "")
             default: break  // ignore -NSDocumentRevisionsDebugMode etc.
             }
         }
-        precondition(c.impl == "table" || c.impl == "custom", "--impl table|custom")
+        precondition(["table", "table-lite", "table-rowdraw", "custom"].contains(c.impl),
+                     "--impl table|table-lite|table-rowdraw|custom")
         return c
     }
 }

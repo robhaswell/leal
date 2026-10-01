@@ -2,6 +2,7 @@
 # Cross-check the in-app phys_footprint numbers with footprint(1) and vmmap(1):
 # run one bench, keep the app open, inspect it, then quit it.
 #   ./memprobe.sh IMPL COLS [extra GridSpike args]
+# IMPL is table, table-lite, table-rowdraw or custom.
 set -euo pipefail
 cd "$(dirname "$0")"
 IMPL=$1 COLS=$2; shift 2
@@ -9,6 +10,7 @@ APP=build/GridSpike.app/Contents/MacOS/GridSpike
 mkdir -p runs
 OUT="runs/probe-$IMPL-$COLS"
 caffeinate -d -w $$ &
+(while kill -0 $$ 2>/dev/null; do caffeinate -u -t 20; done) &  # display on (see bench.sh)
 "$APP" --impl "$IMPL" --cols "$COLS" --bench --hold --out "$PWD/$OUT.json" "$@" >"$OUT.log" 2>&1 &
 PID=$!
 until grep -q holding "$OUT.log" 2>/dev/null; do

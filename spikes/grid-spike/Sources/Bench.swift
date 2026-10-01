@@ -26,6 +26,12 @@ func heapMB() -> Double {
     return Double(stats.size_in_use) / 1_048_576
 }
 
+/// 1-minute load average: a record of background load during the run.
+func loadAverage() -> Double {
+    var l = [Double](repeating: 0, count: 3)
+    return getloadavg(&l, 3) > 0 ? l[0] : -1
+}
+
 func processStartTime() -> Double {
     var kp = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride
@@ -79,6 +85,7 @@ final class Bench: NSObject {
     private var peakMB = 0.0
     private var tickCount = 0
     private var peakHeapMB = 0.0
+    private var stalls = 0
     private var occlusionEvents: [String] = []
     // Main-thread busy time between display-link callbacks: the frame's wall
     // time minus the time the run loop slept. It covers layout, drawing and
@@ -102,7 +109,9 @@ final class Bench: NSObject {
         self.tDidFinish = tDidFinish
         super.init()
         result["impl"] = cfg.impl
-        result["variant"] = cfg.impl == "table" ? (cfg.lite ? "A-lite" : cfg.flatten ? "A-flat" : "A") : "B"
+        result["variant"] = ["table": "A", "table-lite": "A-lite", "table-rowdraw": "C", "custom": "B"][cfg.impl]!
+            + (cfg.clampPrepare ? "+clamp" : "")
+        result["loadAvgAtStart"] = loadAverage()
         result["speed"] = cfg.speed
         result["flingRows"] = cfg.flingRows
         result["cols"] = cfg.cols
@@ -208,6 +217,9 @@ final class Bench: NSObject {
             self.result["footprintAfterLoadMB"] = footprintMB()
             self.result["layersAfterLoad"] = layerCount(self.window.contentView!.layer)
             self.result["heapAfterLoadMB"] = heapMB()
+            // How far beyond the visible rect AppKit keeps content drawn.
+            let pr = self.grid.documentView.preparedContentRect, vr = self.grid.documentView.visibleRect
+            self.result["preparedVsVisible"] = "\(Int(pr.width))x\(Int(pr.height)) vs \(Int(vr.width))x\(Int(vr.height))"
             self.result["visibleAtLoad"] = self.window.occlusionState.contains(.visible)
             self.result["onActiveSpace"] = self.window.isOnActiveSpace
             self.result["refreshMsMedian"] = median(self.frameDurations)
@@ -282,6 +294,9 @@ final class Bench: NSObject {
         frameDurations.append((link.targetTimestamp - link.timestamp) * 1000)
         if lastTs > 0 {
             dt = min(0.05, ts - lastTs)
+            // A gap this long means the display link stopped (display asleep),
+            // not a slow frame: the run is invalid and is flagged.
+            if ts - lastTs > 0.5 { stalls += 1 }
             if let phase = recording {
                 busy[phase, default: []].append(max(0, (wall - lastWall) - idleAcc) * 1000)
                 intervals[phase, default: []].append((ts - lastTs) * 1000)
@@ -356,6 +371,8 @@ final class Bench: NSObject {
         result["windowVisible"] = window.occlusionState.contains(.visible)
         result["occlusionEvents"] = occlusionEvents
         result["pid"] = Int(getpid())
+        result["loadAvgAtEnd"] = loadAverage()
+        result["displayLinkStalls"] = stalls
 
         let json = try! JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         if let out = cfg.out {

@@ -1,11 +1,20 @@
 import AppKit
 
-// Option A: a view-based NSTableView. One NSTableColumn per CSV column, cell
-// views reused through makeView(withIdentifier:), native sticky header,
-// native alternating row colours and vertical grid lines. Cell selection is
-// not native (NSTableView selects rows), so the active-cell ring, edited
-// triangle and hatching are drawn by a small overlay view that exists only on
-// decorated cells. The row-number gutter is the same view B uses.
+// The NSTableView options. All share one NSTableColumn per CSV column, the
+// native sticky header and the same gutter as B. Cell selection is not native
+// (NSTableView selects rows), so the active-cell ring is drawn by us.
+//
+//   A       (--impl table): NSTableCellView + NSTextField per cell, native
+//           alternating rows and grid lines; ring, triangle and hatching come
+//           from a small overlay view that exists only on decorated cells.
+//   A-lite  (--impl table-lite): one self-drawing cell view per cell (no
+//           NSTextField), flattened into its row view's layer
+//           (canDrawSubviewsIntoLayer); the row view draws shading and lines.
+//   C       (--impl table-rowdraw): no cell views; each row view draws the
+//           row's visible cells itself. NSTableView still virtualises rows and
+//           provides the header, column model and row selection.
+//
+// The editing cell always uses a real NSTextField cell view.
 
 final class IndexedColumn: NSTableColumn {
     var index = 0
@@ -24,21 +33,20 @@ final class DecorationView: NSView {
     }
 }
 
-/// Variant "A-lite": a cell view with no NSTextField that draws its own text
-/// (same Core Text code as B), so each cell is one view and one layer.
-/// The editing cell still uses TableCell, which has a real text field.
+/// A-lite: a cell view with no NSTextField that draws its own text (same Core
+/// Text code as B). Its row view flattens all of a row's cells into one layer.
 final class LiteCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("lite")
     private var text: String?
     private var numeric = false, edited = false, active = false, strong = false
     private var find: NSRange?
 
+    /// No `wantsLayer` here: a view that asks for its own layer opts out of
+    /// its row view's canDrawSubviewsIntoLayer, which is the point of A-lite.
     init() {
         super.init(frame: .zero)
         TableCell.created += 1
         identifier = LiteCell.id
-        wantsLayer = true
-        layerContentsRedrawPolicy = .onSetNeedsDisplay
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -68,6 +76,74 @@ final class LiteCell: NSTableCellView {
 
     // VoiceOver still gets the value without an NSTextField.
     override func accessibilityValue() -> Any? { text }
+}
+
+/// NSTableView whose prepared (overdraw) area can be clamped to the visible
+/// rect (--clamp-prepare), to check whether overdraw explains the view count.
+final class SpikeTable: NSTableView {
+    var clamp = false
+    override func prepareContent(in rect: NSRect) {
+        super.prepareContent(in: clamp ? visibleRect : rect)
+    }
+}
+
+/// A-lite's row view: draws shading and grid lines, and flattens its
+/// self-drawing cell views into its own layer.
+final class ShadeRowView: NSTableRowView {
+    static let id = NSUserInterfaceItemIdentifier("shade")
+    var model: DataModel!
+    var columns: Columns!
+    var row = 0
+    override var isOpaque: Bool { true }
+    override func drawBackground(in dirtyRect: NSRect) {
+        let shades = model.styling ? Palette.rowColors : [Palette.rowColors[0]]
+        shades[row % shades.count].setFill()
+        dirtyRect.fill()
+        Palette.grid.setFill()
+        for col in columns.range(dirtyRect.minX, dirtyRect.maxX) {
+            NSRect(x: columns.xs[col + 1] - 1, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
+        }
+    }
+    override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+/// C's row view: draws the row's visible cells itself (the same drawing as
+/// B's grid, one row at a time). No cell views at all.
+final class RowDrawView: NSTableRowView {
+    static let id = NSUserInterfaceItemIdentifier("rowdraw")
+    static var created = 0
+    var model: DataModel!
+    var columns: Columns!
+    var row = 0
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { true }
+    override func drawBackground(in dirtyRect: NSRect) {
+        let shades = model.styling ? Palette.rowColors : [Palette.rowColors[0]]
+        shades[row % shades.count].setFill()
+        dirtyRect.fill()
+    }
+    override func drawSelection(in dirtyRect: NSRect) {}
+    override func drawSeparator(in dirtyRect: NSRect) {}
+    override func draw(_ dirty: NSRect) {
+        super.draw(dirty)  // background
+        guard let ctx = NSGraphicsContext.current?.cgContext, let model, let columns else { return }
+        let cr = columns.range(dirty.minX, dirty.maxX)
+        let textColor = Palette.text.cgColor
+        for col in cr {
+            let r = CGRect(x: columns.xs[col], y: 0, width: columns.widths[col], height: bounds.height)
+            guard let s = model.cell(row, col) else { Deco.hatch(r, ctx); continue }
+            let hl = model.findRange(s)
+            Text.draw(s, in: r, font: Text.font, color: textColor, rightAlign: model.numeric(col), ctx: ctx,
+                      highlight: hl, strong: hl != nil && model.isCurrentFind(row, col))
+            if model.isEdited(row, col) { Deco.triangle(r, ctx) }
+        }
+        ctx.setFillColor(Palette.grid.cgColor)
+        for col in cr { ctx.fill(CGRect(x: columns.xs[col + 1] - 1, y: dirty.minY, width: 1, height: dirty.height)) }
+        if model.styling && row == model.activeRow {
+            let c = model.activeCol
+            Deco.ring(CGRect(x: columns.xs[c], y: 0, width: columns.widths[c], height: bounds.height), ctx)
+        }
+    }
 }
 
 final class TableCell: NSTableCellView {
@@ -136,20 +212,20 @@ final class TableGrid: NSObject, GridImpl, NSTableViewDataSource, NSTableViewDel
     let model: DataModel
     let columns: Columns
     let scrollView = NSScrollView()
-    let table = NSTableView()
+    let table = SpikeTable()
     private(set) var drewOnce = false
     private var viewForCalls = 0
     private var editorCell: (row: Int, col: Int)?
 
-    let flatten: Bool
-    let lite: Bool
+    enum Mode { case cells, lite, rowdraw }
+    let mode: Mode
 
-    init(model: DataModel, columns: Columns, flatten: Bool, lite: Bool) {
+    init(model: DataModel, columns: Columns, mode: Mode, clampPrepare: Bool) {
         self.model = model
         self.columns = columns
-        self.flatten = flatten
-        self.lite = lite
+        self.mode = mode
         super.init()
+        table.clamp = clampPrepare
         table.style = .plain
         table.rowSizeStyle = .custom
         table.rowHeight = Metrics.rowHeight
@@ -161,6 +237,12 @@ final class TableGrid: NSObject, GridImpl, NSTableViewDataSource, NSTableViewDel
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.allowsColumnReordering = false
         table.usesAutomaticRowHeights = false
+        if mode != .cells {
+            // The row views draw shading and grid lines themselves.
+            table.usesAlternatingRowBackgroundColors = false
+            table.gridStyleMask = []
+            table.intercellSpacing = NSSize(width: 0, height: 0)
+        }
         for c in 0..<model.cols {
             let tc = IndexedColumn(identifier: NSUserInterfaceItemIdentifier("c\(c)"))
             tc.index = c
@@ -183,7 +265,9 @@ final class TableGrid: NSObject, GridImpl, NSTableViewDataSource, NSTableViewDel
     }
 
     var documentView: NSView { table }
-    var counters: [String: Int] { ["viewForCalls": viewForCalls, "cellViewsCreated": TableCell.created] }
+    var counters: [String: Int] {
+        ["viewForCalls": viewForCalls, "cellViewsCreated": TableCell.created, "rowDrawViewsCreated": RowDrawView.created]
+    }
 
     func install(in root: NSView, gutter: GutterView, gutterWidth gw: CGFloat) {
         let W = root.bounds.width, H = root.bounds.height
@@ -204,17 +288,38 @@ final class TableGrid: NSObject, GridImpl, NSTableViewDataSource, NSTableViewDel
 
     func numberOfRows(in tableView: NSTableView) -> Int { model.rows }
 
-    /// The standard NSTableView optimisation: a row draws all its cell views
-    /// into its own layer instead of each view having a backing store.
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        guard flatten else { return nil }
-        let id = NSUserInterfaceItemIdentifier("row")
-        if let v = tableView.makeView(withIdentifier: id, owner: nil) as? NSTableRowView { return v }
-        let v = NSTableRowView()
-        v.identifier = id
-        v.wantsLayer = true
-        v.canDrawSubviewsIntoLayer = true
-        return v
+        switch mode {
+        case .cells:
+            return nil
+        case .lite:
+            let v = (tableView.makeView(withIdentifier: ShadeRowView.id, owner: nil) as? ShadeRowView) ?? {
+                let v = ShadeRowView()
+                v.identifier = ShadeRowView.id
+                v.model = model
+                v.columns = columns
+                v.wantsLayer = true
+                v.canDrawSubviewsIntoLayer = true  // one layer per row, not per cell
+                return v
+            }()
+            v.row = row
+            v.needsDisplay = true
+            return v
+        case .rowdraw:
+            let v = (tableView.makeView(withIdentifier: RowDrawView.id, owner: nil) as? RowDrawView) ?? {
+                let v = RowDrawView()
+                RowDrawView.created += 1
+                v.identifier = RowDrawView.id
+                v.model = model
+                v.columns = columns
+                v.wantsLayer = true
+                v.layerContentsRedrawPolicy = .onSetNeedsDisplay
+                return v
+            }()
+            v.row = row
+            v.needsDisplay = true
+            return v
+        }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -222,20 +327,13 @@ final class TableGrid: NSObject, GridImpl, NSTableViewDataSource, NSTableViewDel
         drewOnce = true
         viewForCalls += 1
         let editing = editorCell.map { $0.row == row && $0.col == tc.index } ?? false
-        if lite && !editing {
+        if mode == .rowdraw && !editing { return nil }  // the row view draws it
+        if mode == .lite && !editing {
             let v = (tableView.makeView(withIdentifier: LiteCell.id, owner: nil) as? LiteCell) ?? LiteCell()
             v.configure(model, row: row, col: tc.index)
             return v
         }
-        let v = (tableView.makeView(withIdentifier: TableGrid.cellID, owner: nil) as? TableCell) ?? {
-            let c = TableCell()
-            if flatten {
-                // Also flatten each cell (label + decoration) into one layer.
-                c.wantsLayer = true
-                c.canDrawSubviewsIntoLayer = true
-            }
-            return c
-        }()
+        let v = (tableView.makeView(withIdentifier: TableGrid.cellID, owner: nil) as? TableCell) ?? TableCell()
         v.configure(model, row: row, col: tc.index, editing: editing)
         if editing { v.label.delegate = self }
         return v

@@ -13,7 +13,7 @@ runs = [json.load(open(p)) | {"_file": os.path.basename(p)} for p in sorted(glob
 if not runs:
     sys.exit("no runs")
 
-ORDER = {"A": 0, "A-lite": 1, "B": 2}
+ORDER = {"A": 0, "A-lite": 1, "C": 2, "B": 3}
 
 
 def key(r):
@@ -29,9 +29,13 @@ def med(xs):
     return statistics.median(xs) if xs else float("nan")
 
 
+# A run in which the display link stopped (display asleep) is invalid: it is
+# listed below but left out of the medians.
 groups = defaultdict(list)
 for r in runs:
-    groups[(r["speed"], r["variant"], r["cols"])].append(r)
+    if not r.get("displayLinkStalls"):
+        groups[(r["speed"], r["variant"], r["cols"])].append(r)
+stalled = [r["_file"] for r in runs if r.get("displayLinkStalls")]
 
 r0 = runs[0]
 try:
@@ -48,6 +52,11 @@ print(f"- Window on: {r0['screenName']}, {r0['screenMaxFPS']} Hz max, backing sc
       f"measured display-link frame duration {r0['refreshMsMedian']:.2f} ms")
 print(f"- Displays (`system_profiler SPDisplaysDataType`): {disp}")
 print(f"- Window 1200 × 780 pt, 1,000,000 rows, per-cell styling on, one in-cell editor open")
+loads = [r.get("loadAvgAtStart") for r in runs if r.get("loadAvgAtStart") is not None]
+if loads:
+    print(f"- Background load (1-minute load average at each run's start): median {statistics.median(loads):.1f}, "
+          f"range {min(loads):.1f}–{max(loads):.1f}; the top processes before each run are in the bench log "
+          "(see docs/tasks/0.4.md)")
 print("- **The screen was locked during all runs** (owner away): the app lays out, draws and commits every "
       "frame, but WindowServer does not composite the window. Numbers are main-thread cost; compositor/GPU "
       "hitches are not captured.\n")
@@ -79,7 +88,12 @@ for speed in sorted({r["speed"] for r in runs}, reverse=True):
             continue
         s = lambda f: med([f(r) for r in rs])
         cnt = rs[0]["counters"]
-        work = f"{cnt.get('cellViewsCreated', 0):,} views" if "cellViewsCreated" in cnt else f"{cnt.get('cellsDrawn', 0):,} cells"
+        if cnt.get("rowDrawViewsCreated"):
+            work = f"{cnt['rowDrawViewsCreated']:,} row views"
+        elif "cellViewsCreated" in cnt:
+            work = f"{cnt['cellViewsCreated']:,} cell views"
+        else:
+            work = f"{cnt.get('cellsDrawn', 0):,} cells drawn"
         print(f"| {v} | {c} | {s(lambda r: r['launchToFirstFrameMs']):.0f} | {s(lambda r: r['autosizeMs']):.0f} | "
               f"{s(lambda r: r['footprintAfterLoadMB']):.0f} | {s(lambda r: r['footprintPeakMB']):.0f} | {s(lambda r: r['footprintAfterScrollMB']):.0f} | "
               f"{s(lambda r: r.get('heapAfterLoadMB')):.1f} | {s(lambda r: r.get('heapPeakMB')):.1f} | {s(lambda r: r.get('heapAfterScrollMB')):.1f} | "
@@ -103,10 +117,13 @@ for speed in sorted({r["speed"] for r in runs}, reverse=True):
     print()
 
 print("## Every run\n")
-print("| File | Frame p50 | p99 | >8.3 | >16.7 | Frames | Busy p50 | Jump | Launch→rows | FP load | FP peak | FP after | Heap after | Edit ok |")
-print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+if stalled:
+    print(f"Excluded from the medians because the display link stalled: {', '.join(stalled)}\n")
+print("| File | Frame p50 | p99 | >8.3 | >16.7 | Frames | Busy p50 | Busy p99 | Jump | Launch→rows | FP load | FP peak | FP after | Heap after | Load avg | Stalls | Edit ok |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 for r in sorted(runs, key=lambda r: (key(r), r["_file"])):
     s = r["scroll"]
     print(f"| {r['_file']} | {s['p50']:.1f} | {s['p99']:.1f} | {s['over8']} | {s['over16']} | {s['frames']} | "
-          f"{r['busy']['p50']:.1f} | {r['jumpEndMs']:.1f} | {r['launchToFirstFrameMs']:.0f} | {r['footprintAfterLoadMB']:.0f} | "
-          f"{r['footprintPeakMB']:.0f} | {r['footprintAfterScrollMB']:.0f} | {r.get('heapAfterScrollMB', 0):.1f} | {r['editVerified']} |")
+          f"{r['busy']['p50']:.1f} | {r['busy']['p99']:.1f} | {r['jumpEndMs']:.1f} | {r['launchToFirstFrameMs']:.0f} | {r['footprintAfterLoadMB']:.0f} | "
+          f"{r['footprintPeakMB']:.0f} | {r['footprintAfterScrollMB']:.0f} | {r.get('heapAfterScrollMB', 0):.1f} | "
+          f"{r.get('loadAvgAtStart', -1):.1f} | {r.get('displayLinkStalls', '?')} | {r['editVerified']} |")

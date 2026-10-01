@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            width: size.width, height: size.height)
         window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false, screen: screen)
-        window.title = "orders-2025.csv — \(cfg.impl == "table" ? "A NSTableView" : "B custom") · \(cfg.cols) cols"
+        window.title = "orders-2025.csv — \(cfg.impl) · \(cfg.cols) cols"
         window.isReleasedWhenClosed = false
         window.level = .floating  // stay unoccluded while measuring
 
@@ -59,7 +59,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let root = NSView(frame: NSRect(origin: .zero, size: size))
         gutter = GutterView(model: model)
         let gw = GutterView.width(rows: model.rows)
-        grid = cfg.impl == "table" ? TableGrid(model: model, columns: columns, flatten: cfg.flatten, lite: cfg.lite) : CustomGrid(model: model, columns: columns)
+        switch cfg.impl {
+        case "table": grid = TableGrid(model: model, columns: columns, mode: .cells, clampPrepare: cfg.clampPrepare)
+        case "table-lite": grid = TableGrid(model: model, columns: columns, mode: .lite, clampPrepare: cfg.clampPrepare)
+        case "table-rowdraw": grid = TableGrid(model: model, columns: columns, mode: .rowdraw, clampPrepare: cfg.clampPrepare)
+        default: grid = CustomGrid(model: model, columns: columns)
+        }
         grid.install(in: root, gutter: gutter, gutterWidth: gw)
         let status = makeStatusBar(model)
         status.frame = NSRect(x: 0, y: 0, width: size.width, height: Metrics.statusHeight)
