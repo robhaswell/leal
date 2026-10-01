@@ -17,10 +17,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Runners and Xcode are pinned, so CI's compiler and SDK change only with a
+# commit (docs/tasks/0.3.md, "Toolchain"). The Rust-only job uses the GA
+# macOS 26 image. The app job uses `xcode-27`, GitHub's image with Xcode 27
+# (a public preview as of October 2026), to match local development. If that
+# image is withdrawn or queues badly, fall back to `macos-26` with Xcode 26.6.
 jobs:
   check:
     name: just check
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
 
@@ -48,24 +53,28 @@ jobs:
   # `check` job above stays as the quicker signal.
   check-all:
     name: just check-all
-    runs-on: macos-latest
+    runs-on: xcode-27
+    env:
+      # The Xcode the app is built and tested with. Change it deliberately,
+      # together with README.md and docs/tasks/0.3.md.
+      LEAL_XCODE_VERSION: "27.0"
     steps:
       - uses: actions/checkout@v7
 
-      # The app needs Swift 6 language mode (Xcode 16 or later) and builds for
-      # macOS 14. Select the newest stable Xcode on the runner instead of
-      # relying on the image default, then fail early if it is too old.
+      # Select the pinned Xcode explicitly rather than the image default,
+      # which can change without a commit.
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: ${{ env.LEAL_XCODE_VERSION }}
 
       - name: Check Xcode version
         run: |
           xcodebuild -version
           swift --version
-          major="$(xcodebuild -version | awk 'NR == 1 { split($2, v, "."); print v[1] }')"
-          if [ "$major" -lt 16 ]; then
-            echo "::error::Xcode $major is too old; Swift 6 mode needs Xcode 16 or later"
+          echo "macOS SDK $(xcrun --sdk macosx --show-sdk-version)"
+          version="$(xcodebuild -version | awk 'NR == 1 { print $2 }')"
+          if [ "$version" != "$LEAL_XCODE_VERSION" ]; then
+            echo "::error::expected Xcode $LEAL_XCODE_VERSION, got $version"
             exit 1
           fi
 
@@ -91,16 +100,37 @@ jobs:
 
       - run: just check-all
 
+      # The XCTest suite again, against the Rust release profile and the
+      # Release configuration. Among other things, this checks that a Rust
+      # panic is still caught in the release profile (`panic = "unwind"`).
+      - name: Test against the release profile
+        run: just app-test release
+
+      # Every other xcodebuild here runs through `just`, which builds the Rust
+      # side first and tells the RustFFI target to skip. This one builds the
+      # way the Xcode IDE does: no generated bindings yet, a minimal PATH, and
+      # the RustFFI target running `just ffi` itself.
+      - name: Build like the Xcode IDE
+        run: just ide-build
+
       # `check-all` builds Debug for the runner's architecture only. Also
       # build the universal (arm64 + x86_64) Release app, with the Rust
       # release profile, so the shipping configuration is always checked.
+      # This runs after `app-test release` and rebuilds the release library
+      # without leal-ffi's test-only exports, so check that they are gone.
       - name: Build universal Release app
         run: |
           just app release
-          binary=build/DerivedData/Build/Products/Release/Leal.app/Contents/MacOS/Leal
-          lipo -info "$binary"
-          lipo "$binary" -verify_arch arm64
-          lipo "$binary" -verify_arch x86_64
+          contents=build/DerivedData/Build/Products/Release/Leal.app/Contents
+          for binary in "$contents/MacOS/Leal" "$contents/Frameworks/LealFFI.framework/LealFFI"; do
+            lipo -info "$binary"
+            lipo "$binary" -verify_arch arm64
+            lipo "$binary" -verify_arch x86_64
+          done
+          if nm -gU "$contents/Frameworks/LealFFI.framework/LealFFI" | grep debug_panic; then
+            echo "::error::the Release app contains leal-ffi's test-only exports"
+            exit 1
+          fi
 
       # On failure, keep the xcodebuild logs and test results for debugging.
       - name: Upload build logs

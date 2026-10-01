@@ -1,8 +1,10 @@
+import LealFFI
 import XCTest
 
 /// Calls the Rust core through the generated Swift bindings. The bindings
-/// (`Generated/leal_ffi.swift`) are compiled into this test bundle and it
-/// links `libleal_ffi.a`, so these tests run without launching the app.
+/// (`Generated/leal_ffi.swift`) and `libleal_ffi.a` live in the LealFFI
+/// framework, which this test bundle links, so these tests run without
+/// launching the app.
 final class LealFFITests: XCTestCase {
     func testCoreVersionComesFromRust() {
         let version = coreVersion()
@@ -42,6 +44,27 @@ final class LealFFITests: XCTestCase {
             XCTAssertEqual(errorPath, path)
             XCTAssertFalse(message.isEmpty)
         }
+    }
+
+    /// A Rust panic in an export that returns `Result` arrives in Swift as a
+    /// thrown error instead of crashing the app, and the core keeps working
+    /// afterwards. The app relies on this to survive a bug in the core with
+    /// unsaved edits. `debugPanic` is a test-only export (leal-ffi's
+    /// `test-exports` feature). `just app-test release` runs this against the
+    /// Rust release profile, so `panic = "abort"` there would fail it.
+    func testRustPanicThrowsInsteadOfCrashing() throws {
+        XCTAssertThrowsError(try debugPanic(message: "deliberate test panic")) { error in
+            // UniFFI's `rustPanic` error is fileprivate to the bindings, so
+            // the app sees a panic as "an error that isn't a LealError".
+            XCTAssertNil(error as? LealError, "a panic should not arrive as a LealError: \(error)")
+            XCTAssertTrue(
+                error.localizedDescription.contains("deliberate test panic"),
+                "expected the panic message, got \(error.localizedDescription)"
+            )
+        }
+
+        let url = try temporaryFile(named: "after-panic.csv", contents: "a,b\n")
+        XCTAssertEqual(try inspectFile(path: url.path(percentEncoded: false)).firstLine, "a,b")
     }
 
     /// Writes `contents` to a new file in a temporary directory that is

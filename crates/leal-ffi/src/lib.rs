@@ -97,6 +97,26 @@ pub fn inspect_file(path: &str) -> Result<FileSummary, LealError> {
         .map_err(|err| LealError::from_io(path, &err))
 }
 
+/// Panics with `message`. It exists so the app's tests can check that a Rust
+/// panic in an export that returns `Result` reaches Swift as a thrown error
+/// instead of crashing (`testRustPanicThrowsInsteadOfCrashing`).
+///
+/// Only built with the `test-exports` feature, so it is never in the release
+/// library the app ships with.
+///
+/// # Errors
+///
+/// Never returns an error.
+///
+/// # Panics
+///
+/// Always.
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+pub fn debug_panic(message: &str) -> Result<(), LealError> {
+    panic!("{message}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +146,13 @@ mod tests {
     fn missing_file_is_not_found() {
         let path = "/nonexistent/leal/missing.csv".to_owned();
         assert_eq!(inspect_file(&path), Err(LealError::NotFound { path }));
+    }
+
+    #[cfg(feature = "test-exports")]
+    #[test]
+    #[should_panic(expected = "deliberate")]
+    fn debug_panic_panics() {
+        let _ = debug_panic("deliberate");
     }
 
     #[test]

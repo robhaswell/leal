@@ -1,4 +1,5 @@
 import AppKit
+import LealFFI
 
 /// A plain window showing what the Rust core read from a file. Every value
 /// shown comes from Rust; this file only lays it out.

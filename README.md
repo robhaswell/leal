@@ -20,8 +20,9 @@ you didn't edit.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/PLAN.md`](docs/PLAN.md).
 
-Requirements: macOS 14+, Xcode 16+, Rust via rustup, XcodeGen, just and
-cargo-nextest. From a fresh clone:
+Requirements: Xcode 27 (CI pins 27.0; older versions aren't tested), Rust
+via rustup, XcodeGen, just and cargo-nextest. The app runs on macOS 14 or
+later. From a fresh clone:
 
 ```sh
 brew install just xcodegen cargo-nextest
@@ -29,8 +30,9 @@ rustup toolchain install   # the toolchain and targets in rust-toolchain.toml
 just run                   # build the Rust library, bindings and Leal.app, then launch it
 ```
 
-`just check` runs the Rust checks, `just check-all` adds the app's tests, and
-`just` lists every recipe. How the build fits together is described in
+`just check` runs the Rust checks (including rustdoc with warnings as
+errors), `just check-all` adds the app's tests, and `just` lists every
+recipe. How the build fits together is described in
 [`docs/tasks/0.3.md`](docs/tasks/0.3.md).
 
 ## License

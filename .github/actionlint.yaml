@@ -1,0 +1,6 @@
+# actionlint doesn't know GitHub's preview runner labels yet. `xcode-27` is
+# GitHub-hosted (macOS with Xcode 27, a public preview), not self-hosted; see
+# the comment above `jobs:` in workflows/ci.yml.
+self-hosted-runner:
+  labels:
+    - xcode-27

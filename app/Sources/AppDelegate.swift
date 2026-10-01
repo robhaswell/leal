@@ -1,4 +1,5 @@
 import AppKit
+import LealFFI
 import UniformTypeIdentifiers
 
 /// Opens files and keeps their windows alive.
@@ -53,16 +54,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// A sentence for an error thrown by the Rust core.
+    ///
+    /// The switch over `LealError` is exhaustive, with no `default`, so a new
+    /// variant doesn't compile until it has wording here. Otherwise it would
+    /// show UniFFI's debug-style description (`LealError.X(...)`).
     static func describe(_ error: any Error) -> String {
-        switch error {
-        case LealError.NotFound:
+        guard let error = error as? LealError else {
+            // A Rust panic, which UniFFI throws as an internal error whose
+            // description is the panic message.
+            return error.localizedDescription
+        }
+        return switch error {
+        case .NotFound:
             "The file doesn’t exist."
-        case let LealError.Io(_, message):
+        case let .Io(_, message):
             message
-        default:
-            // Includes a Rust panic, which UniFFI throws as an internal error
-            // whose description is the panic message.
-            error.localizedDescription
         }
     }
 

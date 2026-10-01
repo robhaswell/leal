@@ -26,6 +26,12 @@ crate-type = ["staticlib"]
 # The warning is harmless; `--exclude leal-ffi` silences it.)
 doctest = false
 
+[features]
+# Test-only exports (`debug_panic`) for the app's XCTest suite. `just ffi`
+# turns it on for debug builds and for `just app-test release`; the release
+# library that `just app release` links never has it.
+test-exports = []
+
 [dependencies]
 leal-core.workspace = true
 uniffi.workspace = true
