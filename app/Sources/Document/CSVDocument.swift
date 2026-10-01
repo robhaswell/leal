@@ -26,6 +26,9 @@ final class CSVDocument: NSDocument {
     /// When reading began (`CACurrentMediaTime`), for the open to first
     /// rows budget (DESIGN §1).
     private(set) var openStarted: CFTimeInterval?
+    /// The "Open to first rows" signpost, which the grid's first draw with
+    /// rows ends.
+    private var opening: OSSignpostIntervalState?
 
     /// Leal writes the file only when the user saves (DESIGN §4.3).
     nonisolated override class var autosavesInPlace: Bool { false }
@@ -48,6 +51,10 @@ final class CSVDocument: NSDocument {
 
     private func open(_ url: URL) throws {
         openStarted = CACurrentMediaTime()
+        // Only the first read has a grid still to draw its first rows.
+        if model == nil, opening == nil {
+            opening = Signposts.opening()
+        }
         model?.close()
         model = nil
         do {
@@ -69,6 +76,11 @@ final class CSVDocument: NSDocument {
             }
             model = opened
         } catch {
+            // No rows will be drawn: end the signpost here.
+            if let opening {
+                self.opening = nil
+                Signposts.firstRows(opening)
+            }
             throw Self.openError(error, url: url)
         }
     }
@@ -92,6 +104,10 @@ final class CSVDocument: NSDocument {
         guard let model, let environment else { return }
         let controller = DocumentWindowController(model: model, scheduler: environment.scheduler)
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
+        if let opening {
+            self.opening = nil
+            controller.content.grid.gridView.onFirstRows = { Signposts.firstRows(opening) }
+        }
         addWindowController(controller)
         if model.isFailed {
             // Failed after opening, before there was a window: offer to

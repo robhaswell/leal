@@ -18,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Only the `just bench-scroll` and `just snapshot` builds have it.
         ScriptedRun.startIfAsked(defaults: .standard)
         #endif
+        // The launch budget's end (DESIGN §1): with no document Leal opens
+        // no window, so this is when it is ready for File > Open.
+        Signposts.launched()
     }
 
     /// Whether the app was launched to host the app's XCTests.

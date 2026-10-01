@@ -65,7 +65,8 @@ final class GridView: NSView, NSMenuItemValidation {
     /// When the view first drew rows (`CACurrentMediaTime`), for the open
     /// to first rows budget (DESIGN §1).
     private(set) var firstDrawTime: CFTimeInterval?
-
+    /// Called once, at that first draw with rows.
+    var onFirstRows: (() -> Void)?
 
     override var isFlipped: Bool { true }
     /// Since the macOS 14 SDK views don't clip to their bounds by default,
@@ -124,6 +125,8 @@ final class GridView: NSView, NSMenuItemValidation {
             drawCells(rows: rows, columns: columns, loaded: loaded, source: source, palette: palette, context: context)
             if firstDrawTime == nil, loaded > 0 {
                 firstDrawTime = CACurrentMediaTime()
+                onFirstRows?()
+                onFirstRows = nil
             }
         }
         for column in columns {

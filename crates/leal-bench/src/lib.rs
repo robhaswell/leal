@@ -6,5 +6,6 @@
 //! `docs/tasks/1.2b.md` for how CI runs them and what it checks.
 
 pub mod budgets;
+pub mod perf;
 pub mod reference;
 pub mod report;

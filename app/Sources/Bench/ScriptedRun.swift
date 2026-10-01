@@ -26,8 +26,12 @@ import os
 ///   of the window; `-LealWaitForChange YES` waits (up to 45 s) until the
 ///   file has changed on disk, so the task 1.9 banner shows. The app
 ///   changes nothing: whoever runs it changes the file.
+/// - `-LealReopen <n>`: once the document is indexed, close it and open
+///   its file again, `n` times, then quit: each open's "Open to first rows"
+///   signpost after the first is an open in a running app, without the
+///   costs of the process's first window (`just perf`, task 1.10).
 /// - `-LealAppearance light|dark` and `-LealWindowSize 1000x640` (the
-///   content size, in points) for either.
+///   content size, in points) for any of them.
 ///
 /// Relative paths are in the app's temporary folder (in the sandbox
 /// container). Open the file with `open -a Leal.app file.csv --args …`, so
@@ -46,7 +50,7 @@ final class ScriptedRun {
 
     static func startIfAsked(defaults: UserDefaults) {
         let run = ScriptedRun(defaults: defaults)
-        guard run.value(of: "LealBenchScroll") != nil || run.value(of: "LealSnapshot") != nil else { return }
+        guard ["LealBenchScroll", "LealSnapshot", "LealReopen"].contains(where: { run.value(of: $0) != nil }) else { return }
         switch run.value(of: "LealAppearance") {
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
@@ -93,6 +97,11 @@ final class ScriptedRun {
                 NSApp.terminate(nil)
             }
             keep = bench
+        } else if let count = value(of: "LealReopen").flatMap({ Int($0) }) {
+            Task { @MainActor in
+                await self.reopen(document, times: count)
+                NSApp.terminate(nil)
+            }
         } else if let out = value(of: "LealSnapshot") {
             Task { @MainActor in
                 await self.snapshot(content: content, to: Self.outputURL(out))
@@ -102,6 +111,41 @@ final class ScriptedRun {
     }
 
     private var keep: AnyObject?
+
+    /// Closes `document` and opens its file again through the document
+    /// controller, as Open Recent would, `times` times, each once the last
+    /// has drawn its rows and finished indexing.
+    private func reopen(_ document: CSVDocument, times: Int) async {
+        var document = document
+        for _ in 0..<times {
+            guard await Self.settled(document), let url = document.fileURL else { return }
+            document.close()
+            let opened: NSDocument? = await withCheckedContinuation { continuation in
+                NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { document, _, _ in
+                    continuation.resume(returning: document)
+                }
+            }
+            guard let next = opened as? CSVDocument else { return }
+            document = next
+        }
+        _ = await Self.settled(document)
+    }
+
+    /// Waits (up to 30 s) until the document's grid has drawn rows and its
+    /// index is complete, then half a second more.
+    private static func settled(_ document: CSVDocument) async -> Bool {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            if let content = (document.windowControllers.first as? DocumentWindowController)?.content,
+               content.grid.gridView.firstDrawTime != nil, content.model.isIndexComplete
+            {
+                try? await Task.sleep(for: .milliseconds(500))
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
 
     private func snapshot(content: DocumentViewController, to url: URL) async {
         if !has("LealSnapshotEarly") {

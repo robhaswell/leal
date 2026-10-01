@@ -20,6 +20,18 @@ import QuartzCore
 /// main thread's instructions and cycles per stage, first paint, memory
 /// before and after.
 ///
+/// Background work (task 1.10, DESIGN §1 "including while background work
+/// runs"): `-LealBenchDuringLoad YES` starts scrolling at the first draw
+/// with rows, while the index, review and diagnostics are still running,
+/// instead of after indexing; `-LealBenchFind <text>` shows the find bar
+/// and keeps a search for `text` running through the scroll, starting it
+/// again whenever it finishes, without selecting its matches; and
+/// `-LealBenchNoPause YES` stops the scroll telling the scheduler the user
+/// is scrolling, so P2 and P3 work runs alongside instead of pausing (rule
+/// 3): the worst case, not what real scrolling does. Frames scrolled while
+/// the index or a search was running are also reported on their own
+/// (`whileIndexing`, `whileFinding`).
+///
 /// Busy and CPU time depend on which cores macOS runs the main thread on
 /// and at what clock, which differs between launches (docs/tasks/1.6.md,
 /// "Scroll performance"). Instructions per frame don't: compare builds, or
@@ -64,14 +76,29 @@ final class ScrollBench: NSObject {
     private var slept: CFTimeInterval = 0
     private var observers: [CFRunLoopObserver] = []
 
+    private let duringLoad: Bool
+    private let findQuery: String?
+    private let noPause: Bool
+    private var findStarted = false
+    private var findRuns = 0
+    /// Frames scrolled while background work ran, by kind of work.
+    private var background: [String: (intervals: [Double], busy: [Double], cpu: [Double])] = [:]
+
     init(document: CSVDocument, content: DocumentViewController, profile: String) {
         self.document = document
         self.content = content
         // The spike's profiles: fast is 60,000 pt/s flings over 50,000
         // rows; moderate is 15,000 pt/s over 10,000.
         (speed, flingRows) = profile == "moderate" ? (15_000, 10_000) : (60_000, 50_000)
+        let defaults = UserDefaults.standard
+        duringLoad = defaults.bool(forKey: "LealBenchDuringLoad")
+        findQuery = defaults.string(forKey: "LealBenchFind").flatMap { $0.isEmpty ? nil : $0 }
+        noPause = defaults.bool(forKey: "LealBenchNoPause")
         super.init()
         result["profile"] = profile
+        result["duringLoad"] = duringLoad
+        result["find"] = findQuery ?? ""
+        result["noPause"] = noPause
     }
 
     /// The spike's measuring conditions (docs/tasks/0.4.md): no App Nap or
@@ -122,8 +149,11 @@ final class ScrollBench: NSObject {
         let origin = clip.bounds.origin
         clip.scroll(to: NSPoint(x: min(max(0, x ?? origin.x), maxX), y: min(max(0, y ?? origin.y), maxY)))
         content.grid.scrollView.reflectScrolledClipView(clip)
-        // As a real scroll event does (DESIGN §3.10 rule 3).
-        content.grid.onUserInput?()
+        // As a real scroll event does (DESIGN §3.10 rule 3), unless the run
+        // measures background work that doesn't pause.
+        if !noPause {
+            content.grid.onUserInput?()
+        }
     }
 
     private func describeEnvironment() {
@@ -140,21 +170,23 @@ final class ScrollBench: NSObject {
     }
 
     private func buildStages() {
-        stages.append(("indexed", { [unowned self] _ in
-            guard content.model.isIndexComplete else { return false }
-            result["rows"] = content.model.rowCount
-            if let opened = document.openStarted, let drawn = content.grid.gridView.firstDrawTime {
-                result["openToFirstRowsMs"] = (drawn - opened) * 1000
-                result["launchToFirstRowsMs"] = (drawn - Self.launchTime) * 1000
-            }
-            result["indexedAfterMs"] = (CACurrentMediaTime() - (document.openStarted ?? 0)) * 1000
-            return true
-        }))
-        stages.append(("afterLoad", settle(1.0) { [unowned self] in
-            result["footprintAfterLoadMB"] = Memory.footprintMB()
-            result["heapAfterLoadMB"] = Memory.heapMB()
-            result["refreshMsMedian"] = Self.median(refresh)
-        }))
+        if duringLoad {
+            // Straight away, while the index and the review run.
+            stages.append(("firstRows", { [unowned self] _ in
+                guard content.grid.gridView.firstDrawTime != nil else { return false }
+                result["footprintAfterLoadMB"] = Memory.footprintMB()
+                result["heapAfterLoadMB"] = Memory.heapMB()
+                startFind()
+                return true
+            }))
+        } else {
+            stages.append(("indexed", { [unowned self] _ in content.model.isIndexComplete }))
+            stages.append(("afterLoad", settle(1.0) { [unowned self] in
+                result["footprintAfterLoadMB"] = Memory.footprintMB()
+                result["heapAfterLoadMB"] = Memory.heapMB()
+                startFind()
+            }))
+        }
         let half = flingRows / 2
         stages.append(("vertical", verticalFlings("vertical", rows: half)))
         if defaults.bool(forKey: "LealBenchVerticalOnly") {
@@ -230,12 +262,36 @@ final class ScrollBench: NSObject {
         }
     }
 
+    /// The find bar, searching for `-LealBenchFind`'s text. Its matches are
+    /// highlighted but not selected: selecting one would scroll the grid.
+    private func startFind() {
+        guard let findQuery, !findStarted else { return }
+        findStarted = true
+        content.find.onSelect = { _ in }
+        content.findBar.field.stringValue = findQuery
+        content.showFindBar()
+        findRuns = 1
+    }
+
+    /// Keeps the search running: a new one whenever the last finished.
+    private func keepFinding() {
+        guard let findQuery, findStarted, !content.find.isSearching else { return }
+        content.find.find(findQuery, caseSensitive: false, from: nil)
+        findRuns += 1
+    }
+
     @objc private func tick(_ link: CADisplayLink) {
         let timestamp = link.timestamp
         let wall = CACurrentMediaTime()
         let cpuNow = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         let countsNow = ThreadCounts.current()
         refresh.append((link.targetTimestamp - link.timestamp) * 1000)
+        let indexing = !content.model.isIndexComplete
+        if !indexing, result["indexedAfterMs"] == nil {
+            result["rows"] = content.model.rowCount
+            result["indexedAfterMs"] = (wall - (document.openStarted ?? 0)) * 1000
+        }
+        let finding = content.find.isSearching
         var dt = 1.0 / 120
         if lastTimestamp > 0 {
             dt = min(0.05, timestamp - lastTimestamp)
@@ -252,8 +308,16 @@ final class ScrollBench: NSObject {
                 }
                 let screen = max(1, content.grid.scrollView.contentSize.width * content.grid.scrollView.contentSize.height)
                 drawn[phase, default: []].append(Double((content.grid.gridView.drawnArea - lastDrawn) / screen))
+                if phase != "jumpEnd", phase != "jumpTop" {
+                    for (work, running) in [("whileIndexing", indexing), ("whileFinding", finding)] where running {
+                        background[work, default: ([], [], [])].intervals.append((timestamp - lastTimestamp) * 1000)
+                        background[work, default: ([], [], [])].busy.append(max(0, (wall - lastWall) - slept) * 1000)
+                        background[work, default: ([], [], [])].cpu.append(Double(cpuNow - lastCPU) / 1e6)
+                    }
+                }
             }
         }
+        keepFinding()
         recording = nil
         slept = 0
         lastTimestamp = timestamp
@@ -282,6 +346,7 @@ final class ScrollBench: NSObject {
         for observer in observers {
             CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
         }
+        result["refreshMsMedian"] = Self.median(refresh)
         let refreshMs = (result["refreshMsMedian"] as? Double) ?? 1000.0 / 120
         var scrollIntervals: [Double] = []
         var scrollBusy: [Double] = []
@@ -304,6 +369,14 @@ final class ScrollBench: NSObject {
             }
         }
         result["phases"] = phases
+        for (work, frames) in background {
+            result[work] = Self.stats(frames.intervals, refresh: refreshMs, busy: frames.busy, cpu: frames.cpu)
+        }
+        result["findRuns"] = findRuns
+        if let opened = document.openStarted, let drawn = content.grid.gridView.firstDrawTime {
+            result["openToFirstRowsMs"] = (drawn - opened) * 1000
+            result["launchToFirstRowsMs"] = (drawn - Self.launchTime) * 1000
+        }
         var scroll = Self.stats(scrollIntervals, refresh: refreshMs, busy: scrollBusy, cpu: scrollCPU)
         Self.addCounts(to: &scroll, instructions: scrollInstructions, cycles: scrollCycles, cpu: scrollCPU)
         result["scroll"] = scroll

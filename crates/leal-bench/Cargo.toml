@@ -30,6 +30,13 @@ name = "bench-report"
 path = "src/bin/bench-report.rs"
 bench = false
 
+# Measures the app's budgets (launch, open, index, scrolling, memory) on
+# the app as it ships, and prints docs/perf.md's table. `just perf` runs it.
+[[bin]]
+name = "leal-perf"
+path = "src/bin/leal-perf.rs"
+bench = false
+
 # Every benchmark is a `[[bench]]` here, with `harness = false` so criterion
 # supplies `main`. Later tasks add theirs (DESIGN §5 layer 5, PLAN 1.2b).
 [[bench]]

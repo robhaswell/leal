@@ -375,6 +375,21 @@ bench-scroll file speed="fast" profile="release" *options: (_app-scripted profil
     cat "$container/$out"
     rm -f "$container/$out"
 
+# Measure the app's DESIGN §1 budgets on this Mac and print the table (docs/perf.md): launch, open, index, scrolling (also while background work runs) and memory, 3 runs each, on the Release app launched with `open`. About 25 minutes; Leal's windows come to the front. Options go to leal-perf, e.g. `just perf --runs 1 --no-scroll`.
+perf *options: (app "release") (_app-scripted "release") reference-file
+    #!/usr/bin/env bash
+    set -euo pipefail
+    data="${LEAL_BENCH_DATA:-target/bench-data}"
+    # The 1 GB variant for scrolling while a long index runs. Made once.
+    big="$data/reference-v1-10m.csv"
+    if [ ! -s "$big" ]; then
+        cargo run --release --quiet --package leal-bench --bin leal-refgen -- --rows 10000000 --out "$big"
+    fi
+    cargo run --release --quiet --package leal-bench --bin leal-perf -- \
+        --app "{{ derived_data }}/Build/Products/Release/Leal.app" \
+        --bench-app "{{ bench_derived_data }}/Build/Products/Release/Leal.app" \
+        --file "$data/reference-v1.csv" --big-file "$big" {{ options }}
+
 # Draw `file`'s window offscreen to `out` (a PNG at 1×), with any of -LealAppearance dark, -LealSelect row,column, -LealJumpEnd YES, -LealSnapshotEarly YES. The app quits when it's done.
 snapshot file out *options: (_app-scripted "debug")
     #!/usr/bin/env bash
