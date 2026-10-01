@@ -15,9 +15,11 @@ pub const FIRST_LINE_MAX_BYTES: usize = 200;
 pub struct FileSummary {
     /// The file's size in bytes.
     pub byte_count: u64,
-    /// The first line, without its line ending, cut to at most
-    /// [`FIRST_LINE_MAX_BYTES`] bytes and decoded as UTF-8. Invalid bytes
-    /// become U+FFFD. A character cut in half by the limit is dropped.
+    /// The first line, without its line ending (LF, CRLF or a lone CR) and
+    /// without a UTF-8 byte order mark, decoded as UTF-8. Only the file's
+    /// first [`FIRST_LINE_MAX_BYTES`] bytes are looked at, so a longer line
+    /// is cut. Invalid bytes become U+FFFD. A character cut in half by the
+    /// limit is dropped.
     pub first_line: String,
 }
 
@@ -58,16 +60,25 @@ pub fn inspect_file(path: &Path) -> io::Result<FileSummary> {
     })
 }
 
+/// The UTF-8 byte order mark. It marks the encoding and belongs to no row, so
+/// it isn't part of the first line.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Decodes the first line of `head`, which is the start of a file.
+///
+/// A line ends at LF, CRLF or a lone CR (DESIGN §3.2), so the line stops at
+/// the first CR or LF. This doesn't know about quotes: a line break inside a
+/// quoted first field ends the line here too.
 fn first_line(head: &[u8]) -> String {
-    let line = match head.iter().position(|&b| b == b'\n') {
+    let cut_at_limit = head.len() == FIRST_LINE_MAX_BYTES;
+    let head = head.strip_prefix(UTF8_BOM).unwrap_or(head);
+    let line = match head.iter().position(|&b| b == b'\n' || b == b'\r') {
         Some(end) => &head[..end],
         // No line ending: either the whole file is one line, or the line is
         // longer than the limit and `head` stops mid-line.
-        None if head.len() == FIRST_LINE_MAX_BYTES => drop_partial_char(head),
+        None if cut_at_limit => drop_partial_char(head),
         None => head,
     };
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
     String::from_utf8_lossy(line).into_owned()
 }
 
@@ -142,6 +153,67 @@ mod tests {
         let dir = TempDir::new("crlf");
         let path = dir.file("a.csv", b"a,b\r\n1,2\r\n");
         assert_eq!(inspect_file(&path).unwrap().first_line, "a,b");
+    }
+
+    #[test]
+    fn a_lone_cr_ends_the_line() {
+        let dir = TempDir::new("cr");
+        let path = dir.file("a.csv", b"a,b\r1,2\r");
+        assert_eq!(inspect_file(&path).unwrap().first_line, "a,b");
+    }
+
+    #[test]
+    fn utf8_bom_is_not_part_of_the_line() {
+        let dir = TempDir::new("bom");
+        let path = dir.file("a.csv", b"\xEF\xBB\xBFa,b\n1,2\n");
+        let summary = inspect_file(&path).unwrap();
+        assert_eq!(summary.byte_count, 11, "the BOM still counts as file bytes");
+        assert_eq!(summary.first_line, "a,b");
+    }
+
+    #[test]
+    fn a_bom_alone_is_an_empty_line() {
+        let dir = TempDir::new("bom-only");
+        let path = dir.file("a.csv", b"\xEF\xBB\xBF");
+        assert_eq!(inspect_file(&path).unwrap().first_line, "");
+    }
+
+    #[test]
+    fn a_bom_only_at_the_start_is_dropped() {
+        let dir = TempDir::new("bom-later");
+        let path = dir.file("a.csv", "a\u{FEFF}b\n".as_bytes());
+        assert_eq!(inspect_file(&path).unwrap().first_line, "a\u{FEFF}b");
+    }
+
+    #[test]
+    fn long_line_after_a_bom_is_cut_at_the_limit() {
+        let dir = TempDir::new("bom-long");
+        // The BOM takes 3 of the 200 bytes read, then "é" straddles the end.
+        let mut contents = b"\xEF\xBB\xBF".to_vec();
+        contents.extend(vec![b'x'; FIRST_LINE_MAX_BYTES - 4]);
+        contents.extend_from_slice("é,more".as_bytes());
+        let path = dir.file("a.csv", &contents);
+        let first_line = inspect_file(&path).unwrap().first_line;
+        assert_eq!(first_line, "x".repeat(FIRST_LINE_MAX_BYTES - 4));
+    }
+
+    /// Files from the corpus (`tests/corpus`, task 0.2) whose first line ends
+    /// in a lone CR, or that start with a UTF-8 BOM.
+    #[test]
+    fn corpus_files() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus");
+        for (file, expected) in [
+            ("dialect/line-endings-cr.csv", "name,qty"),
+            ("dialect/line-endings-crlf.csv", "name,qty"),
+            ("dialect/encoding-utf8-bom.csv", "city,population"),
+            (
+                "exports/imitation-excel-mac-utf8-bom.csv",
+                "Name,Amount,Notes",
+            ),
+        ] {
+            let summary = inspect_file(&corpus.join(file)).unwrap();
+            assert_eq!(summary.first_line, expected, "{file}");
+        }
     }
 
     #[test]

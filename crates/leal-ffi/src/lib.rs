@@ -27,8 +27,9 @@ pub fn core_version() -> String {
 pub struct FileSummary {
     /// The file's size in bytes.
     pub byte_count: u64,
-    /// The first line, without its line ending, at most 200 bytes, decoded as
-    /// UTF-8 with invalid bytes replaced.
+    /// The first line, without its line ending (LF, CRLF or a lone CR) or a
+    /// UTF-8 BOM, from the first 200 bytes of the file, decoded as UTF-8 with
+    /// invalid bytes replaced.
     pub first_line: String,
 }
 
