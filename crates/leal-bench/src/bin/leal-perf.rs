@@ -325,14 +325,29 @@ fn rows(
             "—".to_owned()
         } else {
             runs.iter()
-                .map(|r| ScrollRun::describe_late(r.late, r.frames))
+                .map(ScrollRun::describe)
                 .collect::<Vec<_>>()
                 .join("; ")
+        };
+        // Say so when a run's display wasn't 120 Hz: its verdict comes from
+        // frame work, not from frames seen to drop (docs/perf.md).
+        let slow: Vec<String> = runs
+            .iter()
+            .filter(|r| !r.at_budget_rate())
+            .map(|r| format!("{} Hz", r.screen_fps))
+            .collect();
+        let how = if slow.is_empty() {
+            how.to_owned()
+        } else {
+            format!(
+                "{how}. **120 Hz judged from frame work; the display is {}**",
+                slow.first().map_or("", String::as_str)
+            )
         };
         Row {
             budget: budget.to_owned(),
             measured,
-            how: how.to_owned(),
+            how,
             verdict: scroll_verdict(&runs),
         }
     };
@@ -390,6 +405,8 @@ fn rows(
             measured: format!("{} after opening; peak while scrolling {}", mb(heap), mb(heap_peak)),
             how: "`heap -s` (all malloc zones) after the review finished; the bench's `malloc_zone_statistics` peak".into(),
             verdict: match (Verdict::below(heap, 40.0), Verdict::below(heap_peak, 40.0)) {
+                // `--no-scroll`: the peak wasn't measured.
+                (Verdict::Pass, Verdict::Untested) => Verdict::SettledOnly,
                 (Verdict::Untested, v) | (v, Verdict::Untested) => v,
                 (Verdict::Pass, Verdict::Pass) => Verdict::Pass,
                 (Verdict::Fail, _) | (_, Verdict::Fail) => Verdict::Fail,

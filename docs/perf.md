@@ -66,21 +66,36 @@ Also measured:
 - **The screen was locked.** Then no app is frontmost, and macOS ran
   Leal's main thread at about 1.8 GHz in every scroll run (the bench
   reports the clock: cycles over CPU time). When Rob scrolls, Leal is in
-  front. Evidence that the clock dominates: in the stress run, busy
-  background threads raised the clock to 4.25 GHz, and with the same
-  instructions per frame (12.7–12.9 M) the main thread took 0.7 ms a frame
-  and dropped 2–3 frames instead of 7–51. Also, WindowServer composites
+  front. In the stress run, busy background threads raised the clock to
+  4.25 GHz; with the same instructions per frame (12.7–12.9 M) the main
+  thread took 0.7 ms a frame instead of 3.5–3.6 ms, and dropped 2–3
+  frames instead of 7–51. That is 5.1 times the CPU time at 2.3 times
+  less clock: about 2.0 instructions a cycle against 4.3. **So the locked
+  screen's main thread was most likely on an efficiency core**, not just a
+  performance core running slower; that is an inference from the
+  counters, not something the bench can see. Also, WindowServer composites
   nothing for a locked screen, so compositing isn't measured at all.
   **The scrolling verdicts need an unlocked run.**
 - **The reference machine's display is 60 Hz.** A base M1 Air can't show
-  120 Hz, so its late frames are judged against 16.7 ms. For the 120 Hz
-  budget, read the bench's `busyOver120Hz` (frames whose main-thread work
-  took longer than 8.3 ms), or attach a 120 Hz display.
+  120 Hz, and on a 60 Hz display a late frame is one that missed 16.7 ms,
+  which says nothing about 120 Hz. So when a run's display is slower than
+  120 Hz, `just perf` judges the scrolling rows from **frame work**: a frame
+  counts as dropped if the main thread's work alone took longer than
+  8.3 ms (`busyOver120Hz`), and the row says "120 Hz judged from frame
+  work; the display is 60 Hz". That was chosen over printing "untested"
+  because it still answers the question for the main thread, which is
+  where Leal's time goes. It is one-sided: a frame over 8.3 ms would
+  certainly have dropped, but one under it could still drop in rendering
+  or compositing. So on a 60 Hz display a **fail is real and a pass is
+  provisional**. To see 120 Hz itself, attach a 120 Hz display.
 - **Other agents were working on this Mac**, at load averages of 3–7.
   Runs vary: the after-load scroll gave 7, 23 and 51 late frames.
 - **"Launch to empty window"**: Leal opens no empty window, so it is
   measured to when the app has finished launching and can take File ▸
   Open.
+- **`just perf --no-scroll`** measures the heap only once it has settled
+  after opening, so its heap row says "pass (settled only; peak untested)"
+  rather than "pass".
 - **The heap budget counts every malloc zone**, which includes what
   AppKit and Core Animation allocate for the window. With a two-row file
   the heap is 21 MB after opening, against 2.5 MB with no window, so most
@@ -101,6 +116,24 @@ P0 sizing) 12 ms; creating the window 12 ms; showing it 30 ms, of which
 Core Animation commit 12 ms; the rest is the process's first use of
 classes, fonts and methods. Opening the same file again in the running
 app takes 36 ms.
+
+## Decisions for Rob
+
+The 1.10 review's recommendations. **These are proposals**: nothing here
+changes until Rob decides.
+
+- **Idle memory:** measure the physical footprint, which Activity
+  Monitor's Memory column shows (10.9 MB), not RSS (65–68 MB). No AppKit
+  app is under 30 MB of RSS, because RSS counts the shared system
+  libraries every app maps.
+- **Heap:** count every malloc zone minus the per-window AppKit baseline
+  (the heap with a two-row file open, about 21 MB here). Count Leal's own
+  long-lived data, search results included. Leave out AppKit's brief
+  drawing peaks while scrolling. On today's numbers that is about 7 MB
+  settled, plus 12 MB while a search for every row is held.
+- **Scrolling:** the failures here are probably mostly the locked screen
+  (an efficiency core at about 1.8 GHz), but that isn't proven. It needs
+  Rob's unlocked run and, if one is available, a base M1 Air.
 
 ## Commands
 
@@ -201,9 +234,9 @@ For Rob. The numbers that decide the phase 1 gate need either.
    load, displays and whether the screen was locked. Paste it into this
    file under a new heading with the date, and keep
    `target/perf/perf-<time>.json`.
-5. **On the Air's 60 Hz display**, judge the 120 Hz budget by
-   "frames busy over 8.3 ms" in the details, not by "late". To see
-   120 Hz itself, attach a 120 Hz display.
+5. **On the Air's 60 Hz display** the scrolling rows are judged from
+   frame work and say so (see "Caveats"): a fail is real, a pass
+   provisional. To see 120 Hz itself, attach a 120 Hz display.
 6. If anything looks off, `just perf --runs 1 --no-scroll` takes a minute,
    and `just bench-scroll target/bench-data/reference-v1.csv` one scroll
    run.

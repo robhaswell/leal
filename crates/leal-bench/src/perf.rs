@@ -298,6 +298,9 @@ pub enum Verdict {
     Fail,
     /// Not measured.
     Untested,
+    /// Inside the budget where it was measured, but only part of it was:
+    /// the heap settled after opening, with no scroll runs for its peak.
+    SettledOnly,
 }
 
 impl Verdict {
@@ -320,6 +323,7 @@ impl Verdict {
             Verdict::Mixed => "mixed",
             Verdict::Fail => "fail",
             Verdict::Untested => "untested",
+            Verdict::SettledOnly => "pass (settled only; peak untested)",
         }
     }
 }
@@ -394,6 +398,48 @@ impl ScrollRun {
         })
     }
 
+    /// The refresh rate below which a run is judged from its frame work
+    /// rather than its late frames.
+    pub const BUDGET_FPS: f64 = 120.0;
+
+    /// Whether the run's display refreshed at 120 Hz, so its late frames
+    /// are the budget's dropped frames. Below that (a base M1 Air's 60 Hz
+    /// panel) a late frame is one that missed 16.7 ms, which says nothing
+    /// about 120 Hz.
+    #[must_use]
+    pub fn at_budget_rate(&self) -> bool {
+        self.screen_fps >= Self::BUDGET_FPS - 1.0
+    }
+
+    /// The frames that count as dropped at 120 Hz: the late ones on a
+    /// 120 Hz display; on a slower one, those whose main-thread work alone
+    /// took longer than 8.3 ms (they would have missed a 120 Hz refresh,
+    /// though frames that missed it in rendering aren't counted).
+    #[must_use]
+    pub fn dropped_at_120hz(&self) -> u64 {
+        if self.at_budget_rate() {
+            self.late
+        } else {
+            self.busy_over_120hz
+        }
+    }
+
+    /// The run as the table shows it: its late frames, or on a slower
+    /// display its frames with more than 8.3 ms of work.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if self.at_budget_rate() {
+            Self::describe_late(self.late, self.frames)
+        } else {
+            format!(
+                "{} of {} frames over 8.3 ms of main-thread work ({} Hz display)",
+                thousands(self.busy_over_120hz),
+                thousands(self.frames),
+                self.screen_fps
+            )
+        }
+    }
+
     /// `3 of 6,150 late (0.05%)`.
     #[must_use]
     pub fn describe_late(late: u64, frames: u64) -> String {
@@ -456,12 +502,13 @@ pub fn table(rows: &[Row]) -> String {
     out
 }
 
-/// The scroll budget's verdict over several runs: no late frames at all.
+/// The scroll budget's verdict over several runs: no frame dropped at
+/// 120 Hz in any ([`ScrollRun::dropped_at_120hz`]).
 #[must_use]
 pub fn scroll_verdict(runs: &[ScrollRun]) -> Verdict {
     if runs.is_empty() {
         Verdict::Untested
-    } else if runs.iter().all(|r| r.late == 0) {
+    } else if runs.iter().all(|r| r.dropped_at_120hz() == 0) {
         Verdict::Pass
     } else {
         Verdict::Fail

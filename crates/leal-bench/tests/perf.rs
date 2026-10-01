@@ -248,8 +248,39 @@ fn scroll_runs_are_read_and_judged() {
     assert_eq!(ScrollRun::describe_late(0, 0), "0 of 0 late (0.00%)");
     assert_eq!(ScrollRun::parse(&serde_json::json!({})), None);
 
+    // On a 60 Hz display, late frames are 60 Hz ones: the verdict comes
+    // from the frames with more than 8.3 ms of work instead.
+    let sixty = ScrollRun {
+        frames: 100,
+        late: 0,
+        busy_over_120hz: 4,
+        screen_fps: 60.0,
+        ..ScrollRun::default()
+    };
+    assert!(!sixty.at_budget_rate());
+    assert_eq!(sixty.dropped_at_120hz(), 4);
+    assert_eq!(scroll_verdict(std::slice::from_ref(&sixty)), Verdict::Fail);
+    assert_eq!(
+        sixty.describe(),
+        "4 of 100 frames over 8.3 ms of main-thread work (60 Hz display)"
+    );
+    let sixty_clean = ScrollRun {
+        busy_over_120hz: 0,
+        late: 7,
+        ..sixty
+    };
+    assert_eq!(scroll_verdict(&[sixty_clean]), Verdict::Pass);
+    assert!(run.at_budget_rate());
+    assert_eq!(run.dropped_at_120hz(), 3);
+    assert_eq!(run.describe(), "3 of 6,150 late (0.05%)");
+    assert_eq!(
+        Verdict::SettledOnly.label(),
+        "pass (settled only; peak untested)"
+    );
+
     let clean = ScrollRun {
         frames: 10,
+        screen_fps: 120.0,
         ..ScrollRun::default()
     };
     assert_eq!(scroll_verdict(&[]), Verdict::Untested);
