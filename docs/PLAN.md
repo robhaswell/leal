@@ -64,7 +64,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ## Phase 1 — Viewer
 
-- [~] **1.1 Source** — clone + mmap, fallbacks, temp cleanup (DESIGN §3.1).
+- [x] **1.1 Source** — clone + mmap, fallbacks, temp cleanup (DESIGN §3.1).
   - Clone into a temporary folder on the file's own volume
     (`FileManager.url(for: .itemReplacementDirectory, …, appropriateFor:)`),
     because `clonefile` fails across volumes. EXDEV means "clone elsewhere",
