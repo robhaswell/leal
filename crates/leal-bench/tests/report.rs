@@ -437,16 +437,18 @@ fn run_bench_report(dir: &Path, last_attempt: bool) -> (Option<i32>, String, Str
     )
 }
 
-/// Results for the real budgets' benchmarks, at `index_ms`, and for the
-/// baseline, with `baseline-late/memchr3_scan` moved by `late_change` and
-/// `baseline-late/sequential_read` by +15.7% (as at 79fa5af).
-fn write_run(dir: &Path, index_ms: f64, late_change: f64) {
+/// Results for the real budgets' benchmarks, each at `of_budget` times its
+/// own budget (budgets differ: 500 ms for the index, 1 ms for a screen of
+/// rows), and for the baseline, with `baseline-late/memchr3_scan` moved by
+/// `late_change` and `baseline-late/sequential_read` by +15.7% (as at
+/// 79fa5af).
+fn write_run(dir: &Path, of_budget: f64, late_change: f64) {
     let criterion = dir.join("criterion");
     for budget in leal_bench::budgets::BUDGETS {
         write_bench(
             &criterion,
             budget.id,
-            index_ms * 1e6,
+            budget.max_ms * of_budget * 1e6,
             None,
             Some(change(0.04)),
         );
@@ -479,7 +481,7 @@ fn write_run(dir: &Path, index_ms: f64, late_change: f64) {
 #[test]
 fn bench_report_passes_a_noisy_last_attempt_with_a_warning() {
     let dir = scratch("bin-noisy");
-    write_run(&dir, 300.0, 0.157);
+    write_run(&dir, 0.6, 0.157);
 
     let (code, stdout, summary) = run_bench_report(&dir, false);
     assert_eq!(code, Some(3), "{stdout}");
@@ -503,7 +505,7 @@ fn bench_report_passes_a_noisy_last_attempt_with_a_warning() {
 #[test]
 fn bench_report_fails_a_budget_on_a_noisy_last_attempt() {
     let dir = scratch("bin-over-budget");
-    write_run(&dir, 501.0, 0.157);
+    write_run(&dir, 1.002, 0.157);
 
     let (code, stdout, summary) = run_bench_report(&dir, true);
     assert_eq!(code, Some(1), "{stdout}");
@@ -518,7 +520,7 @@ fn bench_report_fails_a_budget_on_a_noisy_last_attempt() {
 #[test]
 fn bench_report_passes_a_quiet_run() {
     let dir = scratch("bin-quiet");
-    write_run(&dir, 300.0, -0.01);
+    write_run(&dir, 0.6, -0.01);
 
     let (code, stdout, summary) = run_bench_report(&dir, false);
     assert_eq!(code, Some(0), "{stdout}");

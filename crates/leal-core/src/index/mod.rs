@@ -101,7 +101,7 @@
 //! - The **whole-file encoding count** (ADR-0003 decision 1) runs later as
 //!   P2 work, not here (ADR-0005 decision 4).
 
-mod scan;
+pub(crate) mod scan;
 #[cfg(test)]
 mod tests;
 

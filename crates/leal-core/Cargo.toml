@@ -10,8 +10,8 @@ publish.workspace = true
 
 [dependencies]
 # Decoding the single-byte encodings Leal supports (DESIGN §3.2, ADR-0005
-# decision 5): whether bytes decode under an attribute's encoding, and the
-# text the header heuristic looks at.
+# decision 5): whether bytes decode under an attribute's encoding, the text
+# the header heuristic looks at (1.2), and display values (1.4).
 encoding_rs.workspace = true
 # The `source` module (PLAN 1.1): `fclonefileat`, `fgetxattr` and `fcntl`,
 # which the standard library doesn't wrap. memmap2 already depends on it.

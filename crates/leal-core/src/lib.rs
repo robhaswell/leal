@@ -9,6 +9,7 @@ pub mod detect;
 pub mod dialect;
 pub mod index;
 mod inspect;
+pub mod rows;
 pub mod source;
 
 pub use inspect::{FIRST_LINE_MAX_BYTES, FileSummary, inspect_file};

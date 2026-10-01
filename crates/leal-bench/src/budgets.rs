@@ -32,4 +32,28 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 500.0,
         source: "DESIGN §1",
     },
+    // "Reads for visible cells are synchronous and must take under 1 ms":
+    // one screenful (60 rows × 12 columns) parsed and displayed, uncached.
+    Budget {
+        id: "rows/screen",
+        max_ms: 1.0,
+        source: "DESIGN §3.9",
+    },
+    // The same with a 1 MB field on screen, read as the grid reads cells
+    // (`display_prefix`): plain UTF-8, with `""` escapes, and UTF-16.
+    Budget {
+        id: "rows/screen_long_field_utf8",
+        max_ms: 1.0,
+        source: "DESIGN §3.9",
+    },
+    Budget {
+        id: "rows/screen_long_field_escaped",
+        max_ms: 1.0,
+        source: "DESIGN §3.9",
+    },
+    Budget {
+        id: "rows/screen_long_field_utf16",
+        max_ms: 1.0,
+        source: "DESIGN §3.9",
+    },
 ];
