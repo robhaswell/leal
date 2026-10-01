@@ -513,7 +513,7 @@ fn a_garbled_interpretation_key_is_noted() {
     assert_eq!(d.notes, []);
 }
 
-/// ADR-0007 decision 2 (proposed, provisional): `us-ascii` reads as UTF-8.
+/// ADR-0007 decision 2: `us-ascii` reads as UTF-8.
 #[test]
 fn an_ascii_encoding_attribute_reads_as_utf8() {
     let d = with_encoding_attribute(b"a,b\n", b"us-ascii;1536");

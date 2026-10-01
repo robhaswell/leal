@@ -87,10 +87,9 @@
 //!   occur inside a character: ADR-0005 decision 5);
 //! - `bom_len`: the length of the BOM that detection found, or 0.
 //!
-//! [`LineEnding`] here duplicates the one 1.2 defines in its `dialect`
-//! module; 1.3a should replace this one with it. Re-indexing with a
-//! different delimiter or encoding is a new [`RowIndex`] over the same
-//! bytes: nothing is reopened (PLAN 1.3).
+//! [`LineEnding`] is the `dialect` module's (task 1.2), re-exported here.
+//! Re-indexing with a different delimiter or encoding is a new
+//! [`RowIndex`] over the same bytes: nothing is reopened (PLAN 1.3).
 //!
 //! # Not in this pass
 //!
@@ -160,16 +159,9 @@ impl CodeUnit {
     }
 }
 
-/// A line ending. A CR directly followed by LF is always one CRLF.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LineEnding {
-    /// LF
-    Lf,
-    /// CR LF
-    Crlf,
-    /// CR on its own
-    Cr,
-}
+/// The line ending type is detection's ([`crate::dialect::LineEnding`]),
+/// re-exported so `index::LineEnding` keeps working.
+pub use crate::dialect::LineEnding;
 
 /// Where one row is.
 #[derive(Clone, Debug, PartialEq, Eq)]

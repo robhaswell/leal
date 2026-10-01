@@ -13,8 +13,7 @@
 //! charset name, a semicolon, and the `CFStringEncoding` number in decimal.
 //! Leal matches only the number (ADR-0005 decision 5); the name is for
 //! people reading the attribute. ASCII (`us-ascii;1536`) is read as UTF-8,
-//! of which it is a subset (ADR-0007 decision 2, *proposed*: provisional
-//! until Rob decides).
+//! of which it is a subset (ADR-0007 decision 2).
 //!
 //! # `io.github.robhaswell.leal.interpretation`
 //!
@@ -32,9 +31,7 @@
 //!   hexadecimal digits. While the file still matches it, the remembered
 //!   choices are used as they are. Once something else has changed the
 //!   file, they are used only if the file still parses sensibly with them
-//!   (see [`crate::detect`]).
-//!   (The fingerprint is ADR-0007 decision 1, *proposed*: provisional
-//!   until Rob decides.)
+//!   (see [`crate::detect`]). This is ADR-0007 decision 1.
 //! - Any of these may be left out, meaning that part was not remembered.
 //!   Other keys made of lowercase letters, digits, `_` and `-` are ignored,
 //!   so a later Leal can add some without older ones rejecting the
@@ -48,7 +45,7 @@ use crate::dialect::{Delimiter, Encoding};
 /// `kCFStringEncodingUTF16`: UTF-16 with its byte order taken from a BOM.
 const CF_UTF16: u32 = 0x0100;
 
-/// `kCFStringEncodingASCII`, read as UTF-8 (ADR-0007 decision 2, proposed).
+/// `kCFStringEncodingASCII`, read as UTF-8 (ADR-0007 decision 2).
 const CF_ASCII: u32 = 0x0600;
 
 /// Why a `com.apple.TextEncoding` value names no encoding Leal can use.
@@ -347,7 +344,7 @@ mod tests {
         }
     }
 
-    /// ADR-0007 decision 2 (proposed).
+    /// ADR-0007 decision 2.
     #[test]
     fn an_ascii_attribute_reads_as_utf8() {
         assert_eq!(parse_text_encoding(b"us-ascii;1536"), Ok(Encoding::Utf8));
