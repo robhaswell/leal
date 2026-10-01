@@ -6,6 +6,10 @@
 //! `Result`, so that a Rust panic reaches Swift as a thrown error rather than
 //! crashing the app.
 
+// No `unwrap`/`expect` outside tests: see `[workspace.lints.clippy]` in the
+// root Cargo.toml.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 uniffi::setup_scaffolding!();
 
 use std::io;

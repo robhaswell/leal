@@ -1,5 +1,9 @@
 //! The `leal` command: opens files in Leal.app and checks CSV files.
 
+// No `unwrap`/`expect` outside tests: see `[workspace.lints.clippy]` in the
+// root Cargo.toml.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 fn main() {
     println!("{}", version_line());
 }

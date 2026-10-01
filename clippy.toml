@@ -1,0 +1,6 @@
+# Clippy settings for the whole workspace. Lint levels are in Cargo.toml.
+
+# `unwrap_used` and `expect_used` are on for the product crates (see
+# Cargo.toml). Tests may still unwrap: a panic there is a test failure.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

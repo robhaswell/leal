@@ -79,6 +79,24 @@ unnecessary_wraps = "warn"
 unused_self = "warn"
 unused_async = "warn"
 
+# `unsafe` (CLAUDE.md): every `unsafe` block needs a `// SAFETY:` comment
+# saying why it is sound. Clippy checks that the comment is there, though not
+# what it says. Macro-generated code from other crates (UniFFI's scaffolding)
+# isn't checked.
+undocumented_unsafe_blocks = "warn"
+# ...and that each `unsafe` block holds one unsafe operation, so that each
+# SAFETY comment covers exactly one thing.
+multiple_unsafe_ops_per_block = "warn"
+
+# No `unwrap` or `expect` in product code. A panic in leal-core or leal-ffi
+# either crashes the app (an export that can't fail is called with `try!`) or
+# turns into an unexplained internal error, so product code returns errors
+# instead. These are turned on at the crate roots of the product crates
+# (leal-core, leal-ffi, leal-cli) with `#![warn(clippy::unwrap_used,
+# clippy::expect_used)]`, not here: leal-testkit and test code use them
+# freely, and a crate can't add lints on top of `[lints] workspace = true`.
+# `clippy.toml` allows them in `#[test]` functions and `#[cfg(test)]` modules.
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

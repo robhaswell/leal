@@ -1,5 +1,9 @@
 //! Leal's CSV engine: everything that matters for correctness and performance.
 
+// No `unwrap`/`expect` outside tests: see `[workspace.lints.clippy]` in the
+// root Cargo.toml.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 mod inspect;
 
 pub use inspect::{FIRST_LINE_MAX_BYTES, FileSummary, inspect_file};
