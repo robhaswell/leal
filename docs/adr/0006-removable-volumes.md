@@ -1,6 +1,6 @@
 # 0006 — Files on removable drives
 
-- Status: proposed (needs Rob's decision)
+- Status: accepted (option C, approved by Rob, 2026-10-01)
 - Date: 2026-10-01
 
 ## Context
@@ -59,14 +59,13 @@ space on the internal drive equal to the file size, but no extra memory.
 
 ## Decision
 
-Pending Rob. Recommendation: **C**.
+**C**, approved by Rob on 2026-10-01.
 
 ## Consequences
 
-- With C: DESIGN §3.1 gains the removable-volume path. Task 1.1 adds it
+- DESIGN §3.1 gains the removable-volume path. Task 1.1 adds it
   (detection via the volume's "is internal" and "is ejectable" properties,
   ordinary reads, copy during indexing, the switch to the map, and the
   disconnect banner's core state). Task 1.7 shows the banner.
-- Until this is decided, task 1.1 lands as is, implementing ADR-0005
-  decision 7, with the risk documented in its `SAFETY` comment and task
-  notes.
+- Task 1.1 landed before this decision, with the risk documented in its
+  `SAFETY` comment and task notes. Task 1.1a implements option C.

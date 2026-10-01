@@ -141,6 +141,16 @@ is deleted, the window shows a banner with **Reload** and **Keep editing**.
 Saving checks the original's identity (inode, size, mtime) against what was
 opened, and asks before overwriting a file changed elsewhere.
 
+**Removable drives (ADR-0006).** A clone on a removable drive can vanish if
+the drive is unplugged, and touching mapped pages then crashes the process.
+So for files on removable volumes, Leal never maps the external clone:
+first paint and early scrolling use ordinary reads (which fail with an
+error, not a crash); the indexing pass also copies the file to Leal's
+temporary folder on the internal disk; and once the copy is complete, Leal
+maps the internal copy and drops the external clone. If the drive vanishes
+first, Leal shows a banner, keeps the rows it has read and the user's edits,
+blocks Save until the drive returns, and offers Save As.
+
 ### 3.2 Dialect and encoding detection
 
 > Exact rules for encoding choice and positions: ADR-0003 (§1, §6, §7),

@@ -1,6 +1,6 @@
 # 0007 — Remembered interpretation: two details
 
-- Status: proposed (needs Rob's decision)
+- Status: accepted (approved by Rob, 2026-10-01)
 - Date: 2026-10-01
 
 ## Context

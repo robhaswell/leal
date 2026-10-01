@@ -94,6 +94,21 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (Phase 0 review rust-4: today `LealError::Io` carries only
     `io::Error`'s Display text, which the alert shows as is, such as
     "Permission denied (os error 13)".)
+- [ ] **1.1a Removable drives** (ADR-0006, option C).
+  - Detect removable volumes from the volume's "is internal" and "is
+    ejectable" properties.
+  - Read ranges with ordinary reads (`pread`) for removable volumes, so the
+    external clone is never mapped.
+  - A streaming copy to the internal temp folder, in chunks, cancellable
+    (ADR-0005 decision 6), exposing the chunks so 1.3a can index from the
+    same pass. Map the internal copy when it completes and drop the
+    external clone.
+  - A "drive disconnected" state when a read or the copy fails because the
+    volume vanished: rows already read stay available, Save is refused, and
+    Save As is allowed. The banner itself is 1.7.
+  - Tests with a disk image detached mid-copy (`hdiutil detach -force`),
+    which must never crash the test process.
+
 - [ ] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
   - Follows ADR-0003 decisions 1, 6 and 7, and the attribute rules of
     ADR-0004 decision 11: a UTF-8 or Windows-1252 attribute is always
@@ -245,7 +260,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     `phase-0` tag (ADR-0001). No code, script or CI job may refer to the
     folder afterwards, and the `spikes/` line comes out of DESIGN §7.
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
-- [ ] **1.7 App: diagnostics banner** — banner, details popover, navigation,
+- [ ] **1.7 App: diagnostics banner** (also the ADR-0006 "drive disconnected" banner) — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
   - Changing the interpretation (ADR-0005 decision 8):
     - **Reopen with encoding…** overrides the encoding, including one from
