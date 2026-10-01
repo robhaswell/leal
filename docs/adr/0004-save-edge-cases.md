@@ -7,8 +7,8 @@
 
 Building the save oracle (task 0.2) turned up nine cases that DESIGN §3.6
 and §3.7 don't settle. Each needs one answer before the serializer (tasks
-2.2 and 2.4) is written. The testkit oracle currently implements the
-provisional answers below; if Rob changes one, the oracle changes with it.
+2.2 and 2.4) is written. The testkit oracle implements the answers below,
+except where a decision says otherwise.
 
 Leal's guiding rules apply throughout: keep the user's data, change as few
 bytes as possible, and never change a value silently.
@@ -21,8 +21,10 @@ bytes as possible, and never change a value silently.
    column) is quoted if the file quotes every field, **or if every existing
    non-empty field in that column is quoted**. That second part keeps files
    like pandas' "quote text columns" style consistent. Otherwise it is
-   quoted only when needed. *(The oracle currently checks only the whole
-   file; per-column detection is added when this ADR is accepted.)*
+   quoted only when needed. *(The oracle checks only the whole file for
+   now; task 2.4 adds per-column detection, in the oracle and the product.
+   ADR-0005 decision 3, proposed, makes the rule precise for inserted and
+   empty columns.)*
 3. **Line ending for a new row** in a file that has none (a single row with
    no line ending): LF.
 4. **End of file.** Whether the file ends with a line ending is kept.
@@ -57,7 +59,10 @@ bytes as possible, and never change a value silently.
    in an unchanged editor harmless. To actually replace the invalid bytes,
    the user types a different value, as the §3.5 editing notice explains.
 
-10. **Reopening gives the same file structure.** Opening a saved file must
+10. **Reopening gives the same file structure.** *(ADR-0005 decision 1,
+    proposed, narrows "the same dialect" here: the delimiter and header
+    choice are guessed from the whole file, so they are remembered rather
+    than guaranteed.)* Opening a saved file must
     give the same dialect, encoding, BOM and rows as the document had
     before saving. Where the smallest splice would break this, the
     serializer makes the smallest extra change next to the edit. Property
@@ -95,7 +100,8 @@ bytes as possible, and never change a value silently.
 ## Consequences
 
 - DESIGN §3.6 and §3.7 get these rules once the ADR is accepted.
-- Task 2.4 adds per-column quoting detection to the oracle (decision 2).
+- Task 2.4 adds per-column quoting detection to the oracle and the
+  product (decision 2).
 - The app disables row and column insertion after an unterminated quote
   (decision 8, task 2.5).
 - The serializer's property tests include the reopen check (decision 10),

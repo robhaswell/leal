@@ -21,5 +21,5 @@ next to the matching image here.
 | `05a-inspector-multiline-edit.png` | Cell inspector pane editing a multiline value; edited-but-unsaved cells carry a blue corner triangle; window title shows "— Edited" | §4.1, §4.3 | 1.8, 2.5 |
 | `05b-in-cell-edit-invalid-bytes.png` | In-cell editor on a cell with an invalid byte, with the callout that explains the replacement before commit | §3.5, §4.2 | 2.5 |
 | `06a-utf16-read-only.png` | UTF-16 file: info banner with "Save As UTF-8…", lock glyph beside the title, "Read-only" in the status bar | §4.3 | 1.2, 2.3 |
-| `06b-no-header-row.png` | No header detected: header cells show 1, 2, 3… in grey; status-bar "Header row: off" toggle | §8 q4 | 1.6 |
-| `06c-keyboard-shortcuts.png` | Keyboard shortcut reference (§4.2 plus the proposed ⌘I for the inspector) | §4.2 | 1.8, 4.4 |
+| `06b-no-header-row.png` | No header detected: header cells show 1, 2, 3… in grey; status-bar "Header row: off" toggle | §8 item 2 | 1.6 |
+| `06c-keyboard-shortcuts.png` | Keyboard shortcut reference (§4.2, including ⌘I for the inspector) | §4.2 | 1.8, 4.4 |
