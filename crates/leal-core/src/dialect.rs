@@ -4,6 +4,8 @@
 //! These are plain values. Deciding which ones a file has is
 //! [`crate::detect`]'s job.
 
+use crate::index::CodeUnit;
+
 /// The quote character. Other quote characters are out of scope for v1
 /// (DESIGN §3.2).
 pub const QUOTE: u8 = b'"';
@@ -280,6 +282,18 @@ impl Encoding {
             Encoding::Iso8859_2 => "iso-8859-2",
             Encoding::Iso8859_15 => "iso-8859-15",
             Encoding::MacRoman => "macintosh",
+        }
+    }
+
+    /// How the encoding stores the structural characters, which is what
+    /// the index and the row parser need: UTF-16 code units for UTF-16,
+    /// single bytes for every other encoding.
+    #[must_use]
+    pub const fn code_unit(self) -> CodeUnit {
+        match self {
+            Encoding::Utf16Le => CodeUnit::Utf16Le,
+            Encoding::Utf16Be => CodeUnit::Utf16Be,
+            _ => CodeUnit::Byte,
         }
     }
 

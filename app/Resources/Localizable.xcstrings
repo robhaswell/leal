@@ -7,14 +7,32 @@
     "An unexpected error occurred." : {
       "comment" : "Open error with no OS error code"
     },
+    "Another app changed it while Leal was reading it." : {
+      "comment" : "Open error: the file changed while it was being read without a snapshot"
+    },
     "It isn’t a regular file." : {
       "comment" : "Open error: the path is a named pipe, socket or device"
+    },
+    "It was stopped." : {
+      "comment" : "Background job error: the job was cancelled"
+    },
+    "It’s 4 GB or larger, more than Leal can open." : {
+      "comment" : "Open error: the file is 4 GiB or more (DESIGN §1)"
     },
     "It’s a folder, not a file." : {
       "comment" : "Open error: the path is a folder"
     },
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
+    },
+    "Something went wrong inside Leal. Close the file and open it again." : {
+      "comment" : "Error after a panic in the Rust core: the document can't be used any more"
+    },
+    "That encoding doesn’t match the file’s byte order mark." : {
+      "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
+    },
+    "The drive it’s on was disconnected." : {
+      "comment" : "Open error: the removable drive holding the file vanished"
     },
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"

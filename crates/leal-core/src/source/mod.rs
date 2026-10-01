@@ -273,8 +273,9 @@ enum VolumeCheck {
     #[cfg(test)]
     Internal,
     /// Treat the volume as removable: a file in an ordinary temporary
-    /// directory standing in for one on a USB drive.
-    #[cfg(test)]
+    /// directory standing in for one on a USB drive. Also for benchmarks,
+    /// through the `test-hooks` feature (`Source::open_simulating_removable`).
+    #[cfg(any(test, feature = "test-hooks"))]
     Removable,
 }
 
@@ -349,6 +350,35 @@ impl Source {
     /// As for [`open`](Self::open).
     pub fn open_on(path: &Path, temp: &TempFolders, volume: VolumeInfo) -> Result<Self, OpenError> {
         Self::open_with_options(path, temp, volume, Options::default())
+    }
+
+    /// TEST HOOK, not for product code: opens `path` as if it were on a
+    /// removable drive (ADR-0006), so the removable path (ordinary reads,
+    /// then [`stream`](Self::stream) copying it in chunks of `chunk_len`)
+    /// can be measured and tested without a real drive. Only built for
+    /// leal-core's tests and with the `test-hooks` feature, which the
+    /// benchmarks turn on and the app never does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn open_simulating_removable(
+        path: &Path,
+        temp: &TempFolders,
+        chunk_len: usize,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_options(
+            path,
+            temp,
+            VolumeInfo::default(),
+            Options {
+                volume: VolumeCheck::Removable,
+                chunk_len,
+                ..Options::default()
+            },
+        )
     }
 
     /// [`open_on`](Self::open_on), with options so tests can reach the copy
@@ -672,7 +702,7 @@ fn can_vanish(
         VolumeCheck::Detect => {}
         #[cfg(test)]
         VolumeCheck::Internal => return false,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         VolumeCheck::Removable => return true,
     }
     // The scratch directory is on the boot volume, which can't vanish

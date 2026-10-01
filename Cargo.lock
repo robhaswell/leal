@@ -484,6 +484,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "proptest",
+ "rayon",
 ]
 
 [[package]]
@@ -491,6 +492,7 @@ name = "leal-ffi"
 version = "0.0.0"
 dependencies = [
  "leal-core",
+ "libc",
  "uniffi",
 ]
 

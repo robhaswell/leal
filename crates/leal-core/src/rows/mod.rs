@@ -77,32 +77,33 @@
 //!
 //! # The seam with detection (1.2) and the scheduler (1.3a)
 //!
-//! The parser takes the [`IndexDialect`] the index was built with and an
-//! [`Encoding`]. That [`Encoding`] is a provisional local copy of the set
-//! in ADR-0005 decision 5, with the same variant names as 1.2's
-//! `dialect::Encoding`, because 1.2 isn't on `main` yet. 1.3a should
-//! replace it with 1.2's and pass the detected encoding here, as it passes
-//! the detected delimiter and BOM to the index.
+//! The parser takes the [`IndexDialect`] the index was built with and the
+//! detected (or chosen) [`Encoding`], 1.2's `dialect::Encoding`. The
+//! document layer ([`crate::document`], task 1.3a) makes both from the
+//! detection result.
 //!
-//! First paint (1.3a) doesn't wait for the index. It can index the first
-//! 64 KB on their own (`RowIndex::build` over that slice), drop the last
-//! row, which may be cut off, and parse the rest: their spans are the same
+//! First paint doesn't wait for the index: the document indexes the first
+//! 64 KB on their own (`RowIndex::build` over that slice), drops the last
+//! row, which may be cut off, and parses the rest. Their spans are the same
 //! offsets as in the whole file.
 
 mod cache;
 mod display;
-mod encoding;
 mod parse;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
 
 use std::fmt;
 use std::ops::Range;
 
 use crate::index::{CodeUnit, IndexDialect, RowIndex};
 
+/// The encoding type is the `dialect` module's (task 1.2), re-exported so
+/// `rows::Encoding` keeps working.
+pub use crate::dialect::Encoding;
 pub use cache::{DEFAULT_CACHE_FIELDS, DEFAULT_CACHE_ROWS, RowCache};
-pub use encoding::Encoding;
 
 /// One field of a parsed row: where its raw bytes are, and how it is
 /// quoted.
@@ -184,6 +185,31 @@ impl FieldSpan {
     #[must_use]
     pub fn raw<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
         bytes.get(self.span()).unwrap_or_default()
+    }
+
+    /// The same field, with every offset `by` bytes later.
+    fn moved_forward(self, by: usize) -> FieldSpan {
+        FieldSpan {
+            start: self.start + by,
+            len: self.len,
+            kind: match self.kind {
+                FieldKind::TextAfterQuote(at) => FieldKind::TextAfterQuote(at + by),
+                other => other,
+            },
+        }
+    }
+
+    /// The same field, with offsets counted from `base` instead of the
+    /// start of the file, or `None` if it starts before `base`.
+    fn moved_back(self, base: usize) -> Option<FieldSpan> {
+        Some(FieldSpan {
+            start: self.start.checked_sub(base)?,
+            len: self.len,
+            kind: match self.kind {
+                FieldKind::TextAfterQuote(at) => FieldKind::TextAfterQuote(at.checked_sub(base)?),
+                other => other,
+            },
+        })
     }
 }
 
@@ -309,7 +335,41 @@ impl RowParser {
     /// at the end of the file is allowed).
     #[must_use]
     pub fn parse(&self, bytes: &[u8], span: Range<usize>) -> Option<ParsedRow> {
-        parse::parse(self.dialect, bytes, span)
+        parse::parse(self.dialect, bytes, 0, span)
+    }
+
+    /// [`parse`](Self::parse), reading the row from `window`: the file's
+    /// bytes from offset `base` on, such as one
+    /// [`Source::read_range`](crate::source::Source::read_range) of a
+    /// screenful of rows, for a file that has no single slice yet (on a
+    /// removable drive, ADR-0006). `span` and the fields' offsets are
+    /// offsets in the file, as from [`parse`](Self::parse).
+    ///
+    /// Returns `None` if `span` isn't inside `window` and after the BOM, or
+    /// (in UTF-16) doesn't start and end on whole code units (a final odd
+    /// byte at the end of the window is allowed).
+    ///
+    /// ```
+    /// use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
+    /// use leal_core::rows::{Encoding, RowParser};
+    ///
+    /// let file = b"id,name\n1,\"Smith, Jo\"\n";
+    /// let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+    /// let index = RowIndex::build(file, dialect)?;
+    /// let parser = RowParser::new(dialect, Encoding::Utf8)?;
+    ///
+    /// let extent = index.row_extent(1).unwrap();
+    /// let window = &file[extent.clone()];
+    /// let span = index.row_in(1, window, extent.start).unwrap().span;
+    /// let row = parser.parse_in(window, extent.start, span).unwrap();
+    /// assert_eq!(row.fields()[1].span(), 10..21);
+    /// let name = parser.display_value_in(window, extent.start, &row.fields()[1]);
+    /// assert_eq!(name, "Smith, Jo");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn parse_in(&self, window: &[u8], base: usize, span: Range<usize>) -> Option<ParsedRow> {
+        parse::parse(self.dialect, window, base, span)
     }
 
     /// Row `row` of the file, split into fields, or `None` if the index
@@ -322,5 +382,23 @@ impl RowParser {
         }
         let span = index.row(row, bytes)?.span;
         self.parse(bytes, span)
+    }
+
+    /// [`parse_row`](Self::parse_row), reading the row from `window`, the
+    /// file's bytes from offset `base` on, which must hold the row's
+    /// extent ([`RowIndex::row_in`]).
+    #[must_use]
+    pub fn parse_row_in(
+        &self,
+        index: &RowIndex,
+        row: usize,
+        window: &[u8],
+        base: usize,
+    ) -> Option<ParsedRow> {
+        if index.dialect() != self.dialect {
+            return None;
+        }
+        let span = index.row_in(row, window, base)?.span;
+        self.parse_in(window, base, span)
     }
 }

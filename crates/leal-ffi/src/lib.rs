@@ -12,6 +12,19 @@
 
 uniffi::setup_scaffolding!();
 
+// The one module of leal-ffi with `unsafe` code (CLAUDE.md): thread QoS,
+// the performance core count and `os_signpost`.
+#[allow(unsafe_code)]
+mod platform;
+
+mod document;
+
+pub use document::{
+    Cell, Delimiter, DialectSource, Document, EncodingSource, FirstScreen, IndexProgress,
+    Interpretation, Job, JobFailure, OpenOptions, ProgressObserver, ReviewResult, Scheduler,
+    TextEncoding, open_document,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -86,12 +99,53 @@ pub enum LealError {
         /// error from `code`.
         message: String,
     },
+    /// The file is 4 GiB or larger, which Leal doesn't open (DESIGN §1).
+    TooLarge {
+        /// The path that was opened.
+        path: String,
+        /// The file's size.
+        byte_count: u64,
+    },
+    /// The encoding chosen with **Reopen with encoding…** doesn't fit the
+    /// file's byte order mark (a file with a BOM can only be read in the
+    /// BOM's encoding).
+    EncodingDoesNotFit {
+        /// The path that was opened.
+        path: String,
+    },
+    /// The removable drive the file is on was disconnected before the bytes
+    /// needed were read (ADR-0006).
+    DriveDisconnected {
+        /// The path that was opened.
+        path: String,
+    },
+    /// The file changed while Leal was reading it without a snapshot (a
+    /// removable drive that can't clone, ADR-0006).
+    ChangedOnDisk {
+        /// The path that was opened.
+        path: String,
+    },
+    /// The document failed after a panic (DESIGN §3.9): Leal makes no
+    /// more calls on it. The app shows an error and offers to reopen the
+    /// file.
+    DocumentFailed {
+        /// The document's path.
+        path: String,
+        /// The panic's message. English, for logs.
+        message: String,
+    },
+    /// A bug in Leal, or threads that couldn't be started. English, for
+    /// logs.
+    Internal {
+        /// What went wrong.
+        message: String,
+    },
 }
 
 impl LealError {
     /// Converts the core's error. `path` is the path exactly as Swift passed
     /// it.
-    fn from_open(path: &str, error: &OpenError) -> Self {
+    pub(crate) fn from_open(path: &str, error: &OpenError) -> Self {
         let path = path.to_owned();
         let code = error.raw_os_error();
         match error.kind() {
@@ -124,7 +178,20 @@ impl std::fmt::Display for LealError {
                 is_directory: true,
             } => write!(f, "{path} is a folder"),
             Self::NotAFile { path, .. } => write!(f, "{path} is not a regular file"),
-            Self::Io { message, .. } => f.write_str(message),
+            Self::Io { message, .. } | Self::Internal { message } => f.write_str(message),
+            Self::TooLarge { path, byte_count } => {
+                write!(f, "{path} is {byte_count} bytes, too large to open")
+            }
+            Self::EncodingDoesNotFit { path } => {
+                write!(f, "the chosen encoding doesn't fit the BOM of {path}")
+            }
+            Self::DriveDisconnected { path } => {
+                write!(f, "the drive holding {path} was disconnected")
+            }
+            Self::ChangedOnDisk { path } => write!(f, "{path} changed while it was being read"),
+            Self::DocumentFailed { path, message } => {
+                write!(f, "the document {path} failed: {message}")
+            }
         }
     }
 }

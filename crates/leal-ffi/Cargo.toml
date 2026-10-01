@@ -35,6 +35,9 @@ test-exports = []
 [dependencies]
 leal-core.workspace = true
 uniffi.workspace = true
+# `sysctlbyname`, for the number of performance cores (the scheduler's pool
+# size, DESIGN §3.10 rule 4). Already a dependency of leal-core.
+libc = "0.2.189"
 
 [lints]
 workspace = true

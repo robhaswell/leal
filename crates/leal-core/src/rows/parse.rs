@@ -20,28 +20,48 @@ use super::{FieldKind, FieldSpan, ParsedRow};
 use crate::index::scan::{Bytes, Units, Utf16};
 use crate::index::{CodeUnit, IndexDialect};
 
-/// Splits the row at `span` of `bytes` into fields, or `None` if the span
-/// isn't inside the file after the BOM, or (in UTF-16) doesn't start and
-/// end on whole code units.
-pub(super) fn parse(dialect: IndexDialect, bytes: &[u8], span: Range<usize>) -> Option<ParsedRow> {
-    let fits = dialect.bom_len <= span.start && span.start <= span.end && span.end <= bytes.len();
+/// Splits the row at `span` into fields, reading it from `window`, the
+/// file's bytes from offset `base` on (the whole file when `base` is 0).
+/// `None` if the span isn't inside the window and after the BOM, or (in
+/// UTF-16) doesn't start and end on whole code units.
+///
+/// The split works in the window's own offsets; the fields are then moved
+/// back to offsets in the file.
+pub(super) fn parse(
+    dialect: IndexDialect,
+    window: &[u8],
+    base: usize,
+    span: Range<usize>,
+) -> Option<ParsedRow> {
+    let window_end = base.checked_add(window.len())?;
+    let fits = dialect.bom_len <= span.start
+        && base <= span.start
+        && span.start <= span.end
+        && span.end <= window_end;
     if !fits {
         return None;
     }
     if dialect.code_unit != CodeUnit::Byte {
         // A row from the index starts on a whole unit, and ends on one or
-        // at the end of the file (after a final odd byte).
+        // at the end of the file (after a final odd byte), which is the
+        // end of any window that holds it.
         let whole = |offset: usize| (offset - dialect.bom_len).is_multiple_of(2);
-        if !whole(span.start) || !(whole(span.end) || span.end == bytes.len()) {
+        if !whole(span.start) || !(whole(span.end) || span.end == window_end) {
             return None;
         }
     }
-    let fields = match dialect.code_unit {
-        CodeUnit::Byte => split(&Bytes, bytes, span.clone(), dialect),
+    let local = span.start - base..span.end - base;
+    let mut fields = match dialect.code_unit {
+        CodeUnit::Byte => split(&Bytes, window, local, dialect),
         CodeUnit::Utf16Le | CodeUnit::Utf16Be => {
-            split(&Utf16::new(dialect), bytes, span.clone(), dialect)
+            split(&<Utf16 as Units>::at(dialect, base), window, local, dialect)
         }
     };
+    if base > 0 {
+        for field in &mut fields {
+            *field = field.moved_forward(base);
+        }
+    }
     Some(ParsedRow { span, fields })
 }
 

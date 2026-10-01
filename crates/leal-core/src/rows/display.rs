@@ -24,24 +24,57 @@ impl RowParser {
     /// short to hold the field, the value is empty.
     #[must_use]
     pub fn value_bytes<'a>(&self, bytes: &'a [u8], field: &FieldSpan) -> Cow<'a, [u8]> {
-        match value_range(field, self.dialect.code_unit.width()) {
-            Some((range, escaped)) if bytes.get(field.span()).is_some() => {
-                self.value_in(bytes, range, escaped)
-            }
-            _ => Cow::Borrowed(&[]),
+        self.value_bytes_in(bytes, 0, field)
+    }
+
+    /// [`value_bytes`](Self::value_bytes), reading the field from
+    /// `window`: the file's bytes from offset `base` on, as for
+    /// [`RowParser::parse_in`]. With a window that doesn't hold the field,
+    /// the value is empty.
+    #[must_use]
+    pub fn value_bytes_in<'a>(
+        &self,
+        window: &'a [u8],
+        base: usize,
+        field: &FieldSpan,
+    ) -> Cow<'a, [u8]> {
+        match self.local_value_range(window, base, field) {
+            Some((range, escaped)) => self.value_in(window, base, range, escaped),
+            None => Cow::Borrowed(&[]),
         }
     }
 
-    /// The value bytes in `range` of the file: unescaped if `escaped`.
-    fn value_in<'a>(&self, bytes: &'a [u8], range: Range<usize>, escaped: bool) -> Cow<'a, [u8]> {
+    /// Where `field`'s value is in `window` (in the window's offsets) and
+    /// whether it needs unescaping, if the window holds the field.
+    fn local_value_range(
+        &self,
+        window: &[u8],
+        base: usize,
+        field: &FieldSpan,
+    ) -> Option<(Range<usize>, bool)> {
+        let local = field.moved_back(base)?;
+        window.get(local.span())?;
+        value_range(&local, self.dialect.code_unit.width())
+    }
+
+    /// The value bytes in `range` of `window` (which starts at `base` in
+    /// the file): unescaped if `escaped`.
+    fn value_in<'a>(
+        &self,
+        window: &'a [u8],
+        base: usize,
+        range: Range<usize>,
+        escaped: bool,
+    ) -> Cow<'a, [u8]> {
         if !escaped {
-            return Cow::Borrowed(&bytes[range]);
+            return Cow::Borrowed(&window[range]);
         }
         let quote = self.dialect.quote;
         match self.dialect.code_unit {
-            CodeUnit::Byte => unescape(&Bytes, bytes, range, quote),
+            CodeUnit::Byte => unescape(&Bytes, window, range, quote),
             CodeUnit::Utf16Le | CodeUnit::Utf16Be => {
-                unescape(&Utf16::new(self.dialect), bytes, range, quote)
+                let units = <Utf16 as Units>::at(self.dialect, base);
+                unescape(&units, window, range, quote)
             }
         }
     }
@@ -65,9 +98,23 @@ impl RowParser {
         field: &FieldSpan,
         max_chars: usize,
     ) -> (Cow<'a, str>, bool) {
-        let Some((range, escaped)) = value_range(field, self.dialect.code_unit.width())
-            .filter(|_| bytes.get(field.span()).is_some())
-        else {
+        self.display_prefix_in(bytes, 0, field, max_chars)
+    }
+
+    /// [`display_prefix`](Self::display_prefix), reading the field from
+    /// `window`: the file's bytes from offset `base` on, as for
+    /// [`RowParser::parse_in`]. With a window that doesn't hold the field,
+    /// the text is empty.
+    #[must_use]
+    pub fn display_prefix_in<'a>(
+        &self,
+        window: &'a [u8],
+        base: usize,
+        field: &FieldSpan,
+        max_chars: usize,
+    ) -> (Cow<'a, str>, bool) {
+        let bytes = window;
+        let Some((range, escaped)) = self.local_value_range(window, base, field) else {
             return (Cow::Borrowed(""), false);
         };
         // A window of the raw bytes that is sure to hold `max_chars + 1`
@@ -92,7 +139,7 @@ impl RowParser {
                 end -= 1;
             }
         }
-        let text = match self.value_in(bytes, range.start..end, escaped) {
+        let text = match self.value_in(bytes, base, range.start..end, escaped) {
             Cow::Borrowed(value) => self.decode(value),
             Cow::Owned(value) => Cow::Owned(self.decode(&value).into_owned()),
         };
@@ -109,7 +156,21 @@ impl RowParser {
     /// [`value_bytes`]: RowParser::value_bytes
     #[must_use]
     pub fn display_value<'a>(&self, bytes: &'a [u8], field: &FieldSpan) -> Cow<'a, str> {
-        match self.value_bytes(bytes, field) {
+        self.display_value_in(bytes, 0, field)
+    }
+
+    /// [`display_value`](Self::display_value), reading the field from
+    /// `window`: the file's bytes from offset `base` on, as for
+    /// [`RowParser::parse_in`]. With a window that doesn't hold the field,
+    /// the text is empty.
+    #[must_use]
+    pub fn display_value_in<'a>(
+        &self,
+        window: &'a [u8],
+        base: usize,
+        field: &FieldSpan,
+    ) -> Cow<'a, str> {
+        match self.value_bytes_in(window, base, field) {
             Cow::Borrowed(value) => self.decode(value),
             Cow::Owned(value) => Cow::Owned(self.decode(&value).into_owned()),
         }
@@ -123,11 +184,12 @@ impl RowParser {
             Encoding::Utf16Le => Cow::Owned(decode_utf16(value, u16::from_le_bytes)),
             Encoding::Utf16Be => Cow::Owned(decode_utf16(value, u16::from_be_bytes)),
             Encoding::Iso8859_1 => decode_latin1(value),
-            other => match other.single_byte() {
+            other => match other.whatwg() {
                 // Single-byte decoders turn any byte they don't map into
                 // U+FFFD, and borrow when the bytes are ASCII.
                 Some(decoder) => decoder.decode_without_bom_handling(value).0,
-                // Every encoding but the four above has a decoder.
+                // Every encoding but ISO-8859-1, handled above, has a
+                // decoder.
                 None => String::from_utf8_lossy(value),
             },
         }

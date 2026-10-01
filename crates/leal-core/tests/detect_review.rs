@@ -120,3 +120,31 @@ fn a_review_can_be_cancelled_while_it_runs() {
     setter.join().unwrap();
     assert_eq!(result, Err(Cancelled));
 }
+
+/// `review_with` calls its checkpoint before every chunk, and stops with
+/// the checkpoint's error (the scheduler's pause and cancel, 1.3a).
+#[test]
+fn the_review_checks_in_before_every_chunk() {
+    let file = repeated(b"a,b\n", b"1,2\n", 3 * REVIEW_CHUNK_BYTES);
+    let d = plain(&file);
+    let chunks = (file.len() - 1) / REVIEW_CHUNK_BYTES + 1;
+    let mut calls = 0;
+    let whole = leal_core::detect::review_with(&file, &d, || {
+        calls += 1;
+        Ok(())
+    });
+    assert!(calls >= chunks, "{calls} checkpoints for {chunks} chunks");
+    assert!(
+        calls <= chunks + 1,
+        "{calls} checkpoints for {chunks} chunks"
+    );
+    assert_eq!(whole, Ok(review(&file, &d)));
+
+    let mut calls = 0;
+    let stopped = leal_core::detect::review_with(&file, &d, || {
+        calls += 1;
+        if calls == 2 { Err(Cancelled) } else { Ok(()) }
+    });
+    assert_eq!(stopped, Err(Cancelled));
+    assert_eq!(calls, 2, "no chunk after the one that said stop");
+}

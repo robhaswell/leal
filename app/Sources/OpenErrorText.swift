@@ -44,9 +44,63 @@ enum OpenErrorText {
             )
         case let .Io(_, code?, _):
             systemReason(code: code)
-        case .Io(_, nil, _):
+        case .Io(_, nil, _), .Internal:
+            String(localized: "An unexpected error occurred.", comment: "Open error with no OS error code")
+        case .TooLarge:
+            String(
+                localized: "It’s 4 GB or larger, more than Leal can open.",
+                comment: "Open error: the file is 4 GiB or more (DESIGN §1)"
+            )
+        case .EncodingDoesNotFit:
+            String(
+                localized: "That encoding doesn’t match the file’s byte order mark.",
+                comment: "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
+            )
+        case .DriveDisconnected:
+            String(
+                localized: "The drive it’s on was disconnected.",
+                comment: "Open error: the removable drive holding the file vanished"
+            )
+        case .ChangedOnDisk:
+            String(
+                localized: "Another app changed it while Leal was reading it.",
+                comment: "Open error: the file changed while it was being read without a snapshot"
+            )
+        case .DocumentFailed:
+            documentFailed
+        }
+    }
+
+    /// A sentence explaining why a background job (indexing, the review)
+    /// didn't finish. The switch is exhaustive, as for `LealError`.
+    static func describe(_ failure: JobFailure) -> String {
+        switch failure {
+        case .Cancelled:
+            String(localized: "It was stopped.", comment: "Background job error: the job was cancelled")
+        case .DriveDisconnected:
+            String(
+                localized: "The drive it’s on was disconnected.",
+                comment: "Open error: the removable drive holding the file vanished"
+            )
+        case .ChangedOnDisk:
+            String(
+                localized: "Another app changed it while Leal was reading it.",
+                comment: "Open error: the file changed while it was being read without a snapshot"
+            )
+        case .Panicked:
+            documentFailed
+        case .Failed:
             String(localized: "An unexpected error occurred.", comment: "Open error with no OS error code")
         }
+    }
+
+    /// After a panic in the core the document has failed (DESIGN §3.9): the
+    /// app makes no more calls on it and offers to reopen the file.
+    private static var documentFailed: String {
+        String(
+            localized: "Something went wrong inside Leal. Close the file and open it again.",
+            comment: "Error after a panic in the Rust core: the document can't be used any more"
+        )
     }
 
     /// The system's own description of a POSIX error code, such as "No space

@@ -137,12 +137,37 @@ impl RowCache {
     /// `bytes` must be the whole file that was indexed. The row comes back
     /// as an [`Arc`], so the caller can keep it while the cache moves on.
     pub fn row(&mut self, index: &RowIndex, row: usize, bytes: &[u8]) -> Option<Arc<ParsedRow>> {
+        let parser = self.parser;
+        self.row_with(row, || parser.parse_row(index, row, bytes))
+    }
+
+    /// [`row`](Self::row), parsing a missing row from `window`, the file's
+    /// bytes from offset `base` on, which must hold the row's extent
+    /// ([`RowParser::parse_row_in`]). Rows are cached by number, so the
+    /// same row comes back however it was first read.
+    pub fn row_in(
+        &mut self,
+        index: &RowIndex,
+        row: usize,
+        window: &[u8],
+        base: usize,
+    ) -> Option<Arc<ParsedRow>> {
+        let parser = self.parser;
+        self.row_with(row, || parser.parse_row_in(index, row, window, base))
+    }
+
+    /// Row `row` from the cache, or parsed by `parse` and kept.
+    fn row_with(
+        &mut self,
+        row: usize,
+        parse: impl FnOnce() -> Option<ParsedRow>,
+    ) -> Option<Arc<ParsedRow>> {
         self.clock += 1;
         if let Some(entry) = self.rows.get_mut(&row) {
             entry.last_read = self.clock;
             return Some(Arc::clone(&entry.row));
         }
-        let parsed = Arc::new(self.parser.parse_row(index, row, bytes)?);
+        let parsed = Arc::new(parse()?);
         let fields = parsed.fields().len();
         if fields > self.max_fields {
             return Some(parsed);

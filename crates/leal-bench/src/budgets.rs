@@ -18,8 +18,22 @@ pub struct Budget {
     pub source: &'static str,
 }
 
-/// The budgets CI enforces. 1.3a adds first paint (< 150 ms).
+/// The budgets CI enforces.
 pub const BUDGETS: &[Budget] = &[
+    // "Open to first rows visible: < 150 ms, independent of file size,
+    // before indexing finishes", with P1–P3 work forced to run at the same
+    // time (DESIGN §3.10, "Measuring it"): from an internal volume, and
+    // through the removable-drive path (ADR-0006).
+    Budget {
+        id: "open/first_paint_under_load",
+        max_ms: 150.0,
+        source: "DESIGN §1",
+    },
+    Budget {
+        id: "open/first_paint_removable_under_load",
+        max_ms: 150.0,
+        source: "DESIGN §1",
+    },
     // "Full index built: < 500 ms" for the reference file, on the calling
     // thread and through the progressive path the app uses.
     Budget {

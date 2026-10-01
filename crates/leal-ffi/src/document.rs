@@ -1,0 +1,915 @@
+//! Documents, jobs and the scheduler, for Swift (task 1.3a). See
+//! [`leal_core::document`] and [`leal_core::schedule`].
+//!
+//! - [`Scheduler`]: one per app. The app reports input through it, which
+//!   pauses background work (DESIGN §3.10 rule 3).
+//! - [`open_document`]: first paint, synchronously, then the index and
+//!   review in the background. It returns a [`Document`] whose
+//!   [`first_screen`](Document::first_screen) is ready.
+//! - [`Document::rows`]: rows for the grid, synchronously (under 1 ms).
+//! - [`Job`]: a background job's handle, with [`cancel`](Job::cancel) and
+//!   an async [`wait`](Job::wait) (ADR-0005 decision 6). The work runs on
+//!   Rust's own threads; the async function only reports completion.
+//!   Swift's task cancellation doesn't reach Rust, so the Swift wrapper
+//!   (task 1.6) calls `cancel()` from `withTaskCancellationHandler`.
+//! - [`ProgressObserver`]: a Swift object told about indexing progress, on
+//!   the index's thread.
+
+use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
+
+use leal_core::detect::{self, Choices, Detection};
+use leal_core::dialect;
+use leal_core::document::{self, DocumentError};
+use leal_core::schedule::{self, JobControl, JobError, SchedulerConfig};
+use leal_core::source::{ReadError, ReadErrorKind, TempFolders};
+
+use crate::platform::MacPlatform;
+use crate::{LealError, SourceStorage, TempLocations, VolumeInfo};
+
+/// Runs the background work of every document (DESIGN §3.10): one per app.
+#[derive(Debug, uniffi::Object)]
+pub struct Scheduler {
+    scheduler: schedule::Scheduler,
+}
+
+#[uniffi::export]
+impl Scheduler {
+    /// Starts the background pool, sized to the performance cores less
+    /// one, with each thread's QoS set and `os_signpost` intervals for
+    /// every job.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::Internal`] if the threads can't be started.
+    #[uniffi::constructor]
+    pub fn new() -> Result<Arc<Self>, LealError> {
+        let config = SchedulerConfig {
+            platform: Arc::new(MacPlatform),
+            ..SchedulerConfig::default()
+        };
+        let scheduler = schedule::Scheduler::new(config).map_err(|error| LealError::Internal {
+            message: error.to_string(),
+        })?;
+        Ok(Arc::new(Scheduler { scheduler }))
+    }
+
+    /// The user scrolled, typed or clicked: background work pauses until
+    /// input has been idle for about 250 ms. Cheap; call it on every event.
+    pub fn note_user_input(&self) {
+        self.scheduler.note_user_input();
+    }
+
+    /// A gesture (a scroll with momentum, a drag) began (`true`) or ended
+    /// (`false`). Background work stays paused while it lasts.
+    pub fn set_interacting(&self, interacting: bool) {
+        self.scheduler.set_interacting(interacting);
+    }
+
+    /// The number of threads in the background pool.
+    #[must_use]
+    pub fn background_threads(&self) -> u32 {
+        u32::try_from(self.scheduler.background_threads()).unwrap_or(u32::MAX)
+    }
+}
+
+/// Told about indexing progress, on the index's thread, after each chunk
+/// (about every millisecond). Keep it short: hop to the main thread.
+#[uniffi::export(with_foreign)]
+pub trait ProgressObserver: Send + Sync {
+    /// The index has got to `progress`.
+    fn index_progressed(&self, progress: IndexProgress);
+}
+
+/// A field delimiter (DESIGN §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Delimiter {
+    /// `,`
+    Comma,
+    /// `;`
+    Semicolon,
+    /// Tab.
+    Tab,
+    /// `|`
+    Pipe,
+}
+
+/// A text encoding Leal reads (ADR-0005 decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TextEncoding {
+    /// UTF-8.
+    Utf8,
+    /// UTF-16, little-endian (read-only in v1).
+    Utf16Le,
+    /// UTF-16, big-endian (read-only in v1).
+    Utf16Be,
+    /// Windows-1252.
+    Windows1252,
+    /// Windows-1250.
+    Windows1250,
+    /// Windows-1251.
+    Windows1251,
+    /// Windows-1253.
+    Windows1253,
+    /// Windows-1254.
+    Windows1254,
+    /// Windows-1255.
+    Windows1255,
+    /// Windows-1256.
+    Windows1256,
+    /// Windows-1257.
+    Windows1257,
+    /// Windows-1258.
+    Windows1258,
+    /// ISO-8859-1.
+    Iso8859_1,
+    /// ISO-8859-2.
+    Iso8859_2,
+    /// ISO-8859-15.
+    Iso8859_15,
+    /// Mac Roman.
+    MacRoman,
+}
+
+/// Where the encoding came from, for the status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum EncodingSource {
+    /// The byte order mark.
+    Bom,
+    /// The `com.apple.TextEncoding` attribute.
+    Attribute,
+    /// Guessed from the bytes.
+    Guess,
+    /// Chosen by the user.
+    User,
+}
+
+/// Where the delimiter or header choice came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DialectSource {
+    /// Leal's interpretation attribute.
+    Attribute,
+    /// Guessed from the bytes.
+    Guess,
+    /// Chosen by the user.
+    User,
+}
+
+/// How the file is read. See [`leal_core::detect::Detection`]; the status
+/// bar notes and line endings come with 1.6 and 1.7.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Interpretation {
+    /// The encoding.
+    pub encoding: TextEncoding,
+    /// Where the encoding came from.
+    pub encoding_source: EncodingSource,
+    /// The delimiter.
+    pub delimiter: Delimiter,
+    /// Where the delimiter came from.
+    pub delimiter_source: DialectSource,
+    /// Whether the first row is the header row.
+    pub header: bool,
+    /// Where the header choice came from.
+    pub header_source: DialectSource,
+}
+
+/// How to open (or re-read) a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct OpenOptions {
+    /// **Treat as**: the delimiter to use instead of detecting one.
+    #[uniffi(default = None)]
+    pub delimiter: Option<Delimiter>,
+    /// The **Header row** toggle, instead of detecting it.
+    #[uniffi(default = None)]
+    pub header: Option<bool>,
+    /// **Reopen with encoding…**: it must fit the file's BOM.
+    #[uniffi(default = None)]
+    pub encoding: Option<TextEncoding>,
+    /// How many rows the first screen has.
+    #[uniffi(default = 100)]
+    pub first_screen_rows: u32,
+    /// The most characters of each cell the first screen shows.
+    #[uniffi(default = 256)]
+    pub max_chars: u32,
+}
+
+/// One cell, as the grid shows it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Cell {
+    /// The start of the cell's value.
+    pub text: String,
+    /// Whether the value has more than `text`.
+    pub truncated: bool,
+}
+
+/// First paint's result. See [`leal_core::document::FirstScreen`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FirstScreen {
+    /// Which reading of the file this is; progress reports carry it.
+    pub generation: u64,
+    /// How the file is read.
+    pub interpretation: Interpretation,
+    /// The first rows, each as its cells.
+    pub rows: Vec<Vec<Cell>>,
+    /// Rows known so far.
+    pub row_count: u64,
+    /// The row count to size the scrollbar with.
+    pub estimated_row_count: u64,
+}
+
+/// Where indexing has got to. See [`leal_core::document::IndexProgress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct IndexProgress {
+    /// The reading this is about.
+    pub generation: u64,
+    /// Rows that can be read now.
+    pub rows: u64,
+    /// The row count to size the scrollbar with: exact once `complete`.
+    pub estimated_rows: u64,
+    /// How far the index has got, in bytes.
+    pub bytes_scanned: u64,
+    /// The file's length.
+    pub bytes_total: u64,
+    /// Whether every row is indexed.
+    pub complete: bool,
+}
+
+/// What the whole-file review suggests (ADR-0005 decision 4). The app
+/// shows the suggestions; nothing changes by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ReviewResult {
+    /// An encoding the whole file fits better: "Reopen as …".
+    pub encoding_suggestion: Option<TextEncoding>,
+    /// A delimiter the whole file fits better: "This file looks
+    /// semicolon-separated — Switch".
+    pub delimiter_suggestion: Option<Delimiter>,
+}
+
+/// Why a job didn't finish.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
+pub enum JobFailure {
+    /// It was cancelled.
+    Cancelled,
+    /// The file's removable drive was disconnected before it was read.
+    DriveDisconnected,
+    /// The file changed while it was read without a snapshot.
+    ChangedOnDisk,
+    /// The job's work panicked. DESIGN §3.9: the document is then treated
+    /// as failed ([`Document::is_failed`]); the app shows an error and
+    /// offers to reopen the file.
+    Panicked {
+        /// The panic's message. English, for logs.
+        message: String,
+    },
+    /// Anything else. English, for logs.
+    Failed {
+        /// What went wrong.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for JobFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::DriveDisconnected => f.write_str("the drive was disconnected"),
+            Self::ChangedOnDisk => f.write_str("the file changed on disk"),
+            Self::Panicked { message } => write!(f, "the job panicked: {message}"),
+            Self::Failed { message } => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for JobFailure {}
+
+impl From<JobError> for JobFailure {
+    fn from(error: JobError) -> Self {
+        match error {
+            JobError::Cancelled => Self::Cancelled,
+            JobError::Read(ReadErrorKind::Disconnected) => Self::DriveDisconnected,
+            JobError::Read(ReadErrorKind::ChangedOnDisk) => Self::ChangedOnDisk,
+            JobError::Panicked(message) => Self::Panicked { message },
+            other => Self::Failed {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+/// A background job (ADR-0005 decision 6).
+#[derive(Debug, uniffi::Object)]
+pub struct Job {
+    control: JobControl,
+}
+
+#[uniffi::export]
+impl Job {
+    /// Stops the job within one chunk of work. Swift calls it from
+    /// `withTaskCancellationHandler` (task 1.6).
+    pub fn cancel(&self) {
+        self.control.cancel();
+    }
+
+    /// Whether the job has finished, however it finished.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.control.is_finished()
+    }
+
+    /// The job's id, which is also its `os_signpost` interval id.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.control.id()
+    }
+
+    /// Waits for the job to finish, without blocking a thread: the job
+    /// wakes the awaiting task when it ends.
+    ///
+    /// # Errors
+    ///
+    /// The [`JobFailure`] the job ended with.
+    pub async fn wait(&self) -> Result<(), JobFailure> {
+        Finished::new(self.control.clone())
+            .await
+            .map_err(JobFailure::from)
+    }
+}
+
+/// A future that is ready when a job has finished. It registers the
+/// awaiting task's [`Waker`] with the job, which wakes it from the job's
+/// thread ([`JobControl::on_finish`]). No async runtime is needed: UniFFI
+/// polls it from Swift.
+struct Finished {
+    control: JobControl,
+    /// Set once the waker callback has been registered with the job.
+    waker: Arc<Mutex<Option<Waker>>>,
+    registered: bool,
+}
+
+impl Finished {
+    fn new(control: JobControl) -> Self {
+        Finished {
+            control,
+            waker: Arc::new(Mutex::new(None)),
+            registered: false,
+        }
+    }
+}
+
+impl Future for Finished {
+    type Output = Result<(), JobError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // Store the newest waker before looking at the outcome, so a job
+        // that finishes between the two still wakes this task.
+        *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(context.waker().clone());
+        if !self.registered {
+            self.registered = true;
+            let waker = Arc::clone(&self.waker);
+            self.control.on_finish(move || {
+                if let Some(waker) = waker.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                    waker.wake();
+                }
+            });
+        }
+        match self.control.outcome() {
+            Some(outcome) => Poll::Ready(outcome),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// An open document. See [`leal_core::document::Document`]. Releasing the
+/// last reference cancels its jobs.
+///
+/// **After a panic the document has failed** (DESIGN §3.9): a panic in one
+/// of its calls, or in one of its background jobs, may have left a lock
+/// inside it poisoned or its state half-changed. From then on every call
+/// returns [`LealError::DocumentFailed`] without touching the core
+/// document; [`is_failed`](Self::is_failed) says so. The app shows an
+/// error and offers to reopen the file.
+#[derive(Debug, uniffi::Object)]
+pub struct Document {
+    document: document::Document,
+    /// The path, for errors.
+    path: String,
+    /// The latest first screen.
+    first_screen: Mutex<FirstScreen>,
+    /// Why the document failed, once it has.
+    failure: Arc<Failure>,
+}
+
+/// Why a document failed: the first panic's message.
+#[derive(Debug, Default)]
+struct Failure {
+    message: Mutex<Option<String>>,
+}
+
+impl Failure {
+    /// Records a failure; only the first is kept.
+    fn set(&self, message: String) {
+        self.message
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(message);
+    }
+
+    fn get(&self) -> Option<String> {
+        self.message
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Marks the document failed if `job` ends in a panic.
+    fn watch(self: &Arc<Self>, job: &JobControl) {
+        let failure = Arc::clone(self);
+        // A clone of the job's handle, inside the job's own callback list:
+        // the list is emptied when the job finishes, which ends the cycle.
+        let finished = job.clone();
+        job.on_finish(move || {
+            if let Some(Err(JobError::Panicked(message))) = finished.outcome() {
+                failure.set(format!("a background job panicked: {message}"));
+            }
+        });
+    }
+}
+
+/// Opens the file at `path` and reads its first screen (P0), then starts
+/// indexing (P1) and the review (P2) in the background, on `scheduler`.
+/// It returns once the first screen is ready (well under 150 ms, however
+/// large the file), without waiting for the index. Call it off the main
+/// thread if the file may be on a slow drive.
+///
+/// `observer`, if given, is told about indexing progress.
+///
+/// # Errors
+///
+/// The open errors of [`crate::open_source`], and
+/// [`LealError::EncodingDoesNotFit`], [`LealError::TooLarge`],
+/// [`LealError::DriveDisconnected`] or [`LealError::ChangedOnDisk`].
+#[uniffi::export]
+pub fn open_document(
+    path: &str,
+    volume: VolumeInfo,
+    temp: TempLocations,
+    scheduler: &Scheduler,
+    options: OpenOptions,
+    observer: Option<Arc<dyn ProgressObserver>>,
+) -> Result<Arc<Document>, LealError> {
+    let temp = TempFolders::from(temp);
+    let progress = observer.map(|observer| -> document::ProgressCallback {
+        Arc::new(move |progress| observer.index_progressed(progress.into()))
+    });
+    let (document, screen) = document::Document::open(
+        Path::new(path),
+        &temp,
+        volume.into(),
+        &scheduler.scheduler,
+        options.into(),
+        progress,
+    )
+    .map_err(|error| document_error(path, error))?;
+    let document = Document {
+        document,
+        path: path.to_owned(),
+        first_screen: Mutex::new(screen.into()),
+        failure: Arc::default(),
+    };
+    document.watch_jobs();
+    Ok(Arc::new(document))
+}
+
+impl Document {
+    /// Runs `call` unless the document has failed, and marks it failed if
+    /// `call` panics. Every export of `Document` goes through this.
+    fn call<T>(&self, call: impl FnOnce() -> Result<T, LealError>) -> Result<T, LealError> {
+        if let Some(message) = self.failure.get() {
+            return Err(self.failed(message));
+        }
+        // `AssertUnwindSafe`: after a panic nothing in the document is
+        // looked at again, because it is marked failed first.
+        match panic::catch_unwind(AssertUnwindSafe(call)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_message(payload.as_ref());
+                self.failure.set(message.clone());
+                Err(self.failed(message))
+            }
+        }
+    }
+
+    fn failed(&self, message: String) -> LealError {
+        LealError::DocumentFailed {
+            path: self.path.clone(),
+            message,
+        }
+    }
+
+    /// Marks the document failed if a job of its current reading panics.
+    fn watch_jobs(&self) {
+        self.failure.watch(self.document.index_job().control());
+        self.failure.watch(self.document.review_job().control());
+    }
+}
+
+/// The text of a panic, if it had one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic without a message".to_owned()
+    }
+}
+
+#[uniffi::export]
+impl Document {
+    /// Whether the document has failed after a panic (see [`Document`]).
+    /// Every other call then returns [`LealError::DocumentFailed`].
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        self.failure.get().is_some()
+    }
+
+    /// The first screen of rows: from opening, or from the latest
+    /// [`reinterpret`](Self::reinterpret).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn first_screen(&self) -> Result<FirstScreen, LealError> {
+        self.call(|| {
+            Ok(self
+                .first_screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone())
+        })
+    }
+
+    /// Rows `start` to `start + count` (as many as can be read now), with
+    /// at most `max_chars` characters of each cell. Fast enough for the
+    /// main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DriveDisconnected`], [`LealError::ChangedOnDisk`] or
+    /// [`LealError::Io`], only for a file on a removable drive whose copy
+    /// isn't complete; [`LealError::DocumentFailed`].
+    pub fn rows(
+        &self,
+        start: u64,
+        count: u32,
+        max_chars: u32,
+    ) -> Result<Vec<Vec<Cell>>, LealError> {
+        self.call(|| {
+            let start = usize::try_from(start).unwrap_or(usize::MAX);
+            let end = start.saturating_add(to_usize(count));
+            let rows = self
+                .document
+                .rows(start..end, to_usize(max_chars))
+                .map_err(|error| read_error(&self.path, &error))?;
+            Ok(rows
+                .into_iter()
+                .map(|row| row.into_iter().map(Cell::from).collect())
+                .collect())
+        })
+    }
+
+    /// Rows that can be read now; the file's row count once indexing is
+    /// complete.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn row_count(&self) -> Result<u64, LealError> {
+        self.call(|| Ok(to_u64(self.document.row_count())))
+    }
+
+    /// The row count to size the scrollbar with while indexing.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn estimated_row_count(&self) -> Result<u64, LealError> {
+        self.call(|| Ok(to_u64(self.document.estimated_row_count())))
+    }
+
+    /// Where indexing has got to.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn progress(&self) -> Result<IndexProgress, LealError> {
+        self.call(|| Ok(self.document.progress().into()))
+    }
+
+    /// How the file is read now.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn interpretation(&self) -> Result<Interpretation, LealError> {
+        self.call(|| Ok((&self.document.detection()).into()))
+    }
+
+    /// Where the file's bytes are held.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn storage(&self) -> Result<SourceStorage, LealError> {
+        self.call(|| Ok(self.document.storage().into()))
+    }
+
+    /// The index job (P1) of the current reading.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn index_job(&self) -> Result<Arc<Job>, LealError> {
+        self.call(|| {
+            Ok(Arc::new(Job {
+                control: self.document.index_job().control().clone(),
+            }))
+        })
+    }
+
+    /// The review job (P2) of the current reading.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn review_job(&self) -> Result<Arc<Job>, LealError> {
+        self.call(|| {
+            Ok(Arc::new(Job {
+                control: self.document.review_job().control().clone(),
+            }))
+        })
+    }
+
+    /// What the review suggests, once it has finished; `None` before, or
+    /// if it didn't finish.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn review(&self) -> Result<Option<ReviewResult>, LealError> {
+        self.call(|| {
+            let job = self.document.review_job();
+            let Some(Ok(review)) = job.result() else {
+                return Ok(None);
+            };
+            Ok(Some(ReviewResult {
+                encoding_suggestion: review.encoding_suggestion.map(TextEncoding::from),
+                delimiter_suggestion: review.delimiter_suggestion.map(Delimiter::from),
+            }))
+        })
+    }
+
+    /// Reads the file again with `options`' choices (**Treat as**, the
+    /// header toggle, **Reopen with encoding…**), without reopening it.
+    /// The old jobs are cancelled; [`index_job`](Self::index_job) and
+    /// [`review_job`](Self::review_job) give the new ones.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::EncodingDoesNotFit`]; the document is then unchanged.
+    /// [`LealError::DocumentFailed`].
+    pub fn reinterpret(&self, options: OpenOptions) -> Result<FirstScreen, LealError> {
+        self.call(|| {
+            let options = document::OpenOptions::from(options);
+            let screen: FirstScreen = self
+                .document
+                .reinterpret(
+                    options.choices,
+                    options.first_screen_rows,
+                    options.max_chars,
+                )
+                .map_err(|error| document_error(&self.path, error))?
+                .into();
+            self.watch_jobs();
+            *self
+                .first_screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = screen.clone();
+            Ok(screen)
+        })
+    }
+}
+
+/// Exports only the app's tests call (the `test-exports` feature, as for
+/// `debug_panic`): ways to make a document fail.
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+impl Document {
+    /// Panics inside a document call, which marks the document failed.
+    ///
+    /// # Errors
+    ///
+    /// Always [`LealError::DocumentFailed`].
+    ///
+    /// # Panics
+    ///
+    /// Inside the call, on purpose; the panic is caught there.
+    pub fn debug_panic(&self) -> Result<(), LealError> {
+        self.call(|| panic!("deliberate document panic"))
+    }
+
+    /// Treats `job` as one of this document's jobs: if it panics, the
+    /// document fails.
+    pub fn debug_watch(&self, job: &Job) {
+        self.failure.watch(&job.control);
+    }
+}
+
+/// A P2 job that panics, for the app's tests (`test-exports`).
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+#[must_use]
+pub fn debug_panicking_job(scheduler: &Scheduler) -> Arc<Job> {
+    let handle: schedule::JobHandle<()> =
+        scheduler
+            .scheduler
+            .spawn(schedule::Priority::P2, schedule::Interval::Review, |_| {
+                panic!("deliberate job panic")
+            });
+    Arc::new(Job {
+        control: handle.control().clone(),
+    })
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+fn to_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+fn document_error(path: &str, error: DocumentError) -> LealError {
+    let path_owned = path.to_owned();
+    match error {
+        DocumentError::Open(error) => LealError::from_open(path, &error),
+        DocumentError::Read(error) => read_error(path, &error),
+        DocumentError::Choice(_) => LealError::EncodingDoesNotFit { path: path_owned },
+        DocumentError::TooLarge { len } => LealError::TooLarge {
+            path: path_owned,
+            byte_count: len,
+        },
+        DocumentError::Internal(message) => LealError::Internal { message },
+    }
+}
+
+fn read_error(path: &str, error: &ReadError) -> LealError {
+    let path = path.to_owned();
+    match error.kind() {
+        ReadErrorKind::Disconnected => LealError::DriveDisconnected { path },
+        ReadErrorKind::ChangedOnDisk => LealError::ChangedOnDisk { path },
+        ReadErrorKind::Cancelled | ReadErrorKind::Other => LealError::Io {
+            path,
+            code: error.raw_os_error(),
+            message: error.to_string(),
+        },
+    }
+}
+
+impl From<OpenOptions> for document::OpenOptions {
+    fn from(options: OpenOptions) -> Self {
+        document::OpenOptions {
+            choices: Choices {
+                delimiter: options.delimiter.map(dialect::Delimiter::from),
+                header: options.header,
+                encoding: options.encoding.map(dialect::Encoding::from),
+            },
+            first_screen_rows: to_usize(options.first_screen_rows),
+            max_chars: to_usize(options.max_chars),
+        }
+    }
+}
+
+impl From<document::Cell> for Cell {
+    fn from(cell: document::Cell) -> Self {
+        Cell {
+            text: cell.text,
+            truncated: cell.truncated,
+        }
+    }
+}
+
+impl From<document::FirstScreen> for FirstScreen {
+    fn from(screen: document::FirstScreen) -> Self {
+        FirstScreen {
+            generation: screen.generation,
+            interpretation: (&screen.detection).into(),
+            rows: screen
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(Cell::from).collect())
+                .collect(),
+            row_count: to_u64(screen.row_count),
+            estimated_row_count: to_u64(screen.estimated_row_count),
+        }
+    }
+}
+
+impl From<document::IndexProgress> for IndexProgress {
+    fn from(progress: document::IndexProgress) -> Self {
+        IndexProgress {
+            generation: progress.generation,
+            rows: to_u64(progress.rows),
+            estimated_rows: to_u64(progress.estimated_rows),
+            bytes_scanned: progress.bytes_scanned,
+            bytes_total: progress.bytes_total,
+            complete: progress.complete,
+        }
+    }
+}
+
+impl From<&Detection> for Interpretation {
+    fn from(detection: &Detection) -> Self {
+        Interpretation {
+            encoding: detection.encoding.into(),
+            encoding_source: detection.encoding_source.into(),
+            delimiter: detection.delimiter.into(),
+            delimiter_source: detection.delimiter_source.into(),
+            header: detection.header,
+            header_source: detection.header_source.into(),
+        }
+    }
+}
+
+impl From<detect::EncodingSource> for EncodingSource {
+    fn from(source: detect::EncodingSource) -> Self {
+        match source {
+            detect::EncodingSource::Bom => Self::Bom,
+            detect::EncodingSource::Attribute => Self::Attribute,
+            detect::EncodingSource::Guess => Self::Guess,
+            detect::EncodingSource::User => Self::User,
+        }
+    }
+}
+
+impl From<detect::DialectSource> for DialectSource {
+    fn from(source: detect::DialectSource) -> Self {
+        match source {
+            detect::DialectSource::Attribute => Self::Attribute,
+            detect::DialectSource::Guess => Self::Guess,
+            detect::DialectSource::User => Self::User,
+        }
+    }
+}
+
+/// The two delimiter enums, one for each direction.
+macro_rules! both_ways {
+    ($ffi:ident, $core:path, [$($variant:ident),* $(,)?]) => {
+        impl From<$core> for $ffi {
+            fn from(value: $core) -> Self {
+                match value {
+                    $(<$core>::$variant => Self::$variant,)*
+                }
+            }
+        }
+
+        impl From<$ffi> for $core {
+            fn from(value: $ffi) -> Self {
+                match value {
+                    $($ffi::$variant => <$core>::$variant,)*
+                }
+            }
+        }
+    };
+}
+
+both_ways!(Delimiter, dialect::Delimiter, [Comma, Semicolon, Tab, Pipe]);
+both_ways!(
+    TextEncoding,
+    dialect::Encoding,
+    [
+        Utf8,
+        Utf16Le,
+        Utf16Be,
+        Windows1252,
+        Windows1250,
+        Windows1251,
+        Windows1253,
+        Windows1254,
+        Windows1255,
+        Windows1256,
+        Windows1257,
+        Windows1258,
+        Iso8859_1,
+        Iso8859_2,
+        Iso8859_15,
+        MacRoman,
+    ]
+);
+
+#[cfg(test)]
+mod tests;

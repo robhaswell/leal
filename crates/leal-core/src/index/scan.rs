@@ -19,8 +19,18 @@
 //! the same state machine reads bytes (UTF-8 and single-byte encodings)
 //! and UTF-16 code units. Rust compiles a separate copy for each, so the
 //! byte version pays nothing for UTF-16's extra checks.
+//!
+//! The scanner keeps every position as an offset into the whole file, but
+//! reads the bytes through a [`View`]: a slice that starts at some offset
+//! `base`. Over a mapped file the view is the whole file (`base` 0). For a
+//! file read in chunks ([`Chunked`], task 1.3a) each view is one chunk plus
+//! the few bytes the scanner still needs from the chunk before: the unit
+//! before its position (for the "quote after a delimiter" look-back) and
+//! anything it hasn't scanned yet. The scanner's own state (inside quotes
+//! or not, the row so far) carries over from one view to the next.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -38,6 +48,11 @@ const LF: u8 = b'\n';
 pub(crate) trait Units {
     /// The width of a code unit in bytes.
     const WIDTH: usize;
+
+    /// The units of a slice that starts at byte `base` of a file written
+    /// in `dialect`. Positions passed to the other methods are then offsets
+    /// into that slice.
+    fn at(dialect: IndexDialect, base: usize) -> Self;
 
     /// The first unit in `from..to` whose value is `a`, `b` or `c`, with
     /// that value.
@@ -58,6 +73,10 @@ pub(crate) struct Bytes;
 
 impl Units for Bytes {
     const WIDTH: usize = 1;
+
+    fn at(_dialect: IndexDialect, _base: usize) -> Self {
+        Bytes
+    }
 
     fn find3(
         &self,
@@ -92,19 +111,14 @@ impl Units for Bytes {
 /// unit and the unit's other byte is 0. So the 0x0A byte in U+0A22, or in
 /// U+220A, is skipped.
 pub(crate) struct Utf16 {
-    /// Where code units start: the end of the BOM.
-    base: usize,
+    /// Which bytes of the slice start a code unit: those at an offset `i`
+    /// with `i + phase` even. Units start at the end of the BOM, so for
+    /// the whole file this is the BOM's length, mod 2.
+    phase: usize,
     big_endian: bool,
 }
 
 impl Utf16 {
-    pub(crate) fn new(dialect: IndexDialect) -> Self {
-        Utf16 {
-            base: dialect.bom_len,
-            big_endian: dialect.code_unit == CodeUnit::Utf16Be,
-        }
-    }
-
     /// The unit's two bytes for an ASCII value, in file order.
     fn pair(&self, value: u8) -> [u8; 2] {
         if self.big_endian {
@@ -128,7 +142,7 @@ impl Utf16 {
             let hit = at + search(&bytes[at..to])?;
             // Where a unit's value byte sits: offset 0 of the unit for
             // little-endian, 1 for big-endian.
-            let in_unit = (hit - self.base) % 2;
+            let in_unit = (hit + self.phase) % 2;
             let start = hit - in_unit;
             if in_unit == usize::from(self.big_endian) {
                 let other = if self.big_endian { start } else { start + 1 };
@@ -144,6 +158,16 @@ impl Utf16 {
 
 impl Units for Utf16 {
     const WIDTH: usize = 2;
+
+    fn at(dialect: IndexDialect, base: usize) -> Self {
+        // A byte at offset `i` of the slice is at `base + i` in the file,
+        // which starts a unit if `base + i - bom_len` is even, that is, if
+        // `i + base + bom_len` is.
+        Utf16 {
+            phase: (base + dialect.bom_len) % 2,
+            big_endian: dialect.code_unit == CodeUnit::Utf16Be,
+        }
+    }
 
     fn find3(
         &self,
@@ -171,6 +195,53 @@ impl Units for Utf16 {
         // odd byte, which isn't one).
         let (units, _odd) = bytes[from..to].as_chunks::<2>();
         units.iter().filter(|&&unit| unit == pair).count()
+    }
+}
+
+/// Part of the file: `bytes` are the file's bytes from offset `base` on.
+/// Its methods take and return offsets into the whole file, so the scanner
+/// never has to know where the slice starts.
+pub(crate) struct View<'a, U> {
+    bytes: &'a [u8],
+    base: usize,
+    units: U,
+}
+
+impl<'a, U: Units> View<'a, U> {
+    /// The view of `bytes`, which start at offset `base` of a file written
+    /// in `dialect`.
+    pub(crate) fn new(bytes: &'a [u8], base: usize, dialect: IndexDialect) -> Self {
+        View {
+            bytes,
+            base,
+            units: U::at(dialect, base),
+        }
+    }
+
+    fn find3(&self, from: usize, to: usize, abc: [u8; 3]) -> Option<(usize, u8)> {
+        let (at, value) = self
+            .units
+            .find3(self.bytes, from - self.base, to - self.base, abc)?;
+        Some((at + self.base, value))
+    }
+
+    fn find1(&self, from: usize, to: usize, a: u8) -> Option<usize> {
+        let at = self
+            .units
+            .find1(self.bytes, from - self.base, to - self.base, a)?;
+        Some(at + self.base)
+    }
+
+    /// False for a position outside the view, as for one past the end of
+    /// the file.
+    fn is(&self, pos: usize, value: u8) -> bool {
+        pos.checked_sub(self.base)
+            .is_some_and(|at| self.units.is(self.bytes, at, value))
+    }
+
+    fn count(&self, from: usize, to: usize, value: u8) -> usize {
+        self.units
+            .count(self.bytes, from - self.base, to - self.base, value)
     }
 }
 
@@ -265,9 +336,9 @@ pub(crate) struct Summary {
     pub unterminated_quote: Option<usize>,
 }
 
-struct Scanner<'a, U> {
-    bytes: &'a [u8],
-    units: U,
+struct Scanner<U> {
+    /// The file's length.
+    len: usize,
     delimiter: u8,
     quote: u8,
     /// The next unit to look at.
@@ -284,13 +355,13 @@ struct Scanner<'a, U> {
     /// Row starts found since the last chunk was published.
     new_starts: Vec<u32>,
     unterminated_quote: Option<usize>,
+    units: PhantomData<U>,
 }
 
-impl<'a, U: Units> Scanner<'a, U> {
-    fn new(bytes: &'a [u8], units: U, dialect: IndexDialect) -> Self {
+impl<U: Units> Scanner<U> {
+    fn new(len: usize, dialect: IndexDialect) -> Self {
         Scanner {
-            bytes,
-            units,
+            len,
             delimiter: dialect.delimiter,
             quote: dialect.quote,
             pos: dialect.bom_len,
@@ -301,23 +372,28 @@ impl<'a, U: Units> Scanner<'a, U> {
             counts: FieldCounts::default(),
             new_starts: Vec::new(),
             unterminated_quote: None,
+            units: PhantomData,
         }
     }
 
-    /// Scans until `pos` reaches `to`. It can stop a unit or two past `to`,
-    /// when it looks ahead for the LF of a CRLF or the second quote of `""`;
-    /// the next chunk carries on from there.
-    fn scan<O: RowObserver>(&mut self, to: usize, observer: &mut O) {
+    /// Scans until `pos` reaches `to`, which is on a code unit boundary or
+    /// at the end of the file. It can stop a unit past `to`, when it looks
+    /// ahead for the LF of a CRLF or the second quote of `""`; the next
+    /// chunk carries on from there.
+    ///
+    /// `view` must hold the unit before `pos` (if there is one), and
+    /// everything from `pos` to one unit past `to`, or to the end of the
+    /// file if that is sooner.
+    fn scan<O: RowObserver>(&mut self, view: &View<'_, U>, to: usize, observer: &mut O) {
         let w = U::WIDTH;
-        let bytes = self.bytes;
         while self.pos < to {
             if self.open_quote.is_some() {
                 // Inside a quoted field: only a quote matters.
-                let Some(q) = self.units.find1(bytes, self.pos, to, self.quote) else {
+                let Some(q) = view.find1(self.pos, to, self.quote) else {
                     self.pos = to;
                     break;
                 };
-                if self.units.is(bytes, q + w, self.quote) {
+                if view.is(q + w, self.quote) {
                     // `""`: an escaped quote.
                     self.pos = q + 2 * w;
                 } else {
@@ -332,9 +408,9 @@ impl<'a, U: Units> Scanner<'a, U> {
             }
 
             // Outside quotes: the next quote, CR or LF.
-            let found = self.units.find3(bytes, self.pos, to, [self.quote, CR, LF]);
+            let found = view.find3(self.pos, to, [self.quote, CR, LF]);
             let end = found.map_or(to, |(at, _)| at);
-            self.fields += self.units.count(bytes, self.pos, end, self.delimiter);
+            self.fields += view.count(self.pos, end, self.delimiter);
             let Some((at, value)) = found else {
                 self.pos = to;
                 break;
@@ -342,14 +418,14 @@ impl<'a, U: Units> Scanner<'a, U> {
             if value == LF {
                 self.end_row(at, Some(LineEnding::Lf), at + w, observer);
             } else if value == CR {
-                if self.units.is(bytes, at + w, LF) {
+                if view.is(at + w, LF) {
                     self.end_row(at, Some(LineEnding::Crlf), at + 2 * w, observer);
                 } else {
                     self.end_row(at, Some(LineEnding::Cr), at + w, observer);
                 }
             } else {
                 // A quote opens a field only as its first unit.
-                if at == self.row_start || self.units.is(bytes, at - w, self.delimiter) {
+                if at == self.row_start || view.is(at - w, self.delimiter) {
                     self.open_quote = Some(at);
                 }
                 // Otherwise it is literal: in an unquoted field (`a"b`), or
@@ -361,7 +437,7 @@ impl<'a, U: Units> Scanner<'a, U> {
 
     /// The end of the file: the last row, if it has no line ending.
     fn finish<O: RowObserver>(&mut self, observer: &mut O) {
-        let len = self.bytes.len();
+        let len = self.len;
         if let Some(open) = self.open_quote.take() {
             // HOOK(1.5): the unterminated quote diagnostic.
             self.unterminated_quote = Some(open);
@@ -413,7 +489,6 @@ impl<'a, U: Units> Scanner<'a, U> {
 pub(crate) fn run<U: Units, O: RowObserver>(
     index: &RowIndex,
     bytes: &[u8],
-    units: U,
     cancel: &AtomicBool,
     chunk_bytes: usize,
     mut on_progress: impl FnMut(Progress),
@@ -422,7 +497,8 @@ pub(crate) fn run<U: Units, O: RowObserver>(
     let dialect = index.dialect;
     let len = bytes.len();
     let step = chunk_bytes.max(1).next_multiple_of(U::WIDTH);
-    let mut scanner = Scanner::new(bytes, units, dialect);
+    let view = View::<U>::new(bytes, 0, dialect);
+    let mut scanner = Scanner::<U>::new(len, dialect);
     index.begin(len);
     let mut boundary = dialect.bom_len;
     loop {
@@ -432,7 +508,7 @@ pub(crate) fn run<U: Units, O: RowObserver>(
             return Err(IndexError::Cancelled);
         }
         boundary = boundary.saturating_add(step).min(len);
-        scanner.scan(boundary, observer);
+        scanner.scan(&view, boundary, observer);
         let done = boundary == len;
         if done {
             scanner.finish(observer);
@@ -446,51 +522,134 @@ pub(crate) fn run<U: Units, O: RowObserver>(
     }
 }
 
+/// The scan of a file that arrives in chunks, in order ([`Source::stream`]
+/// on a removable drive, ADR-0006). Each chunk is scanned as far as it can
+/// be without the next one, which is all of it but its last unit: a CR
+/// there may be half of a CRLF, and a quote half of a `""`. Those few
+/// bytes, and the unit before the scanner's position, are kept for the
+/// next chunk; nothing else is.
+///
+/// [`Source::stream`]: crate::source::Source::stream
+pub(crate) struct Chunked<U> {
+    scanner: Scanner<U>,
+    dialect: IndexDialect,
+    /// The bytes kept from earlier chunks, then the chunk being scanned.
+    /// They start at `window_base` in the file.
+    window: Vec<u8>,
+    window_base: usize,
+}
+
+impl<U: Units> Chunked<U> {
+    /// Starts a scan of a `len`-byte file into `index`.
+    pub(crate) fn new(index: &RowIndex, len: usize) -> Self {
+        index.begin(len);
+        let dialect = index.dialect;
+        Chunked {
+            scanner: Scanner::new(len, dialect),
+            dialect,
+            window: Vec::new(),
+            window_base: 0,
+        }
+    }
+
+    /// How many bytes have arrived so far.
+    pub(crate) fn received(&self) -> usize {
+        self.window_base + self.window.len()
+    }
+
+    /// Scans the next chunk, which follows the last one in the file, and
+    /// publishes the rows it finished. The caller has checked that the
+    /// chunk fits in the file.
+    pub(crate) fn push<O: RowObserver>(
+        &mut self,
+        index: &RowIndex,
+        chunk: &[u8],
+        observer: &mut O,
+    ) -> Progress {
+        let w = U::WIDTH;
+        self.window.extend_from_slice(chunk);
+        let end = self.received();
+        // Leave the last unit for the next chunk, and stop on a unit
+        // boundary (units start at the end of the BOM).
+        let bom_len = self.dialect.bom_len;
+        let to = end
+            .saturating_sub(w)
+            .checked_sub(bom_len)
+            .map(|past| bom_len + past - past % w);
+        if let Some(to) = to.filter(|&to| to > self.scanner.pos) {
+            let view = View::<U>::new(&self.window, self.window_base, self.dialect);
+            self.scanner.scan(&view, to, observer);
+        }
+        // Keep the unit before the scanner's position and everything after
+        // it: at most a few units, since the scan got to within two of the
+        // end.
+        let keep_from = self
+            .scanner
+            .pos
+            .saturating_sub(w)
+            .clamp(self.window_base, end);
+        self.window.drain(..keep_from - self.window_base);
+        self.window_base = keep_from;
+        let summary = self.scanner.summary();
+        index.publish(&mut self.scanner.new_starts, &summary, false)
+    }
+
+    /// Scans what is left once every chunk has arrived, ends the last row
+    /// and marks the index complete.
+    pub(crate) fn finish<O: RowObserver>(mut self, index: &RowIndex, observer: &mut O) -> Progress {
+        let len = self.scanner.len;
+        if len > self.scanner.pos {
+            let view = View::<U>::new(&self.window, self.window_base, self.dialect);
+            self.scanner.scan(&view, len, observer);
+        }
+        self.scanner.finish(observer);
+        let summary = self.scanner.summary();
+        index.publish(&mut self.scanner.new_starts, &summary, true)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reading line endings back
 
 /// The line ending at the end of the row extent `start..next`, read from
-/// the bytes. Every row but the last ends in one. The last row has one only
-/// if its last unit is CR or LF: it can't end in CR or LF otherwise, except
+/// `window`, the file's bytes from `base` on, which must hold the extent.
+/// Every row but the last ends in one. The last row has one only if its
+/// last unit is CR or LF: it can't end in CR or LF otherwise, except
 /// inside an unterminated quote, which the caller handles.
 pub(crate) fn line_ending_before(
-    bytes: &[u8],
+    window: &[u8],
+    base: usize,
     dialect: IndexDialect,
     start: usize,
     next: usize,
 ) -> Option<LineEnding> {
     match dialect.code_unit {
-        CodeUnit::Byte => line_ending_in(&Bytes, bytes, start, next),
+        CodeUnit::Byte => line_ending_in(&View::<Bytes>::new(window, base, dialect), start, next),
         CodeUnit::Utf16Le | CodeUnit::Utf16Be => {
             // A final odd byte in UTF-16 isn't a whole unit, so a row that
             // ends with one has no line ending.
             if !(next - dialect.bom_len).is_multiple_of(2) {
                 return None;
             }
-            line_ending_in(&Utf16::new(dialect), bytes, start, next)
+            line_ending_in(&View::<Utf16>::new(window, base, dialect), start, next)
         }
     }
 }
 
-fn line_ending_in<U: Units>(
-    units: &U,
-    bytes: &[u8],
-    start: usize,
-    next: usize,
-) -> Option<LineEnding> {
+fn line_ending_in<U: Units>(view: &View<'_, U>, start: usize, next: usize) -> Option<LineEnding> {
     let w = U::WIDTH;
     let last = next.checked_sub(w).filter(|&p| p >= start)?;
-    if units.is(bytes, last, LF) {
+    if view.is(last, LF) {
         // A CR straight before an LF is always part of one CRLF.
         let crlf = last
             .checked_sub(w)
-            .is_some_and(|p| p >= start && units.is(bytes, p, CR));
+            .is_some_and(|p| p >= start && view.is(p, CR));
         Some(if crlf {
             LineEnding::Crlf
         } else {
             LineEnding::Lf
         })
-    } else if units.is(bytes, last, CR) {
+    } else if view.is(last, CR) {
         Some(LineEnding::Cr)
     } else {
         None
@@ -528,7 +687,7 @@ mod tests {
             (true, b"\xFE\xFF\x0A\x22\x22\x0A\x00\x0A".as_slice()),
         ] {
             let units = Utf16 {
-                base: 2,
+                phase: 0,
                 big_endian,
             };
             assert_eq!(units.find1(bytes, 2, bytes.len(), LF), Some(6));

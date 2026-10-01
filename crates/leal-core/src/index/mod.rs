@@ -101,6 +101,8 @@
 //! - The **whole-file encoding count** (ADR-0003 decision 1) runs later as
 //!   P2 work, not here (ADR-0005 decision 4).
 
+#[cfg(test)]
+mod chunked_tests;
 pub(crate) mod scan;
 #[cfg(test)]
 mod tests;
@@ -223,6 +225,14 @@ pub enum IndexError {
     },
     /// The cancel flag was set.
     Cancelled,
+    /// A [`ChunkedIndexer`] was given more bytes than the file's length,
+    /// or finished before it had them all.
+    WrongLength {
+        /// The file's length, as given to [`Indexer::chunked`].
+        expected: usize,
+        /// The bytes given so far.
+        received: usize,
+    },
 }
 
 impl fmt::Display for IndexError {
@@ -242,6 +252,10 @@ impl fmt::Display for IndexError {
                 "the file is {len} bytes; Leal reads files of up to {MAX_FILE_BYTES} bytes"
             ),
             IndexError::Cancelled => f.write_str("indexing was cancelled"),
+            IndexError::WrongLength { expected, received } => write!(
+                f,
+                "the index was given {received} bytes of a {expected}-byte file"
+            ),
         }
     }
 }
@@ -397,8 +411,45 @@ impl RowIndex {
         if bytes.len() != state.len {
             return None;
         }
+        self.row_from(&state, row, bytes, 0)
+    }
+
+    /// [`row`](Self::row), reading the line ending from `window`: the
+    /// file's bytes from offset `base` on, rather than the whole file. This
+    /// is for a file that has no single slice yet (one on a removable drive,
+    /// ADR-0006), whose rows are read with
+    /// [`Source::read_range`](crate::source::Source::read_range), one range
+    /// per screenful.
+    ///
+    /// `None` if the row isn't indexed (yet), or `window` doesn't hold all
+    /// of its [extent](Self::row_extent). As with `row`, the window must
+    /// come from the file that was indexed.
+    ///
+    /// ```
+    /// use leal_core::index::{CodeUnit, IndexDialect, LineEnding, RowIndex};
+    ///
+    /// let bytes = b"id,name\r\n1,Ada\r\n2,Bob\r\n";
+    /// let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+    /// let index = RowIndex::build(bytes, dialect)?;
+    /// let extent = index.row_extent(1).unwrap();
+    /// // Only row 1's bytes, as a read of its extent gives them.
+    /// let window = &bytes[extent.clone()];
+    /// let row = index.row_in(1, window, extent.start).unwrap();
+    /// assert_eq!((row.span, row.line_ending), (9..14, Some(LineEnding::Crlf)));
+    /// assert_eq!(index.row_in(2, window, extent.start), None);
+    /// # Ok::<(), leal_core::index::IndexError>(())
+    /// ```
+    #[must_use]
+    pub fn row_in(&self, row: usize, window: &[u8], base: usize) -> Option<RowSpan> {
+        self.row_from(&self.read(), row, window, base)
+    }
+
+    fn row_from(&self, state: &State, row: usize, window: &[u8], base: usize) -> Option<RowSpan> {
         let start = to_usize(*state.starts.get(row)?);
         let next = to_usize(*state.starts.get(row + 1)?);
+        if start < base || next > base.saturating_add(window.len()) {
+            return None;
+        }
         let is_last = state.status == Status::Complete && row + 2 == state.starts.len();
         if is_last && state.unterminated_quote.is_some() {
             // The last row's final newline, if any, is inside the field.
@@ -407,12 +458,25 @@ impl RowIndex {
                 line_ending: None,
             });
         }
-        let line_ending = scan::line_ending_before(bytes, self.dialect, start, next);
+        let line_ending = scan::line_ending_before(window, base, self.dialect, start, next);
         let len = line_ending.map_or(0, |le| scan::line_ending_len(le, self.dialect.code_unit));
         Some(RowSpan {
             span: start..next - len,
             line_ending,
         })
+    }
+
+    /// The extent of rows `rows` together, from the first one's start to
+    /// the last one's end, including its line ending: the one range to read
+    /// for a screenful. `None` if `rows` is empty or its last row isn't
+    /// indexed (yet).
+    #[must_use]
+    pub fn rows_extent(&self, rows: Range<usize>) -> Option<Range<usize>> {
+        let state = self.read();
+        let last = rows.end.checked_sub(1).filter(|&last| last >= rows.start)?;
+        let start = *state.starts.get(rows.start)?;
+        let end = *state.starts.get(last + 1)?;
+        Some(to_usize(start)..to_usize(end))
     }
 
     /// The most common field count among non-blank rows, with ties going to
@@ -525,6 +589,160 @@ impl Indexer {
     }
 }
 
+impl Indexer {
+    /// Indexes a `len`-byte file that arrives in chunks, in order, rather
+    /// than as one slice: a file on a removable drive, indexed from
+    /// [`Source::stream`](crate::source::Source::stream) in the same pass
+    /// that copies it to the internal disk (ADR-0006). Give it each chunk
+    /// with [`ChunkedIndexer::push`], then call
+    /// [`ChunkedIndexer::finish`]. The rows are exactly those
+    /// [`run`](Self::run) finds over the whole file, wherever the chunks
+    /// are cut.
+    ///
+    /// ```
+    /// use leal_core::index::{CodeUnit, IndexDialect, RowIndex, Status};
+    ///
+    /// let bytes = b"a,\"x\r\ny\"\r\nb,c\r\n";
+    /// let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+    /// let (index, indexer) = RowIndex::start(dialect)?;
+    /// let mut chunked = indexer.chunked(bytes.len())?;
+    /// // Cut inside the quoted CRLF, and between the last CR and LF.
+    /// for chunk in [&bytes[..5], &bytes[5..14], &bytes[14..]] {
+    ///     chunked.push(chunk)?;
+    /// }
+    /// chunked.finish()?;
+    /// assert_eq!(index.status(), Status::Complete);
+    /// assert_eq!(index.row_count(), 2);
+    /// assert_eq!(index.row(0, bytes).map(|r| r.span), Some(0..8));
+    /// # Ok::<(), leal_core::index::IndexError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::TooLarge`] or [`IndexError::BomPastEnd`].
+    pub fn chunked(self, len: usize) -> Result<ChunkedIndexer, IndexError> {
+        check_len(len)?;
+        let dialect = self.index.dialect;
+        if dialect.bom_len > len {
+            return Err(IndexError::BomPastEnd {
+                bom_len: dialect.bom_len,
+                len,
+            });
+        }
+        let scan = match dialect.code_unit {
+            CodeUnit::Byte => ChunkedScan::Bytes(scan::Chunked::new(&self.index, len)),
+            CodeUnit::Utf16Le | CodeUnit::Utf16Be => {
+                ChunkedScan::Utf16(scan::Chunked::new(&self.index, len))
+            }
+        };
+        Ok(ChunkedIndexer {
+            indexer: self,
+            scan,
+            len,
+        })
+    }
+}
+
+/// An [`Indexer`] that is given the file in chunks: see
+/// [`Indexer::chunked`]. Dropping it before [`finish`](Self::finish) leaves
+/// the index [`Status::Stopped`], with the rows found so far.
+pub struct ChunkedIndexer {
+    indexer: Indexer,
+    scan: ChunkedScan,
+    len: usize,
+}
+
+/// The chunked scan, for the file's code unit.
+enum ChunkedScan {
+    Bytes(scan::Chunked<Bytes>),
+    Utf16(scan::Chunked<Utf16>),
+}
+
+impl ChunkedIndexer {
+    /// Scans the next chunk of the file and publishes the rows it finished,
+    /// as [`Indexer::run`] does after each of its chunks. The chunk may be
+    /// any length, even empty; a chunk can end in the middle of a CRLF, a
+    /// `""` or a UTF-16 code unit.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::WrongLength`] if the chunks so far would be longer
+    /// than the file. The chunk is then not scanned.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Progress, IndexError> {
+        self.push_observed(chunk, &mut NoObserver)
+    }
+
+    /// [`push`](Self::push), telling `observer` about every row it finds.
+    /// SEAM(1.5): this is where the diagnostics collector joins the pass
+    /// for a file read in chunks, as it joins [`fill`] for a mapped one.
+    pub(crate) fn push_observed<O: RowObserver>(
+        &mut self,
+        chunk: &[u8],
+        observer: &mut O,
+    ) -> Result<Progress, IndexError> {
+        let received = self.received().saturating_add(chunk.len());
+        if received > self.len {
+            return Err(IndexError::WrongLength {
+                expected: self.len,
+                received,
+            });
+        }
+        let index = &self.indexer.index;
+        Ok(match &mut self.scan {
+            ChunkedScan::Bytes(scan) => scan.push(index, chunk, observer),
+            ChunkedScan::Utf16(scan) => scan.push(index, chunk, observer),
+        })
+    }
+
+    /// How many bytes have been given so far.
+    #[must_use]
+    pub fn received(&self) -> usize {
+        match &self.scan {
+            ChunkedScan::Bytes(scan) => scan.received(),
+            ChunkedScan::Utf16(scan) => scan.received(),
+        }
+    }
+
+    /// Ends the last row and marks the index [`Status::Complete`], once
+    /// every byte of the file has been given.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::WrongLength`] if fewer bytes than the file's length
+    /// were given. The index is then [`Status::Stopped`].
+    pub fn finish(self) -> Result<Progress, IndexError> {
+        self.finish_observed(&mut NoObserver)
+    }
+
+    /// [`finish`](Self::finish), telling `observer` about the last row.
+    pub(crate) fn finish_observed<O: RowObserver>(
+        self,
+        observer: &mut O,
+    ) -> Result<Progress, IndexError> {
+        let received = self.received();
+        if received != self.len {
+            return Err(IndexError::WrongLength {
+                expected: self.len,
+                received,
+            });
+        }
+        let ChunkedIndexer { indexer, scan, .. } = self;
+        Ok(match scan {
+            ChunkedScan::Bytes(scan) => scan.finish(&indexer.index, observer),
+            ChunkedScan::Utf16(scan) => scan.finish(&indexer.index, observer),
+        })
+    }
+}
+
+impl fmt::Debug for ChunkedIndexer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChunkedIndexer")
+            .field("len", &self.len)
+            .field("received", &self.received())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for Indexer {
     fn drop(&mut self) {
         let mut state = self.index.write();
@@ -553,24 +771,12 @@ fn fill<O: RowObserver>(
         });
     }
     match dialect.code_unit {
-        CodeUnit::Byte => scan::run(
-            index,
-            bytes,
-            Bytes,
-            cancel,
-            chunk_bytes,
-            on_progress,
-            observer,
-        ),
-        CodeUnit::Utf16Le | CodeUnit::Utf16Be => scan::run(
-            index,
-            bytes,
-            Utf16::new(dialect),
-            cancel,
-            chunk_bytes,
-            on_progress,
-            observer,
-        ),
+        CodeUnit::Byte => {
+            scan::run::<Bytes, O>(index, bytes, cancel, chunk_bytes, on_progress, observer)
+        }
+        CodeUnit::Utf16Le | CodeUnit::Utf16Be => {
+            scan::run::<Utf16, O>(index, bytes, cancel, chunk_bytes, on_progress, observer)
+        }
     }
 }
 

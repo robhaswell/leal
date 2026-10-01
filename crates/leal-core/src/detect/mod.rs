@@ -521,6 +521,28 @@ pub fn review(
     detection: &Detection,
     cancel: &AtomicBool,
 ) -> Result<Review, Cancelled> {
+    review_with(file, detection, || {
+        if cancel.load(Ordering::Relaxed) {
+            Err(Cancelled)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// [`review`], calling `checkpoint` before each chunk instead of checking a
+/// cancel flag. The scheduler (task 1.3a) passes its job's checkpoint,
+/// which also pauses the review while the user is scrolling or editing
+/// (DESIGN §3.10 rule 3). The review stops with the checkpoint's error.
+///
+/// # Errors
+///
+/// [`Cancelled`] if `checkpoint` returned it.
+pub fn review_with(
+    file: &[u8],
+    detection: &Detection,
+    mut checkpoint: impl FnMut() -> Result<(), Cancelled>,
+) -> Result<Review, Cancelled> {
     let body = &file[detection.bom.len().min(file.len())..];
     let encoding = detection.encoding;
     let in_use = detection.delimiter;
@@ -556,9 +578,7 @@ pub fn review(
 
     let mut start = 0;
     while start < body.len() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Cancelled);
-        }
+        checkpoint()?;
         let end = chunk_end(body, start, REVIEW_CHUNK_BYTES, encoding);
         let chunk = &body[start..end];
         if count_utf8 {
