@@ -20,6 +20,13 @@ mkdir -p runs
 caffeinate -d -w $$ &
 (while kill -0 $$ 2>/dev/null; do caffeinate -u -t 20; done) &
 
+# Run a command, killing it (SIGALRM) if it is still running after $1 seconds.
+# Like GNU `timeout`, which macOS doesn't ship. `exec` keeps the pending alarm,
+# so the alarm ends the command itself; it then exits with status 142.
+with_timeout() {
+  perl -e 'alarm shift; exec @ARGV or die "exec $ARGV[0]: $!\n"' "$@"
+}
+
 impl_for() {
   case $1 in
     A) echo table ;;
@@ -40,7 +47,7 @@ case "${1:-run}" in
 compare)
   for v in C B A; do
     prepare
-    timeout 900 "$APP" --impl "$(impl_for $v)" --cols 200 --speed 60000 --fling-rows 20000 --bench \
+    with_timeout 900 "$APP" --impl "$(impl_for $v)" --cols 200 --speed 60000 --fling-rows 20000 --bench \
       --out "$PWD/runs/compare-$v.json" 2>/dev/null
   done
   python3 - <<'PY'
@@ -78,7 +85,7 @@ run)
           echo "$(date +%H:%M:%S) run $i: $prof $v $cols"
           prepare
           # shellcheck disable=SC2086
-          timeout 900 "$APP" --impl "$(impl_for $v)" --cols "$cols" $P --bench \
+          with_timeout 900 "$APP" --impl "$(impl_for $v)" --cols "$cols" $P --bench \
             --out "$PWD/runs/run-$v-$cols-$prof-$i.json" 2>/dev/null || echo "  run failed or timed out"
           sleep 2
         done
