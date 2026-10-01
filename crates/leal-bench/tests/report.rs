@@ -252,9 +252,10 @@ fn a_regression_needs_the_interval_above_the_threshold() {
     assert_eq!(report.verdict(), Verdict::Fail);
 }
 
-/// A real regression on a quiet run fails, on any attempt.
+/// A regression on a quiet first attempt is rerun to confirm it. If that
+/// was the only attempt (`--last-attempt`, with no rerun), it fails.
 #[test]
-fn a_regression_on_a_quiet_run_fails() {
+fn a_regression_on_a_quiet_run_is_rerun_then_fails() {
     let found = [
         measurement("baseline/memchr3_scan", 47e6, Some(change(0.03))),
         measurement("baseline-late/memchr3_scan", 47e6, Some(change(-0.04))),
@@ -263,10 +264,117 @@ fn a_regression_on_a_quiet_run_fails() {
     let report = report::evaluate(&found, &[], CI);
     assert!(!report.noisy);
     assert_eq!(status_of(&report, "index/build"), &Status::Regression);
-    for last_attempt in [false, true] {
-        let outcome = report.outcome(last_attempt);
-        assert_eq!(outcome, Outcome::Fail, "last attempt: {last_attempt}");
-        assert_eq!(outcome.exit_code(), 1);
+    assert_eq!(report.verdict(), Verdict::Fail);
+    assert_eq!(report.outcome(false), Outcome::Rerun);
+    assert_eq!(report.outcome(false).exit_code(), 3);
+    assert_eq!(report.outcome(true), Outcome::Fail);
+    assert_eq!(report.outcome(true).exit_code(), 1);
+}
+
+/// One attempt's results: the two canaries moved by `early` and `late`,
+/// `index/build` (budget 500 ms) at `build_ms` and changed by
+/// `build_change`, and `rows/parse` changed by `parse_change`.
+fn attempt(
+    early: f64,
+    late: f64,
+    build_ms: f64,
+    build_change: f64,
+    parse_change: f64,
+) -> report::Report {
+    let budgets = [Budget {
+        id: "index/build",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    }];
+    let found = [
+        measurement("baseline/memchr3_scan", 47e6, Some(change(early))),
+        measurement("baseline-late/memchr3_scan", 47e6, Some(change(late))),
+        measurement("index/build", build_ms * 1e6, Some(change(build_change))),
+        measurement("rows/parse", 12e3, Some(change(parse_change))),
+    ];
+    report::evaluate(&found, &budgets, CI)
+}
+
+/// A regression on both attempts fails, whether either was noisy or not.
+#[test]
+fn a_regression_on_every_attempt_fails() {
+    for first_canary in [0.02, -0.15] {
+        let first = attempt(first_canary, 0.01, 300.0, 0.0, 0.35);
+        assert_eq!(first.outcome(false), Outcome::Rerun);
+        for rerun_canary in [0.03, 0.16] {
+            let rerun = attempt(0.01, rerun_canary, 300.0, 0.0, 0.33).after(&first);
+            assert_eq!(status_of(&rerun, "rows/parse"), &Status::Regression);
+            assert!(rerun.unconfirmed.is_empty());
+            let outcome = rerun.outcome(true);
+            assert_eq!(
+                outcome,
+                Outcome::Fail,
+                "canaries {first_canary} then {rerun_canary}"
+            );
+            assert_eq!(outcome.exit_code(), 1);
+        }
+    }
+}
+
+/// A regression only on the rerun isn't judged: the run is inconclusive.
+/// This was main at `ed09773`: attempt 1 was noisy (a canary at −15%) with
+/// no regression, and attempt 2 showed +30% in code identical on both
+/// sides, with the late canary at +10.0%, just under the noise limit.
+#[test]
+fn a_regression_only_on_the_rerun_is_inconclusive() {
+    let first = attempt(-0.153, 0.043, 300.0, 0.0, -0.08);
+    assert!(first.noisy);
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+    for rerun_canary in [0.10, 0.16] {
+        let rerun = attempt(0.044, rerun_canary, 300.0, 0.0, 0.307).after(&first);
+        assert_eq!(
+            status_of(&rerun, "rows/parse"),
+            &Status::UnconfirmedRegression
+        );
+        let outcome = rerun.outcome(true);
+        assert_eq!(outcome, Outcome::Inconclusive, "late canary {rerun_canary}");
+        assert_eq!(outcome.exit_code(), 0);
+    }
+}
+
+/// A regression only on the first attempt passes if the rerun is quiet,
+/// and is inconclusive if the rerun is noisy.
+#[test]
+fn a_regression_only_on_the_first_attempt() {
+    let first = attempt(0.02, 0.01, 300.0, 0.0, 0.35);
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+
+    let quiet = attempt(0.01, -0.02, 300.0, 0.0, 0.01).after(&first);
+    assert_eq!(status_of(&quiet, "rows/parse"), &Status::Ok);
+    assert_eq!(quiet.unconfirmed, ["rows/parse"]);
+    assert_eq!(quiet.outcome(true), Outcome::Pass);
+    assert!(
+        quiet.markdown().contains(
+            "Regressed on attempt 1 but not on this attempt, so not failed: `rows/parse`."
+        ),
+        "{}",
+        quiet.markdown()
+    );
+
+    let noisy = attempt(0.01, 0.16, 300.0, 0.0, 0.01).after(&first);
+    assert_eq!(noisy.unconfirmed, ["rows/parse"]);
+    assert_eq!(noisy.outcome(true), Outcome::Inconclusive);
+}
+
+/// A budget fails on either attempt, noisy or not, with or without a
+/// regression.
+#[test]
+fn a_budget_fails_on_either_attempt() {
+    for canary in [0.02, 0.16] {
+        // On the first attempt: no rerun.
+        let first = attempt(canary, 0.01, 501.0, 0.0, 0.35);
+        assert_eq!(first.outcome(false), Outcome::Fail, "canary {canary}");
+
+        // On the rerun, after a first attempt within budget.
+        let first = attempt(canary, 0.01, 300.0, 0.0, 0.35);
+        let rerun = attempt(0.01, canary, 501.0, 0.0, 0.0).after(&first);
+        assert_eq!(status_of(&rerun, "index/build"), &Status::OverBudget);
+        assert_eq!(rerun.outcome(true), Outcome::Fail, "canary {canary}");
     }
 }
 
@@ -507,7 +615,7 @@ fn bench_report_passes_a_noisy_last_attempt_with_a_warning() {
     let (code, stdout, summary) = run_bench_report(&dir, false);
     assert_eq!(code, Some(3), "{stdout}");
     assert!(
-        summary.contains("## Benchmarks: noisy, rerunning"),
+        summary.contains("## Benchmarks: rerunning to confirm"),
         "{summary}"
     );
 
@@ -535,6 +643,91 @@ fn bench_report_fails_a_budget_on_a_noisy_last_attempt() {
         "{stdout}"
     );
     assert!(summary.contains("## Benchmarks: fail"), "{summary}");
+}
+
+/// Runs `bench-report --first-attempt <dir>/first/criterion` on
+/// `<dir>/criterion`, as `just bench-compare` does for the rerun.
+fn run_bench_report_rerun(dir: &Path) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bench-report"))
+        .arg("--first-attempt")
+        .arg(dir.join("first").join("criterion"))
+        .arg(dir.join("criterion"))
+        .env("GITHUB_ACTIONS", "true")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+    )
+}
+
+/// The rerun, given the first attempt's results: a regression on both
+/// fails; one only on the rerun is inconclusive; one only on the first
+/// attempt passes when the rerun is quiet.
+#[test]
+fn bench_report_fails_a_regression_only_on_every_attempt() {
+    let regressed = |dir: &Path| {
+        write_bench(
+            &dir.join("criterion"),
+            "rows/parse",
+            12e3,
+            None,
+            Some(change(0.31)),
+        );
+    };
+    let held = |dir: &Path| {
+        write_bench(
+            &dir.join("criterion"),
+            "rows/parse",
+            12e3,
+            None,
+            Some(change(0.01)),
+        );
+    };
+
+    let dir = scratch("bin-rerun-both");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    regressed(&dir.join("first"));
+    write_run(&dir, 0.6, -0.01);
+    regressed(&dir);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("::error::benchmark rows/parse is a regression"),
+        "{stdout}"
+    );
+
+    let dir = scratch("bin-rerun-only");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    held(&dir.join("first"));
+    write_run(&dir, 0.6, 0.10);
+    regressed(&dir);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(!stdout.contains("::error::"), "{stdout}");
+    assert!(
+        stdout.contains("::warning::benchmarks inconclusive"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("regression? (not on attempt 1)"),
+        "{stdout}"
+    );
+
+    let dir = scratch("bin-rerun-first-only");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    regressed(&dir.join("first"));
+    write_run(&dir, 0.6, -0.01);
+    held(&dir);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(!stdout.contains("::error::"), "{stdout}");
+    assert!(!stdout.contains("inconclusive"), "{stdout}");
+    assert!(
+        stdout.contains("benchmark rows/parse regressed on attempt 1 but not on the rerun"),
+        "{stdout}"
+    );
 }
 
 /// A quiet run within budget passes, whatever `sequential_read` did.

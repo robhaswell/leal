@@ -96,13 +96,16 @@ jobs:
           BASE: ${{ steps.base.outputs.sha }}
         run: just bench-compare "$BASE"
 
-      # The numbers, for the record: criterion's JSON for both sides.
+      # The numbers, for the record: criterion's JSON for both sides, and
+      # the first attempt's if there was a rerun.
       - name: Upload criterion results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: criterion-${{ github.sha }}
-          path: target/bench-compare/criterion
+          path: |
+            target/bench-compare/criterion
+            target/bench-compare/criterion-attempt-1
           retention-days: 90
           if-no-files-found: ignore
 
@@ -110,4 +113,4 @@ jobs:
       # Rust cache, which is saved after the last step.
       - name: Remove generated files
         if: always()
-        run: rm -rf target/bench-data target/bench-compare/base target/bench-compare/criterion
+        run: rm -rf target/bench-data target/bench-compare/base target/bench-compare/criterion target/bench-compare/criterion-attempt-1

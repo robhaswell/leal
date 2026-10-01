@@ -126,15 +126,23 @@ bench-compare base="main" regression="0.20" noise="0.10":
         )
     }
 
-    # A noisy run (a `memchr3_scan` canary moved) is rerun once. If the
-    # rerun is noisy too, bench-report (given --last-attempt) warns that the
-    # run is inconclusive and passes, unless a budget failed: a noisy runner
-    # is no reason to turn CI red (docs/tasks/1.2b.md).
+    # A noisy run (a `memchr3_scan` canary moved), or one with a regression,
+    # is rerun once. A budget fails on either attempt. A regression fails
+    # only if every attempt shows it: the rerun's bench-report is given the
+    # first attempt's results (--first-attempt). If the rerun is noisy, or
+    # shows a regression the first attempt didn't, bench-report warns that
+    # the run is inconclusive and passes: a noisy runner is no reason to
+    # turn CI red (docs/tasks/1.2b.md).
+    first="$work/criterion-attempt-1"
+    rm -rf "$first"
     for attempt in 1 2; do
-        # Unquoted where it's used, so that empty means no argument.
-        last_attempt=""
-        if [ "$attempt" = 2 ] || [ "$has_base" = no ]; then
-            last_attempt="--last-attempt"
+        # An array, so that empty means no argument. The `+` form keeps an
+        # empty one from tripping `set -u` in macOS's bash 3.2.
+        last_attempt=()
+        if [ "$has_base" = no ]; then
+            last_attempt=(--last-attempt)
+        elif [ "$attempt" = 2 ]; then
+            last_attempt=(--first-attempt "$first")
         fi
         rm -rf "$CRITERION_HOME"
         mkdir -p "$CRITERION_HOME"
@@ -152,11 +160,14 @@ bench-compare base="main" regression="0.20" noise="0.10":
 
         status=0
         cargo run --release --quiet --package leal-bench --bin bench-report -- \
-            --regression "{{ regression }}" --noise "{{ noise }}" $last_attempt \
+            --regression "{{ regression }}" --noise "{{ noise }}" ${last_attempt[@]+"${last_attempt[@]}"} \
             "$CRITERION_HOME" || status=$?
         case "$status" in
             0) exit 0 ;;
-            3) warn "bench-compare: a canary moved by more than {{ noise }}, so the run was too noisy to judge; rerunning both sides once" ;;
+            3)
+                warn "bench-compare: a canary moved by more than {{ noise }} or a benchmark regressed; rerunning both sides once (a regression fails only if the rerun shows it too)"
+                mv "$CRITERION_HOME" "$first"
+                ;;
             *) exit "$status" ;;
         esac
     done

@@ -25,9 +25,21 @@
 //! - **Pass** otherwise.
 //!
 //! [`Report::outcome`] turns the verdict into what `just bench-compare`
-//! does ([`Outcome`]): a noisy first attempt is rerun, and a noisy last
-//! attempt is **inconclusive**, which warns but passes. Failing the job
-//! because the runner was noisy would turn CI red for no reason.
+//! does ([`Outcome`]): a first attempt that is noisy or shows a regression
+//! is rerun, and a noisy last attempt is **inconclusive**, which warns but
+//! passes. Failing the job because the runner was noisy would turn CI red
+//! for no reason.
+//!
+//! **A regression fails only if every attempt shows it.** The rerun's
+//! report is judged with the first attempt's ([`Report::after`]). A
+//! benchmark whose whole interval is above the threshold on both fails,
+//! whether either attempt was noisy or not. One that regressed only on the
+//! rerun is inconclusive. One that regressed only on the first attempt
+//! passes if the rerun was quiet, and is inconclusive if it was noisy.
+//! Budgets fail on any attempt. On main at `ed09773`, the first attempt
+//! showed no regression. The rerun showed 13, in code that was identical
+//! on both sides, because noise began part-way through it
+//! (`docs/tasks/1.2b.md`).
 //!
 //! `sequential_read`, the other baseline benchmark, is reported for
 //! information only ([`Status::Info`]): it is no canary, has no budget and
@@ -128,10 +140,15 @@ pub enum Status {
     /// A baseline benchmark that isn't a canary (`sequential_read`):
     /// reported, never gated.
     Info,
-    /// Slower than the baseline past the threshold, on a quiet run. Fails.
+    /// Slower than the baseline past the threshold, on a quiet run; on a
+    /// rerun ([`Report::after`]), on the first attempt too, noisy or not.
+    /// On a first attempt it is rerun to confirm; on the last, it fails.
     Regression,
     /// As `Regression`, but on a noisy run, so it can't be judged.
     NoisyRegression,
+    /// A regression on the rerun that the first attempt didn't show, so it
+    /// isn't judged ([`Report::after`]).
+    UnconfirmedRegression,
     /// The median is over the benchmark's budget. Fails.
     OverBudget,
     /// A budgeted benchmark that has no result. Fails.
@@ -147,6 +164,7 @@ impl Status {
             Self::Info => "info (not gated)",
             Self::Regression => "**regression**",
             Self::NoisyRegression => "regression? (noisy run)",
+            Self::UnconfirmedRegression => "regression? (not on attempt 1)",
             Self::OverBudget => "**over budget**",
             Self::Missing => "**missing**",
         }
@@ -170,12 +188,13 @@ pub enum Verdict {
 pub enum Outcome {
     /// Nothing failed, and the run was quiet.
     Pass,
-    /// A budget failed, or a benchmark regressed on a quiet run.
+    /// A budget failed, or a benchmark regressed on every attempt.
     Fail,
-    /// The run was noisy, and this wasn't the last attempt: rerun.
+    /// The run was noisy or a benchmark regressed, and this wasn't the last
+    /// attempt: rerun.
     Rerun,
-    /// The last attempt was noisy too, and nothing failed: warn, but pass.
-    /// Regressions couldn't be judged.
+    /// Nothing failed, but the last attempt was noisy, or a benchmark
+    /// regressed on it and not on the first: warn, but pass.
     Inconclusive,
 }
 
@@ -197,7 +216,7 @@ impl Outcome {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
-            Self::Rerun => "noisy, rerunning",
+            Self::Rerun => "rerunning to confirm",
             Self::Inconclusive => "inconclusive",
         }
     }
@@ -225,6 +244,9 @@ pub struct Report {
     pub thresholds: Thresholds,
     /// True if a noise canary moved by more than the noise threshold.
     pub noisy: bool,
+    /// For a rerun ([`Report::after`]): the benchmarks that regressed on
+    /// the first attempt but not on this one, sorted by id.
+    pub unconfirmed: Vec<String>,
 }
 
 /// Reads every benchmark result under `dir`, sorted by id.
@@ -368,6 +390,7 @@ pub fn evaluate(
         rows,
         thresholds,
         noisy,
+        unconfirmed: Vec::new(),
     }
 }
 
@@ -387,17 +410,72 @@ impl Report {
         }
     }
 
-    /// What to do with this report. A noisy run is rerun, unless this was
-    /// the `last_attempt`: then it is inconclusive, and passes, because a
-    /// noisy runner is no reason to fail the job. A failure fails on any
-    /// attempt, noisy or not.
+    /// True if `id`'s whole interval was above the regression threshold
+    /// in this report, on a quiet run or a noisy one.
+    #[must_use]
+    pub fn regressed(&self, id: &str) -> bool {
+        self.rows.iter().any(|row| {
+            row.id == id
+                && matches!(
+                    row.status,
+                    Status::Regression | Status::NoisyRegression | Status::UnconfirmedRegression
+                )
+        })
+    }
+
+    /// This report, a rerun's, judged with the `first` attempt's. A
+    /// regression here counts ([`Status::Regression`], noisy or not) only
+    /// if `first` showed it too; otherwise it is
+    /// [`Status::UnconfirmedRegression`]. The first attempt's regressions
+    /// that this one doesn't show are listed in [`Report::unconfirmed`].
+    #[must_use]
+    pub fn after(mut self, first: &Report) -> Report {
+        for row in &mut self.rows {
+            if matches!(row.status, Status::Regression | Status::NoisyRegression) {
+                row.status = if first.regressed(&row.id) {
+                    Status::Regression
+                } else {
+                    Status::UnconfirmedRegression
+                };
+            }
+        }
+        self.unconfirmed = first
+            .rows
+            .iter()
+            .filter(|row| first.regressed(&row.id) && !self.regressed(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        self
+    }
+
+    /// What to do with this report.
+    ///
+    /// - A budget failure fails, on any attempt, noisy or not.
+    /// - Otherwise, before the `last_attempt`, a noisy run or a regression
+    ///   (noisy or not) is rerun, so that a regression fails only if every
+    ///   attempt shows it.
+    /// - On the last attempt, a [`Status::Regression`] fails. On a rerun
+    ///   ([`Report::after`]), that means the first attempt showed it too.
+    ///   A noisy run, or a regression on this attempt only, is
+    ///   inconclusive and passes: a noisy runner is no reason to fail the
+    ///   job.
     #[must_use]
     pub fn outcome(&self, last_attempt: bool) -> Outcome {
-        match self.verdict() {
-            Verdict::Pass => Outcome::Pass,
-            Verdict::Fail => Outcome::Fail,
-            Verdict::Noisy if last_attempt => Outcome::Inconclusive,
-            Verdict::Noisy => Outcome::Rerun,
+        let any = |wanted: &[Status]| self.rows.iter().any(|row| wanted.contains(&row.status));
+        if any(&[Status::OverBudget, Status::Missing]) {
+            Outcome::Fail
+        } else if !last_attempt {
+            if self.noisy || any(&[Status::Regression, Status::NoisyRegression]) {
+                Outcome::Rerun
+            } else {
+                Outcome::Pass
+            }
+        } else if any(&[Status::Regression]) {
+            Outcome::Fail
+        } else if self.noisy || any(&[Status::NoisyRegression, Status::UnconfirmedRegression]) {
+            Outcome::Inconclusive
+        } else {
+            Outcome::Pass
         }
     }
 
@@ -451,8 +529,8 @@ impl Report {
         }
         let _ = write!(
             out,
-            "\nA benchmark regressed if its change's whole 95% interval is above {}. \
-             The run is noisy if a canary (`{}` or `{}`) moved by more than {}. \
+            "\nA benchmark regressed if its change's whole 95% interval is above {}, \
+             and fails only if it regressed on every attempt. The run is noisy if a canary (`{}` or `{}`) moved by more than {}. \
              The other `baseline` benchmarks are information only.",
             percent(self.thresholds.regression),
             CANARIES[0],
@@ -461,6 +539,18 @@ impl Report {
         );
         if self.noisy {
             out.push_str(" **This run was noisy**, so regressions in it can't be judged.");
+        }
+        if !self.unconfirmed.is_empty() {
+            let ids: Vec<String> = self
+                .unconfirmed
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect();
+            let _ = write!(
+                out,
+                " Regressed on attempt 1 but not on this attempt, so not failed: {}.",
+                ids.join(", ")
+            );
         }
         out.push('\n');
         out
