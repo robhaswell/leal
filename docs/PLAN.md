@@ -270,11 +270,14 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     `phase-0` tag (ADR-0001). No code, script or CI job may refer to the
     folder afterwards, and the `spikes/` line comes out of DESIGN §7.
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
-- [~] **1.6a Scroll performance.** The 1.6 grid's main-thread work per
-  frame is about 3× the grid spike's (p50 about 4.5 ms against 1.4 ms on an
-  M5 Pro), from Core Animation redrawing layers. On the reference file 0.05–0.15%
-  of frames are late, and 0.5–0.8% at 200 columns. Find the cause, bring the cost close to the spike's, and
-  meet DESIGN §1's scroll budget. Must be done before the phase 1 gate.
+- [x] **1.6a Scroll performance.** Investigated: the apparent 3× cost over
+  the grid spike was a measurement artefact. Launched the same way, Leal and
+  the spike cost the same per frame (about 1.5 ms shell-launched, 4.3–4.7 ms
+  via `open` on a loaded M5 Pro), and Leal drops fewer frames. The bench now
+  records instructions, cycles and clock speed. Remaining opportunity, for
+  1.10: about half of every frame, in both, is AppKit rebuilding the whole
+  visible content layer per scroll step. The budget on a base M1 Air is
+  checked in 1.10.
 
 - [x] **1.7 App: diagnostics banner** (also the ADR-0006 "drive disconnected" banner) — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
@@ -324,6 +327,15 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
   measured and recorded in `docs/perf.md`, including first paint and scroll
   smoothness while background work runs.
+  - Measure apps the same way they ship: launched with `open`, sandboxed.
+    Shell launches get different cores and aren't comparable (see 1.6a).
+  - Try the 1.6a opportunity: stop AppKit rebuilding the whole visible
+    content layer on every scroll step (e.g. tiled or cached drawing), and
+    keep it only if it measurably helps.
+  - Check the plain index's 1 MiB chunks against the 5 ms rule on a
+    blank-lines file (1.5 open question).
+  - Rob to rerun `just bench-scroll` on an unlocked Mac, and on a base M1
+    Air if one is available.
 
 ## Phase 2 — Editing
 
