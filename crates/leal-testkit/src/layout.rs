@@ -334,4 +334,36 @@ mod tests {
         l.rows[0].line_ending = None;
         assert!(l.check_tiles(bytes, Delimiter::Comma).is_err());
     }
+
+    /// A parser that drops a byte between fields must fail.
+    #[test]
+    fn check_tiles_rejects_a_skipped_byte() {
+        let l = Layout {
+            bom_len: 0,
+            rows: vec![RowLayout {
+                span: 0..4,
+                line_ending: None,
+                fields: vec![field(0..1, b"a"), field(3..4, b"b")],
+            }],
+        };
+        let err = l.check_tiles(b"a,xb", Delimiter::Comma).unwrap_err();
+        assert!(err.contains("field 1 has span"), "{err}");
+    }
+
+    /// A parser that runs two rows together must fail, even when the second
+    /// row starts exactly where the first ends.
+    #[test]
+    fn check_tiles_rejects_rows_with_no_line_ending_between_them() {
+        let row = |span: Range<usize>, value: &[u8]| RowLayout {
+            span: span.clone(),
+            line_ending: None,
+            fields: vec![field(span, value)],
+        };
+        let l = Layout {
+            bom_len: 0,
+            rows: vec![row(0..1, b"a"), row(1..2, b"b")],
+        };
+        let err = l.check_tiles(b"ab", Delimiter::Comma).unwrap_err();
+        assert!(err.contains("not the last row"), "{err}");
+    }
 }
