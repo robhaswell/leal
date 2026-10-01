@@ -12,8 +12,10 @@
 
 uniffi::setup_scaffolding!();
 
-use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use leal_core::source::{self, OpenError, OpenErrorKind, TempFolders};
 
 /// Returns the version of `leal-core` this library was built with.
 #[uniffi::export]
@@ -43,31 +45,70 @@ impl From<leal_core::FileSummary> for FileSummary {
 }
 
 /// An error returned to Swift, where it is thrown.
+///
+/// Each case carries the path that was being opened. The app words each case
+/// itself (DESIGN §4.4); `code` is the OS error code (an errno, for
+/// `NSError(domain: NSPOSIXErrorDomain, code:)`), and `message` is English
+/// for logs only.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum LealError {
     /// No file exists at `path`.
     NotFound {
-        /// The path that was looked up.
+        /// The path that was opened.
         path: String,
+        /// The OS error code: `ENOENT`, or `ENOTDIR` if a folder in the path
+        /// is a file.
+        code: Option<i32>,
     },
-    /// The file exists but couldn't be read.
-    Io {
-        /// The path that was read.
+    /// The file exists, but Leal isn't allowed to read it.
+    PermissionDenied {
+        /// The path that was opened.
         path: String,
-        /// The operating system's description of the error.
+        /// The OS error code: `EACCES`, or `EPERM` from the App Sandbox.
+        code: Option<i32>,
+    },
+    /// The path is a folder, or something else that isn't a regular file (a
+    /// named pipe, socket or device).
+    NotAFile {
+        /// The path that was opened.
+        path: String,
+        /// Whether it is a folder.
+        is_directory: bool,
+    },
+    /// Any other failure to open or read the file, or to make Leal's clone
+    /// or copy of it.
+    Io {
+        /// The path that was opened.
+        path: String,
+        /// The OS error code, if the error came from the system.
+        code: Option<i32>,
+        /// The error in English, for logs. Not for users: the app words the
+        /// error from `code`.
         message: String,
     },
 }
 
 impl LealError {
-    fn from_io(path: &str, err: &io::Error) -> Self {
-        match err.kind() {
-            io::ErrorKind::NotFound => Self::NotFound {
-                path: path.to_owned(),
+    /// Converts the core's error. `path` is the path exactly as Swift passed
+    /// it.
+    fn from_open(path: &str, error: &OpenError) -> Self {
+        let path = path.to_owned();
+        let code = error.raw_os_error();
+        match error.kind() {
+            OpenErrorKind::NotFound => Self::NotFound { path, code },
+            OpenErrorKind::PermissionDenied => Self::PermissionDenied { path, code },
+            OpenErrorKind::Directory => Self::NotAFile {
+                path,
+                is_directory: true,
             },
-            _ => Self::Io {
-                path: path.to_owned(),
-                message: err.to_string(),
+            OpenErrorKind::NotAFile => Self::NotAFile {
+                path,
+                is_directory: false,
+            },
+            OpenErrorKind::Other => Self::Io {
+                path,
+                code,
+                message: error.to_string(),
             },
         }
     }
@@ -76,8 +117,14 @@ impl LealError {
 impl std::fmt::Display for LealError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound { path } => write!(f, "{path} was not found"),
-            Self::Io { path, message } => write!(f, "couldn't read {path}: {message}"),
+            Self::NotFound { path, .. } => write!(f, "{path} was not found"),
+            Self::PermissionDenied { path, .. } => write!(f, "no permission to read {path}"),
+            Self::NotAFile {
+                path,
+                is_directory: true,
+            } => write!(f, "{path} is a folder"),
+            Self::NotAFile { path, .. } => write!(f, "{path} is not a regular file"),
+            Self::Io { message, .. } => f.write_str(message),
         }
     }
 }
@@ -88,13 +135,124 @@ impl std::error::Error for LealError {}
 ///
 /// # Errors
 ///
-/// [`LealError::NotFound`] if nothing exists at `path`, and [`LealError::Io`]
-/// if it can't be read (for example, it is a directory).
+/// [`LealError::NotFound`], [`LealError::PermissionDenied`],
+/// [`LealError::NotAFile`] (for example, a folder), or [`LealError::Io`] if
+/// it can't be read.
 #[uniffi::export]
 pub fn inspect_file(path: &str) -> Result<FileSummary, LealError> {
     leal_core::inspect_file(Path::new(&path))
         .map(FileSummary::from)
-        .map_err(|err| LealError::from_io(path, &err))
+        .map_err(|err| LealError::from_open(path, &err))
+}
+
+/// Where the core may put temporary files. See
+/// [`leal_core::source::TempFolders`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TempLocations {
+    /// The app's temporary directory (`FileManager.temporaryDirectory`):
+    /// clones of files on its volume, and copies.
+    pub scratch_dir: String,
+    /// A folder in Application Support where Leal records each temporary
+    /// folder it makes, for cleanup after a crash.
+    pub records_dir: String,
+}
+
+impl From<TempLocations> for TempFolders {
+    fn from(locations: TempLocations) -> Self {
+        TempFolders::new(locations.scratch_dir, locations.records_dir)
+    }
+}
+
+/// Where an opened file's bytes are held. See
+/// [`leal_core::source::Storage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SourceStorage {
+    /// A memory-mapped clone. The normal case.
+    Clone,
+    /// Read into memory, because the volume can't clone. The app shows a
+    /// status bar note.
+    Memory,
+    /// A memory-mapped copy, because the volume can't clone and the file is
+    /// large.
+    Copy,
+}
+
+impl From<source::Storage> for SourceStorage {
+    fn from(storage: source::Storage) -> Self {
+        match storage {
+            source::Storage::Clone => Self::Clone,
+            source::Storage::Memory => Self::Memory,
+            source::Storage::Copy => Self::Copy,
+        }
+    }
+}
+
+/// An opened file: a private snapshot of its bytes. See
+/// [`leal_core::source::Source`]. Its clone or copy is deleted when Swift
+/// releases the last reference.
+#[derive(Debug, uniffi::Object)]
+pub struct Source {
+    source: source::Source,
+}
+
+#[uniffi::export]
+impl Source {
+    /// The file's size in bytes when it was opened.
+    #[must_use]
+    pub fn byte_count(&self) -> u64 {
+        // A slice's length always fits in u64 on Apple's 64-bit platforms.
+        u64::try_from(self.source.bytes().len()).unwrap_or(u64::MAX)
+    }
+
+    /// Where the bytes are held.
+    #[must_use]
+    pub fn storage(&self) -> SourceStorage {
+        self.source.storage().into()
+    }
+}
+
+/// Opens the file at `path` and takes a snapshot of it. See
+/// [`leal_core::source::Source::open`].
+///
+/// `volume_folder` is a new, empty folder on the file's own volume, from
+/// `FileManager.url(for: .itemReplacementDirectory, in: .userDomainMask,
+/// appropriateFor:, create: true)`, or `nil` if there is none. The core takes
+/// it over and deletes it.
+///
+/// # Errors
+///
+/// [`LealError::NotFound`], [`LealError::PermissionDenied`],
+/// [`LealError::NotAFile`], or [`LealError::Io`].
+#[uniffi::export]
+pub fn open_source(
+    path: &str,
+    volume_folder: Option<String>,
+    temp: TempLocations,
+) -> Result<Arc<Source>, LealError> {
+    let temp = TempFolders::from(temp);
+    source::Source::open(Path::new(path), &temp, volume_folder.map(PathBuf::from))
+        .map(|source| Arc::new(Source { source }))
+        .map_err(|err| LealError::from_open(path, &err))
+}
+
+/// Removes the temporary folders that crashed Leal processes left behind.
+/// The app calls it at launch. Returns how many it removed. See
+/// [`leal_core::source::TempFolders::remove_leftovers`].
+///
+/// # Errors
+///
+/// [`LealError::Io`] if the records folder can't be listed.
+#[uniffi::export]
+pub fn remove_leftover_temp_folders(temp: TempLocations) -> Result<u32, LealError> {
+    let records = temp.records_dir.clone();
+    let removed = TempFolders::from(temp)
+        .remove_leftovers()
+        .map_err(|err| LealError::Io {
+            message: format!("couldn't list {records}: {err}"),
+            code: err.raw_os_error(),
+            path: records,
+        })?;
+    Ok(u32::try_from(removed).unwrap_or(u32::MAX))
 }
 
 /// Panics with `message`. It exists so the app's tests can check that a Rust
@@ -120,6 +278,35 @@ pub fn debug_panic(message: &str) -> Result<(), LealError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A temporary directory that is deleted when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("leal-ffi-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().into_owned()
+        }
+
+        fn locations(&self) -> TempLocations {
+            TempLocations {
+                scratch_dir: self.path("scratch"),
+                records_dir: self.path("records"),
+            }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn core_version_comes_from_core() {
@@ -128,13 +315,11 @@ mod tests {
 
     #[test]
     fn inspect_file_wraps_core() {
-        let path =
-            std::env::temp_dir().join(format!("leal-ffi-inspect-{}.csv", std::process::id()));
+        let dir = TempDir::new("inspect");
+        let path = dir.path("a.csv");
         std::fs::write(&path, b"a,b\n1,2\n").unwrap();
-        let summary = inspect_file(&path.to_string_lossy());
-        std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            summary,
+            inspect_file(&path),
             Ok(FileSummary {
                 byte_count: 8,
                 first_line: "a,b".to_owned(),
@@ -145,7 +330,90 @@ mod tests {
     #[test]
     fn missing_file_is_not_found() {
         let path = "/nonexistent/leal/missing.csv".to_owned();
-        assert_eq!(inspect_file(&path), Err(LealError::NotFound { path }));
+        assert_eq!(
+            inspect_file(&path),
+            Err(LealError::NotFound {
+                path,
+                // ENOENT
+                code: Some(2)
+            })
+        );
+    }
+
+    #[test]
+    fn directory_is_not_a_file() {
+        let dir = TempDir::new("directory");
+        let path = dir.path("");
+        assert_eq!(
+            inspect_file(&path),
+            Err(LealError::NotAFile {
+                path: path.clone(),
+                is_directory: true
+            })
+        );
+        assert!(matches!(
+            open_source(&path, None, dir.locations()),
+            Err(LealError::NotAFile {
+                is_directory: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn permission_denied() {
+        let dir = TempDir::new("denied");
+        let path = dir.path("locked.csv");
+        std::fs::write(&path, b"a\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let expected = LealError::PermissionDenied {
+            path: path.clone(),
+            // EACCES
+            code: Some(13),
+        };
+        assert_eq!(inspect_file(&path), Err(expected.clone()));
+        assert_eq!(
+            open_source(&path, None, dir.locations()).map(|_| ()),
+            Err(expected)
+        );
+    }
+
+    #[test]
+    fn other_errors_carry_the_code_and_a_log_message() {
+        let dir = TempDir::new("other");
+        let path = dir.path("a.csv");
+        std::fs::write(&path, b"a\n").unwrap();
+        // The scratch "directory" is a file, so making a folder in it fails.
+        std::fs::write(dir.path("scratch"), b"").unwrap();
+        let Err(LealError::Io {
+            path: error_path,
+            code,
+            message,
+        }) = open_source(&path, None, dir.locations())
+        else {
+            panic!("expected LealError::Io");
+        };
+        assert_eq!(error_path, path);
+        assert!(code.is_some());
+        assert!(message.contains("a.csv"), "{message}");
+    }
+
+    #[test]
+    fn open_source_wraps_core() {
+        let dir = TempDir::new("open");
+        let path = dir.path("a.csv");
+        std::fs::write(&path, b"a,b\n1,2\n").unwrap();
+        let folder = dir.path("volume-folder");
+        std::fs::create_dir(&folder).unwrap();
+        let source = open_source(&path, Some(folder.clone()), dir.locations()).unwrap();
+        assert_eq!(source.byte_count(), 8);
+        assert_eq!(source.storage(), SourceStorage::Clone);
+        drop(source);
+        assert!(
+            !Path::new(&folder).exists(),
+            "the clone's folder is deleted"
+        );
+        assert_eq!(remove_leftover_temp_folders(dir.locations()), Ok(0));
     }
 
     #[cfg(feature = "test-exports")]
@@ -153,11 +421,5 @@ mod tests {
     #[should_panic(expected = "deliberate")]
     fn debug_panic_panics() {
         let _ = debug_panic("deliberate");
-    }
-
-    #[test]
-    fn directory_is_an_io_error() {
-        let path = std::env::temp_dir().to_string_lossy().into_owned();
-        assert!(matches!(inspect_file(&path), Err(LealError::Io { .. })));
     }
 }

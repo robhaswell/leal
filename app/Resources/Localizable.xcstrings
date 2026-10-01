@@ -1,0 +1,27 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%@ (error %d)." : {
+      "comment" : "Open error: the system's description of an error, then its POSIX error code"
+    },
+    "An unexpected error occurred." : {
+      "comment" : "Open error with no OS error code"
+    },
+    "It isn’t a regular file." : {
+      "comment" : "Open error: the path is a named pipe, socket or device"
+    },
+    "It’s a folder, not a file." : {
+      "comment" : "Open error: the path is a folder"
+    },
+    "Leal couldn’t open “%@”." : {
+      "comment" : "Alert title when a file can't be opened"
+    },
+    "The file doesn’t exist." : {
+      "comment" : "Open error: nothing at the path"
+    },
+    "You don’t have permission to open it." : {
+      "comment" : "Open error: the file can't be read (EACCES or EPERM)"
+    }
+  },
+  "version" : "1.0"
+}

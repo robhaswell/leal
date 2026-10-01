@@ -138,12 +138,17 @@ targets:
       - target: LealFFI
     sources:
       - path: Sources
+      # User-facing strings (DESIGN §4.4), English only for v1.
+      - path: Resources/Localizable.xcstrings
     settings:
       base:
         PRODUCT_NAME: Leal
         PRODUCT_BUNDLE_IDENTIFIER: io.github.robhaswell.leal
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
+        # Extract `String(localized:)` keys at build time, so Xcode can keep
+        # Resources/Localizable.xcstrings in step with the code.
+        SWIFT_EMIT_LOC_STRINGS: YES
         ENABLE_HARDENED_RUNTIME: NO
 
   # Unit tests that call Rust through the generated bindings. They link the
@@ -158,6 +163,11 @@ targets:
       - target: LealFFI
     sources:
       - path: Tests
+      # App code with no AppKit state, compiled into this bundle too so the
+      # tests can check it against real errors from Rust. This bundle doesn't
+      # import the app module, so the two copies never meet.
+      - path: Sources/OpenErrorText.swift
+      - path: Sources/TemporaryFolders.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.robhaswell.leal.tests

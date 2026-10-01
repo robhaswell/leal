@@ -8,5 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The `source` module (PLAN 1.1): `fclonefileat`, `fgetxattr` and `fcntl`,
+# which the standard library doesn't wrap. memmap2 already depends on it.
+libc = "0.2.189"
+# The `source` module: the read-only memory map of the clone (DESIGN §3.1).
+memmap2 = "0.9.11"
+
+[dev-dependencies]
+leal-testkit.workspace = true
+proptest.workspace = true
+
 [lints]
 workspace = true

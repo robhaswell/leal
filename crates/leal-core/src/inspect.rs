@@ -1,11 +1,13 @@
 //! A quick look at a file: its size and first line.
 //!
 //! This exists for the walking skeleton (PLAN 0.3), to prove that the app can
-//! call into the core. The real reader is the `source` module (PLAN 1.1).
+//! call into the core. The real reader is the [`source`](crate::source)
+//! module (PLAN 1.1); task 1.6 switches the app over to it and removes this.
 
-use std::fs::File;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::Path;
+
+use crate::source::{OpenError, open_regular};
 
 /// The most bytes of the first line that [`inspect_file`] returns.
 pub const FIRST_LINE_MAX_BYTES: usize = 200;
@@ -42,17 +44,21 @@ pub struct FileSummary {
 ///
 /// # Errors
 ///
-/// Returns the I/O error if the file can't be opened or read, for example
-/// [`io::ErrorKind::NotFound`] if it doesn't exist, or an error if `path` is a
-/// directory.
-pub fn inspect_file(path: &Path) -> io::Result<FileSummary> {
-    let file = File::open(path)?;
-    let byte_count = file.metadata()?.len();
+/// Returns an [`OpenError`] if the file can't be opened or read, the same
+/// way [`Source::open`](crate::source::Source::open) does: for example
+/// [`OpenErrorKind::NotFound`](crate::source::OpenErrorKind::NotFound) if it
+/// doesn't exist, or
+/// [`OpenErrorKind::Directory`](crate::source::OpenErrorKind::Directory) if
+/// `path` is a folder.
+pub fn inspect_file(path: &Path) -> Result<FileSummary, OpenError> {
+    let (file, identity) = open_regular(path)?;
+    let byte_count = identity.len;
 
     let mut head = Vec::with_capacity(FIRST_LINE_MAX_BYTES);
     // `take` stops after the limit. The cast is lossless: a usize limit of 200.
     file.take(FIRST_LINE_MAX_BYTES as u64)
-        .read_to_end(&mut head)?;
+        .read_to_end(&mut head)
+        .map_err(|error| OpenError::read(path, error))?;
 
     Ok(FileSummary {
         byte_count,
@@ -108,6 +114,7 @@ fn drop_partial_char(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::OpenErrorKind;
     use std::path::PathBuf;
 
     /// A temporary directory that is deleted when the test ends.
@@ -299,13 +306,35 @@ mod tests {
     #[test]
     fn missing_file_is_not_found() {
         let dir = TempDir::new("missing");
-        let err = inspect_file(&dir.0.join("nope.csv")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let path = dir.0.join("nope.csv");
+        let err = inspect_file(&path).unwrap_err();
+        assert_eq!(err.kind(), OpenErrorKind::NotFound);
+        assert_eq!(err.path(), path);
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
     }
 
     #[test]
     fn directory_is_an_error() {
         let dir = TempDir::new("dir");
-        assert!(inspect_file(&dir.0).is_err());
+        let err = inspect_file(&dir.0).unwrap_err();
+        assert_eq!(err.kind(), OpenErrorKind::Directory);
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+    }
+
+    /// Opening a named pipe for reading normally waits for a writer, which
+    /// would hang. It is refused at once instead.
+    #[test]
+    fn named_pipe_is_not_a_file() {
+        let dir = TempDir::new("fifo");
+        let path = dir.0.join("pipe.csv");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            inspect_file(&path).unwrap_err().kind(),
+            OpenErrorKind::NotAFile
+        );
     }
 }

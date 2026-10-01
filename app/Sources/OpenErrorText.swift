@@ -1,0 +1,62 @@
+import Foundation
+import LealFFI
+
+/// The wording of the alert shown when a file can't be opened.
+///
+/// The Rust core reports what went wrong as a structured `LealError` (the
+/// path, the kind and the OS error code); the words are chosen here, from the
+/// String Catalog (DESIGN §4.4). `LealError.Io`'s `message` is English for
+/// logs and never shown.
+///
+/// This file is also compiled into the `LealTests` bundle (see
+/// `project.yml`), so the wording is tested against real errors from Rust.
+enum OpenErrorText {
+    /// The alert's title, for example "Leal couldn’t open “data.csv”."
+    static func title(fileName: String) -> String {
+        String(localized: "Leal couldn’t open “\(fileName)”.", comment: "Alert title when a file can't be opened")
+    }
+
+    /// A sentence explaining an error thrown by the Rust core.
+    ///
+    /// The switch over `LealError` is exhaustive, with no `default`, so a new
+    /// variant doesn't compile until it has wording here. Otherwise it would
+    /// show UniFFI's debug-style description (`LealError.X(...)`).
+    static func describe(_ error: any Error) -> String {
+        guard let error = error as? LealError else {
+            // A Rust panic, which UniFFI throws as an internal error whose
+            // description is the panic message.
+            return error.localizedDescription
+        }
+        return switch error {
+        case .NotFound:
+            String(localized: "The file doesn’t exist.", comment: "Open error: nothing at the path")
+        case .PermissionDenied:
+            String(
+                localized: "You don’t have permission to open it.",
+                comment: "Open error: the file can't be read (EACCES or EPERM)"
+            )
+        case .NotAFile(_, isDirectory: true):
+            String(localized: "It’s a folder, not a file.", comment: "Open error: the path is a folder")
+        case .NotAFile(_, isDirectory: false):
+            String(
+                localized: "It isn’t a regular file.",
+                comment: "Open error: the path is a named pipe, socket or device"
+            )
+        case let .Io(_, code?, _):
+            systemReason(code: code)
+        case .Io(_, nil, _):
+            String(localized: "An unexpected error occurred.", comment: "Open error with no OS error code")
+        }
+    }
+
+    /// The system's own description of a POSIX error code, such as "No space
+    /// left on device", with the code for bug reports.
+    private static func systemReason(code: Int32) -> String {
+        let error = NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        let reason = error.localizedFailureReason ?? error.localizedDescription
+        return String(
+            localized: "\(reason) (error \(code)).",
+            comment: "Open error: the system's description of an error, then its POSIX error code"
+        )
+    }
+}
