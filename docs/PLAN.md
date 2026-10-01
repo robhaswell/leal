@@ -82,9 +82,21 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - The `source` module is the one place in `leal-core` with a narrow
     `#[allow(unsafe_code)]`, and every `unsafe` block has a `// SAFETY:`
     comment (0.1 notes).
-  - The 0.3 skeleton's `inspect_file` (`crates/leal-core/src/inspect.rs`),
-    which reads a CR-only file as one line, is replaced by `source`. If the
-    app still calls it, 1.6 switches it over and removes it.
+  - The 0.3 skeleton's `inspect_file` (`crates/leal-core/src/inspect.rs`,
+    which looks only at the first 200 bytes and ignores quotes) is replaced
+    by `source`. If the app still calls it, 1.6 switches it over and removes
+    it.
+  - I/O errors reach Swift structured, not as Rust's English text. Open,
+    clone and mmap failures carry the path and the OS error code
+    (`io::Error::raw_os_error`, an errno), and the kinds the app must word
+    (at least not found, permission denied, and a directory or other
+    non-regular file) are told apart. `LealError::Io.message` is for logs
+    only. The app words each case in its alerts (String Catalog, DESIGN
+    §4.4), for example via `NSError(domain: NSPOSIXErrorDomain, code:)`
+    for the rest, and an XCTest covers permission denied and a directory.
+    (Phase 0 review rust-4: today `LealError::Io` carries only
+    `io::Error`'s Display text, which the alert shows as is, such as
+    "Permission denied (os error 13)".)
 - [ ] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
   - Follows ADR-0003 decisions 1, 6 and 7, and the attribute rules of
     ADR-0004 decision 11: a UTF-8 or Windows-1252 attribute is always

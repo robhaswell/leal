@@ -128,7 +128,7 @@ enum RawEdit {
     /// Set the file's first cell, often to a BOM-like value, so that
     /// ADR-0004 decisions 7 and 10 (quoting BOM-like first fields) fire.
     SetFirst {
-        value: RawValue,
+        value: FirstValue,
     },
     InsertRow {
         at: Index,
@@ -146,6 +146,22 @@ enum RawEdit {
     },
 }
 
+/// A value for the file's first cell.
+#[derive(Clone, Copy, Debug)]
+enum FirstValue {
+    /// One of the values that is BOM-like in the document's encoding, so
+    /// that none is wasted: U+FEFF (`EF BB BF`) in UTF-8; "ÿþ" or "þÿ"
+    /// (`FF FE`, `FE FF`) in Windows-1252, where U+FEFF can't be encoded.
+    /// ("ï»¿", `EF BB BF` in Windows-1252, is left to ordinary edits:
+    /// `EF BB BF` is already common from UTF-8 files.)
+    BomLike(Index),
+    Other(RawValue),
+}
+
+/// The values of [`EDIT_VALUES`] that start with a UTF-16 BOM in
+/// Windows-1252.
+const WINDOWS_1252_UTF16_BOM_LIKE: [&str; 2] = [EDIT_VALUES[1], EDIT_VALUES[2]];
+
 fn raw_value() -> impl Strategy<Value = RawValue> {
     prop_oneof![
         6 => select(&EDIT_VALUES[..]).prop_map(RawValue::Literal),
@@ -157,9 +173,9 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
     prop_oneof![
         6 => (any::<Index>(), any::<Index>(), raw_value(), prop::bool::weighted(0.25))
             .prop_map(|(row, column, value, revert)| RawEdit::Set { row, column, value, revert }),
-        1 => prop_oneof![
-            select(&EDIT_VALUES[..4]).prop_map(RawValue::Literal), // the BOM-like values
-            raw_value(),
+        2 => prop_oneof![
+            3 => any::<Index>().prop_map(FirstValue::BomLike),
+            1 => raw_value().prop_map(FirstValue::Other),
         ]
         .prop_map(|value| RawEdit::SetFirst { value }),
         1 => (any::<Index>(), [raw_value(), raw_value(), raw_value(), raw_value()])
@@ -176,14 +192,57 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
 /// is instead a run of `x CR`, `y LF`, blank `LF` rows, so that deleting a
 /// `y` row puts a lone CR before a blank LF row (the CR/LF split, ADR-0004
 /// decision 10) often enough to test.
+///
+/// If `config` allows invalid UTF-8, two files in ten are instead a small
+/// Windows-1252 file, so that the BOM-like values that only Windows-1252 can
+/// write ("ÿþ" and "þÿ", ADR-0004 decision 10) are tested often enough.
 pub fn edit_case(config: CsvConfig) -> impl Strategy<Value = EditCase> {
     let m = config.messiness;
-    let files = if m.mixed_line_endings && m.blank_lines {
-        prop_oneof![7 => csv_file(config), 3 => cr_then_blank_lf_file()].boxed()
-    } else {
-        csv_file(config).boxed()
+    let files = match (m.mixed_line_endings && m.blank_lines, m.invalid_utf8) {
+        (true, true) => prop_oneof![
+            5 => csv_file(config),
+            3 => cr_then_blank_lf_file(),
+            2 => windows_1252_file(),
+        ]
+        .boxed(),
+        (true, false) => prop_oneof![7 => csv_file(config), 3 => cr_then_blank_lf_file()].boxed(),
+        (false, true) => prop_oneof![8 => csv_file(config), 2 => windows_1252_file()].boxed(),
+        (false, false) => csv_file(config).boxed(),
     };
     edits_for(files, 6)
+}
+
+/// Up to three LF rows of one to three Latin-1 words, then a `café` row, all
+/// in Windows-1252 (ADR-0003 guesses it: the high bytes are invalid UTF-8).
+fn windows_1252_file() -> impl Strategy<Value = GeneratedCsv> {
+    let words: &[&[u8]] = &[b"caf\xE9", b"\xA35", b"na\xEFve", b"x", b"1"];
+    (
+        select(&Delimiter::ALL[..]),
+        vec(vec(select(words), 1..=3), 0..=3),
+    )
+        .prop_map(|(delimiter, rows)| {
+            let row = |fields: Vec<&[u8]>| ModelRow {
+                fields: fields
+                    .into_iter()
+                    .map(|w| ModelField::Unquoted(w.to_vec()))
+                    .collect(),
+                line_ending: Some(LineEnding::Lf),
+            };
+            let rows = rows
+                .into_iter()
+                .chain([vec![&b"caf\xE9"[..]]])
+                .map(row)
+                .collect();
+            let dialect = ModelDialect {
+                delimiter,
+                line_endings: LineEndings::Uniform(LineEnding::Lf),
+                bom: false,
+                quoting: QuotingStyle::Minimal,
+            };
+            let file = GeneratedCsv::from_model(CsvModel { dialect, rows });
+            debug_assert_eq!(file.encoding, Encoding::Windows1252);
+            file
+        })
 }
 
 /// Blocks of `x CR`, `y LF`, blank `LF`, one to four times.
@@ -276,8 +335,14 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                     continue;
                 }
                 let value = match value {
-                    RawValue::Literal(s) => s.to_owned(),
-                    RawValue::Original => doc.original_value(0, 0).unwrap_or_default(),
+                    FirstValue::BomLike(i) if file.encoding == Encoding::Windows1252 => {
+                        i.get(&WINDOWS_1252_UTF16_BOM_LIKE[..]).to_string()
+                    }
+                    FirstValue::BomLike(_) => EDIT_VALUES[0].to_owned(),
+                    FirstValue::Other(RawValue::Literal(s)) => s.to_owned(),
+                    FirstValue::Other(RawValue::Original) => {
+                        doc.original_value(0, 0).unwrap_or_default()
+                    }
                 };
                 step.push(Edit::SetCell {
                     row: 0,
@@ -396,22 +461,54 @@ mod tests {
         );
     }
 
-    /// `raw_edit` sets the first cell to `EDIT_VALUES[..4]` because those are
-    /// the values that start with a BOM in UTF-8 or Windows-1252.
+    fn bom_like_in(v: &str, e: Encoding) -> bool {
+        use crate::dialect::{UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, encode_value};
+        encode_value(v, e).is_ok_and(|b| {
+            [UTF8_BOM, UTF16LE_BOM, UTF16BE_BOM]
+                .iter()
+                .any(|bom| b.starts_with(bom))
+        })
+    }
+
+    /// `FirstValue::BomLike` picks `EDIT_VALUES[0]` in UTF-8 and one of
+    /// `WINDOWS_1252_UTF16_BOM_LIKE` in Windows-1252, which must start with a
+    /// BOM there. The doc on `EDIT_VALUES` says the BOM-like values come
+    /// first.
     #[test]
     fn the_first_four_edit_values_are_the_bom_like_ones() {
-        use crate::dialect::{UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, encode_value};
-        let bom_like = |v: &str| {
-            [Encoding::Utf8, Encoding::Windows1252].iter().any(|&e| {
-                encode_value(v, e).is_ok_and(|b| {
-                    [UTF8_BOM, UTF16LE_BOM, UTF16BE_BOM]
-                        .iter()
-                        .any(|bom| b.starts_with(bom))
-                })
-            })
-        };
-        for (i, v) in EDIT_VALUES.iter().enumerate() {
-            assert_eq!(bom_like(v), i < 4, "{v:?}");
+        let utf8: Vec<_> = EDIT_VALUES
+            .iter()
+            .filter(|v| bom_like_in(v, Encoding::Utf8))
+            .collect();
+        assert_eq!(utf8, [&EDIT_VALUES[0]]);
+        let w1252: Vec<_> = EDIT_VALUES
+            .iter()
+            .copied()
+            .filter(|v| bom_like_in(v, Encoding::Windows1252))
+            .collect();
+        assert_eq!(w1252, &EDIT_VALUES[1..4]);
+        for v in WINDOWS_1252_UTF16_BOM_LIKE {
+            let bytes = crate::dialect::encode_value(v, Encoding::Windows1252).unwrap();
+            let bom = crate::dialect::Bom::detect(&bytes);
+            assert!(
+                matches!(
+                    bom,
+                    crate::dialect::Bom::Utf16Le | crate::dialect::Bom::Utf16Be
+                ),
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_1252_files_are_windows_1252() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::deterministic();
+        for _ in 0..100 {
+            let file = windows_1252_file().new_tree(&mut runner).unwrap().current();
+            assert_eq!(file.encoding, Encoding::Windows1252, "{file:?}");
+            assert_eq!(file.model.check(), Ok(()), "{file:?}");
         }
     }
 

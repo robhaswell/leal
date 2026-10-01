@@ -504,14 +504,56 @@ fn deleting_an_unterminated_last_row_drops_the_line_ending_before_it() {
 /// the properties above really exercise them.
 #[test]
 fn every_save_rule_and_edge_operation_is_exercised() {
-    use proptest::strategy::ValueTree;
-    use proptest::test_runner::TestRunner;
+    let counts = coverage_counts(&mut proptest::test_runner::TestRunner::deterministic());
+    if let Err(e) = check_coverage(&counts) {
+        panic!("{e}");
+    }
+}
 
-    const N: usize = 3000;
-    let mut runner = TestRunner::deterministic();
+/// The coverage floors hold for other seeds too, not just the deterministic
+/// one, so a harmless change to a generator doesn't trip them. Slow, so it
+/// runs on demand:
+/// `cargo nextest run -p leal-testkit --run-ignored only --no-capture seeds`.
+#[test]
+#[ignore = "slow: checks the coverage floors over 40 seeds"]
+fn coverage_floors_hold_for_many_seeds() {
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    let mut all: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut failures = Vec::new();
+    for seed in 0..40_u8 {
+        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]);
+        let counts = coverage_counts(&mut TestRunner::new_with_rng(Config::default(), rng));
+        if let Err(e) = check_coverage(&counts) {
+            failures.push(format!("seed {seed}: {}", e.lines().next().unwrap_or("")));
+        }
+        for (k, v) in counts {
+            all.entry(k).or_default().push(v);
+        }
+    }
+    for (k, v) in &all {
+        let min = v.iter().min().copied().unwrap_or(0);
+        let mean = v.iter().sum::<usize>() / v.len();
+        println!(
+            "{k}: min {min}, mean {mean} of {COVERAGE_CASES} ({} seeds)",
+            v.len()
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Cases per coverage sample.
+const COVERAGE_CASES: usize = 3000;
+
+/// How many of [`COVERAGE_CASES`] edit cases from `runner` exercise each
+/// save rule and edge operation.
+fn coverage_counts(
+    runner: &mut proptest::test_runner::TestRunner,
+) -> std::collections::BTreeMap<&'static str, usize> {
+    use proptest::strategy::ValueTree;
+
     let strategy = edit_case(CsvConfig::messy());
-    let cases: Vec<EditCase> = (0..N)
-        .map(|_| strategy.new_tree(&mut runner).unwrap().current())
+    let cases: Vec<EditCase> = (0..COVERAGE_CASES)
+        .map(|_| strategy.new_tree(runner).unwrap().current())
         .collect();
 
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -577,12 +619,26 @@ fn every_save_rule_and_edge_operation_is_exercised() {
             *counts.entry(s).or_default() += 1;
         }
     }
+    counts
+}
 
+/// Checks the coverage floors, returning the first one missed.
+///
+/// Every floor is 1% (30 of 3000). Over 40 seeds
+/// (`coverage_floors_hold_for_many_seeds`) the lowest count for any item
+/// was 38 (the CR/LF split, mean 50), and the BOM-like kinds bottomed out at
+/// 55 (`FF FE` and `FE FF`, mean 72) and 209 (`EF BB BF`, mean 244). Each
+/// floor is at most 60% of its item's mean, so it fails only if a change
+/// makes the item clearly rarer. Rerun that test after changing a generator.
+fn check_coverage(counts: &std::collections::BTreeMap<&str, usize>) -> Result<(), String> {
+    const N: usize = COVERAGE_CASES;
     let expected = [
         "fix: empty row written as \"\"",
         "fix: CR/LF split",
         "fix: BOM-like first field quoted",
         "fix: BOM-like EF BB BF quoted",
+        "fix: BOM-like FF FE quoted",
+        "fix: BOM-like FE FF quoted",
         "encoding hint written",
         "edit: the only row",
         "edit: the only column",
@@ -597,17 +653,11 @@ fn every_save_rule_and_edge_operation_is_exercised() {
         "insert: first column",
         "insert: after the last column",
     ];
-    let report = format!("{counts:#?}");
     for name in expected {
         let n = counts.get(name).copied().unwrap_or(0);
-        assert!(n * 100 >= N, "{name}: {n} of {N} cases, under 1%\n{report}");
+        if n * 100 < N {
+            return Err(format!("{name}: {n} of {N} cases, under 1%\n{counts:#?}"));
+        }
     }
-    // `FF FE` and `FE FF` are BOM-like only in Windows-1252 files (as "ÿþ"
-    // and "þÿ"), which few generated files are, so these are rarer. The unit
-    // test `utf16_bom_bytes_moved_to_the_start_are_quoted` pins each; this
-    // checks that the properties reach them too.
-    for name in ["fix: BOM-like FF FE quoted", "fix: BOM-like FE FF quoted"] {
-        let n = counts.get(name).copied().unwrap_or(0);
-        assert!(n >= 5, "{name}: {n} of {N} cases, under 5\n{report}");
-    }
+    Ok(())
 }
