@@ -107,8 +107,8 @@ bench-compare base="main" regression="0.20" noise="0.10":
     fi
 
     # One side's benchmarks, in the directory $1 with the target directory
-    # $2, passing the rest to criterion: everything (the `baseline` canaries
-    # included), then the canaries again as `baseline-late`, to catch noise
+    # $2, passing the rest to criterion: everything (the `baseline` group
+    # included), then that group again as `baseline-late`, to catch noise
     # that started part-way through. The steps are chained with `&&`
     # because `set -e` is off inside a function called with `||`.
     run_side() {
@@ -122,8 +122,16 @@ bench-compare base="main" regression="0.20" noise="0.10":
         )
     }
 
-    # A noisy run (a canary moved) is rerun once before it fails.
+    # A noisy run (a `memchr3_scan` canary moved) is rerun once. If the
+    # rerun is noisy too, bench-report (given --last-attempt) warns that the
+    # run is inconclusive and passes, unless a budget failed: a noisy runner
+    # is no reason to turn CI red (docs/tasks/1.2b.md).
     for attempt in 1 2; do
+        # Unquoted where it's used, so that empty means no argument.
+        last_attempt=""
+        if [ "$attempt" = 2 ] || [ "$has_base" = no ]; then
+            last_attempt="--last-attempt"
+        fi
         rm -rf "$CRITERION_HOME"
         mkdir -p "$CRITERION_HOME"
         if [ "$has_base" = yes ]; then
@@ -140,19 +148,16 @@ bench-compare base="main" regression="0.20" noise="0.10":
 
         status=0
         cargo run --release --quiet --package leal-bench --bin bench-report -- \
-            --regression "{{ regression }}" --noise "{{ noise }}" "$CRITERION_HOME" || status=$?
+            --regression "{{ regression }}" --noise "{{ noise }}" $last_attempt \
+            "$CRITERION_HOME" || status=$?
         case "$status" in
             0) exit 0 ;;
-            3)
-                if [ "$attempt" = 1 ]; then
-                    warn "bench-compare: a canary moved by more than {{ noise }}, so the run was too noisy to judge; rerunning both sides once"
-                else
-                    fail "bench-compare: the run was noisy twice (a canary moved by more than {{ noise }}); rerun the job, and if it keeps happening see docs/tasks/1.2b.md"
-                fi
-                ;;
+            3) warn "bench-compare: a canary moved by more than {{ noise }}, so the run was too noisy to judge; rerunning both sides once" ;;
             *) exit "$status" ;;
         esac
     done
+    # Only reachable if bench-report asked for a rerun on the last attempt.
+    fail "bench-compare: bench-report asked for a rerun after the last attempt"
 
 # Build the universal libleal_ffi.a and generate the Swift bindings (profile: debug or release).
 ffi profile="debug" test_exports="auto":

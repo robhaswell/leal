@@ -3,12 +3,15 @@
 //! anything. Nothing that reads or indexes the file can beat these numbers,
 //! so later benchmarks (the row index, 1.3) are compared with them.
 //!
-//! These are also CI's noise canaries: their code doesn't change between
-//! commits, so if they move, the machine moved (see `src/report.rs`).
-//! `just bench-compare` runs them a second time after all the other
-//! benchmarks, with `LEAL_BENCH_BASELINE_GROUP=baseline-late`, so that noise
-//! late in a run is caught too. That second run is reported under its own
-//! group name, `baseline-late/…`.
+//! `memchr3_scan` is also CI's noise canary: its code doesn't change
+//! between commits, so if it moves, the machine moved (see `src/report.rs`).
+//! `sequential_read` is reported for information only. It is short and
+//! depends on the page cache and the VM's I/O, so on a shared CI runner it
+//! moves too much to be a canary. `just bench-compare` runs both a second
+//! time after all the other benchmarks, with
+//! `LEAL_BENCH_BASELINE_GROUP=baseline-late`, so that noise late in a run is
+//! caught too. That second run is reported under its own group name,
+//! `baseline-late/…`.
 //!
 //! Both run with the file in the page cache (criterion's warm-up reads it),
 //! which is the case for a file the user just opened. A cold read from disk
@@ -51,9 +54,9 @@ fn baseline(c: &mut Criterion) {
 
     let name = std::env::var("LEAL_BENCH_BASELINE_GROUP").unwrap_or_else(|_| "baseline".into());
     assert!(
-        leal_bench::report::CANARY_GROUPS.contains(&name.as_str()),
+        leal_bench::report::BASELINE_GROUPS.contains(&name.as_str()),
         "LEAL_BENCH_BASELINE_GROUP must be one of {:?}",
-        leal_bench::report::CANARY_GROUPS
+        leal_bench::report::BASELINE_GROUPS
     );
     let mut group = c.benchmark_group(name);
     common::whole_file(&mut group, len);

@@ -14,15 +14,27 @@
 //!   budgeted benchmark has no result, or, on a quiet run, a benchmark
 //!   regressed: the lower end of the 95% interval for its median's change
 //!   is above [`Thresholds::regression`]. Requiring the whole interval to be
-//!   above the threshold means a single noisy median doesn't fail.
+//!   above the threshold means a single noisy median doesn't fail. A noisy
+//!   run never excuses a budget failure.
 //! - **Noisy** if a noise canary moved, in either direction, by more than
-//!   [`Thresholds::noise`] (and nothing is over budget). The canaries are
-//!   the `baseline` benchmarks, which run first, and again as
+//!   [`Thresholds::noise`] (and nothing failed). The canaries are the
+//!   `memchr3_scan` baselines ([`CANARIES`]), which run first, and again as
 //!   `baseline-late` after all the others. Their code is the same on both
 //!   sides of a comparison, so when one moves, the machine moved, and the
-//!   run can't judge regressions. `just bench-compare` reruns once, then
-//!   fails.
+//!   run can't judge regressions.
 //! - **Pass** otherwise.
+//!
+//! [`Report::outcome`] turns the verdict into what `just bench-compare`
+//! does ([`Outcome`]): a noisy first attempt is rerun, and a noisy last
+//! attempt is **inconclusive**, which warns but passes. Failing the job
+//! because the runner was noisy would turn CI red for no reason.
+//!
+//! `sequential_read`, the other baseline benchmark, is reported for
+//! information only ([`Status::Info`]): it is no canary, has no budget and
+//! can't regress. It takes about 7 ms on CI and depends on the page cache
+//! and the VM's I/O, so on a shared GitHub runner it moved by 10–16%
+//! between runs of identical code while `memchr3_scan` (CPU-bound, about
+//! 47 ms) stayed within 6% (`docs/tasks/1.2b.md`).
 
 use std::fmt::Write as _;
 use std::fs;
@@ -33,16 +45,29 @@ use serde_json::Value;
 
 use crate::budgets::Budget;
 
-/// The criterion groups that are noise canaries: `baseline` runs with the
-/// other benchmarks, and `bench-compare` runs it again as `baseline-late`
-/// after them (`benches/baseline.rs`).
-pub const CANARY_GROUPS: [&str; 2] = ["baseline", "baseline-late"];
+/// The criterion groups of the speed-of-light baseline: `baseline` runs
+/// with the other benchmarks, and `bench-compare` runs it again as
+/// `baseline-late` after them (`benches/baseline.rs`).
+pub const BASELINE_GROUPS: [&str; 2] = ["baseline", "baseline-late"];
+
+/// The noise canaries: the CPU-bound scan, in both baseline groups. The
+/// other baseline benchmark, `sequential_read`, is too short and too
+/// sensitive to I/O to be one (see the module docs).
+pub const CANARIES: [&str; 2] = ["baseline/memchr3_scan", "baseline-late/memchr3_scan"];
 
 /// True if `id` (`group/name`) is a noise canary.
 #[must_use]
 pub fn is_canary(id: &str) -> bool {
+    CANARIES.contains(&id)
+}
+
+/// True if `id` is in one of the [`BASELINE_GROUPS`]. The baseline's code
+/// is the same on both sides of every comparison, so its benchmarks never
+/// gate: each is either a canary or information.
+#[must_use]
+pub fn is_baseline(id: &str) -> bool {
     id.split_once('/')
-        .is_some_and(|(group, _)| CANARY_GROUPS.contains(&group))
+        .is_some_and(|(group, _)| BASELINE_GROUPS.contains(&group))
 }
 
 /// One benchmark's result.
@@ -88,6 +113,9 @@ pub enum Status {
     Canary,
     /// A noise canary that moved by more than the noise threshold.
     NoisyCanary,
+    /// A baseline benchmark that isn't a canary (`sequential_read`):
+    /// reported, never gated.
+    Info,
     /// Slower than the baseline past the threshold, on a quiet run. Fails.
     Regression,
     /// As `Regression`, but on a noisy run, so it can't be judged.
@@ -104,6 +132,7 @@ impl Status {
             Self::Ok => "ok",
             Self::Canary => "canary",
             Self::NoisyCanary => "**canary moved (noisy run)**",
+            Self::Info => "info (not gated)",
             Self::Regression => "**regression**",
             Self::NoisyRegression => "regression? (noisy run)",
             Self::OverBudget => "**over budget**",
@@ -119,8 +148,47 @@ pub enum Verdict {
     Pass,
     /// A budget failed, or a regression on a quiet run.
     Fail,
-    /// A canary moved, so regressions can't be judged: rerun.
+    /// A canary moved, so regressions can't be judged.
     Noisy,
+}
+
+/// What `just bench-compare` does with a report, given whether it may
+/// still rerun ([`Report::outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing failed, and the run was quiet.
+    Pass,
+    /// A budget failed, or a benchmark regressed on a quiet run.
+    Fail,
+    /// The run was noisy, and this wasn't the last attempt: rerun.
+    Rerun,
+    /// The last attempt was noisy too, and nothing failed: warn, but pass.
+    /// Regressions couldn't be judged.
+    Inconclusive,
+}
+
+impl Outcome {
+    /// `bench-report`'s exit status: 0 to pass (inconclusive included), 1
+    /// to fail, 3 to ask for a rerun.
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Pass | Self::Inconclusive => 0,
+            Self::Fail => 1,
+            Self::Rerun => 3,
+        }
+    }
+
+    /// The outcome in a few words, for the job summary's heading.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Rerun => "noisy, rerunning",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
 }
 
 /// One row of the report.
@@ -249,6 +317,8 @@ pub fn evaluate(
                 Status::NoisyCanary
             } else if is_canary(&m.id) {
                 Status::Canary
+            } else if is_baseline(&m.id) {
+                Status::Info
             } else if m
                 .change
                 .is_some_and(|change| change.lower > thresholds.regression)
@@ -305,11 +375,25 @@ impl Report {
         }
     }
 
+    /// What to do with this report. A noisy run is rerun, unless this was
+    /// the `last_attempt`: then it is inconclusive, and passes, because a
+    /// noisy runner is no reason to fail the job. A failure fails on any
+    /// attempt, noisy or not.
+    #[must_use]
+    pub fn outcome(&self, last_attempt: bool) -> Outcome {
+        match self.verdict() {
+            Verdict::Pass => Outcome::Pass,
+            Verdict::Fail => Outcome::Fail,
+            Verdict::Noisy if last_attempt => Outcome::Inconclusive,
+            Verdict::Noisy => Outcome::Rerun,
+        }
+    }
+
     /// The rows worth an annotation: failures, and what made a run noisy.
     pub fn problems(&self) -> impl Iterator<Item = &Row> {
         self.rows
             .iter()
-            .filter(|row| !matches!(row.status, Status::Ok | Status::Canary))
+            .filter(|row| !matches!(row.status, Status::Ok | Status::Canary | Status::Info))
     }
 
     /// The report as a Markdown table, for the terminal and for GitHub's job
@@ -356,8 +440,11 @@ impl Report {
         let _ = write!(
             out,
             "\nA benchmark regressed if its change's whole 95% interval is above {}. \
-             The run is noisy if a `baseline` or `baseline-late` canary moved by more than {}.",
+             The run is noisy if a canary (`{}` or `{}`) moved by more than {}. \
+             The other `baseline` benchmarks are information only.",
             percent(self.thresholds.regression),
+            CANARIES[0],
+            CANARIES[1],
             percent(self.thresholds.noise),
         );
         if self.noisy {
