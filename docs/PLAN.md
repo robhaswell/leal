@@ -10,8 +10,15 @@ explains what each task is for.
   commit messages starting with the task ID. See `CLAUDE.md` for the full
   process.
 - Tick the box once the task is reviewed and its findings are fixed.
+- The bullets under a task are its acceptance criteria. They include what
+  the ADRs and earlier task notes ask of it; read the ADRs and notes a task
+  cites before starting it.
+- Criteria marked **(ADR-0005, pending: …)** depend on ADR-0005, which Rob
+  hasn't accepted yet. If he changes a decision, the criterion changes with
+  it, and product code for it waits until the ADR is accepted (CLAUDE.md).
 - A task is done only when every acceptance criterion holds,
-  `just check` passes locally and in CI, and its review findings are fixed.
+  `just check` passes locally and in CI (`just check-all` for a task that
+  touches `app/` or `crates/leal-ffi`), and its review findings are fixed.
 - A phase is done when its phase-end review is complete and Rob has approved
   it. The approved commit is tagged `phase-<n>`.
 - If a task turns out to need a design change, stop and write an ADR in
@@ -61,23 +68,186 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 ## Phase 1 — Viewer
 
 - [ ] **1.1 Source** — clone + mmap, fallbacks, temp cleanup (DESIGN §3.1).
+  - Clone into a temporary folder on the file's own volume
+    (`FileManager.url(for: .itemReplacementDirectory, …, appropriateFor:)`),
+    because `clonefile` fails across volumes. EXDEV means "clone elsewhere",
+    not "no cloning"; the read-into-memory and copy fallbacks are only for
+    volumes that can't clone at all. Launch cleanup checks every folder
+    Leal recorded. Tested with a file on a second APFS volume (a disk
+    image will do). (ADR-0005, pending: decision 7)
+  - Temporary files go only where a sandboxed app may write (DESIGN §4.3);
+    1.6 checks this with the sandbox on.
+  - Reads the `com.apple.TextEncoding` extended attribute on open and passes
+    it to detection (ADR-0004 decision 11).
+  - The `source` module is the one place in `leal-core` with a narrow
+    `#[allow(unsafe_code)]`, and every `unsafe` block has a `// SAFETY:`
+    comment (0.1 notes).
+  - The 0.3 skeleton's `inspect_file` (`crates/leal-core/src/inspect.rs`),
+    which reads a CR-only file as one line, is replaced by `source`. If the
+    app still calls it, 1.6 switches it over and removes it.
 - [ ] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
+  - Follows ADR-0003 decisions 1, 6 and 7, and the attribute rules of
+    ADR-0004 decision 11: a UTF-8 or Windows-1252 attribute is always
+    honoured, another valid one only if the bytes decode under it, and a
+    UTF-16 attribute on a file without a UTF-16 BOM is ignored. Detection
+    reports where the encoding came from (BOM, attribute or guess), so the
+    status bar can say so (1.7).
+  - Encoding order: BOM, then the attribute, then ADR-0003 rule 1 on the
+    first 64 KB for first paint. The whole-file rule runs later as P2 work,
+    and a disagreement becomes a suggestion, never a silent re-decode. A
+    corpus or generated case over 64 KB whose later bytes change the guess
+    tests this. (ADR-0005, pending: decision 4)
+  - The v1 encodings: UTF-8, UTF-16 with a BOM and Windows-1252 are
+    detected; the other single-byte encodings ADR-0005 lists are used only
+    from the attribute or **Reopen with encoding…**. Attribute values are
+    matched by their CFStringEncoding number, and an unsupported or
+    unreadable attribute is ignored with a status bar note. (ADR-0005,
+    pending: decision 5)
+  - Reads Leal's own `io.github.robhaswell.leal.interpretation` attribute
+    (remembered delimiter and header choice) and honours it if the file
+    still parses sensibly with it. (ADR-0005, pending: decision 1)
+  - The core accepts a user-chosen delimiter, header choice or encoding in
+    place of the detected one, without changing any bytes (DESIGN §3.2).
+  - From the 0.2 notes ("Obligations for later tasks"):
+    - The testkit's reopen property also checks the delimiter and header
+      decision after an edit, with the interpretation attribute modelled
+      the way the encoding hint already is. (ADR-0005, pending: decision 1)
+    - The encoding attribute is tested on real reads: one that contradicts
+      the guess, a UTF-16 one on a file without a BOM, and a UTF-8 one over
+      invalid bytes.
+    - The hand-written header expectations in the corpus sidecars are
+      checked against the detector.
+  - The testkit conventions no ADR records are confirmed, or taken to Rob
+    as an ADR: `,` for files with no delimiter, `header = false` for a
+    single-row file, and a final odd byte in a UTF-16 file reported as
+    `invalid_encoding` (0.2 notes, "Still open").
+- [ ] **1.2a Real-world exports in the corpus** (DESIGN §5, layer 2).
+  *Rob supplies the files.*
+  - Real exports replace or verify the seven imitations in
+    `tests/corpus/exports/`: Excel for Windows (UTF-8 BOM and
+    Windows-1252), Excel for Mac (including whether "CSV UTF-8" still ends
+    rows with a lone CR), Google Sheets (line endings, final newline),
+    Numbers (line endings and quoting), pandas and PostgreSQL `COPY`.
+  - Rob supplies the Excel, Numbers and Google Sheets files, with
+    non-sensitive data; the pandas and `COPY` files can be made here.
+  - Each has a sidecar, and 1.2's detection passes on all of them. The
+    0.2 notes' "Imitation exports: sources" table is updated with what the
+    real files showed.
+  - Runs whenever the files arrive and blocks no other task. If they
+    haven't arrived by the phase 1 gate, it moves to phase 4, before 4.1.
+- [ ] **1.2b Reference file and CI benchmarks** (DESIGN §1, §3.10, §5).
+  - A deterministic generator for the reference file: 100 MB, 1M rows × 12
+    columns, UTF-8, quoted fields containing some newlines (DESIGN §1).
+    It is generated on demand (a `just` recipe) and never committed.
+  - `criterion` benchmarks run against it, and `just bench` runs them.
+    1.3, 1.3a and later tasks add their benchmarks here.
+  - Decide, and record in the task notes, whether CI runs the benchmarks
+    and whether they gate or only report, since GitHub's runners are not
+    the reference machine. If CI runs them, add the job and the regression
+    alert DESIGN §5 asks for.
 - [ ] **1.3 Row index** — quote-aware, progressive, `u32` offsets (§3.3).
-  Benchmark: 100 MB reference file indexed in < 500 ms.
+  Benchmark: 100 MB reference file (1.2b) indexed in < 500 ms.
+  - The same pass produces the dominant field count (ADR-0003 decision 4).
+    The whole-file encoding count (ADR-0003 decision 1) is gathered in this
+    pass or as separate P2 work, whichever keeps the index within budget.
+    (ADR-0005, pending: decision 4)
+  - Re-indexing with a different delimiter or encoding (1.2) works without
+    reopening the file.
 - [ ] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
   resume on user input, `os_signpost` intervals (§3.10). First-paint path
   parses the first screen without waiting for the index. Benchmark: first
-  rows < 150 ms with P1–P3 work forced to run concurrently.
+  rows < 150 ms with P1–P3 work forced to run concurrently (in the 1.2b
+  harness).
+  - Cancellation is explicit: each long job has a handle with `cancel()`,
+    which sets a flag the Rust job checks at its chunk boundaries. Swift
+    wraps each await in `withTaskCancellationHandler`, which calls
+    `cancel()`. Long work runs on Rust-owned threads or pools; the async
+    function only reports completion. A test shows a cancelled Swift task
+    stops the Rust job. (ADR-0005, pending: decision 6)
 - [ ] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
+  - Follows ADR-0003 decisions 2, 3, 6 and 7: text after a closing quote
+    displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
+    position is a byte offset into the file as stored (UTF-16 included),
+    and an unpaired surrogate displays as U+FFFD.
 - [ ] **1.5 Diagnostics** — all kinds in §3.5, collected during indexing.
+  - Follows ADR-0003 decisions 4, 5 and 7, and matches every corpus
+    sidecar (the kinds table in `tests/corpus/README.md`): one occurrence
+    per row, field or file as listed; ties go to the first seen; blank
+    lines are left out of the dominant field count and are never ragged;
+    in UTF-16 a NUL is a U+0000 code unit; locations are byte offsets as
+    stored.
+  - The dominant field count is final only once indexing finishes, so the
+    notes say how ragged rows and hatched cells behave before then.
 - [ ] **1.6 App: document and grid** — `NSDocument`, grid bound to the core,
   gutter, header row, column sizing, status bar (§4.1). Grid appears from
   the P0 first screen; scrollbar uses the estimated row count while
   indexing (§3.10).
+  - Builds the custom grid, option B of ADR-0001:
+    - A document view that draws only the visible cells with Core Text,
+      with laid-out text cached for visible cells.
+    - Header and gutter views, column geometry held as running totals,
+      column resize by dragging the header edge, and double-click to fit.
+    - At first paint, columns are sized from the first screen of rows; the
+      1,000-row sizing runs as P2 work.
+    - A test that the last rows of a very tall document view (1M and 40M
+      rows) draw correctly.
+    - The cell drawing lives in one place that fallback C could reuse.
+    - Hitches and footprint are re-measured on an unlocked screen, and on
+      a base M1 Air if one is available, and recorded in the notes.
+    - Column drag-to-reorder (1–2 days) isn't in the mockups, so the notes
+      ask Rob at the phase 1 gate whether it is in v1.
+  - The status-bar "Header row" toggle (ADR-0002 question 13, mockup 06b).
+  - UTF-16 files open read-only with the info banner, lock glyph and
+    "Read-only" in the status bar (mockup 06a); its Save As UTF-8 button
+    is wired up in 2.3.
+  - Changes the 0.3 skeleton (0.3 notes, "Decisions and deviations"):
+    - `AppDelegate` no longer implements `openDocument(_:)` or
+      `application(_:open:)`, so every open goes through
+      `NSDocumentController` (Open Recent, tabs, reopening).
+    - `Info.plist` names the `NSDocumentClass`. The role stays `Viewer`
+      until 2.5 makes it `Editor`.
+    - The App Sandbox is on (user-selected read-write files), so the rest
+      of phases 1–2 runs sandboxed from the start (DESIGN §4.3), and 1.1's
+      clones and temporary folders are checked under it. The notes say
+      whether the hardened runtime goes on now or in 4.5.
+    - The Edit menu has the standard items (Undo, Redo, Cut, Copy, Paste,
+      Delete, Select All), which text fields need for their shortcuts.
+    - The Swift bindings are compiled, and the Rust library linked, in
+      exactly one place: a hosted `LealTests` without its own copy of the
+      bindings, or a framework target both depend on. Hosted `NSDocument`
+      tests then build.
+    - Every FFI export that can fail, or could panic, returns `Result`
+      (0.3 notes). Decide whether to add a permanent test that a Rust
+      panic reaches Swift as an error (0.3 open questions).
+  - Deletes `spikes/grid-spike/` once the grid is in and re-measured. Its
+    results stay in `docs/tasks/0.4-results.md` and the code at the
+    `phase-0` tag (ADR-0001). Nothing else may refer to the folder.
+  - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
 - [ ] **1.7 App: diagnostics banner** — banner, details popover, navigation,
-  gutter markers.
+  gutter markers (mockups 03a, 03b).
+  - Changing the interpretation:
+    - The status bar says when the encoding came from the file's attribute,
+      with **Reopen with encoding…** to override it (ADR-0004 decision 11).
+    - A **Treat as** delimiter menu that re-indexes the file, and the
+      "This file looks semicolon-separated — Switch" suggestion when later
+      samples disagree (DESIGN §3.2).
+    - The encoding suggestion when the whole-file rule disagrees with first
+      paint, and the status bar note for an unsupported attribute.
+      (ADR-0005, pending: decisions 4 and 5)
+    - These follow the existing ADR-0002 status-bar and banner styles with
+      no separate mockup round, and Rob sees screenshots at the phase 1
+      gate. (ADR-0005, pending: decision 8)
 - [ ] **1.8 App: find, go to row, copy, cell inspector.**
+  - Cell selection, multi-cell selection (click, shift-click, drag, ⌘A)
+    and keyboard navigation (arrows, Page Up/Down, ⌘↑/⌘↓, Tab, keeping the
+    active cell visible) are custom code, about 3–5 days (ADR-0001).
+  - Find highlights are drawn by the grid. Go to row is scroll arithmetic,
+    and jumping past the indexed region follows §3.10 rule 5.
+  - In the inspector ⌘↩ commits (ADR-0002 question 11); elsewhere it
+    inserts a row (2.5a), so the two don't clash.
+  - Screenshots next to mockups 04a, 05a and 06c.
 - [ ] **1.9 External changes** — watch the original, Reload / Keep editing.
+  - Works with the App Sandbox on.
 - [ ] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
   measured and recorded in `docs/perf.md`, including first paint and scroll
   smoothness while background work runs.
@@ -85,13 +255,62 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 ## Phase 2 — Editing
 
 - [ ] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
+  - Editing a hatched (missing) cell of a short or blank row is allowed:
+    the save appends the delimiters needed to reach that column, then the
+    value, at the end of the row before its line ending. Edits past an
+    unterminated quote are still rejected (ADR-0004 decision 8). The save
+    oracle (`Document::apply`) and the edit strategy, which today reject or
+    never generate such edits, change to match. (ADR-0005, pending:
+    decision 2)
 - [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
+  - Replays the testkit's `EditCase` edits on the real document with
+    `existing_hint` passed through, and requires the same bytes, splices,
+    `line_endings`, `encoding_hint` and `fixes` as the oracle (0.2 notes).
+    Until 2.4 lands, the replay is limited to cell edits, because
+    `EditCase` also generates row and column inserts and deletes.
+  - The reopen property covers the BOM, quote character, line endings and
+    every row's values (ADR-0004 decision 10); the delimiter and header
+    choice are covered through the remembered interpretation. (ADR-0005,
+    pending: decision 1)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
+  - Covers every single-byte encoding Leal supports. (ADR-0005, pending:
+    decision 5)
+  - The UTF-16 banner's Save As UTF-8 button works (mockup 06a).
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
+  - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
+    and the product, with a unit test and edit-strategy coverage; this
+    removes `TODO(ADR-0004 #2)` in `crates/leal-testkit/src/save.rs`. A
+    column's fields are those at that index in non-blank rows long enough
+    to have one, header included, and a new field is quoted if the column
+    has at least one non-empty field and all of them are quoted.
+    (ADR-0005, pending: decision 3)
+  - 2.2's oracle replay is extended to every edit kind.
 - [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
   Save / Save As / Revert, safe-save with metadata preserved.
+  - In-cell editing uses an `NSTextField` overlaid on the cell; Return
+    commits and Esc cancels through the field editor (ADR-0001).
+  - The invalid-bytes callout is a small view anchored to the edited cell
+    (ADR-0001, mockup 05b).
+  - Hatched cells can be edited. (ADR-0005, pending: decision 2)
+  - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
+    guess a different encoding, and updates it if the file already has one
+    (ADR-0004 decision 11).
+  - Writes the interpretation attribute when a reopen would guess a
+    different delimiter or header choice, or the user chose them.
+    (ADR-0005, pending: decision 1)
+  - `Info.plist`'s document role becomes `Editor`.
+  - Screenshots next to mockups 05a and 05b.
+- [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
+  - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
+    delete columns, all undoable, on top of 2.4.
+  - Inserting a row or column after an unterminated quote is disabled,
+    with an explanation (ADR-0004 decision 8, which names 2.5).
+  - Menu commands and shortcuts only; anything more needs a mockup Rob
+    approves (ADR-0002).
 - [ ] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
+  - Pasting over short rows follows the hatched-cell rule from 2.1.
+    (ADR-0005, pending: decision 2)
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
 
@@ -101,16 +320,32 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   streamed results (§3.8). Runs as P3 work: filters apply while indexing,
   lazy per-column acceleration, dropped under memory pressure (§3.10).
   Acceptance: scrolling stays smooth during a filter scan (Instruments).
+  - Cancellation uses the explicit job handles from 1.3a. (ADR-0005,
+    pending: decision 6)
 - [ ] **3.2 Sort** — multi-column, stable, numeric-aware.
 - [ ] **3.3 App: filter bar and quick search**, editing in filtered views.
+  - The header's sort indicator and click-to-sort are drawn by the grid
+    (ADR-0001, mockup 04b), about 1 day.
+  - Screenshot next to mockup 04b.
 
 ## Phase 4 — Release
 
 - [ ] **4.1 Performance and memory audit** against every budget in DESIGN §1;
   published comparison with Tad.
 - [ ] **4.2 Accessibility** — VoiceOver, keyboard access, contrast (§4.4).
+  - The grid draws its own cells, so it implements the `NSAccessibility`
+    table protocols itself (ADR-0001, "Accessibility"): row and cell
+    elements for visible rows only, the table with full row and column
+    counts and headers, cell lookup that scrolls on demand, a settable
+    editing path with the usual undo and fidelity rules, announcements for
+    ragged, edited and invalid cells, rotors for find matches and
+    diagnostics, notifications, and audits (Accessibility Inspector, the
+    XCUITest audit, a scripted VoiceOver pass, full keyboard access).
+  - Estimate: 2–3 weeks more than a standard `NSTableView` would need.
 - [ ] **4.3 CLI** — `leal <file>`, `leal check <file>`.
 - [ ] **4.4 Polish** — icon, About, Settings, README, website page.
 - [ ] **4.5 Release pipeline** — signing, notarization, DMG, Sparkle,
   GitHub Actions release, Homebrew cask. *Needs the Apple Developer Program.*
+  - Hardened runtime on, if 1.6 left it off; the sandbox entitlements are
+    reviewed for the signed build.
 - [ ] **4.6 Public beta, then 1.0.**

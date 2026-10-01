@@ -62,7 +62,7 @@ notes"). Each open question is resolved the way the mockups draw it:
     inspector.
 12. **Invalid bytes.** Editing such a cell shows a callout under it saying
     the invalid byte will be replaced on commit; Esc keeps the original bytes.
-13. **Header row (DESIGN §8, "Header row", now decided item 2).** Trust the detection. When no header is
+13. **Header row (DESIGN §8 item 2).** Trust the detection. When no header is
     found, the header cells show 1, 2, 3… in grey. Option drawn: **the toggle
     is in the status bar ("Header row: off")**, not the header corner cell.
 14. **UTF-16.** An info banner with a primary "Save As UTF-8…" button, a lock
@@ -81,7 +81,7 @@ popovers and the find bar follow macOS conventions.
   §4.2; record the header-row answer in §8 (trust detection, status-bar
   toggle); note in §3.5 that ragged rows and text after a closing quote are
   shown in the grid as described above. *(All three are done: §4.2, §8
-  item 2, and a pointer to decisions 5 and 6 at the top of §3.5.)*
+  item 2, and a pointer to questions 5 and 6 at the top of §3.5.)*
 - The grid spike (0.4, ADR-0001) must be able to draw everything shown here:
   gutter markers, per-cell styling for selection, edits and hatched cells,
   in-cell editors and highlighted find matches.

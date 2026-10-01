@@ -95,9 +95,10 @@ enforced.
 - The grid itself is a custom AppKit view that draws only the visible cells
   with Core Text (ADR-0001, option B). The phase 0 spike showed that
   `NSTableView` makes a view for every column of each visible row, so it
-  slows down on wide files; the custom grid stays well inside the frame
-  budget at 200 columns. The fallback, if B hits a wall, is an `NSTableView`
-  whose rows draw their own cells (option C), reusing the same drawing code.
+  slows down on wide files. The custom grid stayed well inside the frame
+  budget at 200 columns, on a faster Mac than the reference (1.6
+  re-measures). The fallback, if B hits a wall, is an `NSTableView` whose
+  rows draw their own cells (option C), reusing the same drawing code.
 - Keeping the core in Rust gives predictable memory use, fast byte scanning,
   and makes the fidelity guarantees testable without a UI.
 - Tauri or Electron would reintroduce the memory overhead Leal exists to avoid.
@@ -210,7 +211,7 @@ rows for the visible area are kept in a small LRU cache.
 > What counts as one occurrence, tie-breaks, blank lines and UTF-16 rules:
 > ADR-0003 (§4, §5, §7). How ragged rows and text after a closing quote are
 > shown in the grid (hatched cells, an extra "Column N", raw text): ADR-0002
-> (decisions 5 and 6). The ADRs take precedence over this section.
+> (questions 5 and 6). The ADRs take precedence over this section.
 
 Leal's rule for irregular input: **show it faithfully, warn clearly, never fix
 it silently.**
