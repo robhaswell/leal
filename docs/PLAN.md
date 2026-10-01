@@ -180,7 +180,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     after first paint, not in this pass. (ADR-0005 decision 4)
   - Re-indexing with a different delimiter or encoding (1.2) works without
     reopening the file.
-- [~] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
+- [x] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
   resume on user input, `os_signpost` intervals (§3.10). First-paint path
   parses the first screen without waiting for the index. Benchmark: first
   rows < 150 ms with P1–P3 work forced to run concurrently (in the 1.2b
