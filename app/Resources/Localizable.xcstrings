@@ -171,6 +171,9 @@
         }
       }
     },
+    "Read into memory" : {
+      "comment" : "Status bar: the file's volume can't make a snapshot, so Leal read the file into memory (DESIGN §3.1)"
+    },
     "Read-only" : {
       "comment" : "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)\nThe lock glyph by a read-only file's title, for VoiceOver"
     },
@@ -212,6 +215,9 @@
     },
     "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it." : {
       "comment" : "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
+    },
+    "This volume can’t make a snapshot of the file, so Leal read the whole file into memory." : {
+      "comment" : "Status bar tooltip: why the file was read into memory (DESIGN §3.1)"
     },
     "UTF-16 files are read-only in this version of Leal." : {
       "comment" : "Tooltip of the lock glyph by a read-only file's title"

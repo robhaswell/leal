@@ -36,11 +36,20 @@ enum DocumentChange: Equatable, Sendable {
 /// reports `.failed`; the window offers to reopen the file.
 @MainActor
 final class DocumentModel: GridDataSource {
-    /// Rows in the first screen, from P0 (enough for a tall screen).
+    /// Rows the first sizing and number detection read, at P0 (a tall
+    /// screen's worth).
     nonisolated static let firstScreenRows: UInt32 = 100
     /// Rows the refined column sizing and number detection read (ADR-0002
     /// question 2; P2 work in DESIGN §3.10).
     nonisolated static let sizingRows: UInt32 = 1_000
+    /// The most fields (rows × columns) a sizing read takes, as the core's
+    /// row cache caps fields: a file of 20,000 columns is sized from 5 rows,
+    /// not 1,000 (20M cells).
+    nonisolated static let sizingFieldLimit = 100_000
+
+    /// Called after first paint inside `init`, on the core's document. Only
+    /// tests set it, to make the document fail while it opens.
+    static var afterFirstPaintForTesting: ((LealFFI.Document) throws -> Void)?
 
     let url: URL
     private var handle: LealFFI.Document?
@@ -56,6 +65,9 @@ final class DocumentModel: GridDataSource {
     private(set) var reviewedLineEnding: LineEnding?
     /// The most common field count: the "× N columns" of the status bar.
     private(set) var fileColumnCount: Int
+    /// Where the file's bytes are held (DESIGN §3.1): a clone, or a copy in
+    /// memory when the volume can't clone, which the status bar notes.
+    private(set) var storage: SourceStorage = .clone
     /// Why the document failed, once it has.
     private(set) var failure: (any Error)?
     /// How many calls the model has made on the core's document, so a test
@@ -68,9 +80,16 @@ final class DocumentModel: GridDataSource {
     private var headerTitles: [String] = []
     /// Columns the user has resized; sizing leaves them alone.
     private var resizedColumns: Set<Int> = []
-    /// The rows the column widths were measured from, as (text, truncated),
-    /// kept for double-click to fit.
-    private var sample: [[(text: String, truncated: Bool)]] = []
+    /// Each column's widest text in the rows the widths were measured from
+    /// (up to `GridMetrics.fitMaximumWidth`), kept for double-click to fit
+    /// instead of the rows themselves.
+    private var widestText: [CGFloat] = []
+    /// The most fields a row read for sizing had.
+    private var widestSampleRow = 0
+    /// The most fields one sizing read has taken, for tests.
+    private(set) var largestSizingRead = 0
+    /// This document's scroll gesture is under way (see `setInteracting`).
+    private var interacting = false
     private var tiles: CellTileCache!
     private var tasks: [Task<Void, Never>] = []
     private var refinedSizingStarted = false
@@ -90,7 +109,10 @@ final class DocumentModel: GridDataSource {
             volume: TemporaryFolders.volume(for: url),
             temp: environment.temp,
             scheduler: environment.scheduler,
-            options: OpenOptions(firstScreenRows: firstScreenRows, maxChars: GridMetrics.maxCellCharacters),
+            // The first screen's rows are read below, through `cells`, with
+            // a cap on the fields; the core's first screen need only bring
+            // the first row, for the header titles.
+            options: OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters),
             observer: relay
         )
         let model = try DocumentModel(url: url, handle: handle, scheduler: environment.scheduler)
@@ -118,6 +140,10 @@ final class DocumentModel: GridDataSource {
         )
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
         applyFirstScreen(screen)
+        storage = call({ try $0.storage() }) ?? storage
+        if let hook = Self.afterFirstPaintForTesting {
+            _ = call { try hook($0) }
+        }
     }
 
     /// Starts waiting for the background jobs. Call once the window exists.
@@ -131,6 +157,7 @@ final class DocumentModel: GridDataSource {
     /// jobs they wait for, and the core's document is released, which
     /// cancels the rest and deletes the file's clone (DESIGN §3.1).
     func close() {
+        setInteracting(false)
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
@@ -147,6 +174,16 @@ final class DocumentModel: GridDataSource {
     /// The first row is a header row, so the grid's row `r` is the file's
     /// row `r + 1`.
     private var headerOffset: Int { interpretation.header ? 1 : 0 }
+
+    /// A scroll gesture in this document's grid began or ended (DESIGN
+    /// §3.10 rule 3). The scheduler has no timeout, so a gesture this
+    /// document started is always ended: by the grid, or when the document
+    /// closes or fails. The scheduler is the app's, not the document's.
+    func setInteracting(_ active: Bool) {
+        guard active != interacting else { return }
+        interacting = active
+        scheduler.setInteracting(interacting: active)
+    }
 
     // MARK: Calls on the core
 
@@ -178,6 +215,7 @@ final class DocumentModel: GridDataSource {
         guard failure == nil else { return }
         Logger.document.error("Document failed: \(String(describing: error), privacy: .public)")
         failure = error
+        setInteracting(false)
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
@@ -240,6 +278,10 @@ final class DocumentModel: GridDataSource {
         if let count = call({ try $0.columnCount() }) {
             fileColumnCount = Int(count)
         }
+        // A removable drive's file moves from being read to a copy as the
+        // index pass copies it. SEAM(1.7): Copy, Reading and Disconnected.
+        storage = call({ try $0.storage() }) ?? storage
+        loadHeaderTitlesIfNeeded()
         updateColumnCount()
         let enough = Int(report.rows) >= Int(Self.sizingRows) + headerOffset
         if !refinedSizingStarted, enough || report.complete {
@@ -313,39 +355,84 @@ final class DocumentModel: GridDataSource {
 
     // MARK: Columns
 
-    /// Sizes the columns from the first screen (P0) and asks the core which
-    /// are numeric, from the same rows.
+    /// How many rows a sizing read takes for `columns` columns: `wanted`,
+    /// or fewer, so that it reads at most `sizingFieldLimit` fields.
+    nonisolated static func sizingRows(wanted: UInt32, columns: Int) -> UInt32 {
+        let fit = sizingFieldLimit / max(1, columns)
+        return UInt32(max(1, min(Int(wanted), fit)))
+    }
+
+    /// Sizes the columns from the first screen's rows (P0) and asks the core
+    /// which are numeric, from the same rows. The first screen gave the first
+    /// row (the header titles); the rows are read here, capped in fields.
     private func applyFirstScreen(_ screen: FirstScreen) {
-        var rows = screen.rows.map { $0.map { (text: $0.text, truncated: $0.truncated) } }
         headerTitles = []
-        if interpretation.header, !rows.isEmpty {
-            headerTitles = rows.removeFirst().map { CellText.display($0.text).text }
+        if interpretation.header, let first = screen.rows.first {
+            headerTitles = first.map { CellText.display($0.text).text }
         }
-        sample = rows
-        numeric = call({ try $0.numericColumns(sample: Self.firstScreenRows) }) ?? []
+        let columns = max(fileColumnCount, headerTitles.count, screen.rows.first?.count ?? 0, 1)
+        let wanted = Self.sizingRows(wanted: Self.firstScreenRows, columns: columns)
+        let rows = readSizingRows(count: wanted, columns: columns)
+        numeric = call({ try $0.numericColumns(sample: wanted) }) ?? []
+        widestSampleRow = rows.fieldCount
         updateColumnCount()
-        columnWidths = measure(rows: rows, columns: columnCount)
+        widestText = measure(rows: rows.cells, columns: columnCount)
+        columnWidths = ColumnSizer.widths(fromWidest: widestText)
+    }
+
+    /// The sizing rows after the header, as (text, truncated), with the most
+    /// fields any of them has.
+    private func readSizingRows(count: UInt32, columns: Int) -> (cells: [[(text: String, truncated: Bool)]], fieldCount: Int) {
+        largestSizingRead = max(largestSizingRead, Int(count) * columns)
+        let start = UInt64(headerOffset)
+        let read = call {
+            try $0.cells(
+                rowStart: start,
+                rowCount: count,
+                columnStart: 0,
+                columnCount: UInt32(columns),
+                maxChars: GridMetrics.maxCellCharacters
+            )
+        } ?? []
+        return (
+            read.map { $0.cells.map { (text: $0.text, truncated: $0.truncated) } },
+            read.map { Int($0.fieldCount) }.max() ?? 0
+        )
+    }
+
+    /// A header row longer than the first 64 KB isn't in the first screen:
+    /// read its titles once the index has it.
+    private func loadHeaderTitlesIfNeeded() {
+        guard interpretation.header, headerTitles.isEmpty, progress.rows > 0 else { return }
+        let columns = UInt32(max(fileColumnCount, 1))
+        guard let row = call({ try $0.cells(rowStart: 0, rowCount: 1, columnStart: 0, columnCount: columns, maxChars: GridMetrics.maxCellCharacters) })?.first else { return }
+        headerTitles = row.cells.map { CellText.display($0.text).text }
+        onChange?(.columns)
     }
 
     /// The grid's column count: the most common field count, or more if the
     /// header or a row read so far is longer.
     private func updateColumnCount() {
-        let widestSample = sample.map(\.count).max() ?? 0
-        let count = max(fileColumnCount, headerTitles.count, widestSample, tiles?.widestRow ?? 0)
+        let count = max(fileColumnCount, headerTitles.count, widestSampleRow, tiles?.widestRow ?? 0)
         guard count != columnCount else { return }
         columnCount = count
         if columnWidths.count < count {
             columnWidths += Array(repeating: GridMetrics.defaultColumnWidth, count: count - columnWidths.count)
         }
+        if widestText.count < count {
+            widestText += Array(repeating: 0, count: count - widestText.count)
+        }
     }
 
-    private func measure(rows: [[(text: String, truncated: Bool)]], columns: Int, maximum: CGFloat = GridMetrics.maximumColumnWidth) -> [CGFloat] {
+    /// Each column's widest text in `rows` and the header, up to the widest
+    /// a double-click can make a column.
+    private func measure(rows: [[(text: String, truncated: Bool)]], columns: Int) -> [CGFloat] {
         let header = headerMeasurer
-        return ColumnSizer.widths(
+        return ColumnSizer.widest(
             columns: columns,
             header: interpretation.header ? headerTitles : [],
             rows: rows,
-            maximum: maximum,
+            limit: GridMetrics.fitMaximumWidth,
             measureCell: Self.cellMeasure(numeric: numeric, cell: cellMeasurer, number: numberMeasurer),
             measureHeader: { header.width(of: $0) }
         )
@@ -364,33 +451,44 @@ final class DocumentModel: GridDataSource {
     }
 
     /// P2 (DESIGN §3.10): widths and number detection from the first 1,000
-    /// rows, off the main thread, once the index has them.
+    /// rows (fewer for a very wide file), off the main thread, once the
+    /// index has them.
     private func startRefinedSizing() {
         guard let handle, failure == nil else { return }
         refinedSizingStarted = true
         let generation = generation
         let first = UInt64(headerOffset)
-        let columns = UInt32(max(columnCount, 1))
+        let columns = max(columnCount, 1)
+        let rowCount = Self.sizingRows(wanted: Self.sizingRows, columns: columns)
+        largestSizingRead = max(largestSizingRead, Int(rowCount) * columns)
         let cell = cellMeasurer
         let number = numberMeasurer
         let header = headerMeasurer
         let titles = interpretation.header ? headerTitles : []
         let task = Task.detached(priority: .utility) { [weak self] in
             // Off the main thread: two reads from the core (each well under
-            // a millisecond a hundred rows) and the measuring.
+            // a millisecond a hundred rows) and the measuring. Only each
+            // column's widest text is kept.
             let result: Result<RefinedColumns, any Error>
             do {
-                let rows = try handle.cells(rowStart: first, rowCount: Self.sizingRows, columnStart: 0, columnCount: columns, maxChars: GridMetrics.maxCellCharacters)
-                let numeric = try handle.numericColumns(sample: Self.sizingRows)
-                let sample = rows.map { $0.cells.map { (text: $0.text, truncated: $0.truncated) } }
-                let widths = ColumnSizer.widths(
-                    columns: Int(columns),
+                let rows = try handle.cells(
+                    rowStart: first,
+                    rowCount: rowCount,
+                    columnStart: 0,
+                    columnCount: UInt32(columns),
+                    maxChars: GridMetrics.maxCellCharacters
+                )
+                let numeric = try handle.numericColumns(sample: rowCount)
+                let widest = ColumnSizer.widest(
+                    columns: columns,
                     header: titles,
-                    rows: sample,
+                    rows: rows.map { $0.cells.map { (text: $0.text, truncated: $0.truncated) } },
+                    limit: GridMetrics.fitMaximumWidth,
                     measureCell: Self.cellMeasure(numeric: numeric, cell: cell, number: number),
                     measureHeader: { header.width(of: $0) }
                 )
-                result = .success(RefinedColumns(sample: sample, widths: widths, numeric: numeric))
+                let fieldCount = rows.map { Int($0.fieldCount) }.max() ?? 0
+                result = .success(RefinedColumns(widest: widest, numeric: numeric, fieldCount: fieldCount))
             } catch {
                 result = .failure(error)
             }
@@ -403,12 +501,16 @@ final class DocumentModel: GridDataSource {
         guard generation == self.generation, failure == nil else { return }
         switch result {
         case let .success(refined):
-            sample = refined.sample
             numeric = refined.numeric
-            for (column, width) in refined.widths.enumerated() where column < columnWidths.count && !resizedColumns.contains(column) {
+            widestSampleRow = max(widestSampleRow, refined.fieldCount)
+            updateColumnCount()
+            for (column, widest) in refined.widest.enumerated() where column < widestText.count {
+                widestText[column] = widest
+            }
+            let widths = ColumnSizer.widths(fromWidest: refined.widest)
+            for (column, width) in widths.enumerated() where column < columnWidths.count && !resizedColumns.contains(column) {
                 columnWidths[column] = width
             }
-            updateColumnCount()
             onChange?(.columns)
         case let .failure(error):
             switch error as? LealError {
@@ -429,27 +531,27 @@ final class DocumentModel: GridDataSource {
         columnWidths[column] = width
     }
 
-    /// The width that fits column `column`'s contents in the sample and in
-    /// `visibleRows`, for a double-click on its header edge.
+    /// The width that fits column `column`'s contents in the sizing rows and
+    /// in `visibleRows`, for a double-click on its header edge.
     func fittingWidth(column: Int, visibleRows: Range<Int>) -> CGFloat? {
         guard column < columnCount else { return nil }
-        var rows = sample.map { row in column < row.count ? [row[column]] : [] }
+        var rows: [[(text: String, truncated: Bool)]] = []
         for row in visibleRows {
             if case let .text(text, truncated) = cell(row: row, column: column) {
                 rows.append([(text, truncated)])
             }
         }
-        let title = interpretation.header && column < headerTitles.count ? [headerTitles[column]] : []
-        let header = headerMeasurer
         let font = isNumeric(column: column) ? numberMeasurer : cellMeasurer
-        return ColumnSizer.widths(
+        let visible = ColumnSizer.widest(
             columns: 1,
-            header: title,
+            header: [],
             rows: rows,
-            maximum: GridMetrics.fitMaximumWidth,
+            limit: GridMetrics.fitMaximumWidth,
             measureCell: { _, text, truncated in font.cellWidth(of: text, truncated: truncated) },
-            measureHeader: { header.width(of: $0) }
-        ).first
+            measureHeader: { _ in 0 }
+        ).first ?? 0
+        let sampled = column < widestText.count ? widestText[column] : 0
+        return ColumnSizer.widths(fromWidest: [max(visible, sampled)], maximum: GridMetrics.fitMaximumWidth).first
     }
 
     // MARK: Re-reading
@@ -464,7 +566,7 @@ final class DocumentModel: GridDataSource {
             delimiter: current.delimiterSource == .user ? current.delimiter : nil,
             header: header,
             encoding: current.encodingSource == .user ? current.encoding : nil,
-            firstScreenRows: Self.firstScreenRows,
+            firstScreenRows: 1,
             maxChars: GridMetrics.maxCellCharacters
         )
         guard let screen = call({ try $0.reinterpret(options: options) }) else { return }
@@ -477,6 +579,8 @@ final class DocumentModel: GridDataSource {
         tiles.removeAll()
         resizedColumns.removeAll()
         columnWidths = []
+        widestText = []
+        widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false
         if let current = call({ try $0.progress() }) { progress = current }
@@ -500,16 +604,19 @@ final class DocumentModel: GridDataSource {
             encodingSource: interpretation.encodingSource,
             header: interpretation.header,
             headerSource: interpretation.headerSource,
-            readOnly: isReadOnly
+            readOnly: isReadOnly,
+            storage: storage
         )
     }
 }
 
 /// The refined sizing's result, from the background.
 private struct RefinedColumns: Sendable {
-    let sample: [[(text: String, truncated: Bool)]]
-    let widths: [CGFloat]
+    /// Each column's widest text.
+    let widest: [CGFloat]
     let numeric: [Bool]
+    /// The most fields a sampled row had.
+    let fieldCount: Int
 }
 
 /// The model, for the progress relay, which exists before it.

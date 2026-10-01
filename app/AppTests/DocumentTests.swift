@@ -237,14 +237,125 @@ final class DocumentTests: XCTestCase {
         }
         XCTAssertTrue(review.isFinished())
 
-        // A task cancelled before it waits cancels the job at once.
-        let index = try document.indexJob()
+        // A task cancelled before it waits cancels the job at once. Another
+        // document's review is held too (the scheduler is still
+        // interacting), so the job is certainly still running.
+        let other = try openDocument(
+            path: url.path(percentEncoded: false),
+            volume: VolumeInfo(),
+            temp: environment.temp,
+            scheduler: environment.scheduler,
+            options: OpenOptions(),
+            observer: nil
+        )
+        let held = try other.reviewJob()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(held.isFinished(), "held while interacting")
         let early = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            try await index.finish()
+            try await held.finish()
         }
-        _ = await early.result
-        XCTAssertTrue(index.isFinished())
+        let earlyResult = await early.result
+        XCTAssertThrowsError(try earlyResult.get()) { error in
+            XCTAssertEqual(error as? JobFailure, .Cancelled)
+        }
+        XCTAssertTrue(held.isFinished())
+    }
+
+    /// A window closed mid-gesture: closing the document ends its gesture,
+    /// so background work of every document resumes (the scheduler has no
+    /// timeout).
+    func testClosingADocumentMidGestureLetsBackgroundWorkResume() async throws {
+        let small = try file("a.csv", "a,b\n1,2\n")
+        let document = try open(small)
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        controller.content.grid.scrollView.setGesture(true)
+
+        // Another document's review is held by the gesture.
+        let (url, _) = try bigFile("big.csv", bytes: 4 << 20)
+        let other = try openDocument(
+            path: url.path(percentEncoded: false),
+            volume: VolumeInfo(),
+            temp: environment.temp,
+            scheduler: environment.scheduler,
+            options: OpenOptions(),
+            observer: nil
+        )
+        let review = try other.reviewJob()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(review.isFinished(), "held during the gesture")
+
+        document.close()
+        try await waitUntil("the other document's review runs") { review.isFinished() }
+    }
+
+    // MARK: Failing while opening (DESIGN §3.9)
+
+    /// A panic while the document opens fails it before there is a window
+    /// to show the failure in: the open throws, worded, and nothing is left
+    /// open.
+    func testAPanicWhileOpeningIsAnOpenError() async throws {
+        let url = try file("a.csv", "a,b\n1,2\n")
+        DocumentModel.afterFirstPaintForTesting = { try $0.debugPanic() }
+        defer { DocumentModel.afterFirstPaintForTesting = nil }
+        XCTAssertThrowsError(try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.localizedDescription, "Leal couldn’t open “a.csv”.")
+            XCTAssertEqual(error.localizedRecoverySuggestion, "Something went wrong inside Leal. Close the file and open it again.")
+        }
+        try await waitUntil("the clone is removed") { records().isEmpty }
+    }
+
+    /// A failure after opening but before the window is on screen is shown
+    /// once the window is (not lost).
+    func testAFailureBeforeTheWindowIsShownIsOfferedLater() throws {
+        let url = try file("a.csv", "a,b\n1,2\n")
+        let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+        let model = try XCTUnwrap(document.model)
+        _ = model.call { try $0.debugPanic() }
+        XCTAssertTrue(model.isFailed)
+        document.makeWindowControllers()
+        XCTAssertTrue(document.isOfferingReopen)
+        document.close()
+    }
+
+    // MARK: Very wide files
+
+    /// Column sizing reads at most `sizingFieldLimit` fields, however wide
+    /// the file: 20,000 columns are sized from 5 rows, not 1,000.
+    func testColumnSizingOfAVeryWideFileIsCapped() async throws {
+        let columns = 20_000
+        var text = (0..<columns).map { _ in "a" }.joined(separator: ",") + "\n"
+        let row = (0..<columns).map { String($0 % 10) }.joined(separator: ",") + "\n"
+        for _ in 0..<30 { text += row }
+        let document = try open(try file("wide.csv", text))
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        // The refined sizing runs once the index is complete; let it land.
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(model.columnCount, columns)
+        XCTAssertEqual(model.columnWidths.count, columns)
+        XCTAssertGreaterThan(model.largestSizingRead, 0)
+        XCTAssertLessThanOrEqual(model.largestSizingRead, DocumentModel.sizingFieldLimit)
+        XCTAssertEqual(DocumentModel.sizingRows(wanted: 1_000, columns: columns), 5)
+        XCTAssertEqual(DocumentModel.sizingRows(wanted: 1_000, columns: 12), 1_000)
+        XCTAssertEqual(DocumentModel.sizingRows(wanted: 1_000, columns: 1_000_000), 1)
+        XCTAssertNotNil(model.fittingWidth(column: columns - 1, visibleRows: 0..<5))
+        XCTAssertEqual(model.cell(row: 29, column: columns - 1), .text("9", truncated: false))
+        document.close()
+    }
+
+    // MARK: The status bar
+
+    func testAFileReadIntoMemoryHasAStatusBarNote() {
+        var status = StatusSummary(
+            rows: 3, columns: 2, indexing: false, fractionIndexed: 1, delimiter: .comma, lineEnding: .lf,
+            encoding: .utf8, encodingSource: .guess, header: true, headerSource: .guess, readOnly: false
+        )
+        XCTAssertEqual(StatusText.segments(status), ["3 rows × 2 columns", "Comma", "LF", "UTF-8"])
+        status.storage = .memory
+        XCTAssertEqual(StatusText.segments(status), ["3 rows × 2 columns", "Comma", "LF", "UTF-8", "Read into memory"])
+        XCTAssertTrue(StatusText.help(status).contains("read the whole file into memory"))
     }
 
     // MARK: The header row (ADR-0002 question 13)

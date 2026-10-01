@@ -65,7 +65,7 @@ final class GridContainerView: NSView {
         gutterClip.documentView = gutterView
         gutterClip.drawsBackground = false
         scrollView.onScroll = { [weak self] in self?.followScroll() }
-        scrollView.onScrollInput = { [weak self] in self?.onUserInput?() }
+        scrollView.onScrollInput = { [weak self] in self?.scrollInputArrived() }
         scrollView.onGesture = { [weak self] began in self?.onGesture?(began) }
         headerView.scrollTarget = scrollView
         gutterView.scrollTarget = scrollView
@@ -170,8 +170,8 @@ final class GridContainerView: NSView {
         }
         updateDocumentSize()
         if isJumpingToEnd, isIndexComplete() {
-            isJumpingToEnd = false
             if rows > 0 { select(CellPosition(row: rows - 1, column: activeCell?.column ?? 0)) }
+            isJumpingToEnd = false
         }
         if let cell = activeCell, cell.row >= rows {
             activeCell = rows > 0 ? CellPosition(row: rows - 1, column: cell.column) : nil
@@ -197,6 +197,12 @@ final class GridContainerView: NSView {
         return geometry.rowRange(minY: visible.minY, maxY: visible.maxY, rows: dataSource?.rowCount ?? 0)
     }
 
+    /// The user scrolled: a pending ⌘↓ no longer applies.
+    func scrollInputArrived() {
+        isJumpingToEnd = false
+        onUserInput?()
+    }
+
     private func followScroll() {
         let origin = scrollView.contentView.bounds.origin
         headerView.offsetX = origin.x
@@ -210,7 +216,10 @@ final class GridContainerView: NSView {
 
     // MARK: The active cell and keys
 
+    /// Makes `cell` the active cell and scrolls it into view. A pending ⌘↓
+    /// (`isJumpingToEnd`) is dropped: the user chose another cell.
     func select(_ cell: CellPosition) {
+        isJumpingToEnd = false
         guard let source = dataSource, source.rowCount > 0, geometry.columnCount > 0 else { return }
         let clamped = CellPosition(
             row: min(max(0, cell.row), source.rowCount - 1),
@@ -228,12 +237,11 @@ final class GridContainerView: NSView {
         let from = activeCell ?? CellPosition(row: 0, column: 0)
         let pageRows = Int((scrollView.contentView.bounds.height / geometry.rowHeight).rounded(.down))
         let target = activeCell == nil ? from : move.apply(to: from, rows: rows, columns: columns, pageRows: pageRows)
+        select(target)
         // ⌘↓ before the index is complete aims at the estimated last row,
         // which shows skeleton rows and the pill until the real last row
-        // is known (mockup 02b).
+        // is known (mockup 02b). Any other move, click or scroll drops it.
         isJumpingToEnd = move == .lastRow && !isIndexComplete()
-        if move == .firstRow { isJumpingToEnd = false }
-        select(target)
         updatePill()
     }
 

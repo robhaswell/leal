@@ -124,6 +124,28 @@ enum ColumnSizer {
         measureCell: (_ column: Int, _ text: String, _ truncated: Bool) -> CGFloat,
         measureHeader: (String) -> CGFloat
     ) -> [CGFloat] {
+        let texts = widest(
+            columns: columns,
+            header: header,
+            rows: rows,
+            limit: maximum - 2 * GridMetrics.cellPadding,
+            measureCell: measureCell,
+            measureHeader: measureHeader
+        )
+        return widths(fromWidest: texts, maximum: maximum)
+    }
+
+    /// The widest text of each column, unpadded. Measuring a column stops
+    /// once it reaches `limit`, since no more cells could change its width.
+    /// The model keeps these, not the sample, for double-click to fit.
+    static func widest(
+        columns: Int,
+        header: [String],
+        rows: [[(text: String, truncated: Bool)]],
+        limit: CGFloat,
+        measureCell: (_ column: Int, _ text: String, _ truncated: Bool) -> CGFloat,
+        measureHeader: (String) -> CGFloat
+    ) -> [CGFloat] {
         guard columns > 0 else { return [] }
         var widest = [CGFloat](repeating: 0, count: columns)
         for (column, title) in header.prefix(columns).enumerated() {
@@ -131,13 +153,17 @@ enum ColumnSizer {
         }
         for row in rows {
             for (column, cell) in row.prefix(columns).enumerated() where !cell.text.isEmpty || cell.truncated {
-                // Once a column is at the maximum, its other cells can't
-                // change anything.
-                guard widest[column] + 2 * GridMetrics.cellPadding < maximum else { continue }
+                guard widest[column] < limit else { continue }
                 widest[column] = max(widest[column], measureCell(column, cell.text, cell.truncated))
             }
         }
-        return widest.map { width in
+        return widest
+    }
+
+    /// Column widths from each column's widest text: padded, and between
+    /// `GridMetrics.minimumColumnWidth` and `maximum`.
+    static func widths(fromWidest widest: [CGFloat], maximum: CGFloat = GridMetrics.maximumColumnWidth) -> [CGFloat] {
+        widest.map { width in
             let padded = (width + 2 * GridMetrics.cellPadding).rounded(.up)
             return min(maximum, max(GridMetrics.minimumColumnWidth, padded))
         }

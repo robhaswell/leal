@@ -17,6 +17,8 @@ struct StatusSummary: Equatable, Sendable {
     var header: Bool
     var headerSource: DialectSource
     var readOnly: Bool
+    /// Where the bytes are held: in memory gets a note (DESIGN §3.1).
+    var storage: SourceStorage = .clone
 }
 
 /// The status bar's words: `1,000,000 rows × 12 columns · Comma · CRLF ·
@@ -34,6 +36,14 @@ enum StatusText {
         if status.readOnly {
             segments.append(String(localized: "Read-only", comment: "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)"))
         }
+        if status.storage == .memory {
+            segments.append(String(
+                localized: "Read into memory",
+                comment: "Status bar: the file's volume can't make a snapshot, so Leal read the file into memory (DESIGN §3.1)"
+            ))
+        }
+        // SEAM(1.7): notes for a file copied off a removable drive, still
+        // being read from it, or whose drive was disconnected.
         if !status.header, status.headerSource == .guess {
             segments.append(String(localized: "No header row detected", comment: "Status bar: detection found no header row (mockup 06b)"))
         }
@@ -116,6 +126,19 @@ enum StatusText {
         case .iso885915: "ISO-8859-15"
         case .macRoman: "Mac Roman"
         }
+    }
+
+    /// The status bar's tooltip: where the encoding came from, and why the
+    /// file is in memory if it is.
+    static func help(_ status: StatusSummary) -> String {
+        var lines = [encodingHelp(status.encodingSource)]
+        if status.storage == .memory {
+            lines.append(String(
+                localized: "This volume can’t make a snapshot of the file, so Leal read the whole file into memory.",
+                comment: "Status bar tooltip: why the file was read into memory (DESIGN §3.1)"
+            ))
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// "31%".

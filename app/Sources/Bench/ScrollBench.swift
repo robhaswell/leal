@@ -1,6 +1,10 @@
 import AppKit
 import QuartzCore
 
+// Only in the builds `just bench-scroll` and `just snapshot` make
+// (`LEAL_BENCH`): the shipped app has no scripted runs (CI checks with nm).
+#if LEAL_BENCH
+
 /// The scroll benchmark (`-LealBenchScroll`), the spike's method (docs/tasks/
 /// 0.4.md) on the real grid and the real core: a display link fires once
 /// per refresh, records the time since the last frame, and moves the
@@ -387,3 +391,5 @@ enum Memory {
         return Double(stats.size_in_use) / 1_048_576
     }
 }
+
+#endif

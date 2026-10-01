@@ -1,6 +1,10 @@
 import AppKit
 import os
 
+// Only in the builds `just bench-scroll` and `just snapshot` make
+// (`LEAL_BENCH`): the shipped app has no scripted runs (CI checks with nm).
+#if LEAL_BENCH
+
 /// Runs the app by itself, from launch arguments, so it can be measured
 /// and photographed without sending input to the system (CLAUDE.md). The
 /// options are `-Name value` pairs, which macOS reads into the argument
@@ -158,3 +162,5 @@ enum Snapshot {
         try? small.representation(using: .png, properties: [:])?.write(to: url)
     }
 }
+
+#endif

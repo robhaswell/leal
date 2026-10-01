@@ -274,10 +274,13 @@ final class GridScrollView: NSScrollView {
     /// A scroll gesture began (`true`) or ended, momentum included (`false`).
     var onGesture: ((Bool) -> Void)?
 
+    /// Whether a scroll gesture (or its momentum) is under way.
+    private(set) var isInGesture = false
+
     override func scrollWheel(with event: NSEvent) {
         onScrollInput?()
         if event.phase.contains(.began) || event.momentumPhase.contains(.began) {
-            onGesture?(true)
+            setGesture(true)
         }
         super.scrollWheel(with: event)
         if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
@@ -286,8 +289,25 @@ final class GridScrollView: NSScrollView {
         {
             // A gesture that ends without momentum ends here; one with
             // momentum gets `.began` again from its momentum phase.
-            onGesture?(false)
+            setGesture(false)
         }
+    }
+
+    /// Reports a gesture beginning or ending, once each.
+    func setGesture(_ active: Bool) {
+        guard active != isInGesture else { return }
+        isInGesture = active
+        onGesture?(active)
+    }
+
+    /// A window closed mid-gesture never sends the gesture's end, and the
+    /// scheduler has no timeout: end it here, or background work would stay
+    /// paused for every document.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            setGesture(false)
+        }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     override func reflectScrolledClipView(_ clipView: NSClipView) {

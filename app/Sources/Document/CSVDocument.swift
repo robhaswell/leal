@@ -18,9 +18,11 @@ final class CSVDocument: NSDocument {
 
     private(set) var model: DocumentModel?
     private var environment: DocumentEnvironment?
-    /// The failure alert is showing, or would be if the window were on
-    /// screen (DESIGN §3.9).
+    /// The document has failed and offers to reopen the file (DESIGN §3.9):
+    /// the alert is showing, or will be once the window is on screen.
     private(set) var isOfferingReopen = false
+    /// The failure alert has been shown.
+    private var failureShown = false
     /// When reading began (`CACurrentMediaTime`), for the open to first
     /// rows budget (DESIGN §1).
     private(set) var openStarted: CFTimeInterval?
@@ -51,7 +53,15 @@ final class CSVDocument: NSDocument {
         do {
             let environment = try Self.environment()
             self.environment = environment
-            model = try DocumentModel.open(url: url, environment: environment)
+            let opened = try DocumentModel.open(url: url, environment: environment)
+            // A panic while opening (in a call `init` makes) fails the
+            // document before there is a window to show the failure in:
+            // report it as an open error instead (DESIGN §3.9).
+            if let failure = opened.failure {
+                opened.close()
+                throw failure
+            }
+            model = opened
         } catch {
             throw Self.openError(error, url: url)
         }
@@ -77,12 +87,24 @@ final class CSVDocument: NSDocument {
         let controller = DocumentWindowController(model: model, scheduler: environment.scheduler)
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
         addWindowController(controller)
-        model.start()
+        if model.isFailed {
+            // Failed after opening, before there was a window: offer to
+            // reopen once it's on screen (`showWindows`).
+            presentFailure()
+        } else {
+            model.start()
+        }
     }
 
     override func showWindows() {
         super.showWindows()
+        // A failure found before the window was on screen.
+        if model?.isFailed == true {
+            presentFailure()
+        }
+        #if LEAL_BENCH
         ScriptedRun.documentShown(self)
+        #endif
     }
 
     /// Phase 1 is a viewer: there is nothing to save yet.
@@ -100,9 +122,9 @@ final class CSVDocument: NSDocument {
     /// The core panicked: the model has stopped calling it. Say so and
     /// offer to reopen the file, which makes a new core document.
     func presentFailure() {
-        guard !isOfferingReopen else { return }
         isOfferingReopen = true
-        guard let window = windowControllers.first?.window, window.isVisible else { return }
+        guard !failureShown, let window = windowControllers.first?.window, window.isVisible else { return }
+        failureShown = true
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = String(

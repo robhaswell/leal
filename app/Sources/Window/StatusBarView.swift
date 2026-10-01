@@ -85,7 +85,7 @@ final class StatusBarView: NSView {
             ))
         }
         label.attributedStringValue = text
-        label.toolTip = StatusText.encodingHelp(status.encodingSource)
+        label.toolTip = StatusText.help(status)
         progress.isHidden = !status.indexing
         percent.isHidden = !status.indexing
         progress.doubleValue = status.fractionIndexed

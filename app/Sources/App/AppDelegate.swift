@@ -4,8 +4,9 @@ import os
 
 /// The app's delegate. Opening files is `NSDocumentController`'s job
 /// (File > Open, Open Recent, Finder, the Dock, `open -a`): this only sets
-/// up the menus, removes leftover temporary folders and starts a scripted
-/// run if the launch arguments ask for one (`ScriptedRun`).
+/// up the menus, removes leftover temporary folders and, in a build with
+/// `LEAL_BENCH`, starts a scripted run if the launch arguments ask for one
+/// (`ScriptedRun`).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -13,7 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A test host opens nothing and doesn't take focus (0.3 notes).
         guard !Self.isTestHost else { return }
         Self.removeLeftoverTemporaryFolders()
+        #if LEAL_BENCH
+        // Only the `just bench-scroll` and `just snapshot` builds have it.
         ScriptedRun.startIfAsked(defaults: .standard)
+        #endif
     }
 
     /// Whether the app was launched to host the app's XCTests.

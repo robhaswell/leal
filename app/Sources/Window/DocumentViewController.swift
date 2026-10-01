@@ -60,7 +60,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         super.viewDidLoad()
         let scheduler = scheduler
         grid.onUserInput = { scheduler.noteUserInput() }
-        grid.onGesture = { scheduler.setInteracting(interacting: $0) }
+        grid.onGesture = { [weak self] in self?.model.setInteracting($0) }
         grid.onColumnResized = { [weak self] column, width in self?.model.columnResized(column, width: width) }
         grid.fittingWidth = { [weak self] column in
             guard let self else { return nil }

@@ -11,6 +11,10 @@ derived_data := "build/DerivedData"
 # with leal-ffi's test-only exports, so its Leal.app must not land where
 # `just app release` puts the app.
 test_derived_data := "build/DerivedData-test"
+# The builds with the scripted runs (`LEAL_BENCH`) for `bench-scroll` and
+# `snapshot`. They have different build settings, so they never share
+# products with `app`: the shipped app has no scripted runs.
+bench_derived_data := "build/DerivedData-bench"
 
 # List the recipes.
 default:
@@ -354,7 +358,7 @@ wide-file:
     ls -l target/bench-data/wide-200.csv
 
 # Open `file` in a new Leal that scrolls itself frame by frame and print the frame times and memory (docs/tasks/1.6.md). Speed: fast or moderate. The app quits when it's done.
-bench-scroll file speed="fast" profile="release" *options: (app profile)
+bench-scroll file speed="fast" profile="release" *options: (_app-scripted profile)
     #!/usr/bin/env bash
     set -euo pipefail
     # The sandboxed app writes into its container. `open` hands it the file,
@@ -362,7 +366,7 @@ bench-scroll file speed="fast" profile="release" *options: (app profile)
     # defaults (docs/tasks/1.6.md).
     container="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
     out="bench-scroll-$$.json"
-    app="$PWD/{{ derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
+    app="$PWD/{{ bench_derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
     # A locked Mac turns its display off, and then the display link stops:
     # wake it and keep it on (the spike did the same, docs/tasks/0.4.md).
     caffeinate -u -t 2
@@ -372,14 +376,41 @@ bench-scroll file speed="fast" profile="release" *options: (app profile)
     rm -f "$container/$out"
 
 # Draw `file`'s window offscreen to `out` (a PNG at 1×), with any of -LealAppearance dark, -LealSelect row,column, -LealJumpEnd YES, -LealSnapshotEarly YES. The app quits when it's done.
-snapshot file out *options: (app "debug")
+snapshot file out *options: (_app-scripted "debug")
     #!/usr/bin/env bash
     set -euo pipefail
     container="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
     name="snapshot-$$.png"
-    just _run-scripted "$PWD/{{ derived_data }}/Build/Products/Debug/Leal.app" "{{ file }}" 60 back -LealSnapshot "$name" {{ options }}
+    just _run-scripted "$PWD/{{ bench_derived_data }}/Build/Products/Debug/Leal.app" "{{ file }}" 60 back -LealSnapshot "$name" {{ options }}
     mv "$container/$name" "{{ out }}"
     echo "snapshot: {{ out }}"
+
+# Build Leal.app with the scripted runs (the `LEAL_BENCH` compilation condition) into its own DerivedData.
+[private]
+_app-scripted profile: (ffi profile) xcodeproj
+    #!/usr/bin/env bash
+    set -euo pipefail
+    configuration="$(just _configuration {{ profile }})"
+    mkdir -p build
+    log="build/xcodebuild-bench.log"
+    # LEAL_FFI_PREBUILT=1: see `app`.
+    LEAL_FFI_PREBUILT=1 xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
+        -configuration "$configuration" -derivedDataPath {{ bench_derived_data }} \
+        -destination "platform=macOS,arch=$(uname -m)" \
+        'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) LEAL_BENCH' \
+        build 2>&1 | tee "$log"
+    just _no_warnings "$log"
+
+# Fail if a Release app has the scripted runs (`LEAL_BENCH`): they write files and quit when given launch arguments. CI runs it after `just app release`.
+check-no-bench app="build/DerivedData/Build/Products/Release/Leal.app":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    binary="{{ app }}/Contents/MacOS/Leal"
+    if nm "$binary" | grep -E 'ScriptedRun|ScrollBench' || strings "$binary" | grep -E 'LealBenchScroll|LealSnapshot'; then
+        echo "error: $binary has the scripted runs (LEAL_BENCH)" >&2
+        exit 1
+    fi
+    echo "check-no-bench: $binary has no scripted runs"
 
 # Open a file in a new Leal with scripted-run options (`place`: front, or back to leave the frontmost app alone), wait for it to quit by itself, and quit it after `limit` seconds.
 [private]

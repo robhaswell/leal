@@ -272,6 +272,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
 - [ ] **1.7 App: diagnostics banner** (also the ADR-0006 "drive disconnected" banner) — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
+  - Status-bar notes for where the file's bytes are (`Document.storage()`):
+    still being read from a removable drive (`Reading`), the internal copy
+    (`Copy`), and `Disconnected` with its banner. 1.6 shows the in-memory
+    note (`Memory`, DESIGN §3.1); `DocumentModel` has `SEAM(1.7)` there.
   - Changing the interpretation (ADR-0005 decision 8):
     - **Reopen with encoding…** overrides the encoding, including one from
       the file's attribute (ADR-0004 decision 11).

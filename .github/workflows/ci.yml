@@ -134,6 +134,8 @@ jobs:
             echo "::error::the Release app contains leal-ffi's test-only exports"
             exit 1
           fi
+          # Nor the scripted runs (the bench and snapshot hooks, LEAL_BENCH).
+          just check-no-bench
 
       # On failure, keep the xcodebuild logs and test results for debugging.
       - name: Upload build logs

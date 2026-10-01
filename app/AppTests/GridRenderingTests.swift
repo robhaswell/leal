@@ -173,6 +173,48 @@ final class GridRenderingTests: XCTestCase {
         XCTAssertTrue(grid.pill.isHidden)
     }
 
+    /// A click or a scroll after ⌘↓ drops the pending jump: finishing the
+    /// index then leaves the active cell where the user put it.
+    func testAClickOrScrollAfterJumpingDropsTheJump() {
+        let source = FakeGridSource(rows: 10_000, columns: 3, loaded: 500)
+        var complete = false
+        let (_, grid) = makeGrid(source: source)
+        grid.isIndexComplete = { complete }
+        grid.activeCell = CellPosition(row: 0, column: 0)
+        grid.move(.lastRow)
+        XCTAssertTrue(grid.isJumpingToEnd)
+        grid.select(CellPosition(row: 3, column: 1))
+        XCTAssertFalse(grid.isJumpingToEnd)
+        complete = true
+        source.rowCount = 9_000
+        source.loadedRowCount = 9_000
+        grid.reloadData()
+        XCTAssertEqual(grid.activeCell, CellPosition(row: 3, column: 1))
+
+        complete = false
+        grid.move(.lastRow)
+        XCTAssertTrue(grid.isJumpingToEnd)
+        grid.scrollView.onScrollInput?()
+        XCTAssertFalse(grid.isJumpingToEnd)
+        grid.move(.down)
+        XCTAssertFalse(grid.isJumpingToEnd)
+    }
+
+    /// A window closed mid-gesture never sends the gesture's end; the scroll
+    /// view ends it when it leaves the window, once.
+    func testAGestureEndsWhenTheGridLeavesItsWindow() {
+        let source = FakeGridSource(rows: 10, columns: 3)
+        let (window, grid) = makeGrid(source: source)
+        var gestures: [Bool] = []
+        grid.onGesture = { gestures.append($0) }
+        grid.scrollView.setGesture(true)
+        grid.scrollView.setGesture(true)
+        XCTAssertTrue(grid.scrollView.isInGesture)
+        window.contentView = nil
+        XCTAssertEqual(gestures, [true, false])
+        XCTAssertFalse(grid.scrollView.isInGesture)
+    }
+
     func testDraggingAColumnEdgeResizesIt() {
         let source = FakeGridSource(rows: 10, columns: 3)
         let (_, grid) = makeGrid(source: source)
