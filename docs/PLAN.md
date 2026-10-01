@@ -306,7 +306,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - In the inspector ⌘↩ commits (ADR-0002 question 11); elsewhere it
     inserts a row (2.5a), so the two don't clash.
   - Screenshots next to mockups 04a, 05a and 06c.
-- [ ] **1.9 External changes** — watch the original, Reload / Keep editing.
+- [~] **1.9 External changes** — watch the original, Reload / Keep editing.
   - Works with the App Sandbox on.
   - On `ReadErrorKind::ChangedOnDisk` (or `Source::changed_on_disk()`): a
     file on a removable drive that can't clone changed while Leal was
@@ -389,6 +389,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     different delimiter or header choice, or the user chose them.
     (ADR-0005 decision 1)
   - `Info.plist`'s document role becomes `Editor`.
+  - Save asks before writing over a file that changed elsewhere
+    (`OriginalStatus.diverged`, which stays set after Keep Editing; DESIGN
+    §3.1), and **re-checks the original's identity immediately before
+    writing**, whatever the watcher last said: a network share's watcher
+    sees only this Mac's changes, and a change can land between the last
+    event and the save. (1.9 review)
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
