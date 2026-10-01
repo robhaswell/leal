@@ -32,7 +32,7 @@ impl<'a> Units<'a> {
     }
 
     /// The number of bytes in one unit.
-    pub(crate) const fn width(&self) -> usize {
+    const fn width(&self) -> usize {
         if self.encoding.is_ascii_compatible() {
             1
         } else {
@@ -68,11 +68,6 @@ impl<'a> Units<'a> {
         let start = range.start.saturating_mul(w).min(self.bytes.len());
         let end = range.end.saturating_mul(w).clamp(start, self.bytes.len());
         &self.bytes[start..end]
-    }
-
-    /// The units from `start` to the end.
-    pub(crate) fn starting_at(&self, start: usize) -> Units<'a> {
-        Units::new(self.bytes(start..self.len()), self.encoding)
     }
 
     /// The text of the units in `range`, with anything that doesn't decode

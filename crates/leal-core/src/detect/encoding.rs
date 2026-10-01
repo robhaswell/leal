@@ -36,6 +36,15 @@ impl Census {
         census
     }
 
+    /// The counts of two pieces of a file together. The pieces must be
+    /// split where [`chunk_end`] splits them, so no sequence is cut.
+    pub(crate) fn plus(self, other: Census) -> Census {
+        Census {
+            multibyte: self.multibyte + other.multibyte,
+            invalid: self.invalid + other.invalid,
+        }
+    }
+
     /// The encoding ADR-0003 decision 1 gives a file without a BOM: UTF-8
     /// if it is pure ASCII, or if it has at least one valid multibyte
     /// sequence and more of them than invalid bytes; otherwise
@@ -61,17 +70,54 @@ fn unfinished(invalid: &[u8]) -> bool {
 /// single-byte encoding. Some have unassigned bytes (for example 0xAA in
 /// Windows-1253), which don't decode.
 pub(crate) fn decodes(bytes: &[u8], encoding: Encoding) -> bool {
-    let Some(whatwg) = encoding.whatwg() else {
-        return true; // ISO-8859-1 assigns every byte
-    };
+    let assigned = assigned_bytes(encoding);
+    bytes.iter().all(|&b| assigned[usize::from(b)])
+}
+
+/// For each byte value, whether it is a character in `encoding`, a
+/// single-byte encoding.
+pub(crate) fn assigned_bytes(encoding: Encoding) -> [bool; 256] {
     let mut assigned = [true; 256];
+    let Some(whatwg) = encoding.whatwg() else {
+        return assigned; // ISO-8859-1 assigns every byte
+    };
     for (byte, slot) in (0..=u8::MAX).zip(assigned.iter_mut()) {
         let one = [byte];
         *slot = whatwg
             .decode_without_bom_handling_and_without_replacement(&one)
             .is_some();
     }
-    bytes.iter().all(|&b| assigned[usize::from(b)])
+    assigned
+}
+
+/// Where a chunk of about `size` bytes starting at `start` should end, so
+/// that chunks can be read one at a time: never inside a UTF-16 code unit,
+/// and never inside a UTF-8 sequence that could be valid, so that
+/// [`Census::plus`] over the chunks equals the census of the whole.
+///
+/// A UTF-8 split is moved back over at most three continuation bytes
+/// (0x80..=0xBF) to the byte before them: a valid sequence has at most
+/// three. If more than three come in a row, no valid sequence ends in the
+/// split, so it stays.
+pub(crate) fn chunk_end(bytes: &[u8], start: usize, size: usize, encoding: Encoding) -> usize {
+    let size = if encoding.is_ascii_compatible() {
+        size.max(4)
+    } else {
+        size.max(2) & !1 // an even number of bytes
+    };
+    let end = start.saturating_add(size);
+    if end >= bytes.len() {
+        return bytes.len();
+    }
+    if !encoding.is_ascii_compatible() {
+        return end;
+    }
+    let continuation = |i: usize| bytes[i] & 0xC0 == 0x80;
+    (end - 3..=end)
+        .rev()
+        .find(|&i| !continuation(i))
+        .filter(|&i| i > start)
+        .unwrap_or(end)
 }
 
 #[cfg(test)]
@@ -104,6 +150,37 @@ mod tests {
         assert_eq!(census(b"ab\xFF", true), (0, 1));
         // Only the very end is forgiven.
         assert_eq!(census(b"\xF0\x9F a", true), (0, 2));
+    }
+
+    /// Splitting a file into chunks anywhere `chunk_end` allows gives the
+    /// same census as the whole, for every chunk size.
+    #[test]
+    fn a_chunked_census_equals_the_whole() {
+        let samples: [&[u8]; 5] = [
+            "aé€😀b".as_bytes(),
+            b"\xF0\x9F\x98\x80\x80\x80\x80\x80x\xE2\x82",
+            b"\x80\x80\x80\x80\x80\x80",
+            b"ab\xC3\xA9\xFF\xF0\x9F\x98\xC3",
+            b"\xED\xA0\x80\xC0\xAF\xE2\x82\xAC",
+        ];
+        for bytes in samples {
+            let whole = Census::of(bytes, false);
+            for size in 1..=bytes.len() {
+                let mut sum = Census::default();
+                let mut start = 0;
+                while start < bytes.len() {
+                    let end = chunk_end(bytes, start, size, Encoding::Utf8);
+                    assert!(end > start);
+                    sum = sum.plus(Census::of(&bytes[start..end], false));
+                    start = end;
+                }
+                assert_eq!(sum, whole, "{} in chunks of {size}", bytes.escape_ascii());
+            }
+        }
+        // UTF-16 chunks have an even number of bytes.
+        assert_eq!(chunk_end(&[0; 10], 0, 5, Encoding::Utf16Le), 4);
+        assert_eq!(chunk_end(&[0; 10], 4, 5, Encoding::Utf16Le), 8);
+        assert_eq!(chunk_end(&[0; 10], 8, 5, Encoding::Utf16Le), 10);
     }
 
     #[test]

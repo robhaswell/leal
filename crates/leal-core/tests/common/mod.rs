@@ -4,8 +4,26 @@
 
 #![allow(dead_code)] // each test file uses a different subset
 
+use std::sync::atomic::AtomicBool;
+
+use leal_core::detect::{ChoiceError, Choices, Detection, Hints, Review};
 use leal_core::dialect::{Bom, Delimiter, Encoding, LineEnding};
 use leal_testkit::dialect as tk;
+
+/// `leal_core::detect::detect` on a whole file in memory.
+pub fn detect(file: &[u8], hints: Hints<'_>, choices: Choices) -> Result<Detection, ChoiceError> {
+    leal_core::detect::detect(file, len(file), hints, choices)
+}
+
+/// `leal_core::detect::review`, never cancelled.
+pub fn review(file: &[u8], detection: &Detection) -> Review {
+    leal_core::detect::review(file, detection, &AtomicBool::new(false)).expect("nothing cancels it")
+}
+
+/// A slice's length as a file length.
+pub fn len(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).expect("fits")
+}
 
 pub fn delimiter(d: tk::Delimiter) -> Delimiter {
     Delimiter::from_byte(d.byte()).expect("the testkit's delimiters are Leal's")

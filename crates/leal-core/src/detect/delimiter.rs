@@ -1,22 +1,54 @@
 //! Choosing the delimiter: the one that gives the most consistent field
-//! count across the sampled rows (DESIGN §3.2).
+//! count across the rows (DESIGN §3.2).
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
-use super::rows::{after_first_line_ending, whole_rows};
+use super::rows::{Ended, whole_rows};
 use super::units::Units;
 use crate::dialect::Delimiter;
 
-/// One non-blank row of a sample, as a delimiter splits it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Split {
-    /// The number of fields.
-    pub fields: usize,
-    /// Whether its quotes are badly formed under this delimiter.
-    pub irregular: bool,
+/// Counts how a delimiter splits non-blank rows, one row at a time, so a
+/// whole file can be tallied without keeping its rows.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Tally {
+    rows: usize,
+    regular_rows: usize,
+    /// Field count → (rows with it, the row it was first seen in).
+    counts: HashMap<usize, (usize, usize)>,
 }
 
-/// How consistently a delimiter splits a sample's non-blank rows.
+impl Tally {
+    /// Counts one row; blank rows don't count.
+    pub(crate) fn add(&mut self, row: &Ended) {
+        if row.is_blank() {
+            return;
+        }
+        let seen = self.rows;
+        self.counts.entry(row.fields).or_insert((0, seen)).0 += 1;
+        self.rows += 1;
+        if !row.irregular {
+            self.regular_rows += 1;
+        }
+    }
+
+    /// The score, or `None` if there were no non-blank rows.
+    pub(crate) fn score(&self) -> Option<Score> {
+        // The most rows; a tie goes to the count seen first.
+        let (&mode, &(mode_rows, _)) = self
+            .counts
+            .iter()
+            .max_by(|(_, (a, a_first)), (_, (b, b_first))| a.cmp(b).then(b_first.cmp(a_first)))?;
+        Some(Score {
+            rows: self.rows,
+            mode,
+            mode_rows,
+            regular_rows: self.regular_rows,
+        })
+    }
+}
+
+/// How consistently a delimiter splits non-blank rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Score {
     /// Non-blank rows.
@@ -30,28 +62,6 @@ pub(crate) struct Score {
 }
 
 impl Score {
-    /// The score of rows in file order. `None` if there are none.
-    pub(crate) fn of(rows: &[Split]) -> Option<Self> {
-        // (count, rows), in order of first appearance. Samples are at most
-        // 64 KB, so there are few distinct counts.
-        let mut histogram: Vec<(usize, usize)> = Vec::new();
-        for row in rows {
-            match histogram.iter_mut().find(|(count, _)| *count == row.fields) {
-                Some((_, n)) => *n += 1,
-                None => histogram.push((row.fields, 1)),
-            }
-        }
-        // `max_by_key` keeps the last of equal elements, so search in
-        // reverse to keep the first seen.
-        let &(mode, mode_rows) = histogram.iter().rev().max_by_key(|(_, n)| *n)?;
-        Some(Score {
-            rows: rows.len(),
-            mode,
-            mode_rows,
-            regular_rows: rows.iter().filter(|r| !r.irregular).count(),
-        })
-    }
-
     /// Compares two shares, `a` of `of_a` and `b` of `of_b`, without
     /// dividing.
     fn share_cmp(a: usize, of_a: usize, b: usize, of_b: usize) -> Ordering {
@@ -88,33 +98,28 @@ impl Score {
     }
 }
 
-/// The whole, non-blank rows of a sample under `delimiter`.
-pub(crate) fn splits(units: Units<'_>, delimiter: Delimiter, cut: bool) -> Vec<Split> {
-    whole_rows(units, delimiter.byte(), cut)
-        .into_iter()
-        .filter(|r| !r.is_blank())
-        .map(|r| Split {
-            fields: r.fields,
-            irregular: r.irregular,
-        })
-        .collect()
-}
-
-/// The rows of a sample taken from the middle of the file: those after its
-/// first line ending, without the last row if the sample was cut.
-pub(crate) fn splits_from(units: Units<'_>, delimiter: Delimiter, cut: bool) -> Vec<Split> {
-    match after_first_line_ending(units) {
-        Some(start) => splits(units.starting_at(start), delimiter, cut),
-        None => Vec::new(),
+/// The tally of a window's whole rows under `delimiter` (see
+/// [`whole_rows`]).
+pub(crate) fn tally(units: Units<'_>, delimiter: Delimiter, cut: bool) -> Tally {
+    let mut tally = Tally::default();
+    for row in whole_rows(units, delimiter.byte(), cut) {
+        tally.add(&Ended {
+            len: row.span.len(),
+            fields: row.fields,
+            ending: row.ending,
+            irregular: row.irregular,
+        });
     }
+    tally
 }
 
-/// Every delimiter's score, in [`Delimiter::ALL`] order.
+/// Every delimiter's score, in [`Delimiter::ALL`] order. A delimiter that
+/// wasn't tallied has no score.
 pub(crate) type Scores = [(Delimiter, Option<Score>); 4];
 
-/// Scores each delimiter on how it splits the rows.
-pub(crate) fn scores(rows: impl Fn(Delimiter) -> Vec<Split>) -> Scores {
-    Delimiter::ALL.map(|d| (d, Score::of(&rows(d))))
+/// Scores each delimiter from its tally.
+pub(crate) fn scores(tally: impl Fn(Delimiter) -> Option<Score>) -> Scores {
+    Delimiter::ALL.map(|d| (d, tally(d)))
 }
 
 /// The best delimiter among those that split rows: the most consistent,
@@ -149,30 +154,34 @@ mod tests {
 
     fn guess(text: &[u8]) -> Option<Delimiter> {
         let units = Units::new(text, Encoding::Utf8);
-        best(&scores(|d| splits(units, d, false))).map(|(d, _)| d)
+        best(&scores(|d| tally(units, d, false).score())).map(|(d, _)| d)
     }
 
-    fn counts(units: Units<'_>, d: Delimiter, cut: bool, middle: bool) -> Vec<usize> {
-        let rows = if middle {
-            splits_from(units, d, cut)
-        } else {
-            splits(units, d, cut)
-        };
-        rows.into_iter().map(|r| r.fields).collect()
+    fn row(fields: usize, irregular: bool) -> Ended {
+        Ended {
+            len: 1,
+            fields,
+            ending: None,
+            irregular,
+        }
     }
 
     #[test]
     fn the_mode_ties_go_to_the_first_seen() {
-        let rows: Vec<Split> = [3, 2, 2, 3]
-            .into_iter()
-            .map(|fields| Split {
-                fields,
-                irregular: fields == 2,
-            })
-            .collect();
-        let s = Score::of(&rows).unwrap();
+        let mut t = Tally::default();
+        for fields in [3, 2, 2, 3] {
+            t.add(&row(fields, fields == 2));
+        }
+        // A blank row doesn't count.
+        t.add(&Ended {
+            len: 0,
+            fields: 1,
+            ending: Some(crate::dialect::LineEnding::Lf),
+            irregular: false,
+        });
+        let s = t.score().unwrap();
         assert_eq!((s.rows, s.mode, s.mode_rows, s.regular_rows), (4, 3, 2, 2));
-        assert_eq!(Score::of(&[]), None);
+        assert_eq!(Tally::default().score(), None);
     }
 
     /// A pipe file whose quoted values hold commas splits as evenly under
@@ -214,21 +223,5 @@ mod tests {
         // Blank lines don't count.
         assert_eq!(guess(b"\n\n\n"), None);
         assert_eq!(guess(b"note\nhello, world\nfoo\n"), None);
-    }
-
-    #[test]
-    fn a_middle_sample_skips_its_partial_first_row() {
-        let units = Units::new(b"x,y,z\na;b\nc;d\ne;", Encoding::Utf8);
-        assert_eq!(counts(units, Delimiter::Semicolon, true, true), [2, 2]);
-        assert_eq!(counts(units, Delimiter::Semicolon, false, true), [2, 2, 2]);
-        assert_eq!(
-            counts(units, Delimiter::Semicolon, false, false),
-            [1, 2, 2, 2]
-        );
-        let none = Units::new(b"no line ending", Encoding::Utf8);
-        assert_eq!(
-            counts(none, Delimiter::Comma, true, true),
-            Vec::<usize>::new()
-        );
     }
 }

@@ -2,15 +2,19 @@
 //! and Leal's own `io.github.robhaswell.leal.interpretation`.
 //!
 //! This module only parses and writes attribute *values*. Reading them from
-//! a file is the `source` module's job (task 1.1), and writing them on save
-//! is task 2.5.
+//! a file is the `source` module's job (task 1.1; the attribute names are
+//! [`TEXT_ENCODING_ATTRIBUTE`](crate::source::TEXT_ENCODING_ATTRIBUTE) and
+//! [`INTERPRETATION_ATTRIBUTE`](crate::source::INTERPRETATION_ATTRIBUTE)),
+//! and writing them on save is task 2.5.
 //!
 //! # `com.apple.TextEncoding`
 //!
 //! Written by TextEdit and `NSString`, for example `utf-8;134217984`: an IANA
 //! charset name, a semicolon, and the `CFStringEncoding` number in decimal.
 //! Leal matches only the number (ADR-0005 decision 5); the name is for
-//! people reading the attribute.
+//! people reading the attribute. ASCII (`us-ascii;1536`) is read as UTF-8,
+//! of which it is a subset (ADR-0007 decision 2, *proposed*: provisional
+//! until Rob decides).
 //!
 //! # `io.github.robhaswell.leal.interpretation`
 //!
@@ -29,22 +33,23 @@
 //!   choices are used as they are. Once something else has changed the
 //!   file, they are used only if the file still parses sensibly with them
 //!   (see [`crate::detect`]).
+//!   (The fingerprint is ADR-0007 decision 1, *proposed*: provisional
+//!   until Rob decides.)
 //! - Any of these may be left out, meaning that part was not remembered.
-//!   Other keys are ignored, so a later Leal can add some without older
-//!   ones rejecting the attribute. A key given twice, or an unknown value
-//!   for one of these keys, makes the value unreadable.
+//!   Other keys made of lowercase letters, digits, `_` and `-` are ignored,
+//!   so a later Leal can add some without older ones rejecting the
+//!   attribute. Any other key (`" delimiter"`, `Header`), a key given twice,
+//!   or an unknown value for one of the keys above makes the value
+//!   unreadable, so a garbled attribute is noted rather than half-read.
 
 use crate::detect::FIRST_PAINT_BYTES;
 use crate::dialect::{Delimiter, Encoding};
 
-/// The name of macOS's text encoding attribute.
-pub const TEXT_ENCODING: &str = "com.apple.TextEncoding";
-
-/// The name of Leal's interpretation attribute (ADR-0005 decision 1).
-pub const INTERPRETATION: &str = "io.github.robhaswell.leal.interpretation";
-
 /// `kCFStringEncodingUTF16`: UTF-16 with its byte order taken from a BOM.
 const CF_UTF16: u32 = 0x0100;
+
+/// `kCFStringEncodingASCII`, read as UTF-8 (ADR-0007 decision 2, proposed).
+const CF_ASCII: u32 = 0x0600;
 
 /// Why a `com.apple.TextEncoding` value names no encoding Leal can use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +57,7 @@ pub enum TextEncodingError {
     /// The value isn't `name;number` with a decimal number.
     Unreadable,
     /// The number is a valid `CFStringEncoding` that Leal doesn't read, for
-    /// example Shift_JIS (`2561`) or ASCII (`1536`).
+    /// example Shift_JIS (`2561`).
     Unsupported {
         /// The `CFStringEncoding` number.
         cf_string_encoding: u32,
@@ -101,6 +106,8 @@ pub fn parse_text_encoding(value: &[u8]) -> Result<Encoding, TextEncodingError> 
         None if cf_string_encoding == CF_UTF16 => {
             Err(TextEncodingError::Utf16 { cf_string_encoding })
         }
+        // ASCII is a subset of UTF-8, so this can't misread an ASCII file.
+        None if cf_string_encoding == CF_ASCII => Ok(Encoding::Utf8),
         None => Err(TextEncodingError::Unsupported { cf_string_encoding }),
     }
 }
@@ -147,16 +154,21 @@ impl Fingerprint {
     /// The fingerprint of `file`. Only its first 64 KB are read.
     #[must_use]
     pub fn of(file: &[u8]) -> Self {
+        Self::from_head(file, u64::try_from(file.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The fingerprint of a file `length` bytes long that starts with
+    /// `head` (at least its first 64 KB, or all of it). Only the first
+    /// 64 KB of `head` are read.
+    #[must_use]
+    pub fn from_head(head: &[u8], length: u64) -> Self {
         const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0100_0000_01b3;
-        let head = &file[..file.len().min(FIRST_PAINT_BYTES)];
+        let head = &head[..head.len().min(FIRST_PAINT_BYTES)];
         let head_hash = head.iter().fold(OFFSET_BASIS, |hash, &b| {
             (hash ^ u64::from(b)).wrapping_mul(PRIME)
         });
-        Fingerprint {
-            length: u64::try_from(file.len()).unwrap_or(u64::MAX),
-            head_hash,
-        }
+        Fingerprint { length, head_hash }
     }
 
     /// Parses `<length>-<16 lowercase hex digits>`.
@@ -220,6 +232,11 @@ impl Interpretation {
             let Some((key, value)) = item.split_once('=') else {
                 return fail(format!("`{item}` is not key=value"));
             };
+            let plain =
+                |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-';
+            if key.is_empty() || !key.bytes().all(plain) {
+                return fail(format!("`{key}` is not a key"));
+            }
             if seen.contains(&key) || key == "v" {
                 return fail(format!("`{key}` is given twice"));
             }
@@ -320,7 +337,7 @@ mod tests {
                 })
             );
         }
-        for n in [1536u32, 2561, 201_326_848] {
+        for n in [2561u32, 201_326_848] {
             assert_eq!(
                 parse_text_encoding(format!("x;{n}").as_bytes()),
                 Err(TextEncodingError::Unsupported {
@@ -328,6 +345,12 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// ADR-0007 decision 2 (proposed).
+    #[test]
+    fn an_ascii_attribute_reads_as_utf8() {
+        assert_eq!(parse_text_encoding(b"us-ascii;1536"), Ok(Encoding::Utf8));
     }
 
     #[test]
@@ -429,6 +452,9 @@ mod tests {
             b"v=1;v=1",
             b"v=1;",
             b"v=1 ;header=yes",
+            b"v=1; delimiter=tab",
+            b"v=1;Header=yes",
+            b"v=1;=yes",
             b"v=1;file=12",
             b"v=1;file=12-abc",
             b"v=1;file=12-00000000000000AB",

@@ -3,9 +3,8 @@
 
 mod common;
 
-use leal_core::detect::{
-    Choices, Detection, EncodingSource, FIRST_PAINT_BYTES, Hints, detect, review,
-};
+use common::{detect, review};
+use leal_core::detect::{Choices, Detection, EncodingSource, FIRST_PAINT_BYTES, Hints};
 use leal_core::dialect::Delimiter;
 use leal_testkit::dialect::{self as tk, expected_encoding, reopen_encoding};
 use leal_testkit::strategies::bytes::csv_bytes;
@@ -44,9 +43,9 @@ fn other_delimiters(file: &GeneratedCsv) -> Vec<u8> {
 }
 
 /// A tidy file with 2 to 5 columns: unquoted words, and quoted values that
-/// hold the *other* delimiters, quotes and newlines. Returns its delimiter
-/// and bytes.
-fn tidy_file() -> impl Strategy<Value = (Delimiter, Vec<u8>)> {
+/// hold the *other* delimiters, quotes and newlines. Returns its delimiter,
+/// its number of columns and its bytes.
+fn tidy_file() -> impl Strategy<Value = (Delimiter, usize, Vec<u8>)> {
     let word = proptest::collection::vec(proptest::sample::select(&b"abz019 .-"[..]), 0..6);
     let tricky = proptest::collection::vec(proptest::sample::select(&b"az1 ,;|\t\"\n"[..]), 0..6)
         .prop_map(|v| {
@@ -68,9 +67,9 @@ fn tidy_file() -> impl Strategy<Value = (Delimiter, Vec<u8>)> {
     )
         .prop_flat_map(move |(d, columns, rows)| {
             let row = proptest::collection::vec(cell.clone(), columns);
-            (Just(d), proptest::collection::vec(row, rows))
+            (Just(d), Just(columns), proptest::collection::vec(row, rows))
         })
-        .prop_map(|(d, rows)| {
+        .prop_map(|(d, columns, rows)| {
             let mut bytes = Vec::new();
             for row in rows {
                 for (i, cell) in row.iter().enumerate() {
@@ -83,15 +82,93 @@ fn tidy_file() -> impl Strategy<Value = (Delimiter, Vec<u8>)> {
                 }
                 bytes.push(b'\n');
             }
-            (d, bytes)
+            (d, columns, bytes)
         })
+}
+
+/// Runs `test` on values from `strategy` an eighth as many times as usual
+/// (32 by default, 2,500 under `just test-deep`), for properties whose
+/// cases are files of hundreds of kilobytes. The `proptest!` macro would
+/// let `PROPTEST_CASES` override that, so the runner is built by hand.
+fn run_large<S: Strategy>(strategy: &S, test: impl Fn(S::Value) -> Result<(), TestCaseError>) {
+    let config = ProptestConfig::default(); // reads PROPTEST_CASES
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: (config.cases / 8).max(1),
+        ..config
+    });
+    if let Err(e) = runner.run(strategy, test) {
+        panic!("{e}");
+    }
+}
+
+/// A tidy file, plus a row whose every field is a multi-line quoted value
+/// full of the other delimiters, repeated past 192 KB: first paint finds
+/// its delimiter, and the whole-file review, which reads quotes from the
+/// start, never suggests another one (review finding 1).
+#[test]
+fn multi_line_fields_past_64_kb_get_no_delimiter_suggestion() {
+    run_large(&tidy_file(), |(delimiter, columns, bytes)| {
+        let field = b"\"one, two;\nthree|four\tfive\n\"";
+        let mut extra = Vec::new();
+        for i in 0..columns {
+            if i > 0 {
+                extra.push(delimiter.byte());
+            }
+            extra.extend_from_slice(field);
+        }
+        extra.push(b'\n');
+        let copy = [bytes, extra].concat();
+        let mut file = Vec::new();
+        while file.len() <= FIRST_PAINT_BYTES * 3 {
+            file.extend_from_slice(&copy);
+        }
+        let d = plain(&file);
+        prop_assert_eq!(d.delimiter, delimiter);
+        prop_assert_eq!(review(&file, &d).delimiter_suggestion, None);
+        Ok(())
+    });
+}
+
+/// Arbitrary bytes made longer than 64 KB, by padding with ASCII or by
+/// repeating them: whatever first paint guessed, taking the review's
+/// suggestion gives the testkit's whole-file encoding (ADR-0003 decision
+/// 1, ADR-0005 decision 4).
+#[test]
+fn the_review_suggests_the_whole_file_encoding() {
+    let files = (csv_bytes(), csv_bytes(), any::<bool>()).prop_map(|(a, b, pad)| {
+        let mut file = a.clone();
+        if pad {
+            while file.len() <= FIRST_PAINT_BYTES {
+                file.extend_from_slice(b"ascii,padding\n");
+            }
+            file.extend_from_slice(&b);
+        } else {
+            while file.len() <= FIRST_PAINT_BYTES {
+                file.extend_from_slice(&b);
+                file.extend_from_slice(&a);
+                if a.is_empty() && b.is_empty() {
+                    file.push(b'x');
+                }
+            }
+        }
+        file
+    });
+    run_large(&files, |file| {
+        let d = plain(&file);
+        let r = review(&file, &d);
+        prop_assert_eq!(
+            r.encoding_suggestion.unwrap_or(d.encoding),
+            common::encoding(expected_encoding(&file))
+        );
+        Ok(())
+    });
 }
 
 proptest! {
     /// In a tidy file, the guess is the file's delimiter, whatever the
     /// other delimiters inside quoted values.
     #[test]
-    fn the_delimiter_guess_finds_a_tidy_file_delimiter((delimiter, bytes) in tidy_file()) {
+    fn the_delimiter_guess_finds_a_tidy_file_delimiter((delimiter, _, bytes) in tidy_file()) {
         prop_assert_eq!(plain(&bytes).delimiter, delimiter);
     }
 }
@@ -166,21 +243,10 @@ proptest! {
 /// The same file repeated past 64 KB: first paint, from the first 64 KB
 /// only, finds what the whole file has, and the review agrees.
 ///
-/// Each case is a 200 KB file, so this runs an eighth of the usual number
-/// of cases (32 by default, 2,500 under `just test-deep`). The `proptest!`
-/// macro would let `PROPTEST_CASES` override that, so the runner is built
-/// by hand.
+/// Each case is a 200 KB file, so it uses [`run_large`].
 #[test]
 fn a_large_file_is_detected_from_its_first_64_kb() {
-    let config = ProptestConfig::default(); // reads PROPTEST_CASES
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases: (config.cases / 8).max(1),
-        ..config
-    });
-    let result = runner.run(&csv_file(CsvConfig::clean()), |file| large_file_case(&file));
-    if let Err(e) = result {
-        panic!("{e}");
-    }
+    run_large(&csv_file(CsvConfig::clean()), |file| large_file_case(&file));
 }
 
 fn large_file_case(file: &GeneratedCsv) -> Result<(), TestCaseError> {

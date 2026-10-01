@@ -10,10 +10,11 @@
 //! - [`detect`] at first paint (P0). It reads only the first
 //!   [`FIRST_PAINT_BYTES`] of the file, and decides everything the grid
 //!   needs: encoding, BOM, delimiter, quote, line endings and header row.
-//! - [`review`] afterwards (P2), over the whole file. It applies the
-//!   whole-file encoding rule, checks the delimiter on samples from the
-//!   middle and end, and finds the trailing newline. A disagreement becomes
-//!   a *suggestion* for the app to show; nothing is re-decided silently.
+//! - [`review`] afterwards (P2), in one pass over the whole file. It
+//!   applies the whole-file encoding rule, checks the delimiter on every
+//!   row, and finds the trailing newline. A disagreement becomes a
+//!   *suggestion* for the app to show; nothing is re-decided silently. It
+//!   can be cancelled between chunks (ADR-0005 decision 6).
 //!
 //! # Encoding order
 //!
@@ -50,16 +51,24 @@ mod rows;
 mod units;
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::attributes::{Fingerprint, Interpretation, TextEncodingError, parse_text_encoding};
 use crate::dialect::{Bom, Delimiter, Encoding, LineEnding, QUOTE};
-use delimiter::{Scores, best, score_of, scores, splits, splits_from};
-use encoding::{Census, decodes};
-use rows::{Row, Rows, field_values, whole_rows};
+use crate::source::RawAttributes;
+use delimiter::{Scores, Tally, best, score_of, scores, tally};
+use encoding::{Census, assigned_bytes, chunk_end, decodes};
+use rows::{Row, Scanner, field_values, whole_rows};
 use units::Units;
 
 /// How much of the start of a file first paint reads (DESIGN §3.2).
 pub const FIRST_PAINT_BYTES: usize = 64 * 1024;
+
+/// How many bytes [`review`] reads between checks of its cancel flag:
+/// 512 KiB, about 3 ms' work when all four delimiters are checked (the
+/// slowest case, ~185 MB/s on an M5 Pro), so that it stops within the
+/// ~5 ms DESIGN §3.10 rule 3 allows.
+pub const REVIEW_CHUNK_BYTES: usize = 512 * 1024;
 
 /// The raw values of the file's extended attributes, as the `source`
 /// module reads them. `None` means the attribute isn't there.
@@ -70,6 +79,15 @@ pub struct Hints<'a> {
     /// `io.github.robhaswell.leal.interpretation`; the format is in
     /// [`crate::attributes`].
     pub interpretation: Option<&'a [u8]>,
+}
+
+impl<'a> From<&'a RawAttributes> for Hints<'a> {
+    fn from(raw: &'a RawAttributes) -> Self {
+        Hints {
+            text_encoding: raw.text_encoding.as_deref(),
+            interpretation: raw.interpretation.as_deref(),
+        }
+    }
 }
 
 /// What the user chose in place of what detection would find (DESIGN
@@ -203,15 +221,21 @@ impl fmt::Display for ChoiceError {
 
 impl std::error::Error for ChoiceError {}
 
-/// Decides how to read `file` for first paint, from its first
-/// [`FIRST_PAINT_BYTES`] only. Pass the whole file (for example the mapped
-/// clone): nothing past that limit is read.
+/// Decides how to read a file for first paint, from its first
+/// [`FIRST_PAINT_BYTES`] only.
+///
+/// `head` is the start of the file: at least its first
+/// [`FIRST_PAINT_BYTES`], or all of it if it is shorter. It may be the
+/// whole file (for example the mapped clone); nothing past the limit is
+/// read. `file_len` is the file's whole length, which says whether `head`
+/// is all of it.
 ///
 /// ```
 /// use leal_core::detect::{Choices, Hints, detect};
 /// use leal_core::dialect::{Delimiter, Encoding};
 ///
-/// let d = detect(b"product;price\nApple;1,20\n", Hints::default(), Choices::default())?;
+/// let file = b"product;price\nApple;1,20\n";
+/// let d = detect(file, 25, Hints::default(), Choices::default())?;
 /// assert_eq!(d.delimiter, Delimiter::Semicolon);
 /// assert_eq!(d.encoding, Encoding::Utf8);
 /// assert!(d.header);
@@ -222,9 +246,14 @@ impl std::error::Error for ChoiceError {}
 ///
 /// [`ChoiceError::EncodingDoesNotMatchBom`] if `choices.encoding`
 /// disagrees with the file's BOM.
-pub fn detect(file: &[u8], hints: Hints<'_>, choices: Choices) -> Result<Detection, ChoiceError> {
-    let cut = file.len() > FIRST_PAINT_BYTES;
-    let head = &file[..file.len().min(FIRST_PAINT_BYTES)];
+pub fn detect(
+    head: &[u8],
+    file_len: u64,
+    hints: Hints<'_>,
+    choices: Choices,
+) -> Result<Detection, ChoiceError> {
+    let head = &head[..head.len().min(FIRST_PAINT_BYTES)];
+    let cut = file_len > u64::try_from(head.len()).unwrap_or(u64::MAX);
     let bom = Bom::detect(head);
     let body = &head[bom.len()..];
     let mut notes = Vec::new();
@@ -240,9 +269,16 @@ pub fn detect(file: &[u8], hints: Hints<'_>, choices: Choices) -> Result<Detecti
     let units = Units::new(body, encoding);
 
     // The delimiter: chosen, remembered, or guessed.
-    let scores = scores(|d| splits(units, d, cut));
+    let scores = scores(|d| tally(units, d, cut).score());
     let guess = best(&scores).map(|(d, _)| d);
-    let remembered = remembered(file, hints.interpretation, &scores, guess, &mut notes);
+    let fingerprint = Fingerprint::from_head(head, file_len);
+    let remembered = remembered(
+        fingerprint,
+        hints.interpretation,
+        &scores,
+        guess,
+        &mut notes,
+    );
     let (delimiter, delimiter_source) = match (choices.delimiter, remembered.delimiter) {
         (Some(d), _) => (d, DialectSource::User),
         (None, Some(d)) => (d, DialectSource::Attribute),
@@ -319,7 +355,7 @@ fn choose_encoding(
 /// is the one Leal saved or its delimiter still fits; otherwise nothing,
 /// with a note.
 fn remembered(
-    file: &[u8],
+    fingerprint: Fingerprint,
     value: Option<&[u8]>,
     scores: &Scores,
     guess: Option<Delimiter>,
@@ -332,7 +368,7 @@ fn remembered(
         notes.push(Note::InterpretationUnreadable);
         return Interpretation::default();
     };
-    let unchanged = interpretation.file == Some(Fingerprint::of(file));
+    let unchanged = interpretation.file == Some(fingerprint);
     if let Some(d) = interpretation.delimiter
         && !unchanged
         && !fits(scores, d, guess)
@@ -362,17 +398,41 @@ fn fits(scores: &Scores, remembered: Delimiter, guess: Option<Delimiter>) -> boo
 fn line_endings(
     endings: impl IntoIterator<Item = Option<LineEnding>>,
 ) -> (Option<LineEnding>, bool) {
-    // (ending, count), in order of first appearance.
-    let mut counts: Vec<(LineEnding, usize)> = Vec::new();
-    for ending in endings.into_iter().flatten() {
-        match counts.iter_mut().find(|(e, _)| *e == ending) {
+    let mut counts = EndingCounts::default();
+    for ending in endings {
+        counts.add(ending);
+    }
+    counts.result()
+}
+
+/// Line endings counted one row at a time.
+#[derive(Clone, Debug, Default)]
+struct EndingCounts {
+    /// (ending, count), in order of first appearance.
+    counts: Vec<(LineEnding, usize)>,
+}
+
+impl EndingCounts {
+    fn add(&mut self, ending: Option<LineEnding>) {
+        let Some(ending) = ending else { return };
+        match self.counts.iter_mut().find(|(e, _)| *e == ending) {
             Some((_, n)) => *n += 1,
-            None => counts.push((ending, 1)),
+            None => self.counts.push((ending, 1)),
         }
     }
-    // `max_by_key` keeps the last of equal counts; reversed, the first.
-    let dominant = counts.iter().rev().max_by_key(|(_, n)| *n).map(|(e, _)| *e);
-    (dominant, counts.len() > 1)
+
+    /// The most common (ties go to the first seen), and whether there is
+    /// more than one kind.
+    fn result(&self) -> (Option<LineEnding>, bool) {
+        // `max_by_key` keeps the last of equal counts; reversed, the first.
+        let dominant = self
+            .counts
+            .iter()
+            .rev()
+            .max_by_key(|(_, n)| *n)
+            .map(|(e, _)| *e);
+        (dominant, self.counts.len() > 1)
+    }
 }
 
 fn guess_header(units: Units<'_>, rows: &[Row], delimiter: Delimiter) -> bool {
@@ -400,8 +460,8 @@ pub struct Review {
     /// the file doesn't decode under the attribute's single-byte encoding.
     /// The app offers "Reopen as …"; it never re-decodes by itself.
     pub encoding_suggestion: Option<Encoding>,
-    /// A delimiter the middle and end of the file fit better than the
-    /// guessed one ("This file looks semicolon-separated — Switch").
+    /// A delimiter the whole file fits better than the guessed one
+    /// ("This file looks semicolon-separated — Switch").
     pub delimiter_suggestion: Option<Delimiter>,
     /// The most common line ending in the whole file (ties go to the first
     /// seen), read with the document's delimiter.
@@ -412,96 +472,181 @@ pub struct Review {
     pub trailing_newline: bool,
 }
 
+/// [`review`] was cancelled before it finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the review was cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 /// Checks first paint's decisions against the whole of `file` (P2 work,
 /// DESIGN §3.10). `detection` is what [`detect`] returned for this file.
 ///
-/// This reads every byte, once for the encoding rule and once for the
-/// rows, so it belongs on a background thread.
+/// It reads every byte once, from the start, in chunks of
+/// [`REVIEW_CHUNK_BYTES`]: the encoding rule, and a quote-aware scan of
+/// every row under each delimiter (only the one in use, if it wasn't
+/// guessed). Reading from the start means the scan always knows whether it
+/// is inside quotes. Before each chunk it checks `cancel`, and returns
+/// [`Cancelled`] if it is set (ADR-0005 decision 6). It keeps no rows, so
+/// it needs little memory whatever the file's size.
 ///
 /// ```
+/// use std::sync::atomic::AtomicBool;
 /// use leal_core::detect::{Choices, FIRST_PAINT_BYTES, Hints, detect, review};
 /// use leal_core::dialect::Encoding;
 ///
 /// // ASCII for the first 64 KB, then a Windows-1252 "é".
 /// let mut file = vec![b'a'; FIRST_PAINT_BYTES];
 /// file.extend_from_slice(b"\ncaf\xE9\n");
-/// let d = detect(&file, Hints::default(), Choices::default())?;
+/// let len = file.len() as u64;
+/// let d = detect(&file, len, Hints::default(), Choices::default())?;
 /// assert_eq!(d.encoding, Encoding::Utf8);
-/// assert_eq!(review(&file, &d).encoding_suggestion, Some(Encoding::Windows1252));
-/// # Ok::<(), leal_core::detect::ChoiceError>(())
+/// let r = review(&file, &d, &AtomicBool::new(false))?;
+/// assert_eq!(r.encoding_suggestion, Some(Encoding::Windows1252));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use]
-pub fn review(file: &[u8], detection: &Detection) -> Review {
+///
+/// # Errors
+///
+/// [`Cancelled`] if `cancel` was set before the review finished.
+pub fn review(
+    file: &[u8],
+    detection: &Detection,
+    cancel: &AtomicBool,
+) -> Result<Review, Cancelled> {
     let body = &file[detection.bom.len().min(file.len())..];
-    let cut = file.len() > FIRST_PAINT_BYTES;
+    let encoding = detection.encoding;
+    let in_use = detection.delimiter;
 
-    let encoding_suggestion = match detection.encoding_source {
-        EncodingSource::Guess => {
-            Some(Census::of(body, false).guess()).filter(|e| *e != detection.encoding)
-        }
-        EncodingSource::Attribute
-            if !matches!(detection.encoding, Encoding::Utf8 | Encoding::Windows1252)
-                && !decodes(body, detection.encoding) =>
-        {
-            Some(Census::of(body, false).guess())
-        }
-        _ => None,
+    // What to check: the encoding rule only for a guess, or for an
+    // attribute's single-byte encoding that must decode; every delimiter
+    // only if the delimiter was guessed.
+    let other_single_byte = encoding.is_ascii_compatible()
+        && !matches!(encoding, Encoding::Utf8 | Encoding::Windows1252);
+    let check_decoding =
+        detection.encoding_source == EncodingSource::Attribute && other_single_byte;
+    let count_utf8 = detection.encoding_source == EncodingSource::Guess || check_decoding;
+    let assigned = check_decoding.then(|| assigned_bytes(encoding));
+    let guessed = detection.delimiter_source == DialectSource::Guess;
+    let delimiters: &[Delimiter] = if guessed {
+        &Delimiter::ALL
+    } else {
+        std::slice::from_ref(&detection.delimiter)
     };
 
-    let units = Units::new(body, detection.encoding);
-    let delimiter_suggestion = if detection.delimiter_source == DialectSource::Guess && cut {
-        later_delimiter(units, detection.delimiter)
+    let mut census = Census::default();
+    let mut decodes_so_far = true;
+    let mut scans: Vec<Scan> = delimiters.iter().map(|&d| Scan::new(d)).collect();
+    let mut endings = EndingCounts::default();
+    let mut last_ending = None;
+    let mut record = |scan: &mut Scan, row: rows::Ended| {
+        scan.tally.add(&row);
+        if scan.delimiter == in_use {
+            endings.add(row.ending);
+            last_ending = Some(row.ending);
+        }
+    };
+
+    let mut start = 0;
+    while start < body.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled);
+        }
+        let end = chunk_end(body, start, REVIEW_CHUNK_BYTES, encoding);
+        let chunk = &body[start..end];
+        if count_utf8 {
+            census = census.plus(Census::of(chunk, false));
+        }
+        if let Some(assigned) = &assigned {
+            decodes_so_far &= chunk.iter().all(|&b| assigned[usize::from(b)]);
+        }
+        // Each delimiter's scan reads the whole chunk in turn, which keeps
+        // the loop tight (the chunk stays in cache).
+        for scan in &mut scans {
+            let mut feed = |u: u16| {
+                if let Some(row) = scan.scanner.feed(u) {
+                    record(scan, row);
+                }
+            };
+            match encoding {
+                // `as_chunks` gives whole pairs; a final odd byte is no unit.
+                Encoding::Utf16Le => chunk
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .for_each(|&pair| feed(u16::from_le_bytes(pair))),
+                Encoding::Utf16Be => chunk
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .for_each(|&pair| feed(u16::from_be_bytes(pair))),
+                _ => chunk.iter().for_each(|&b| feed(u16::from(b))),
+            }
+        }
+        start = end;
+    }
+    for scan in &mut scans {
+        if let Some(row) = scan.scanner.finish() {
+            record(scan, row);
+        }
+    }
+
+    let encoding_suggestion = match detection.encoding_source {
+        EncodingSource::Guess => Some(census.guess()).filter(|e| *e != encoding),
+        EncodingSource::Attribute if check_decoding && !decodes_so_far => Some(census.guess()),
+        _ => None,
+    };
+    let scores = scores(|d| {
+        scans
+            .iter()
+            .find(|s| s.delimiter == d)
+            .and_then(|s| s.tally.score())
+    });
+    let delimiter_suggestion = if guessed {
+        better_delimiter(&scores, in_use)
     } else {
         None
     };
-
-    // One pass over every row, without keeping them.
-    let mut last_ending = None;
-    let endings = Rows::new(units, detection.delimiter.byte()).map(|r| {
-        last_ending = Some(r.ending);
-        r.ending
-    });
-    let (line_ending, mixed_line_endings) = line_endings(endings);
-    Review {
+    let (line_ending, mixed_line_endings) = endings.result();
+    Ok(Review {
         encoding_suggestion,
         delimiter_suggestion,
         line_ending,
         mixed_line_endings,
         trailing_newline: last_ending.flatten().is_some(),
+    })
+}
+
+/// One delimiter's scan in [`review`].
+struct Scan {
+    delimiter: Delimiter,
+    scanner: Scanner,
+    tally: Tally,
+}
+
+impl Scan {
+    fn new(delimiter: Delimiter) -> Self {
+        Scan {
+            delimiter,
+            scanner: Scanner::new(delimiter.byte()),
+            tally: Tally::default(),
+        }
     }
 }
 
-/// The delimiter that samples from the middle and end of the file suggest,
-/// if it isn't `in_use` and splits those rows more consistently than
-/// `in_use` does.
-fn later_delimiter(units: Units<'_>, in_use: Delimiter) -> Option<Delimiter> {
-    let len = units.len();
-    // The samples are the size of first paint's, in units, and don't
-    // overlap first paint's or each other.
-    let window = FIRST_PAINT_BYTES / units.width();
-    let end_start = len.saturating_sub(window).max(window);
-    let middle_start = (len / 2).saturating_sub(window / 2).max(window);
-    let middle_end = (middle_start + window).min(end_start);
-
-    let sample = |d: Delimiter| {
-        let mut counts = Vec::new();
-        if middle_start < middle_end {
-            let middle = Units::new(units.bytes(middle_start..middle_end), units.encoding());
-            counts.extend(splits_from(middle, d, true));
-        }
-        if end_start < len {
-            counts.extend(splits_from(units.starting_at(end_start), d, false));
-        }
-        counts
-    };
-    let scores = scores(sample);
-    let (suggested, score) = best(&scores)?;
+/// The best delimiter for the whole file, if it isn't `in_use` and
+/// `in_use` doesn't split the rows as consistently.
+fn better_delimiter(scores: &Scores, in_use: Delimiter) -> Option<Delimiter> {
+    let (suggested, score) = best(scores)?;
     if suggested == in_use {
         return None;
     }
-    let better = match score_of(&scores, in_use) {
-        Some(current) if current.splits() => !current.at_least_as_consistent_as(&score),
-        _ => true,
-    };
-    better.then_some(suggested)
+    let fine = score_of(scores, in_use)
+        .is_some_and(|current| current.splits() && current.at_least_as_consistent_as(&score));
+    (!fine).then_some(suggested)
 }

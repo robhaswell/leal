@@ -4,7 +4,8 @@
 
 mod common;
 
-use leal_core::detect::{Choices, DialectSource, EncodingSource, Hints, detect, review};
+use common::{detect, review};
+use leal_core::detect::{Choices, DialectSource, EncodingSource, Hints};
 use leal_core::dialect::Bom;
 
 #[test]

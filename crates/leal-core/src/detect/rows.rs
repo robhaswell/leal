@@ -41,19 +41,195 @@ impl Row {
     }
 }
 
+/// Where the scanner is within the current field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// At the start of a field: a quote here opens a quoted field.
+    FieldStart,
+    /// In an unquoted field.
+    Unquoted,
+    /// Inside quotes.
+    Quoted,
+    /// Inside quotes, just after a `"`: either the first half of `""` or
+    /// the closing quote, depending on the next unit.
+    QuoteInQuoted,
+    /// After a closing quote (any text here is literal).
+    AfterQuote,
+}
+
+/// A row the [`Scanner`] has finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ended {
+    /// The row's length in units, without its line ending.
+    pub len: usize,
+    /// The number of fields (at least 1).
+    pub fields: usize,
+    /// The line ending, or `None` at the end of the text.
+    pub ending: Option<LineEnding>,
+    /// See [`Row::irregular`].
+    pub irregular: bool,
+}
+
+impl Ended {
+    /// A row with no units before its line ending.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.len == 0 && self.ending.is_some()
+    }
+}
+
+/// The row scanner, fed one unit at a time, so the same code reads a 64 KB
+/// window and streams a whole file in chunks. It starts outside quotes.
+#[derive(Clone, Debug)]
+pub(crate) struct Scanner {
+    delimiter: u16,
+    state: State,
+    /// The last unit was a CR outside quotes: an LF next makes it CR LF.
+    pending_cr: bool,
+    fields: usize,
+    len: usize,
+    irregular: bool,
+}
+
+impl Scanner {
+    pub(crate) fn new(delimiter: u8) -> Self {
+        Scanner {
+            delimiter: u16::from(delimiter),
+            state: State::FieldStart,
+            pending_cr: false,
+            fields: 1,
+            len: 0,
+            irregular: false,
+        }
+    }
+
+    /// Reads the next unit. Returns the row it finished, if it finished one.
+    pub(crate) fn feed(&mut self, u: u16) -> Option<Ended> {
+        if self.pending_cr {
+            self.pending_cr = false;
+            if u == LF {
+                return Some(self.end(Some(LineEnding::Crlf)));
+            }
+            let row = self.end(Some(LineEnding::Cr));
+            // `u` starts the next row. It can't finish that row: an LF was
+            // handled above, and a CR is only pending.
+            let _ = self.step(u);
+            return Some(row);
+        }
+        self.step(u)
+    }
+
+    /// The end of the text: the last row, if it has any units or a pending
+    /// CR. A quote still open makes that row irregular.
+    pub(crate) fn finish(&mut self) -> Option<Ended> {
+        if self.pending_cr {
+            self.pending_cr = false;
+            return Some(self.end(Some(LineEnding::Cr)));
+        }
+        if self.len == 0 {
+            return None;
+        }
+        self.irregular |= self.state == State::Quoted;
+        Some(self.end(None))
+    }
+
+    fn step(&mut self, u: u16) -> Option<Ended> {
+        match self.state {
+            State::Quoted => {
+                if u == QUOTE_UNIT {
+                    self.state = State::QuoteInQuoted;
+                }
+                self.len += 1;
+                None
+            }
+            State::QuoteInQuoted if u == QUOTE_UNIT => {
+                self.state = State::Quoted; // `""`, an escaped quote
+                self.len += 1;
+                None
+            }
+            State::QuoteInQuoted => {
+                self.state = State::AfterQuote; // the quote closed the field
+                self.outside(u)
+            }
+            _ => self.outside(u),
+        }
+    }
+
+    /// A unit outside quotes.
+    fn outside(&mut self, u: u16) -> Option<Ended> {
+        if u == LF {
+            return Some(self.end(Some(LineEnding::Lf)));
+        }
+        if u == CR {
+            self.pending_cr = true;
+            return None;
+        }
+        self.len += 1;
+        if u == self.delimiter {
+            self.fields += 1;
+            self.state = State::FieldStart;
+            return None;
+        }
+        match self.state {
+            State::FieldStart if u == QUOTE_UNIT => self.state = State::Quoted,
+            State::FieldStart => self.state = State::Unquoted,
+            // A quote in the middle of an unquoted field is literal.
+            State::Unquoted => self.irregular |= u == QUOTE_UNIT,
+            // Text after a closing quote.
+            _ => self.irregular = true,
+        }
+        None
+    }
+
+    fn end(&mut self, ending: Option<LineEnding>) -> Ended {
+        let row = Ended {
+            len: self.len,
+            fields: self.fields,
+            ending,
+            irregular: self.irregular,
+        };
+        self.state = State::FieldStart;
+        self.fields = 1;
+        self.len = 0;
+        self.irregular = false;
+        row
+    }
+}
+
+/// The number of units a line ending takes.
+const fn width(ending: Option<LineEnding>) -> usize {
+    match ending {
+        None => 0,
+        Some(LineEnding::Crlf) => 2,
+        Some(_) => 1,
+    }
+}
+
 /// The rows of `units`, read with `delimiter`, starting outside quotes.
 pub(crate) struct Rows<'a> {
     units: Units<'a>,
-    delimiter: u16,
+    scanner: Scanner,
     pos: usize,
+    row_start: usize,
 }
 
 impl<'a> Rows<'a> {
     pub(crate) fn new(units: Units<'a>, delimiter: u8) -> Self {
         Rows {
             units,
-            delimiter: u16::from(delimiter),
+            scanner: Scanner::new(delimiter),
             pos: 0,
+            row_start: 0,
+        }
+    }
+
+    fn row(&mut self, ended: Ended) -> Row {
+        let start = self.row_start;
+        self.row_start = start + ended.len + width(ended.ending);
+        Row {
+            span: start..start + ended.len,
+            fields: ended.fields,
+            ending: ended.ending,
+            irregular: ended.irregular,
         }
     }
 }
@@ -62,100 +238,39 @@ impl Iterator for Rows<'_> {
     type Item = Row;
 
     fn next(&mut self) -> Option<Row> {
-        let len = self.units.len();
-        if self.pos >= len {
-            return None;
-        }
-        let start = self.pos;
-        let mut fields = 1;
-        let mut field_start = true;
-        let mut in_quotes = false;
-        let mut just_closed = false;
-        let mut irregular = false;
-        let mut i = start;
-        while i < len {
-            let u = self.units.get(i);
-            if in_quotes {
-                if u == QUOTE_UNIT {
-                    if self.units.get(i + 1) == QUOTE_UNIT && i + 1 < len {
-                        i += 2; // an escaped quote
-                        continue;
-                    }
-                    in_quotes = false; // what follows is literal text
-                    just_closed = true;
-                }
-                i += 1;
-                continue;
-            }
-            let after_quote = std::mem::take(&mut just_closed);
-            if u == QUOTE_UNIT && field_start {
-                in_quotes = true;
-                field_start = false;
-                i += 1;
-            } else if u == self.delimiter {
-                fields += 1;
-                field_start = true;
-                i += 1;
-            } else if u == CR || u == LF {
-                let crlf = u == CR && i + 1 < len && self.units.get(i + 1) == LF;
-                let (ending, width) = match (u, crlf) {
-                    (LF, _) => (LineEnding::Lf, 1),
-                    (_, true) => (LineEnding::Crlf, 2),
-                    _ => (LineEnding::Cr, 1),
-                };
-                self.pos = i + width;
-                return Some(Row {
-                    span: start..i,
-                    fields,
-                    ending: Some(ending),
-                    irregular,
-                });
-            } else {
-                // Text after a closing quote, or a stray quote mid-field.
-                irregular |= after_quote || u == QUOTE_UNIT;
-                field_start = false;
-                i += 1;
+        while self.pos < self.units.len() {
+            let u = self.units.get(self.pos);
+            self.pos += 1;
+            if let Some(ended) = self.scanner.feed(u) {
+                return Some(self.row(ended));
             }
         }
-        self.pos = len;
-        Some(Row {
-            span: start..len,
-            fields,
-            ending: None,
-            irregular: irregular || in_quotes,
-        })
+        let ended = self.scanner.finish()?;
+        Some(self.row(ended))
     }
 }
 
-/// The rows of a sample that are known to be whole. If the sample was cut
-/// short (`cut`), the last row may be missing its end: a row with no line
-/// ending, or one ending in a CR at the very end (which could be the first
-/// half of a CR LF), is dropped.
+/// The rows of a window that are known to be whole. If the window was cut
+/// from a longer file (`cut`), its last row may be missing its end: a row
+/// with no line ending, or one ending in a CR at the very end (which could
+/// be the first half of a CR LF), is dropped. If it is the only row (a row
+/// longer than the window), it is kept, without that line ending, since
+/// it is the only evidence there is.
 pub(crate) fn whole_rows(units: Units<'_>, delimiter: u8, cut: bool) -> Vec<Row> {
     let len = units.len();
     let mut rows: Vec<Row> = Rows::new(units, delimiter).collect();
-    if cut && let Some(last) = rows.last() {
+    let only_one = rows.len() == 1;
+    if cut && let Some(last) = rows.last_mut() {
         let ends_in_cr = last.ending == Some(LineEnding::Cr) && last.span.end + 1 == len;
         if last.ending.is_none() || ends_in_cr {
-            rows.pop();
+            if only_one {
+                last.ending = None;
+            } else {
+                rows.pop();
+            }
         }
     }
     rows
-}
-
-/// Where a sample taken from the middle of the text starts: just after
-/// its first line ending, so that its first (probably partial) row is
-/// skipped. `None` if it has no line ending.
-///
-/// Whether that line ending was inside a quoted field can't be known
-/// without reading from the start of the file. If it was, the sample's
-/// first rows are misread, which is acceptable for a suggestion: quotes
-/// only open at a field's start, so a wrong guess rarely spreads far.
-pub(crate) fn after_first_line_ending(units: Units<'_>) -> Option<usize> {
-    let len = units.len();
-    let i = (0..len).find(|&i| matches!(units.get(i), CR | LF))?;
-    let crlf = units.get(i) == CR && i + 1 < len && units.get(i + 1) == LF;
-    Some(if crlf { i + 2 } else { i + 1 })
 }
 
 /// The display values of the fields in `row` (DESIGN §3.4): a quoted
@@ -277,21 +392,52 @@ mod tests {
     #[test]
     fn a_cut_sample_drops_its_unfinished_last_row() {
         let u = |t: &'static [u8]| Units::new(t, Encoding::Utf8);
-        assert_eq!(whole_rows(u(b"a\nb"), b',', true).len(), 1);
-        assert_eq!(whole_rows(u(b"a\nb"), b',', false).len(), 2);
-        assert_eq!(whole_rows(u(b"a\nb\r"), b',', true).len(), 1);
-        assert_eq!(whole_rows(u(b"a\nb\r"), b',', false).len(), 2);
-        assert_eq!(whole_rows(u(b"a\nb\n"), b',', true).len(), 2);
-        assert_eq!(whole_rows(u(b"a\n\"b\n"), b',', true).len(), 1);
+        let endings = |t, cut| -> Vec<Option<LineEnding>> {
+            whole_rows(u(t), b',', cut)
+                .iter()
+                .map(|r| r.ending)
+                .collect()
+        };
+        assert_eq!(endings(b"a\nb", true), [Some(Lf)]);
+        assert_eq!(endings(b"a\nb", false), [Some(Lf), None]);
+        assert_eq!(endings(b"a\nb\r", true), [Some(Lf)]);
+        assert_eq!(endings(b"a\nb\r", false), [Some(Lf), Some(Cr)]);
+        assert_eq!(endings(b"a\nb\n", true), [Some(Lf), Some(Lf)]);
+        assert_eq!(endings(b"a\n\"b\n", true), [Some(Lf)]);
+        // A row longer than the window is kept: it is all there is.
+        assert_eq!(endings(b"a\tb\tc", true), [None]);
+        assert_eq!(endings(b"a\tb\r", true), [None]);
     }
 
+    /// Feeding a scanner unit by unit gives the same rows as the iterator,
+    /// wherever CR LF, `""` and closing quotes fall.
     #[test]
-    fn a_middle_sample_starts_after_its_first_line_ending() {
-        let u = |t: &'static [u8]| Units::new(t, Encoding::Utf8);
-        assert_eq!(after_first_line_ending(u(b"tail\r\nnext")), Some(6));
-        assert_eq!(after_first_line_ending(u(b"\nnext")), Some(1));
-        assert_eq!(after_first_line_ending(u(b"tail\rnext")), Some(5));
-        assert_eq!(after_first_line_ending(u(b"no ending")), None);
+    fn the_scanner_is_the_same_unit_by_unit() {
+        let text = b"a,\"b\"\"c\",d\r\n\"x\ny\"z\r\rq,\"open";
+        let units = Units::new(text, Encoding::Utf8);
+        let rows: Vec<(usize, usize, Option<LineEnding>, bool)> = Rows::new(units, b',')
+            .map(|r| (r.span.len(), r.fields, r.ending, r.irregular))
+            .collect();
+        let mut scanner = Scanner::new(b',');
+        let mut fed = Vec::new();
+        for &b in text {
+            fed.extend(scanner.feed(u16::from(b)));
+        }
+        fed.extend(scanner.finish());
+        let fed: Vec<_> = fed
+            .into_iter()
+            .map(|e| (e.len, e.fields, e.ending, e.irregular))
+            .collect();
+        assert_eq!(rows, fed);
+        assert_eq!(
+            rows,
+            [
+                (10, 3, Some(Crlf), false),
+                (6, 1, Some(Cr), true),
+                (0, 1, Some(Cr), false),
+                (7, 2, None, true),
+            ]
+        );
     }
 
     #[test]

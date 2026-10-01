@@ -2,9 +2,11 @@
 //! ADR-0005 decisions 1, 4 and 5), and first paint versus the whole file.
 
 use leal_core::attributes::{Fingerprint, Interpretation, text_encoding_value};
+mod common;
+
+use common::{detect, review};
 use leal_core::detect::{
     ChoiceError, Choices, Detection, DialectSource, EncodingSource, FIRST_PAINT_BYTES, Hints, Note,
-    detect, review,
 };
 use leal_core::dialect::{Bom, Delimiter, Encoding, LineEnding};
 
@@ -249,17 +251,17 @@ fn first_paint_reads_only_the_first_64_kb() {
     assert!(!review(&changed, &e).trailing_newline);
 }
 
-/// Later rows that fit a different delimiter better give a suggestion,
-/// never a silent switch.
+/// When most of the file, past the first 64 KB, fits a different
+/// delimiter, the review suggests it; it never switches by itself.
 #[test]
-fn the_review_suggests_a_delimiter_from_the_middle_and_end() {
+fn the_review_suggests_a_delimiter_the_whole_file_fits() {
     // The first 64 KB: one column, with one comma in the first row.
     let mut file = b"name,\n".to_vec();
     while file.len() < FIRST_PAINT_BYTES + 10 {
         file.extend_from_slice(b"x\n");
     }
-    // The rest: clearly semicolon-separated.
-    for i in 0..30_000 {
+    // The rest, three times as many rows: clearly semicolon-separated.
+    for i in 0..100_000 {
         file.extend_from_slice(format!("{i};a;b\n").as_bytes());
     }
     let d = plain(&file);
@@ -493,5 +495,30 @@ fn a_chosen_delimiter_changes_what_is_read_under_it() {
     assert_eq!(
         (comma.trailing_newline, comma.line_ending),
         (Some(true), Some(LineEnding::Lf))
+    );
+}
+
+/// A garbled key is noted, not silently skipped (`" delimiter"` would
+/// otherwise look like a key from a later version).
+#[test]
+fn a_garbled_interpretation_key_is_noted() {
+    let d = with_interpretation(b"a;b\nc;d\n", b"v=1; delimiter=comma");
+    assert_eq!(
+        (d.delimiter, d.delimiter_source),
+        (Delimiter::Semicolon, DialectSource::Guess)
+    );
+    assert_eq!(d.notes, [Note::InterpretationUnreadable]);
+    // A well-formed key from a later version is still ignored quietly.
+    let d = with_interpretation(b"a;b\nc;d\n", b"v=1;colour=blue");
+    assert_eq!(d.notes, []);
+}
+
+/// ADR-0007 decision 2 (proposed, provisional): `us-ascii` reads as UTF-8.
+#[test]
+fn an_ascii_encoding_attribute_reads_as_utf8() {
+    let d = with_encoding_attribute(b"a,b\n", b"us-ascii;1536");
+    assert_eq!(
+        (d.encoding, d.encoding_source, &d.notes[..]),
+        (Encoding::Utf8, EncodingSource::Attribute, &[][..])
     );
 }
