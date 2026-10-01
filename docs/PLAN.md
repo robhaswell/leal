@@ -94,7 +94,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (Phase 0 review rust-4: today `LealError::Io` carries only
     `io::Error`'s Display text, which the alert shows as is, such as
     "Permission denied (os error 13)".)
-- [~] **1.1a Removable drives** (ADR-0006, option C).
+- [x] **1.1a Removable drives** (ADR-0006, option C).
   - Detect removable volumes from the volume's "is internal" and "is
     ejectable" properties.
   - Read ranges with ordinary reads (`pread`) for removable volumes, so the
