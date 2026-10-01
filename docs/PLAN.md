@@ -191,7 +191,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     reports completion. A Rust test shows that calling `cancel()` stops a
     running job within one chunk. The Swift side is 1.6. (ADR-0005
     decision 6)
-- [~] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
+- [x] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
   - Follows ADR-0003 decisions 2, 3, 6 and 7: text after a closing quote
     displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
     position is a byte offset into the file as stored (UTF-16 included),
