@@ -231,7 +231,7 @@ fn spreads_and_verdicts() {
 #[test]
 fn scroll_runs_are_read_and_judged() {
     let json: serde_json::Value = serde_json::from_str(
-        r#"{"scroll":{"frames":6150,"late":3,"p99":8.3,"cpuP50":4.1,"cpuP99":6.4,"instructionsMean":17.9,"mainThreadGHz":2.0},
+        r#"{"scroll":{"frames":6150,"late":3,"p99":8.3,"cpuP50":4.1,"cpuP99":6.4,"busyOver120Hz":2,"instructionsMean":17.9,"mainThreadGHz":2.0},
             "heapPeakMB":35.7,"screenMaxFPS":120,"whileIndexing":{"frames":20,"late":1},"findRuns":4,
             "displayLinkStalls":0,"windowVisible":true}"#,
     )
@@ -239,6 +239,7 @@ fn scroll_runs_are_read_and_judged() {
     let run = ScrollRun::parse(&json).unwrap();
     assert_eq!((run.frames, run.late), (6150, 3));
     assert_eq!(run.while_indexing, (1, 20));
+    assert_eq!(run.busy_over_120hz, 2);
     assert_eq!(run.while_finding, (0, 0));
     assert_eq!(run.find_runs, 4);
     assert!(run.visible);

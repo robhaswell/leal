@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.pwr_mgt
 import QuartzCore
 
 // Only in the builds `just bench-scroll` and `just snapshot` make
@@ -106,6 +107,7 @@ final class ScrollBench: NSObject {
     /// scrolling sends no input events, so macOS would otherwise treat the
     /// app as idle and slow its cores), and a window nothing covers.
     private var activity: NSObjectProtocol?
+    private var keepAwake: Timer?
     private let defaults = UserDefaults.standard
 
     func start(finish: @escaping ([String: Any]) -> Void) {
@@ -115,6 +117,16 @@ final class ScrollBench: NSObject {
             reason: "Scroll benchmark"
         )
         content.view.window?.level = .floating
+        // On the screen with the fastest refresh (a Mac with a 60 Hz
+        // external display opens windows on whichever has the menu bar),
+        // at the same place on it.
+        if let window = content.view.window, let current = window.screen,
+           let fastest = NSScreen.screens.max(by: { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }),
+           fastest.maximumFramesPerSecond > current.maximumFramesPerSecond
+        {
+            let offset = NSPoint(x: window.frame.minX - current.visibleFrame.minX, y: window.frame.maxY - current.visibleFrame.maxY)
+            window.setFrameTopLeftPoint(NSPoint(x: fastest.visibleFrame.minX + max(0, offset.x), y: fastest.visibleFrame.maxY + min(0, offset.y)))
+        }
         guard let view = content.view.window?.contentView else { return }
         let link = view.displayLink(target: self, selector: #selector(tick(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 120, maximum: 120, preferred: 120)
@@ -135,6 +147,13 @@ final class ScrollBench: NSObject {
         for observer in [wake, sleep].compactMap({ $0 }) {
             CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
             observers.append(observer)
+        }
+        // A locked Mac turns its display off after a while, and the
+        // display link stops with it. Keep declaring user activity, as
+        // `caffeinate -u` does: a power assertion, not an input event.
+        keepAwake = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            var assertion: IOPMAssertionID = 0
+            IOPMAssertionDeclareUserActivity("Leal scroll benchmark" as CFString, kIOPMUserActiveLocal, &assertion)
         }
         describeEnvironment()
         buildStages()
@@ -342,6 +361,7 @@ final class ScrollBench: NSObject {
 
     private func done() {
         link?.invalidate()
+        keepAwake?.invalidate()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
         for observer in observers {
             CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
@@ -416,6 +436,10 @@ final class ScrollBench: NSObject {
             "cpuP50": percentile(cpuSorted, 0.5),
             "cpuP99": percentile(cpuSorted, 0.99),
             "cpuMax": cpuSorted.last ?? 0,
+            // Frames whose main-thread work took longer than a 120 Hz
+            // refresh: what decides the budget on a 60 Hz display (a base
+            // M1 Air's), where a late frame needs twice that.
+            "busyOver120Hz": busy.filter { $0 > 1000.0 / 120 }.count,
         ]
     }
 

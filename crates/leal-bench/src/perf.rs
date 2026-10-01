@@ -337,6 +337,9 @@ pub struct ScrollRun {
     pub cpu_p50_ms: f64,
     /// The same, 99th percentile.
     pub cpu_p99_ms: f64,
+    /// Frames whose main-thread work took longer than a 120 Hz refresh
+    /// (8.3 ms): what decides the budget on a 60 Hz display.
+    pub busy_over_120hz: u64,
     /// The main thread's instructions per frame, mean, in millions.
     pub instructions_mean: f64,
     /// The main thread's clock: cycles over CPU time, in GHz.
@@ -375,6 +378,7 @@ impl ScrollRun {
             p99_ms: number(scroll, "p99"),
             cpu_p50_ms: number(scroll, "cpuP50"),
             cpu_p99_ms: number(scroll, "cpuP99"),
+            busy_over_120hz: count(scroll, "busyOver120Hz"),
             instructions_mean: number(scroll, "instructionsMean"),
             ghz: number(scroll, "mainThreadGHz"),
             heap_peak_mb: number(json, "heapPeakMB"),

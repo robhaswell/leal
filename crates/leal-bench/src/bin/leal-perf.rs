@@ -188,7 +188,15 @@ fn run() -> Result<(), String> {
         for (name, file, extra) in &scenarios {
             for run in 1..=options.runs {
                 eprintln!("leal-perf: scroll {name}, {run} of {}", options.runs);
-                let json = scroll_run(&options, file, extra)?;
+                // A run that fails (the display slept, the app hung) is
+                // reported and left out; the others still count.
+                let json = match scroll_run(&options, file, extra) {
+                    Ok(json) => json,
+                    Err(message) => {
+                        eprintln!("warning: scroll {name} run {run} left out: {message}");
+                        continue;
+                    }
+                };
                 let parsed = ScrollRun::parse(&json).ok_or(format!(
                     "the scroll benchmark's JSON has no results: {json}"
                 ))?;
@@ -388,12 +396,13 @@ fn format_report(
         for (i, (_, r)) in runs.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "- Scroll `{name}` run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {:.1}/{:.1} ms, {:.1} M instructions a frame at {:.2} GHz; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB; screen {} Hz{}",
+                "- Scroll `{name}` run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {:.1}/{:.1} ms, {} frames busy over 8.3 ms, {:.1} M instructions a frame at {:.2} GHz; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB; screen {} Hz{}",
                 i + 1,
                 ScrollRun::describe_late(r.late, r.frames),
                 r.p99_ms,
                 r.cpu_p50_ms,
                 r.cpu_p99_ms,
+                r.busy_over_120hz,
                 r.instructions_mean,
                 r.ghz,
                 ScrollRun::describe_late(r.while_indexing.0, r.while_indexing.1),
@@ -534,11 +543,11 @@ fn scroll_run(options: &Options, file: &Path, extra: &[String]) -> Result<Value,
     args.extend(extra.iter().cloned());
     let result = (|| {
         let launched = Launched::open(&options.bench_app, Some(file), &args)?;
-        let deadline = Instant::now() + Duration::from_secs(300);
+        let deadline = Instant::now() + Duration::from_secs(480);
         while launched.is_running() {
             if Instant::now() > deadline {
                 launched.quit();
-                return Err("the scroll benchmark didn't finish in 300 s".to_owned());
+                return Err("the scroll benchmark didn't finish in 480 s".to_owned());
             }
             thread::sleep(Duration::from_millis(250));
         }
@@ -561,6 +570,8 @@ fn scroll_run(options: &Options, file: &Path, extra: &[String]) -> Result<Value,
 /// A Leal this run started with `open`, known by its PID.
 struct Launched {
     pid: u32,
+    /// Its executable, to check that the PID is still this process.
+    executable: PathBuf,
     /// When `open` was called, in seconds since the epoch.
     started: f64,
 }
@@ -591,7 +602,11 @@ impl Launched {
                 .into_iter()
                 .find(|p| !before.contains(p))
             {
-                return Ok(Launched { pid, started });
+                return Ok(Launched {
+                    pid,
+                    executable,
+                    started,
+                });
             }
             if Instant::now() > deadline {
                 return Err(format!("{} didn't start within 15 s", app.display()));
@@ -600,23 +615,35 @@ impl Launched {
         }
     }
 
+    /// Whether the process is still running, and still this app: once it
+    /// has exited, its PID could be another process's.
     fn is_running(&self) -> bool {
-        Command::new("kill")
-            .args(["-0", &self.pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        Command::new("ps")
+            .args(["-o", "command=", "-p", &self.pid.to_string()])
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains(&*self.executable.to_string_lossy())
+            })
     }
 
     /// Quits it (SIGTERM, then SIGKILL after 5 s) and waits until it has
     /// gone. The next launch removes any temporary folder it leaves.
     fn quit(&self) {
+        if !self.is_running() {
+            return;
+        }
         let pid = self.pid.to_string();
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid])
+            .stderr(Stdio::null())
+            .status();
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.is_running() {
             if Instant::now() > deadline {
-                let _ = Command::new("kill").args(["-KILL", &pid]).status();
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid])
+                    .stderr(Stdio::null())
+                    .status();
                 break;
             }
             thread::sleep(Duration::from_millis(50));
