@@ -1151,6 +1151,25 @@ proptest! {
             prop_assert_eq!(diagnostics.next_row_with_diagnostic(at), next, "next from {}", at);
             prop_assert_eq!(diagnostics.previous_row_with_diagnostic(at), previous, "before {}", at);
         }
+        // Each kind's walk (task 1.7's Previous and Next) agrees with its
+        // row-by-row test: in a wide mode, each `Mark` has its own walk.
+        for which in [Mark::Any, Mark::Ragged, Mark::Flagged] {
+            let rows: Vec<bool> = (0..want.len()).map(|r| diagnostics.row_is(r, which)).collect();
+            for at in 0..=rows.len() + 1 {
+                let next = (at.min(rows.len())..rows.len()).find(|&r| rows[r]);
+                let previous = (0..at.min(rows.len())).rev().find(|&r| rows[r]);
+                prop_assert_eq!(
+                    diagnostics.rows_where(at, which, true, 1).first().copied(),
+                    next,
+                    "{:?} next from {}", which, at
+                );
+                prop_assert_eq!(
+                    diagnostics.rows_where(at, which, false, 1).first().copied(),
+                    previous,
+                    "{:?} before {}", which, at
+                );
+            }
+        }
     }
 }
 

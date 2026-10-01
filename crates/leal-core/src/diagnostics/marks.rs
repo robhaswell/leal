@@ -119,8 +119,8 @@ impl RowMarks {
     /// The first row at or after `from` marked as `which` says.
     pub(crate) fn next_where(&self, from: usize, which: Mark) -> Option<usize> {
         let tail = self.codes.get(from..)?;
-        match self.byte_test(which) {
-            Some(test) => {
+        match self.test(which) {
+            Test::Byte(test) => {
                 // Skip blocks with no marked row, 64 codes at a time: a loop
                 // without an early exit, which the compiler vectorises.
                 let mut at = from;
@@ -136,28 +136,43 @@ impl RowMarks {
                 }
                 None
             }
-            None => {
-                // A wide mode: wide rows need their exact count from the
-                // side list. Walk it alongside the codes (one search to
-                // find where to start), so the cost stays one step per row,
-                // as for a narrow file, not a search per row.
-                let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < from);
-                for (row, &code) in (from..).zip(tail) {
-                    let fields = self.step_wide(code, &mut w, row);
-                    if self.marked_with(code, fields, which) {
-                        return Some(row);
-                    }
-                }
-                None
+            // One walk for each `which`, so it is decided once per search,
+            // not again on every row (see `WideTest`).
+            Test::Wide(test) => match which {
+                Mark::Any => self.next_wide::<true, true>(from, tail, test),
+                Mark::Ragged => self.next_wide::<false, true>(from, tail, test),
+                Mark::Flagged => self.next_wide::<true, false>(from, tail, test),
+            },
+        }
+    }
+
+    /// [`next_where`](Self::next_where) in a wide mode, for flagged rows if
+    /// `FLAGGED` and ragged ones if `RAGGED`: the first such row of `tail`,
+    /// which starts at row `from`. Wide rows need their exact count from
+    /// the side list. It is walked alongside the codes (one search to find
+    /// where to start), so the cost stays one step per row, as for a narrow
+    /// file, not a search per row.
+    fn next_wide<const FLAGGED: bool, const RAGGED: bool>(
+        &self,
+        from: usize,
+        tail: &[u8],
+        test: WideTest,
+    ) -> Option<usize> {
+        let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < from);
+        for (row, &code) in (from..).zip(tail) {
+            let fields = self.step_wide(code, &mut w, row);
+            if (FLAGGED && code & FLAG != 0) || (RAGGED && test.ragged(code, fields)) {
+                return Some(row);
             }
         }
+        None
     }
 
     /// The last row before `to` marked as `which` says.
     pub(crate) fn previous_where(&self, to: usize, which: Mark) -> Option<usize> {
         let head = &self.codes[..to.min(self.codes.len())];
-        match self.byte_test(which) {
-            Some(test) => {
+        match self.test(which) {
+            Test::Byte(test) => {
                 let mut end = head.len();
                 for block in head.rchunks(BLOCK) {
                     end -= block.len();
@@ -171,24 +186,36 @@ impl RowMarks {
                 }
                 None
             }
-            None => {
-                // As in `next`, walking the side list backwards: `w` is one
-                // past the last wide row before `to`.
-                let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < head.len());
-                for (row, &code) in head.iter().enumerate().rev() {
-                    let fields = if code & !FLAG == WIDE {
-                        w = w.checked_sub(1)?;
-                        self.wide_entry(w, row)
-                    } else {
-                        None
-                    };
-                    if self.marked_with(code, fields, which) {
-                        return Some(row);
-                    }
-                }
+            // As in `next_where`.
+            Test::Wide(test) => match which {
+                Mark::Any => self.previous_wide::<true, true>(head, test),
+                Mark::Ragged => self.previous_wide::<false, true>(head, test),
+                Mark::Flagged => self.previous_wide::<true, false>(head, test),
+            },
+        }
+    }
+
+    /// [`next_wide`](Self::next_wide) backwards: the last such row of
+    /// `head`, which starts at row 0. `w` is one past the last wide row in
+    /// `head`, and walks the side list backwards.
+    fn previous_wide<const FLAGGED: bool, const RAGGED: bool>(
+        &self,
+        head: &[u8],
+        test: WideTest,
+    ) -> Option<usize> {
+        let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < head.len());
+        for (row, &code) in head.iter().enumerate().rev() {
+            let fields = if code & !FLAG == WIDE {
+                w = w.checked_sub(1)?;
+                self.wide_entry(w, row)
+            } else {
                 None
+            };
+            if (FLAGGED && code & FLAG != 0) || (RAGGED && test.ragged(code, fields)) {
+                return Some(row);
             }
         }
+        None
     }
 
     /// True if the row with this code is marked as `which` says.
@@ -250,23 +277,30 @@ impl RowMarks {
             .map(|delimiters| delimiters + 1)
     }
 
-    /// A test that needs only the code: when the mode isn't wide, or when
-    /// only the flag matters.
-    fn byte_test(&self, which: Mark) -> Option<ByteTest> {
+    /// How a search for `which` tests each row: from the code alone when
+    /// the mode isn't wide, or when only the flag matters; otherwise with
+    /// wide rows' exact counts too.
+    fn test(&self, which: Mark) -> Test {
         if which == Mark::Flagged {
-            return Some(ByteTest { mode: None, which });
+            return Test::Byte(ByteTest { mode: None, which });
         }
         match self.mode {
-            None => Some(ByteTest { mode: None, which }),
-            Some(mode) => u8::try_from(mode)
-                .ok()
-                .filter(|&m| m < WIDE)
-                .map(|m| ByteTest {
+            None => Test::Byte(ByteTest { mode: None, which }),
+            Some(mode) => match u8::try_from(mode).ok().filter(|&m| m < WIDE) {
+                Some(m) => Test::Byte(ByteTest {
                     mode: Some(m),
                     which,
                 }),
+                None => Test::Wide(WideTest { mode }),
+            },
         }
     }
+}
+
+/// How a search tests each row ([`RowMarks::test`]).
+enum Test {
+    Byte(ByteTest),
+    Wide(WideTest),
 }
 
 /// A row number from the side list (a `u32`, which always fits).
@@ -295,6 +329,35 @@ impl ByteTest {
             Mark::Any => flagged | ragged,
             Mark::Ragged => ragged,
             Mark::Flagged => flagged,
+        }
+    }
+}
+
+/// Whether a row is ragged when the mode is [`WIDE`] or more: a wide row is
+/// if its exact count isn't the mode, and every other row (all narrower)
+/// is unless it is blank.
+///
+/// This is [`RowMarks::marked`] with what a wide mode already settles taken
+/// out: that there is a mode, and how a narrower row compares with it. With
+/// that, and `which` decided once per search ([`RowMarks::next_wide`]), a
+/// walk over a wide file is a few instructions per row. Every step counts
+/// at about half a nanosecond a row: deciding `which` on each row, as 1.7
+/// first did, made **Previous** a third slower (docs/tasks/1.7.md, "The
+/// marks benchmarks").
+#[derive(Clone, Copy)]
+struct WideTest {
+    mode: usize,
+}
+
+impl WideTest {
+    /// `wide_fields` is the exact count of a [`WIDE`] row, from the side
+    /// list.
+    fn ragged(self, code: u8, wide_fields: Option<usize>) -> bool {
+        let count = code & !FLAG;
+        if count == WIDE {
+            wide_fields != Some(self.mode)
+        } else {
+            count != 0
         }
     }
 }
