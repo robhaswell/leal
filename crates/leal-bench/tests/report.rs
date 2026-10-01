@@ -194,6 +194,27 @@ fn sequential_read_never_regresses() {
     assert_eq!(report.verdict(), Verdict::Pass);
 }
 
+/// A budget-only benchmark never fails on change between commits, but
+/// still fails when it goes over its budget.
+#[test]
+fn budget_only_benchmarks_gate_on_their_budget_alone() {
+    let id = "open/first_paint_removable_under_load";
+    let budget = [Budget {
+        id,
+        max_ms: 150.0,
+        source: "DESIGN §1",
+    }];
+    let slower = [measurement(id, 7e6, Some(change(0.70)))];
+    let report = report::evaluate(&slower, &budget, CI);
+    assert_eq!(status_of(&report, id), &Status::Info);
+    assert_eq!(report.verdict(), Verdict::Pass);
+
+    let over = [measurement(id, 151e6, Some(change(0.0)))];
+    let report = report::evaluate(&over, &budget, CI);
+    assert_eq!(status_of(&report, id), &Status::OverBudget);
+    assert_ne!(report.verdict(), Verdict::Pass);
+}
+
 /// A regression is a slowdown whose whole 95% interval is above the
 /// threshold, so a noisy median alone doesn't fail the job.
 #[test]

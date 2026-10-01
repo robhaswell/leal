@@ -61,6 +61,18 @@ pub fn is_canary(id: &str) -> bool {
     CANARIES.contains(&id)
 }
 
+/// Benchmarks gated on their budget only, never on change between commits,
+/// because shared runners make them too noisy to compare: the simulated
+/// removable open reads through `pread` under background load, and its
+/// 95% interval spans tens of percent between identical commits.
+pub const BUDGET_ONLY: [&str; 1] = ["open/first_paint_removable_under_load"];
+
+/// True if `id` is gated on its budget only (see [`BUDGET_ONLY`]).
+#[must_use]
+pub fn is_budget_only(id: &str) -> bool {
+    BUDGET_ONLY.contains(&id)
+}
+
 /// True if `id` is in one of the [`BASELINE_GROUPS`]. The baseline's code
 /// is the same on both sides of every comparison, so its benchmarks never
 /// gate: each is either a canary or information.
@@ -317,7 +329,7 @@ pub fn evaluate(
                 Status::NoisyCanary
             } else if is_canary(&m.id) {
                 Status::Canary
-            } else if is_baseline(&m.id) {
+            } else if is_baseline(&m.id) || is_budget_only(&m.id) {
                 Status::Info
             } else if m
                 .change
