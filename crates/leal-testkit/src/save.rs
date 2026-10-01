@@ -881,6 +881,77 @@ mod tests {
         assert_eq!(out(r), "\"a\",\"b\"\n\"1\",\"\"\n");
     }
 
+    /// ADR-0004 decision 1: blank lines have no field bytes to quote, so
+    /// they don't stop a file from quoting every field.
+    #[test]
+    fn a_blank_line_does_not_stop_a_file_quoting_every_field() {
+        let q = [(0, 0), (0, 1), (2, 0), (2, 1)];
+        let bytes = b"\"a\",\"b\"\n\n\"c\",\"d\"\n";
+        assert_eq!(
+            out(save(bytes, &q, &[set(2, 0, "x")])),
+            "\"a\",\"b\"\n\n\"x\",\"d\"\n"
+        );
+        let ins = Edit::InsertRow {
+            at: 3,
+            values: vec!["1".into(), "2".into()],
+        };
+        assert_eq!(
+            out(save(bytes, &q, &[ins])),
+            "\"a\",\"b\"\n\n\"c\",\"d\"\n\"1\",\"2\"\n"
+        );
+    }
+
+    /// ADR-0004 decision 3: a file with no line ending at all gives new rows
+    /// LF.
+    #[test]
+    fn new_rows_in_a_file_with_no_line_ending_use_lf() {
+        let ins = |at| Edit::InsertRow {
+            at,
+            values: vec!["x".into()],
+        };
+        assert_eq!(out(save(b"a", &[], &[ins(1)])), "a\nx");
+        assert_eq!(out(save(b"a", &[], &[ins(0)])), "x\na");
+        assert_eq!(out(save(b"a,b", &[], &[ins(1), ins(2)])), "a,b\nx\nx");
+    }
+
+    /// ADR-0004 decision 5: a blank line never loses its cell to a column
+    /// delete, so a later column insert can't turn it into data.
+    #[test]
+    fn a_blank_line_survives_a_column_delete_then_insert() {
+        let edits = [
+            Edit::DeleteColumn { column: 0 },
+            Edit::InsertColumn {
+                at: 0,
+                value: "N".into(),
+            },
+        ];
+        let r = save(b"a,b\n\nc,d\n", &[], &edits).unwrap();
+        assert_eq!(String::from_utf8(r.bytes).unwrap(), "N,b\n\nN,d\n");
+    }
+
+    /// Changes are per row: a row inserted between two untouched rows is
+    /// one insert, and touches neither neighbour.
+    #[test]
+    fn an_inserted_row_is_one_insert_between_its_neighbours() {
+        let ins = Edit::InsertRow {
+            at: 1,
+            values: vec!["x".into(), "y".into()],
+        };
+        let r = save(b"a,b\nc,d\n", &[], &[ins]).unwrap();
+        assert_eq!(r.changes, vec![Change::insert(4, "x,y\n")]);
+    }
+
+    #[test]
+    fn typical_row_len_is_the_most_common_row_length() {
+        let bytes = b"a,b\nc,d\ne\n";
+        let layout = simple_layout(bytes, &[]);
+        let doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        assert_eq!(doc.typical_row_len(), 2);
+        let layout = simple_layout(b"", &[]);
+        let doc = Document::new(b"", &layout, Delimiter::Comma, Encoding::Utf8);
+        assert_eq!(doc.typical_row_len(), 1, "an empty file still gets one");
+    }
+
     #[test]
     fn reverting_restores_the_original_bytes() {
         let edits = [set(0, 1, "x"), set(0, 1, "b")];
@@ -1044,17 +1115,21 @@ mod tests {
     /// single-byte file would be read as a UTF-16 BOM.
     #[test]
     fn utf16_bom_bytes_moved_to_the_start_are_quoted() {
-        let bytes = b"x\n\xFF\xFEy\n";
-        let layout = Layout {
-            bom_len: 0,
-            rows: vec![
-                row_layout(0..1, LineEnding::Lf, b"x"),
-                row_layout(2..5, LineEnding::Lf, b"\xFF\xFEy"),
-            ],
-        };
-        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
-        doc.apply(&Edit::DeleteRow { row: 0 }).unwrap();
-        assert_eq!(doc.save().unwrap().bytes, b"\"\xFF\xFEy\"\n");
+        for bom in [UTF16LE_BOM, UTF16BE_BOM] {
+            let bytes = [b"x\n", bom, b"y\n"].concat();
+            let layout = Layout {
+                bom_len: 0,
+                rows: vec![
+                    row_layout(0..1, LineEnding::Lf, b"x"),
+                    row_layout(2..5, LineEnding::Lf, &bytes[2..5]),
+                ],
+            };
+            let mut doc = Document::new(&bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
+            doc.apply(&Edit::DeleteRow { row: 0 }).unwrap();
+            let saved = doc.save().unwrap();
+            assert_eq!(saved.bytes, [b"\"", bom, b"y\"\n"].concat(), "{bom:x?}");
+            assert_eq!(saved.fixes, vec![Fix::BomLikeQuoted], "{bom:x?}");
+        }
     }
 
     fn row_layout(span: std::ops::Range<usize>, le: LineEnding, value: &[u8]) -> RowLayout {

@@ -37,11 +37,13 @@ use crate::strategies::csv::{
 /// Values the edit strategy writes: plain text, every character that forces
 /// quoting, leading and trailing spaces, the empty string, text that
 /// Windows-1252 can (é, €) and can't (😀) encode, and BOM-like starts
-/// (ADR-0004 decisions 7 and 10): U+FEFF, and "ÿþ" and "ï»¿", which are the
-/// bytes `FF FE` and `EF BB BF` in Windows-1252.
-pub const EDIT_VALUES: [&str; 21] = [
+/// (ADR-0004 decisions 7 and 10): U+FEFF, and "ÿþ", "þÿ" and "ï»¿", which are
+/// the bytes `FF FE`, `FE FF` and `EF BB BF` in Windows-1252. The BOM-like
+/// values come first.
+pub const EDIT_VALUES: [&str; 22] = [
     "\u{FEFF}x",
     "\u{FF}\u{FE}",
+    "\u{FE}\u{FF}",
     "\u{EF}\u{BB}\u{BF}",
     "",
     "x",
@@ -156,7 +158,7 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
         6 => (any::<Index>(), any::<Index>(), raw_value(), prop::bool::weighted(0.25))
             .prop_map(|(row, column, value, revert)| RawEdit::Set { row, column, value, revert }),
         1 => prop_oneof![
-            select(&EDIT_VALUES[..3]).prop_map(RawValue::Literal), // the BOM-like values
+            select(&EDIT_VALUES[..4]).prop_map(RawValue::Literal), // the BOM-like values
             raw_value(),
         ]
         .prop_map(|value| RawEdit::SetFirst { value }),
@@ -392,6 +394,25 @@ mod tests {
                 r#"fixes: [BomLikeQuoted]) }"#,
             )
         );
+    }
+
+    /// `raw_edit` sets the first cell to `EDIT_VALUES[..4]` because those are
+    /// the values that start with a BOM in UTF-8 or Windows-1252.
+    #[test]
+    fn the_first_four_edit_values_are_the_bom_like_ones() {
+        use crate::dialect::{UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, encode_value};
+        let bom_like = |v: &str| {
+            [Encoding::Utf8, Encoding::Windows1252].iter().any(|&e| {
+                encode_value(v, e).is_ok_and(|b| {
+                    [UTF8_BOM, UTF16LE_BOM, UTF16BE_BOM]
+                        .iter()
+                        .any(|bom| b.starts_with(bom))
+                })
+            })
+        };
+        for (i, v) in EDIT_VALUES.iter().enumerate() {
+            assert_eq!(bom_like(v), i < 4, "{v:?}");
+        }
     }
 
     #[test]

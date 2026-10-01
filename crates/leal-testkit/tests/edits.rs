@@ -5,7 +5,8 @@ mod oracle;
 
 use leal_testkit::diagnostics::{self, DiagnosticKind};
 use leal_testkit::dialect::{
-    Bom, Delimiter, Encoding, decode_value, encode_value, expected_encoding, reopen_encoding,
+    Bom, Delimiter, Encoding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value, encode_value,
+    expected_encoding, reopen_encoding,
 };
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
@@ -170,12 +171,26 @@ fn edit_strategy_reaches_every_kind_of_edit() {
             .any(|c| matches!(c.saved, Err(SaveError::Unencodable(_))))
     );
     // Some saves need an encoding hint (ADR-0004 decision 11), so the reopen
-    // property really tests it.
+    // property really tests it: some write none, and some write one only
+    // because the guess would differ (the file had no hint before).
     assert!(
         cases
             .iter()
             .any(|c| c.saved.as_ref().is_ok_and(|s| s.encoding_hint.is_some()))
     );
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.saved.as_ref().is_ok_and(|s| s.encoding_hint.is_none()))
+    );
+    assert!(
+        cases.iter().any(|c| c.existing_hint.is_none()
+            && c.saved.as_ref().is_ok_and(|s| s.encoding_hint.is_some()))
+    );
+    // Inserted rows are as wide as the file's rows, not always one field.
+    assert!(has(
+        &|e| matches!(e, Edit::InsertRow { values, .. } if values.len() > 1)
+    ));
     // Some saves change exactly one field.
     assert!(
         cases
@@ -509,6 +524,16 @@ fn every_save_rule_and_edge_operation_is_exercised() {
                     Fix::CrSplit { .. } => "fix: CR/LF split",
                     Fix::BomLikeQuoted => "fix: BOM-like first field quoted",
                 });
+                // Also counted per BOM, so that each kind is exercised. The
+                // file has no BOM, so the output starts with the quote.
+                if *fix == Fix::BomLikeQuoted {
+                    seen.push(match &saved.bytes[1..] {
+                        b if b.starts_with(UTF8_BOM) => "fix: BOM-like EF BB BF quoted",
+                        b if b.starts_with(UTF16LE_BOM) => "fix: BOM-like FF FE quoted",
+                        b if b.starts_with(UTF16BE_BOM) => "fix: BOM-like FE FF quoted",
+                        _ => panic!("BomLikeQuoted without a BOM-like start: {case:?}"),
+                    });
+                }
             }
             if saved.encoding_hint.is_some() {
                 seen.push("encoding hint written");
@@ -557,6 +582,7 @@ fn every_save_rule_and_edge_operation_is_exercised() {
         "fix: empty row written as \"\"",
         "fix: CR/LF split",
         "fix: BOM-like first field quoted",
+        "fix: BOM-like EF BB BF quoted",
         "encoding hint written",
         "edit: the only row",
         "edit: the only column",
@@ -575,5 +601,13 @@ fn every_save_rule_and_edge_operation_is_exercised() {
     for name in expected {
         let n = counts.get(name).copied().unwrap_or(0);
         assert!(n * 100 >= N, "{name}: {n} of {N} cases, under 1%\n{report}");
+    }
+    // `FF FE` and `FE FF` are BOM-like only in Windows-1252 files (as "ÿþ"
+    // and "þÿ"), which few generated files are, so these are rarer. The unit
+    // test `utf16_bom_bytes_moved_to_the_start_are_quoted` pins each; this
+    // checks that the properties reach them too.
+    for name in ["fix: BOM-like FF FE quoted", "fix: BOM-like FE FF quoted"] {
+        let n = counts.get(name).copied().unwrap_or(0);
+        assert!(n >= 5, "{name}: {n} of {N} cases, under 5\n{report}");
     }
 }
