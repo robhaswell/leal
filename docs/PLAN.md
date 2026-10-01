@@ -215,13 +215,16 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       whether the hardened runtime goes on now or in 4.5.
     - The Edit menu has the standard items (Undo, Redo, Cut, Copy, Paste,
       Delete, Select All), which text fields need for their shortcuts.
-    - The Swift bindings are compiled, and the Rust library linked, in
-      exactly one place: a hosted `LealTests` without its own copy of the
-      bindings, or a framework target both depend on. Hosted `NSDocument`
-      tests then build.
+    - The `LealFFI` framework target (from the phase 0 review) already
+      owns the generated bindings and the Rust library. Hosted `NSDocument`
+      tests go in a new test target hosted in `Leal.app` that links
+      `LealFFI`, with no copy of the bindings of its own.
     - Every FFI export that can fail, or could panic, returns `Result`
       (0.3 notes). Decide whether to add a permanent test that a Rust
       panic reaches Swift as an error (0.3 open questions).
+    - After a panic caught at the boundary, the document is treated as
+      failed (DESIGN §3.9): the app makes no further calls on its handle,
+      shows an error and offers to reopen the file. A test covers it.
   - Swift wraps each await on a long job in `withTaskCancellationHandler`,
     which calls the job handle's `cancel()` from 1.3a, and an XCTest shows
     that cancelling the Swift task stops the Rust job. (ADR-0005, pending:

@@ -319,6 +319,11 @@ of physical row numbers to show, in order.
   exposed as Swift `async`), with progress callbacks and cancellation.
 - The main thread never waits on a long operation. While indexing, the row
   count is "rows indexed so far".
+- A Rust panic that UniFFI catches at the boundary reaches Swift as an
+  error, but it can leave a `Mutex` inside the document poisoned. So after
+  a caught panic, that document is treated as failed: Leal makes no further
+  calls on its handle, and the app shows an error and offers to reopen the
+  file.
 
 ### 3.10 First paint and work priority
 
