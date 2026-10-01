@@ -518,6 +518,19 @@ value = "x"
                 GOOD.replace("offset = 12", "offset = 12 }, { row = 2, offset = 3"),
                 "more locations",
             ),
+            // An empty `first` would make the corpus test's location check
+            // (a prefix match) pass trivially.
+            (
+                GOOD.replace("first = [{ row = 2, offset = 12 }]", "first = []"),
+                "must not be empty",
+            ),
+            (
+                GOOD.replace(
+                    "count = 1\nfirst = [{ row = 2",
+                    "count = 0\nfirst = [{ row = 2",
+                ),
+                "must not be empty",
+            ),
         ];
         for (text, needle) in cases {
             let err = Sidecar::parse(&text).expect_err(needle);
