@@ -4,7 +4,7 @@
 //! mixed line endings), per field (text after a closing quote, invalid
 //! encoding, NUL bytes) and per file (unterminated quote, BOM).
 //!
-//! [`derive`] is the testkit's definition of the expected diagnostics for a
+//! [`derive()`] is the testkit's definition of the expected diagnostics for a
 //! [`Layout`]. The hand-written corpus sidecars are checked against it (via the
 //! reference parser in this crate's tests), and later tasks can compare the
 //! real diagnostics against it for generated files.

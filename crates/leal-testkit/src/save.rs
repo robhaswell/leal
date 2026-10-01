@@ -51,11 +51,10 @@
 //! a reopen must find. The encoding is kept by the encoding hint
 //! ([`SavedFile::encoding_hint`], ADR-0004 decision 11).
 //!
-//! How these map to ADR-0004 (provisional until Rob accepts it): rule 3 is
-//! decisions 1 and 3 (decision 2, per-column quoting, is not in yet: see
-//! `TODO(ADR-0004 #2)`); rule 4 is decision 4; rule 5 is decision 9; rule 6
-//! is decision 5; rules 8, 9 and 10 are decisions 6, 7 and 8; rules 9 and
-//! 11 are decision 10.
+//! How these map to ADR-0004: rule 3 is decisions 1 and 3 (decision 2,
+//! per-column quoting, is not in yet: see `TODO(ADR-0004 #2)`); rule 4 is
+//! decision 4; rule 5 is decision 9; rule 6 is decision 5; rules 8, 9 and 10
+//! are decisions 6, 7 and 8; rules 9 and 11 are decision 10.
 
 use std::fmt;
 
