@@ -82,13 +82,23 @@ pub struct EditCase {
 }
 
 impl fmt::Debug for EditCase {
+    // Proptest prints this for a failing case, so it shows every input needed
+    // to rebuild the case by hand (including `existing_hint`) and the parts of
+    // the expected save that tests compare. The splices and line endings are
+    // left out: they follow from the bytes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let saved = match &self.saved {
-            Ok(s) => format!("Ok(b\"{}\")", s.bytes.escape_ascii()),
+            Ok(s) => format!(
+                "Ok(b\"{}\", encoding_hint: {:?}, fixes: {:?})",
+                s.bytes.escape_ascii(),
+                s.encoding_hint,
+                s.fixes
+            ),
             Err(e) => format!("Err({e:?})"),
         };
         f.debug_struct("EditCase")
             .field("file", &self.file)
+            .field("existing_hint", &self.existing_hint)
             .field("edits", &self.edits)
             .field("saved", &format_args!("{saved}"))
             .finish()
@@ -320,5 +330,76 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
         existing_hint,
         edits,
         saved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `a,b` LF, with `edits` applied and saved.
+    fn case(existing_hint: Option<Encoding>, edits: Vec<Edit>) -> EditCase {
+        let file = GeneratedCsv::from_model(CsvModel {
+            dialect: ModelDialect {
+                delimiter: Delimiter::Comma,
+                line_endings: LineEndings::Uniform(LineEnding::Lf),
+                bom: false,
+                quoting: QuotingStyle::Minimal,
+            },
+            rows: vec![ModelRow {
+                fields: vec![
+                    ModelField::Unquoted(b"a".to_vec()),
+                    ModelField::Unquoted(b"b".to_vec()),
+                ],
+                line_ending: Some(LineEnding::Lf),
+            }],
+        });
+        let mut doc = file.document().with_existing_hint(existing_hint);
+        for e in &edits {
+            doc.apply(e).unwrap();
+        }
+        let saved = doc.save();
+        EditCase {
+            file,
+            existing_hint,
+            edits,
+            saved,
+        }
+    }
+
+    /// Proptest prints this for a shrunk failure, and it is the only
+    /// human-readable record of one, so it must show every input.
+    #[test]
+    fn debug_shows_every_input_and_the_expected_save() {
+        let case = case(
+            Some(Encoding::Utf8),
+            vec![Edit::SetCell {
+                row: 0,
+                column: 0,
+                value: "\u{FEFF}x".to_owned(),
+            }],
+        );
+        assert_eq!(
+            format!("{case:?}"),
+            concat!(
+                r#"EditCase { file: GeneratedCsv { bytes: b"a,b\n", dialect: ModelDialect { "#,
+                r#"delimiter: Comma, line_endings: Uniform(Lf), bom: false, quoting: Minimal }, "#,
+                r#"encoding: Utf8, rows: [ModelRow { fields: [Unquoted("a"), Unquoted("b")], "#,
+                r#"line_ending: Some(Lf) }], diagnostics: [] }, "#,
+                r#"existing_hint: Some(Utf8), "#,
+                r#"edits: [SetCell { row: 0, column: 0, value: "\u{feff}x" }], "#,
+                r#"saved: Ok(b"\"\xef\xbb\xbfx\",b\n", encoding_hint: Some(Utf8), "#,
+                r#"fixes: [BomLikeQuoted]) }"#,
+            )
+        );
+    }
+
+    #[test]
+    fn debug_shows_a_missing_hint_and_a_failed_save() {
+        let mut case = case(None, Vec::new());
+        case.saved = Err(SaveError::ReadOnly);
+        let printed = format!("{case:?}");
+        assert!(printed.contains(" existing_hint: None, "), "{printed}");
+        assert!(printed.ends_with(" saved: Err(ReadOnly) }"), "{printed}");
     }
 }
