@@ -412,6 +412,23 @@ mod tests {
     }
 
     #[test]
+    fn ascii_compatible_means_structural_characters_are_their_ascii_byte() {
+        let structural = [",", ";", "\t", "|", "\"", "\r", "\n"];
+        for (encoding, expected) in [
+            (Encoding::Utf8, true),
+            (Encoding::Windows1252, true),
+            (Encoding::Utf16Le, false),
+            (Encoding::Utf16Be, false),
+        ] {
+            assert_eq!(encoding.is_ascii_compatible(), expected, "{encoding:?}");
+            let single_bytes = structural
+                .iter()
+                .all(|s| encode_value(s, encoding) == Ok(s.as_bytes().to_vec()));
+            assert_eq!(single_bytes, expected, "{encoding:?}");
+        }
+    }
+
+    #[test]
     fn delimiter_bytes_round_trip() {
         for d in Delimiter::ALL {
             assert_eq!(Delimiter::from_byte(d.byte()), Some(d));
