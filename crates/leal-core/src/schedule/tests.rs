@@ -3,8 +3,13 @@
 //!
 //! Tests that need a job to be at a particular point hand-shake with it
 //! over channels instead of sleeping, so they don't depend on timing.
-//! Pausing is about time by nature (idle for 250 ms), so those tests use a
-//! short idle time and generous margins.
+//! Pausing is about time by nature (idle for 250 ms), so those tests stop
+//! the scheduler's clock and move it themselves
+//! ([`Input::use_manual_clock`]), and tell that a job is paused from its
+//! `Paused` interval rather than from it going quiet for a while. A slow or
+//! busy machine then can't let the idle time run out early or late.
+//!
+//! [`Input::use_manual_clock`]: super::input::Input::use_manual_clock
 
 use super::*;
 
@@ -196,85 +201,128 @@ fn moves_within(count: &AtomicUsize, timeout: Duration) -> bool {
     false
 }
 
-/// Waits until `count` stops moving for `quiet`, within `timeout`.
-fn settles_within(count: &AtomicUsize, quiet: Duration, timeout: Duration) -> bool {
+/// How many `Paused` intervals have begun and not ended: the jobs waiting
+/// for the user right now. A job begins one just before it waits and ends
+/// it just after, so a job counted here is not working.
+fn paused_now(recorder: &Recorder) -> usize {
+    let events = recorder.events();
+    let begun = events
+        .iter()
+        .filter(|e| matches!(e, Event::Begin(Interval::Paused, _)))
+        .count();
+    let ended = events
+        .iter()
+        .filter(|e| matches!(e, Event::End(Interval::Paused, _)))
+        .count();
+    begun - ended
+}
+
+/// Waits until exactly `jobs` jobs are paused, or gives up after `timeout`.
+fn paused_within(recorder: &Recorder, jobs: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let from = count.load(Ordering::SeqCst);
-        thread::sleep(quiet);
-        if count.load(Ordering::SeqCst) == from {
+        if paused_now(recorder) == jobs {
             return true;
         }
+        thread::sleep(Duration::from_millis(1));
     }
     false
+}
+
+/// Gives paused jobs a moment in which they would resume if they were
+/// wrongly going to, then says whether `jobs` jobs are still paused. Only a
+/// wrong resume can fail it; a slow machine can only make it miss one.
+fn still_paused(recorder: &Recorder, jobs: usize) -> bool {
+    thread::sleep(Duration::from_millis(20));
+    paused_now(recorder) == jobs
 }
 
 #[test]
 fn background_jobs_pause_while_the_user_interacts_and_resume_when_idle() {
     let idle = Duration::from_millis(100);
+    let tick = Duration::from_millis(1);
     let (scheduler, recorder) = scheduler(2, idle);
+    // Time moves only when the test moves it, so each step below happens at
+    // an exact time since the input, however slowly the machine runs it.
+    let input = &scheduler.shared.input;
+    input.use_manual_clock();
     let (p2, p2_count) = counting_job(&scheduler, Priority::P2);
     let (p3, p3_count) = counting_job(&scheduler, Priority::P3);
+    let counts = || {
+        (
+            p2_count.load(Ordering::SeqCst),
+            p3_count.load(Ordering::SeqCst),
+        )
+    };
     assert!(moves_within(&p2_count, LONG) && moves_within(&p3_count, LONG));
+    assert_eq!(paused_now(&recorder), 0);
 
     scheduler.set_interacting(true);
     assert!(scheduler.is_holding_background_work());
-    assert!(settles_within(&p2_count, Duration::from_millis(50), LONG));
-    assert!(settles_within(&p3_count, Duration::from_millis(50), LONG));
+    // Both jobs pause at their next checkpoint.
+    assert!(paused_within(&recorder, 2, LONG));
+    let paused_at = counts();
     // Still paused well past the idle time, because the gesture goes on.
-    let (a, b) = (
-        p2_count.load(Ordering::SeqCst),
-        p3_count.load(Ordering::SeqCst),
-    );
-    thread::sleep(idle * 3);
-    assert_eq!(
-        (
-            p2_count.load(Ordering::SeqCst),
-            p3_count.load(Ordering::SeqCst)
-        ),
-        (a, b)
-    );
+    input.advance_clock(idle * 3);
+    assert!(scheduler.is_holding_background_work());
+    assert!(still_paused(&recorder, 2));
+    assert_eq!(counts(), paused_at);
 
-    // The gesture ends; work resumes once input has been idle long enough,
-    // and not before.
-    let ended = Instant::now();
+    // The gesture ends; work resumes once input has been idle for the idle
+    // time, and not a moment before.
     scheduler.set_interacting(false);
-    assert!(moves_within(&p2_count, LONG) && moves_within(&p3_count, LONG));
-    assert!(
-        ended.elapsed() >= idle,
-        "resumed after {:?}",
-        ended.elapsed()
-    );
+    input.advance_clock(idle - tick);
+    assert!(scheduler.is_holding_background_work());
+    assert!(still_paused(&recorder, 2));
+    assert_eq!(counts(), paused_at);
+    input.advance_clock(tick);
     assert!(!scheduler.is_holding_background_work());
+    assert!(paused_within(&recorder, 0, LONG));
+    assert!(moves_within(&p2_count, LONG) && moves_within(&p3_count, LONG));
 
-    // A single input event pauses work too, for the idle time.
+    // A single input event pauses work too, for the idle time, measured
+    // from the event.
     scheduler.note_user_input();
-    assert!(settles_within(&p2_count, Duration::from_millis(30), LONG));
-    assert!(moves_within(&p2_count, LONG));
+    assert!(scheduler.is_holding_background_work());
+    assert!(paused_within(&recorder, 2, LONG));
+    let paused_at = counts();
+    input.advance_clock(idle - tick);
+    assert!(scheduler.is_holding_background_work());
+    assert!(still_paused(&recorder, 2));
+    assert_eq!(counts(), paused_at);
+    input.advance_clock(tick);
+    assert!(!scheduler.is_holding_background_work());
+    assert!(paused_within(&recorder, 0, LONG));
+    assert!(moves_within(&p2_count, LONG) && moves_within(&p3_count, LONG));
 
     p2.cancel();
     p3.cancel();
     assert_eq!(p2.wait(), Err(JobError::Cancelled));
     assert_eq!(p3.wait(), Err(JobError::Cancelled));
-    // Each pause is an interval.
-    let pauses = recorder
-        .events()
+    // Each pause is one interval, begun and ended: one per job for each of
+    // the two pauses above. Being woken while paused (by the gesture
+    // ending, or the clock moving) doesn't begin another.
+    let events = recorder.events();
+    let begun = events
         .iter()
         .filter(|e| matches!(e, Event::Begin(Interval::Paused, _)))
         .count();
-    assert!(pauses >= 3, "{pauses} pauses");
+    assert_eq!((begun, paused_now(&recorder)), (4, 0), "{events:?}");
 }
 
 #[test]
 fn the_index_never_pauses() {
-    let (scheduler, _) = scheduler(2, Duration::from_secs(60));
+    let (scheduler, recorder) = scheduler(2, Duration::from_secs(60));
     scheduler.set_interacting(true);
     let (p1, p1_count) = counting_job(&scheduler, Priority::P1);
     let (p2, p2_count) = counting_job(&scheduler, Priority::P2);
     assert!(moves_within(&p1_count, LONG));
-    thread::sleep(Duration::from_millis(50));
+    // P2 pauses at its first checkpoint, before it counts anything.
+    assert!(paused_within(&recorder, 1, LONG));
     assert_eq!(p2_count.load(Ordering::SeqCst), 0, "P2 waits for the user");
     assert!(moves_within(&p1_count, LONG), "P1 keeps going");
+    // The one paused job is P2: P1 never begins a pause.
+    assert_eq!(paused_now(&recorder), 1);
     p1.cancel();
     p2.cancel();
     assert_eq!(p1.wait(), Err(JobError::Cancelled));
@@ -283,18 +331,22 @@ fn the_index_never_pauses() {
 
 #[test]
 fn cancel_wakes_a_paused_job() {
-    let (scheduler, _) = scheduler(2, Duration::from_secs(60));
+    // During a gesture a paused job's own wait times out only after the
+    // idle time, far longer than `LONG`: so only the cancel's wake-up can
+    // end it in time.
+    let idle = Duration::from_secs(60);
+    assert!(idle > LONG * 2);
+    let (scheduler, recorder) = scheduler(2, idle);
     let (job, count) = counting_job(&scheduler, Priority::P2);
     assert!(moves_within(&count, LONG));
     scheduler.set_interacting(true);
-    assert!(settles_within(&count, Duration::from_millis(30), LONG));
-    let cancelled = Instant::now();
+    assert!(paused_within(&recorder, 1, LONG));
     job.cancel();
     assert_eq!(
         job.control().wait_timeout(LONG),
         Some(Err(JobError::Cancelled))
     );
-    assert!(cancelled.elapsed() < Duration::from_secs(5));
+    assert_eq!(paused_now(&recorder), 0);
 }
 
 // ---------------------------------------------------------------------------
