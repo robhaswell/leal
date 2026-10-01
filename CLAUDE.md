@@ -72,6 +72,11 @@ there are no pull requests and no long-lived branches.
   Justify any new dependency in the task notes.
 - No `unsafe` outside `source` (mmap) and `leal-ffi`, and each `unsafe` block
   has a `// SAFETY:` comment.
+- **Never kill Leal (or any app) by name.** Several agents run Leal test
+  hosts and benchmarks on this Mac at once, so `pkill Leal` or
+  `killall Leal` can kill another agent's run. Kill only processes you
+  started, by the PID you recorded. Agents don't use `just run` (it quits
+  any running Leal for Rob's convenience).
 - **Never send synthetic input to the system.** No AppleScript/System Events
   keystrokes, `cliclick`, CGEvent posting or similar: whatever app is frontmost
   (possibly one of Rob's) receives it. Drive the app from inside itself
