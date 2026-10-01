@@ -288,11 +288,13 @@ impl Report {
 }
 
 /// The diagnostics of a file being indexed, shared between the indexer and
-/// its readers. Made by [`RowIndex::start_with_diagnostics`]; the
+/// its readers. Made by [`RowIndex::start_with_diagnostics`], or by
+/// [`Indexer::with_diagnostics`] on the index's own thread; the
 /// [`Indexer`](crate::index::Indexer) publishes a new [`Report`] and the
 /// new rows' marks after each chunk, before its progress callback.
 ///
 /// [`RowIndex::start_with_diagnostics`]: crate::index::RowIndex::start_with_diagnostics
+/// [`Indexer::with_diagnostics`]: crate::index::Indexer::with_diagnostics
 pub struct Diagnostics {
     dialect: IndexDialect,
     encoding: Encoding,

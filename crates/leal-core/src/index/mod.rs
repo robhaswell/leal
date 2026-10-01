@@ -94,8 +94,9 @@
 //! # Diagnostics
 //!
 //! [`RowIndex::build_with_diagnostics`] and
-//! [`RowIndex::start_with_diagnostics`] also collect the file's
-//! [diagnostics](crate::diagnostics) in the same pass (DESIGN §3.3, §3.5).
+//! [`RowIndex::start_with_diagnostics`] (or [`Indexer::with_diagnostics`],
+//! later) also collect the file's [diagnostics](crate::diagnostics) in the
+//! same pass (DESIGN §3.3, §3.5).
 //! They need the file's text encoding as well as the dialect, for invalid
 //! text and NUL code units. [`RowIndex::build`] and [`RowIndex::start`]
 //! skip them.
@@ -421,6 +422,8 @@ impl RowIndex {
     /// [`DIAGNOSTICS_CHUNK_BYTES`], not [`CHUNK_BYTES`], so it publishes,
     /// calls back and checks the cancel flag four times as often.
     ///
+    /// It is [`RowIndex::start`] then [`Indexer::with_diagnostics`].
+    ///
     /// # Errors
     ///
     /// [`IndexError::InvalidDialect`] or [`IndexError::EncodingMismatch`].
@@ -428,10 +431,8 @@ impl RowIndex {
         dialect: IndexDialect,
         encoding: Encoding,
     ) -> Result<(Arc<RowIndex>, Arc<Diagnostics>, Indexer), IndexError> {
-        let (index, mut indexer) = RowIndex::start(dialect)?;
-        let diagnostics = Arc::new(Diagnostics::new(dialect, encoding)?);
-        indexer.diagnostics = Some(Arc::clone(&diagnostics));
-        indexer.chunk_bytes = DIAGNOSTICS_CHUNK_BYTES;
+        let (index, indexer) = RowIndex::start(dialect)?;
+        let (indexer, diagnostics) = indexer.with_diagnostics(encoding)?;
         Ok((index, diagnostics, indexer))
     }
 
@@ -652,6 +653,28 @@ impl RowIndex {
 }
 
 impl Indexer {
+    /// This indexer, made to collect the file's diagnostics too, whose text
+    /// is in `encoding`, and the shared [`Diagnostics`] it will publish
+    /// them to: what [`RowIndex::start_with_diagnostics`] gives, but later.
+    /// A document makes its indexer at first paint and calls this on the
+    /// index's own thread, so that first paint does no diagnostics work
+    /// (DESIGN §3.10 rule 1).
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::EncodingMismatch`] if `encoding` doesn't store
+    /// characters the way the index's dialect says. The indexer is then
+    /// dropped, so the index is [`Status::Stopped`].
+    pub fn with_diagnostics(
+        mut self,
+        encoding: Encoding,
+    ) -> Result<(Indexer, Arc<Diagnostics>), IndexError> {
+        let diagnostics = Arc::new(Diagnostics::new(self.index.dialect(), encoding)?);
+        self.diagnostics = Some(Arc::clone(&diagnostics));
+        self.chunk_bytes = DIAGNOSTICS_CHUNK_BYTES;
+        Ok((self, diagnostics))
+    }
+
     /// Indexes `bytes`, publishing rows to the [`RowIndex`] as it goes, and
     /// diagnostics to its [`Diagnostics`] if it was made by
     /// [`RowIndex::start_with_diagnostics`]. After each chunk of

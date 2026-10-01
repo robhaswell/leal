@@ -782,6 +782,57 @@ fn diagnostics_of_a_removable_file_arrive_chunk_by_chunk() {
     assert_eq!(document.storage(), Storage::Copy);
 }
 
+/// First paint does no diagnostics work (DESIGN §3.10 rule 1; "First-paint
+/// regression" in `docs/tasks/1.5.md`): the index job makes the reading's
+/// diagnostics when it starts. With its thread held at the start, the
+/// document has none yet, and readers see an empty, incomplete report and
+/// no marked rows. The same holds for a reading made by `reinterpret`.
+#[test]
+fn first_paint_makes_no_diagnostics() {
+    let dir = Dir::new("first-paint-diagnostics");
+    let bytes = messy_sample(2 * crate::index::DIAGNOSTICS_CHUNK_BYTES);
+    let path = dir.file("messy.csv", &bytes);
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let check_none_yet = |document: &Document| {
+        assert!(
+            document.current().diagnostics.get().is_none(),
+            "first paint made the diagnostics"
+        );
+        assert_eq!(*document.diagnostics(), Report::default());
+        assert_eq!(document.diagnostics_with_generation().1.rows(), 0);
+        assert!(!document.row_has_diagnostic(0));
+        assert_eq!(document.next_row_with_diagnostic(0), None);
+        assert_eq!(document.previous_row_with_diagnostic(usize::MAX), None);
+    };
+
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler,
+        options(5),
+        None,
+    )
+    .unwrap();
+    check_none_yet(&document);
+    gate.open();
+    check_document_diagnostics(&document, &bytes);
+    assert!(document.next_row_with_diagnostic(0).is_some());
+
+    // A new reading starts with none either, not the old reading's.
+    *gate.closed.lock().unwrap() = true;
+    let choices = Choices {
+        encoding: Some(Encoding::Windows1252),
+        ..Choices::default()
+    };
+    document.reinterpret(choices, 5, 1000).unwrap();
+    check_none_yet(&document);
+    gate.open();
+    wait_for_index(&document);
+    assert!(document.diagnostics().is_complete());
+}
+
 /// On a removable drive, `Source::stream` checks the cancel flag only
 /// between its 1 MiB chunks, but the index pushes each in 256 KiB pieces.
 /// A cancel during the first piece stops the index after that piece, not
