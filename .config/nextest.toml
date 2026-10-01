@@ -1,0 +1,23 @@
+# cargo-nextest configuration (https://nexte.st/docs/configuration/).
+
+[test-groups]
+# Tests that create and attach disk images with `hdiutil`. Run in parallel,
+# `hdiutil create` and `attach` sometimes fail ("Resource busy"), so these
+# run one at a time. `DiskImage::new` in crates/leal-core/src/source/tests.rs
+# fails a test that uses an image but isn't in this group.
+disk-images = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = """
+package(leal-core) & test(/^source::tests::(\
+file_on_a_second_apfs_volume_is_cloned_on_that_volume|\
+file_on_another_volume_without_a_folder_there_falls_back|\
+given_folder_on_the_wrong_volume_clones_elsewhere|\
+volume_that_cant_clone_reads_into_memory|\
+large_file_on_a_volume_that_cant_clone_is_copied|\
+file_exactly_at_the_memory_limit_is_read_into_memory|\
+memory_fallback_leaves_no_temporary_folder|\
+cleanup_removes_a_crashed_clone_on_another_volume\
+)$/)
+"""
+test-group = "disk-images"

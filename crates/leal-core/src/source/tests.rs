@@ -6,6 +6,7 @@ use super::*;
 use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use proptest::prelude::*;
 
@@ -63,59 +64,211 @@ impl Drop for TempDir {
 }
 
 /// A small disk image, attached for the length of a test.
+///
+/// Tests that use one are in the `disk-images` test group in
+/// `.config/nextest.toml`, which runs them one at a time: `hdiutil`
+/// sometimes fails with "Resource busy" when several images are created or
+/// attached at once. [`DiskImage::new`] checks that its test is in the group.
 struct DiskImage {
+    image: PathBuf,
     mount: PathBuf,
     // Dropped after `Drop::drop` has detached the image.
     _dir: TempDir,
 }
+
+/// The nextest test group that runs the disk-image tests one at a time.
+const DISK_IMAGE_TEST_GROUP: &str = "disk-images";
+
+/// How many times `hdiutil create` and `attach` are tried before a test
+/// fails, and the wait before the first retry (doubled for each one after).
+const HDIUTIL_ATTEMPTS: u32 = 5;
+const HDIUTIL_FIRST_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Errors `hdiutil` reports when another image is being created, attached
+/// or detached at the same moment, or when the disk arbitration daemon is
+/// still catching up. Trying again shortly afterwards usually works.
+const TRANSIENT_HDIUTIL_ERRORS: [&str; 4] = [
+    "Resource busy",
+    "Resource temporarily unavailable",
+    "no mountable file systems",
+    "Device not configured",
+];
 
 impl DiskImage {
     /// Creates and attaches a 16 MB image formatted as `fs` (`"APFS"` or
     /// `"HFS+"`), mounted inside a temporary directory, not in `/Volumes`,
     /// and hidden from Finder (`-nobrowse`).
     fn new(fs_type: &str) -> Self {
+        // Under nextest, a disk-image test outside the group would run in
+        // parallel with the others.
+        if std::env::var_os("NEXTEST").is_some() {
+            assert_eq!(
+                std::env::var("NEXTEST_TEST_GROUP").as_deref(),
+                Ok(DISK_IMAGE_TEST_GROUP),
+                "add this test to the {DISK_IMAGE_TEST_GROUP} test group in .config/nextest.toml"
+            );
+        }
+
+        // The directory's name is unique to this process and image, and so
+        // is the volume name, so images made at the same time never meet.
         let dir = TempDir::new("image");
         let image = dir.path().join("volume.dmg");
         let mount = dir.folder("mnt");
-        run(Command::new("hdiutil")
-            .args([
-                "create", "-quiet", "-size", "16m", "-fs", fs_type, "-volname", "LealTest",
-            ])
-            .arg(&image));
-        run(Command::new("hdiutil")
-            .args([
-                "attach",
-                "-quiet",
-                "-nobrowse",
-                "-noverify",
-                "-noautoopen",
-                "-mountpoint",
-            ])
-            .arg(&mount)
-            .arg(&image));
-        Self { mount, _dir: dir }
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let volume_name = format!(
+            "LealTest-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        hdiutil_with_retries("create", || {
+            // A failed attempt may leave a partial image behind.
+            let _ = fs::remove_file(&image);
+            let mut command = Command::new("/usr/bin/hdiutil");
+            command
+                .args(["create", "-size", "16m", "-fs", fs_type, "-volname"])
+                .arg(&volume_name)
+                .arg(&image);
+            command
+        });
+        // From here on, `Drop` detaches the image, even if attaching fails
+        // part way (attached, but not mounted).
+        let disk_image = Self {
+            image,
+            mount,
+            _dir: dir,
+        };
+        hdiutil_with_retries("attach", || {
+            disk_image.detach_all();
+            let mut command = Command::new("/usr/bin/hdiutil");
+            command
+                .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
+                .arg("-mountpoint")
+                .arg(&disk_image.mount)
+                .arg(&disk_image.image);
+            command
+        });
+        disk_image
     }
 
     /// The root of the mounted volume.
     fn root(&self) -> &Path {
         &self.mount
     }
+
+    /// Detaches every device attached from this image, trying a normal
+    /// detach first and then `-force`. Returns the devices still attached.
+    fn detach_all(&self) -> Vec<String> {
+        for force in [false, false, true, true] {
+            let devices = attached_devices(&self.image);
+            if devices.is_empty() {
+                return devices;
+            }
+            for device in &devices {
+                let mut command = Command::new("/usr/bin/hdiutil");
+                command.arg("detach").arg(device);
+                if force {
+                    command.arg("-force");
+                }
+                // A failure here shows up as a device still attached.
+                let _ = command.output();
+            }
+            std::thread::sleep(HDIUTIL_FIRST_BACKOFF);
+        }
+        attached_devices(&self.image)
+    }
 }
 
 impl Drop for DiskImage {
     fn drop(&mut self) {
-        let detached = Command::new("hdiutil")
-            .args(["detach", "-quiet"])
-            .arg(&self.mount)
-            .status()
-            .is_ok_and(|status| status.success());
-        if !detached {
-            let _ = Command::new("hdiutil")
-                .args(["detach", "-quiet", "-force"])
-                .arg(&self.mount)
-                .status();
+        let left = self.detach_all();
+        if !left.is_empty() {
+            // Not a panic: this may run while the test is already panicking,
+            // and a second panic would abort without the first one's message.
+            eprintln!(
+                "warning: couldn't detach {} ({}); run `hdiutil detach -force` on it",
+                self.image.display(),
+                left.join(", ")
+            );
         }
     }
+}
+
+/// The whole-disk devices (`/dev/diskN`) attached from `image`, from
+/// `hdiutil info`. Empty if none are, or if `hdiutil info` fails.
+fn attached_devices(image: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("/usr/bin/hdiutil").arg("info").output() else {
+        return Vec::new();
+    };
+    let info = String::from_utf8_lossy(&output.stdout);
+    let image = image.to_string_lossy();
+    // One section per attached image, each starting with a line of `=`.
+    info.split("\n=")
+        .filter(|section| {
+            section.lines().any(|line| {
+                line.split_once(':')
+                    .is_some_and(|(key, value)| key.trim() == "image-path" && value.trim() == image)
+            })
+        })
+        // The first device listed is the whole disk; detaching it detaches
+        // its partitions and any APFS container on it.
+        .filter_map(|section| {
+            section
+                .lines()
+                .find(|line| line.starts_with("/dev/disk"))
+                .and_then(|line| line.split_whitespace().next())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Runs the `hdiutil` command `make_command` builds (a new one for each
+/// attempt), retrying with a backoff while it fails with an error in
+/// [`TRANSIENT_HDIUTIL_ERRORS`]. Panics with the last attempt's exit status,
+/// stdout and stderr if it never succeeds.
+fn hdiutil_with_retries(what: &str, mut make_command: impl FnMut() -> Command) {
+    let mut backoff = HDIUTIL_FIRST_BACKOFF;
+    for attempt in 1..=HDIUTIL_ATTEMPTS {
+        let mut command = make_command();
+        let output = command.output().unwrap();
+        if output.status.success() {
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let transient = TRANSIENT_HDIUTIL_ERRORS
+            .iter()
+            .any(|error| stdout.contains(error) || stderr.contains(error));
+        if !transient || attempt == HDIUTIL_ATTEMPTS {
+            panic!(
+                "hdiutil {what} failed on attempt {attempt} of {HDIUTIL_ATTEMPTS} \
+                 ({}): {command:?}\n{}",
+                if transient {
+                    "transient error"
+                } else {
+                    "not a transient error, so not retried"
+                },
+                describe(&output)
+            );
+        }
+        eprintln!(
+            "hdiutil {what} failed on attempt {attempt} of {HDIUTIL_ATTEMPTS}, \
+             retrying in {backoff:?}\n{}",
+            describe(&output)
+        );
+        std::thread::sleep(backoff);
+        backoff *= 2;
+    }
+}
+
+/// A command's exit status, stdout and stderr, for a failure message.
+fn describe(output: &std::process::Output) -> String {
+    format!(
+        "{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        String::from_utf8_lossy(&output.stderr).trim_end()
+    )
 }
 
 fn run(command: &mut Command) {
@@ -123,7 +276,7 @@ fn run(command: &mut Command) {
     assert!(
         output.status.success(),
         "{command:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        describe(&output)
     );
 }
 

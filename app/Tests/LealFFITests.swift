@@ -183,36 +183,190 @@ final class LealFFITests: XCTestCase {
 }
 
 /// A small APFS disk image, attached inside a temporary directory (not in
-/// `/Volumes`) and hidden from Finder.
+/// `/Volumes`) and hidden from Finder. The same approach as `DiskImage` in
+/// crates/leal-core/src/source/tests.rs: a unique path and volume name,
+/// retries on `hdiutil`'s transient errors, and a failure that reports
+/// `hdiutil`'s exit status, stdout and stderr.
 private struct DiskImage {
+    let image: URL
     let root: URL
 
+    /// How many times `hdiutil create` and `attach` are tried, and the wait
+    /// before the first retry (doubled for each one after).
+    private static let attempts = 5
+    private static let firstBackoff: TimeInterval = 0.25
+
+    /// Errors `hdiutil` reports when another image is being created,
+    /// attached or detached at the same moment. Trying again shortly
+    /// afterwards usually works.
+    private static let transientErrors = [
+        "Resource busy",
+        "Resource temporarily unavailable",
+        "no mountable file systems",
+        "Device not configured",
+    ]
+
+    /// Creates and attaches the image. On failure, anything attached is
+    /// detached before this throws; otherwise the caller detaches it with
+    /// `detach()`.
     init(temporaryDirectory: URL) throws {
-        let image = temporaryDirectory.appending(path: "volume.dmg")
+        image = temporaryDirectory.appending(path: "volume.dmg")
         root = temporaryDirectory.appending(path: "mnt")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Self.hdiutil(["create", "-quiet", "-size", "16m", "-fs", "APFS", "-volname", "LealTest", image.path])
-        try Self.hdiutil(["attach", "-quiet", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", root.path, image.path])
-    }
-
-    func detach() {
-        if (try? Self.hdiutil(["detach", "-quiet", root.path])) == nil {
-            try? Self.hdiutil(["detach", "-quiet", "-force", root.path])
+        // `temporaryDirectory` is unique to this test; so is the volume name.
+        let volumeName = "LealTest-\(UUID().uuidString.prefix(8))"
+        let image = self.image
+        let root = self.root
+        try Self.withRetries {
+            // A failed attempt may leave a partial image behind.
+            try? FileManager.default.removeItem(at: image)
+            return ["create", "-size", "16m", "-fs", "APFS", "-volname", volumeName, image.path]
+        }
+        do {
+            try Self.withRetries {
+                // A failed attempt may leave the image attached but not mounted.
+                Self.detachAll(imagePath: image.path)
+                return ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", root.path, image.path]
+            }
+        } catch {
+            Self.detachAll(imagePath: image.path)
+            throw error
         }
     }
 
-    private static func hdiutil(_ arguments: [String]) throws {
+    /// Detaches every device attached from the image, trying a normal detach
+    /// first and then `-force`, even if the test failed.
+    func detach() {
+        let left = Self.detachAll(imagePath: image.path)
+        if !left.isEmpty {
+            print("warning: couldn't detach \(image.path) (\(left.joined(separator: ", "))); run `hdiutil detach -force` on it")
+        }
+    }
+
+    /// Detaches the devices attached from `imagePath`. Returns the ones
+    /// still attached.
+    @discardableResult
+    private static func detachAll(imagePath: String) -> [String] {
+        for force in [false, false, true, true] {
+            let devices = attachedDevices(imagePath: imagePath)
+            if devices.isEmpty {
+                return devices
+            }
+            for device in devices {
+                // A failure here shows up as a device still attached.
+                _ = try? run(["detach", device] + (force ? ["-force"] : []))
+            }
+            Thread.sleep(forTimeInterval: firstBackoff)
+        }
+        return attachedDevices(imagePath: imagePath)
+    }
+
+    /// The whole-disk devices (`/dev/diskN`) attached from `imagePath`, from
+    /// `hdiutil info -plist`. Empty if none are, or if that fails.
+    private static func attachedDevices(imagePath: String) -> [String] {
+        guard
+            let result = try? run(["info", "-plist"]), result.status == 0,
+            let plist = try? PropertyListSerialization.propertyList(from: result.stdout, format: nil),
+            let images = (plist as? [String: Any])?["images"] as? [[String: Any]]
+        else {
+            return []
+        }
+        let resolved = URL(filePath: imagePath).resolvingSymlinksInPath().path
+        return images.compactMap { entry in
+            guard let path = entry["image-path"] as? String,
+                  path == imagePath || path == resolved,
+                  let entities = entry["system-entities"] as? [[String: Any]]
+            else {
+                return nil
+            }
+            // The whole disk is the shortest device name (`/dev/disk7`, not
+            // `/dev/disk7s1`); detaching it detaches the rest.
+            return entities.compactMap { $0["dev-entry"] as? String }.min { $0.count < $1.count }
+        }
+    }
+
+    /// Runs `hdiutil` with the arguments `makeArguments` returns (called
+    /// again before each attempt), retrying with a backoff while it fails
+    /// with one of `transientErrors`.
+    private static func withRetries(_ makeArguments: () -> [String]) throws {
+        var backoff = firstBackoff
+        for attempt in 1...attempts {
+            let arguments = makeArguments()
+            let result = try run(arguments)
+            if result.status == 0 {
+                return
+            }
+            let output = result.outputText
+            let transient = transientErrors.contains { output.contains($0) }
+            if !transient || attempt == attempts {
+                throw NSError(
+                    domain: "DiskImage",
+                    code: Int(result.status),
+                    userInfo: [
+                        NSLocalizedDescriptionKey: """
+                        hdiutil \(arguments.joined(separator: " ")) failed on attempt \(attempt) of \(attempts) \
+                        (\(transient ? "transient error" : "not a transient error, so not retried")), \
+                        exit status \(result.status)
+                        \(result.report)
+                        """,
+                    ]
+                )
+            }
+            print("hdiutil \(arguments[0]) failed on attempt \(attempt) of \(attempts), retrying in \(backoff)s\n\(result.report)")
+            Thread.sleep(forTimeInterval: backoff)
+            backoff *= 2
+        }
+    }
+
+    /// One `hdiutil` run's exit status and output.
+    private struct Run {
+        let status: Int32
+        let stdout: Data
+        let stderr: Data
+
+        var outputText: String {
+            String(decoding: stdout, as: UTF8.self) + String(decoding: stderr, as: UTF8.self)
+        }
+
+        /// stdout and stderr, for a failure message.
+        var report: String {
+            """
+            --- stdout ---
+            \(String(decoding: stdout, as: UTF8.self))
+            --- stderr ---
+            \(String(decoding: stderr, as: UTF8.self))
+            """
+        }
+    }
+
+    /// Runs `/usr/bin/hdiutil` and collects its exit status and output.
+    private static func run(_ arguments: [String]) throws -> Run {
         let process = Process()
         process.executableURL = URL(filePath: "/usr/bin/hdiutil")
         process.arguments = arguments
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
         try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw NSError(
-                domain: "DiskImage",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "hdiutil \(arguments.joined(separator: " ")) failed"]
-            )
+        // Read both pipes to the end before waiting, so a full pipe buffer
+        // can't block `hdiutil`: stderr on another thread, stdout here.
+        let errorData = ReadBuffer()
+        let errorRead = DispatchSemaphore(value: 0)
+        let errorHandle = stderr.fileHandleForReading
+        DispatchQueue.global().async {
+            errorData.data = errorHandle.readDataToEndOfFile()
+            errorRead.signal()
         }
+        let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+        errorRead.wait()
+        process.waitUntilExit()
+        return Run(status: process.terminationStatus, stdout: outputData, stderr: errorData.data)
+    }
+
+    /// Data read on another thread. The semaphore in `run` orders the write
+    /// before the read, so no lock is needed.
+    private final class ReadBuffer: @unchecked Sendable {
+        var data = Data()
     }
 }
