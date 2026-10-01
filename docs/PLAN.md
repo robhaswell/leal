@@ -306,7 +306,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - In the inspector ⌘↩ commits (ADR-0002 question 11); elsewhere it
     inserts a row (2.5a), so the two don't clash.
   - Screenshots next to mockups 04a, 05a and 06c.
-- [~] **1.9 External changes** — watch the original, Reload / Keep editing.
+- [x] **1.9 External changes** — watch the original, Reload / Keep editing.
   - Works with the App Sandbox on.
   - On `ReadErrorKind::ChangedOnDisk` (or `Source::changed_on_disk()`): a
     file on a removable drive that can't clone changed while Leal was
