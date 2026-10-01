@@ -50,11 +50,8 @@ their own cells, as the documented fallback.**
   locked. So compositor cost isn't measured, and the reference machine is
   slower. Ranked by main-thread time in the slowest 1% of frames, the order
   was B < C < A-lite < A in every configuration. Rob can re-check the
-  headline on an unlocked Mac in about 3 minutes:
-
-  ```sh
-  cd spikes/grid-spike && ./build.sh && ./bench.sh compare
-  ```
+  headline on an unlocked Mac in about 3 minutes, with the commands at the
+  end of *Caveats*. They work before and after task 1.6 deletes the spike.
 
 ## Context
 
@@ -112,8 +109,9 @@ reach the screen.
 
 ## Measurements
 
-The spike app is in `spikes/grid-spike/`, with method details in
-`docs/tasks/0.4.md` and every run in `spikes/grid-spike/results.md`. It has
+The spike app is in `spikes/grid-spike/` until task 1.6 deletes it, and stays
+available at the `phase-0` tag. Method details are in `docs/tasks/0.4.md`
+and every run is in `docs/tasks/0.4-results.md`. It has
 1,000,000 synthetic rows at 12, 50 and 200 columns, generated on demand, with
 all the mockup styling switched on and one in-cell editor open. The app
 scrolls itself frame by frame from a display link:
@@ -371,8 +369,10 @@ grid does, so little work would be lost.
   - The header, column resize and reorder, and sort indicators come native.
   - Accessibility is 1.5–2 weeks.
   - Wide files need profiling on an M1 Air early, since C has less headroom.
-- **The spike** (`spikes/grid-spike/`) is deleted after Rob decides, per
-  PLAN 0.4.
+- **The spike** (`spikes/grid-spike/`) is kept until task 1.6 lands, so
+  this comparison can still be rerun, and 1.6 then deletes it (PLAN 0.4 and
+  1.6). Its results are kept in `docs/tasks/0.4-results.md`, and the code
+  stays available at the `phase-0` tag.
 
 ## Caveats
 
@@ -400,7 +400,7 @@ grid does, so little work would be lost.
     and ranged from 2.5 to 24.8. The peak was Spotlight indexing the fresh
     build at the start of the session.
   - The top three processes before each run are in the bench log, and the
-    load is recorded for every run in `results.md`.
+    load is recorded for every run in `docs/tasks/0.4-results.md`.
   - During the reviewer's earlier runs, `mediaanalysisd` used over 200% CPU.
   - Configurations were interleaved so load affected every option alike, and
     the 3 runs of each agree closely.
@@ -411,11 +411,23 @@ grid does, so little work would be lost.
 - **Synthetic data.** Cell text is generated in Swift. The real app asks the
   Rust core through FFI, which adds the same per-row cost to every option.
 - **To reproduce the headline yourself** on an unlocked Mac, in about 3
-  minutes:
+  minutes. While the spike is still in the tree:
 
   ```sh
   cd spikes/grid-spike && ./build.sh && ./bench.sh compare
   ```
+
+  After task 1.6 has deleted it, check out the `phase-0` tag (created when
+  Rob approves phase 0) in a separate worktree:
+
+  ```sh
+  git worktree add /tmp/grid-spike phase-0
+  cd /tmp/grid-spike/spikes/grid-spike && ./build.sh && ./bench.sh compare
+  ```
+
+  Remove the worktree afterwards with `git worktree remove /tmp/grid-spike`.
+  The spike needs XcodeGen, and `bench.sh` uses `timeout`, which macOS
+  doesn't ship (`brew install coreutils`).
 
   It scrolls A, C and B at 200 columns and prints late frames, p99 and
   main-thread time for each.
