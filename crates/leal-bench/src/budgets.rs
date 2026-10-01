@@ -46,6 +46,18 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 500.0,
         source: "DESIGN §1",
     },
+    // The same with diagnostics collected in the pass (DESIGN §3.3), as the
+    // app indexes.
+    Budget {
+        id: "index/build_diagnostics",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
+    Budget {
+        id: "index/run_diagnostics",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
     // "Reads for visible cells are synchronous and must take under 1 ms":
     // one screenful (60 rows × 12 columns) parsed and displayed, uncached.
     Budget {

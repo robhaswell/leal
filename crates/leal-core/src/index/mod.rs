@@ -91,15 +91,19 @@
 //! Re-indexing with a different delimiter or encoding is a new
 //! [`RowIndex`] over the same bytes: nothing is reopened (PLAN 1.3).
 //!
+//! # Diagnostics
+//!
+//! [`RowIndex::build_with_diagnostics`] and
+//! [`RowIndex::start_with_diagnostics`] also collect the file's
+//! [diagnostics](crate::diagnostics) in the same pass (DESIGN §3.3, §3.5).
+//! They need the file's text encoding as well as the dialect, for invalid
+//! text and NUL code units. [`RowIndex::build`] and [`RowIndex::start`]
+//! skip them.
+//!
 //! # Not in this pass
 //!
-//! - **Diagnostics** (1.5) are collected during this pass, but not yet.
-//!   `scan::RowObserver` is the hook: the scanner calls it once per row with
-//!   the row's span, field count and line ending, and the places where text
-//!   after a closing quote and an unterminated quote are found are marked
-//!   `HOOK(1.5)` in `scan.rs`.
-//! - The **whole-file encoding count** (ADR-0003 decision 1) runs later as
-//!   P2 work, not here (ADR-0005 decision 4).
+//! The **whole-file encoding count** (ADR-0003 decision 1) runs later as P2
+//! work, not here (ADR-0005 decision 4).
 
 #[cfg(test)]
 mod chunked_tests;
@@ -114,10 +118,22 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use scan::{Bytes, NoObserver, RowObserver, Utf16};
 
+use crate::diagnostics::{Collector, Diagnostics, Report};
+use crate::dialect::Encoding;
+
 /// How much of the file the indexer scans between publishing rows and
 /// checking the cancel flag: 1 MiB, about 1 ms of work on the development
 /// Mac and a few on a base M1 Air, inside DESIGN §3.10's ~5 ms chunks.
 pub const CHUNK_BYTES: usize = 1 << 20;
+
+/// The chunk size when diagnostics are collected too
+/// ([`RowIndex::start_with_diagnostics`]): 256 KiB. In the worst files, where
+/// every field or every row is an occurrence, diagnostics cost up to about
+/// 6 ns per row or field on the development Mac, so a 1 MiB chunk could take
+/// 7 ms there and more on a base M1 Air. A quarter of that stays inside
+/// DESIGN §3.10's ~5 ms chunks (rule 3), and costs nothing measurable on
+/// ordinary files (`docs/tasks/1.5.md`).
+pub const DIAGNOSTICS_CHUNK_BYTES: usize = 256 << 10;
 
 /// The largest file the index can hold: offsets are `u32` (DESIGN §3.3), and
 /// files of 4 GiB or more are out of scope (DESIGN §1).
@@ -223,6 +239,15 @@ pub enum IndexError {
         /// The file's length.
         len: usize,
     },
+    /// The encoding given for diagnostics doesn't store characters the way
+    /// the dialect says: UTF-16 needs UTF-16 code units, and every other
+    /// encoding needs bytes.
+    EncodingMismatch {
+        /// The dialect's code unit.
+        code_unit: CodeUnit,
+        /// The encoding given.
+        encoding: Encoding,
+    },
     /// The cancel flag was set.
     Cancelled,
     /// A [`ChunkedIndexer`] was given more bytes than the file's length,
@@ -250,6 +275,13 @@ impl fmt::Display for IndexError {
             IndexError::TooLarge { len } => write!(
                 f,
                 "the file is {len} bytes; Leal reads files of up to {MAX_FILE_BYTES} bytes"
+            ),
+            IndexError::EncodingMismatch {
+                code_unit,
+                encoding,
+            } => write!(
+                f,
+                "can't collect diagnostics in {encoding:?} for a file read as {code_unit:?} code units"
             ),
             IndexError::Cancelled => f.write_str("indexing was cancelled"),
             IndexError::WrongLength { expected, received } => write!(
@@ -297,6 +329,8 @@ struct State {
 pub struct Indexer {
     index: Arc<RowIndex>,
     chunk_bytes: usize,
+    /// Where to publish diagnostics, if they are collected.
+    diagnostics: Option<Arc<Diagnostics>>,
 }
 
 impl RowIndex {
@@ -342,8 +376,63 @@ impl RowIndex {
         let indexer = Indexer {
             index: Arc::clone(&index),
             chunk_bytes: CHUNK_BYTES,
+            diagnostics: None,
         };
         Ok((index, indexer))
+    }
+
+    /// Indexes `bytes` on this thread, collecting the file's diagnostics in
+    /// the same pass, and returns the complete index and the diagnostics.
+    /// `encoding` is the file's text encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::InvalidDialect`], [`IndexError::EncodingMismatch`],
+    /// [`IndexError::BomPastEnd`] or [`IndexError::TooLarge`].
+    pub fn build_with_diagnostics(
+        bytes: &[u8],
+        dialect: IndexDialect,
+        encoding: Encoding,
+    ) -> Result<(RowIndex, Report), IndexError> {
+        let index = RowIndex::new(dialect)?;
+        let diagnostics = Arc::new(Diagnostics::new(dialect, encoding)?);
+        fill(
+            &index,
+            bytes,
+            &AtomicBool::new(false),
+            CHUNK_BYTES,
+            |_| {},
+            &mut Collector::new(Arc::clone(&diagnostics)),
+        )?;
+        // The collector is gone, so this is the only `Arc` left, and the
+        // report moves out without a copy.
+        let report = Arc::try_unwrap(diagnostics).map_or_else(
+            |shared| Arc::unwrap_or_clone(shared.report()),
+            Diagnostics::into_report,
+        );
+        Ok((index, report))
+    }
+
+    /// Like [`RowIndex::start`], but the [`Indexer`] also collects the
+    /// file's diagnostics, whose text is in `encoding`. Readers get the
+    /// diagnostics found so far from the shared [`Diagnostics`], which the
+    /// indexer updates after each chunk, before it calls its progress
+    /// callback. See [`crate::diagnostics`]. Its chunks are
+    /// [`DIAGNOSTICS_CHUNK_BYTES`], not [`CHUNK_BYTES`], so it publishes,
+    /// calls back and checks the cancel flag four times as often.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::InvalidDialect`] or [`IndexError::EncodingMismatch`].
+    pub fn start_with_diagnostics(
+        dialect: IndexDialect,
+        encoding: Encoding,
+    ) -> Result<(Arc<RowIndex>, Arc<Diagnostics>, Indexer), IndexError> {
+        let (index, mut indexer) = RowIndex::start(dialect)?;
+        let diagnostics = Arc::new(Diagnostics::new(dialect, encoding)?);
+        indexer.diagnostics = Some(Arc::clone(&diagnostics));
+        indexer.chunk_bytes = DIAGNOSTICS_CHUNK_BYTES;
+        Ok((index, diagnostics, indexer))
     }
 
     fn new(dialect: IndexDialect) -> Result<RowIndex, IndexError> {
@@ -563,29 +652,51 @@ impl RowIndex {
 }
 
 impl Indexer {
-    /// Indexes `bytes`, publishing rows to the [`RowIndex`] as it goes.
-    /// After each chunk of [`CHUNK_BYTES`] it calls `on_progress` and checks
-    /// `cancel`; once `cancel` is set, it stops at the next chunk boundary.
+    /// Indexes `bytes`, publishing rows to the [`RowIndex`] as it goes, and
+    /// diagnostics to its [`Diagnostics`] if it was made by
+    /// [`RowIndex::start_with_diagnostics`]. After each chunk of
+    /// [`CHUNK_BYTES`] (with diagnostics, [`DIAGNOSTICS_CHUNK_BYTES`]) it
+    /// calls `on_progress` and checks `cancel`; once `cancel` is set, it
+    /// stops at the next chunk boundary.
     ///
     /// # Errors
     ///
     /// [`IndexError::Cancelled`] if `cancel` was set, or
     /// [`IndexError::BomPastEnd`] or [`IndexError::TooLarge`]. The index's
-    /// status is then [`Status::Stopped`].
+    /// status is then [`Status::Stopped`], and the last diagnostics report
+    /// stays incomplete.
     pub fn run(
         self,
         bytes: &[u8],
         cancel: &AtomicBool,
         on_progress: impl FnMut(Progress),
     ) -> Result<(), IndexError> {
-        fill(
-            &self.index,
-            bytes,
-            cancel,
-            self.chunk_bytes,
-            on_progress,
-            &mut NoObserver,
-        )
+        match &self.diagnostics {
+            Some(diagnostics) => fill(
+                &self.index,
+                bytes,
+                cancel,
+                self.chunk_bytes,
+                on_progress,
+                &mut Collector::new(Arc::clone(diagnostics)),
+            ),
+            None => fill(
+                &self.index,
+                bytes,
+                cancel,
+                self.chunk_bytes,
+                on_progress,
+                &mut NoObserver,
+            ),
+        }
+    }
+
+    /// Scans `chunk_bytes` at a time instead of [`CHUNK_BYTES`], so tests
+    /// can put chunk boundaries anywhere.
+    #[cfg(test)]
+    pub(crate) fn with_chunk_bytes(mut self, chunk_bytes: usize) -> Self {
+        self.chunk_bytes = chunk_bytes;
+        self
     }
 }
 
@@ -635,10 +746,15 @@ impl Indexer {
                 ChunkedScan::Utf16(scan::Chunked::new(&self.index, len))
             }
         };
+        let collector = self
+            .diagnostics
+            .as_ref()
+            .map(|diagnostics| Collector::new(Arc::clone(diagnostics)));
         Ok(ChunkedIndexer {
             indexer: self,
             scan,
             len,
+            collector,
         })
     }
 }
@@ -646,10 +762,18 @@ impl Indexer {
 /// An [`Indexer`] that is given the file in chunks: see
 /// [`Indexer::chunked`]. Dropping it before [`finish`](Self::finish) leaves
 /// the index [`Status::Stopped`], with the rows found so far.
+///
+/// If the indexer was made by [`RowIndex::start_with_diagnostics`], it
+/// collects diagnostics chunk by chunk, exactly as [`Indexer::run`] does over
+/// the whole file: the collector's state, like the scanner's, carries over
+/// from one chunk to the next, and a UTF-8 sequence or UTF-16 pair cut by a
+/// chunk boundary is judged once the next chunk arrives.
 pub struct ChunkedIndexer {
     indexer: Indexer,
     scan: ChunkedScan,
     len: usize,
+    /// The diagnostics collector, if the indexer has diagnostics.
+    collector: Option<Collector>,
 }
 
 /// The chunked scan, for the file's code unit.
@@ -669,12 +793,19 @@ impl ChunkedIndexer {
     /// [`IndexError::WrongLength`] if the chunks so far would be longer
     /// than the file. The chunk is then not scanned.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Progress, IndexError> {
-        self.push_observed(chunk, &mut NoObserver)
+        // The diagnostics collector joins the pass here, as it joins
+        // `fill` for a mapped file.
+        match self.collector.take() {
+            Some(mut collector) => {
+                let progress = self.push_observed(chunk, &mut collector);
+                self.collector = Some(collector);
+                progress
+            }
+            None => self.push_observed(chunk, &mut NoObserver),
+        }
     }
 
     /// [`push`](Self::push), telling `observer` about every row it finds.
-    /// SEAM(1.5): this is where the diagnostics collector joins the pass
-    /// for a file read in chunks, as it joins [`fill`] for a mapped one.
     pub(crate) fn push_observed<O: RowObserver>(
         &mut self,
         chunk: &[u8],
@@ -710,8 +841,11 @@ impl ChunkedIndexer {
     ///
     /// [`IndexError::WrongLength`] if fewer bytes than the file's length
     /// were given. The index is then [`Status::Stopped`].
-    pub fn finish(self) -> Result<Progress, IndexError> {
-        self.finish_observed(&mut NoObserver)
+    pub fn finish(mut self) -> Result<Progress, IndexError> {
+        match self.collector.take() {
+            Some(mut collector) => self.finish_observed(&mut collector),
+            None => self.finish_observed(&mut NoObserver),
+        }
     }
 
     /// [`finish`](Self::finish), telling `observer` about the last row.

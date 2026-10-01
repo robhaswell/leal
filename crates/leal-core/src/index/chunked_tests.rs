@@ -8,7 +8,7 @@
 //! (so the diagnostics hook, 1.5, sees the same rows). `build` itself is
 //! checked against the testkit's layouts in `tests.rs`.
 
-use super::scan::{RowFacts, RowObserver};
+use super::scan::{FieldCounts, RowFacts, RowObserver};
 use super::*;
 
 use leal_testkit::dialect::Encoding as TkEncoding;
@@ -21,7 +21,7 @@ use proptest::prelude::*;
 struct Rows(Vec<RowFacts>);
 
 impl RowObserver for Rows {
-    fn row(&mut self, facts: &RowFacts) {
+    fn row(&mut self, facts: &RowFacts, _counts: &FieldCounts) {
         self.0.push(facts.clone());
     }
 }

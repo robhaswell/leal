@@ -6,6 +6,7 @@
 
 pub mod attributes;
 pub mod detect;
+pub mod diagnostics;
 pub mod dialect;
 pub mod document;
 pub mod index;

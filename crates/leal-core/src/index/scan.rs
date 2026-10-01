@@ -28,6 +28,11 @@
 //! before its position (for the "quote after a delimiter" look-back) and
 //! anything it hasn't scanned yet. The scanner's own state (inside quotes
 //! or not, the row so far) carries over from one view to the next.
+//!
+//! It is generic over a [`RowObserver`] too, which hears what the scan
+//! finds: that is how diagnostics are collected in the same pass
+//! (`crate::diagnostics`). Without one ([`NoObserver`]) the hooks compile
+//! to nothing.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -218,14 +223,14 @@ impl<'a, U: Units> View<'a, U> {
         }
     }
 
-    fn find3(&self, from: usize, to: usize, abc: [u8; 3]) -> Option<(usize, u8)> {
+    pub(crate) fn find3(&self, from: usize, to: usize, abc: [u8; 3]) -> Option<(usize, u8)> {
         let (at, value) = self
             .units
             .find3(self.bytes, from - self.base, to - self.base, abc)?;
         Some((at + self.base, value))
     }
 
-    fn find1(&self, from: usize, to: usize, a: u8) -> Option<usize> {
+    pub(crate) fn find1(&self, from: usize, to: usize, a: u8) -> Option<usize> {
         let at = self
             .units
             .find1(self.bytes, from - self.base, to - self.base, a)?;
@@ -234,14 +239,24 @@ impl<'a, U: Units> View<'a, U> {
 
     /// False for a position outside the view, as for one past the end of
     /// the file.
-    fn is(&self, pos: usize, value: u8) -> bool {
+    pub(crate) fn is(&self, pos: usize, value: u8) -> bool {
         pos.checked_sub(self.base)
             .is_some_and(|at| self.units.is(self.bytes, at, value))
     }
 
-    fn count(&self, from: usize, to: usize, value: u8) -> usize {
+    pub(crate) fn count(&self, from: usize, to: usize, value: u8) -> usize {
         self.units
             .count(self.bytes, from - self.base, to - self.base, value)
+    }
+
+    /// The file's bytes `from..to`, which must be in the view.
+    pub(crate) fn slice(&self, from: usize, to: usize) -> &'a [u8] {
+        &self.bytes[from - self.base..to - self.base]
+    }
+
+    /// The offset in the file just past the view's last byte.
+    pub(crate) fn end(&self) -> usize {
+        self.base + self.bytes.len()
     }
 }
 
@@ -263,23 +278,63 @@ pub(crate) struct RowFacts {
     pub fields: usize,
 }
 
-/// Told about every row as the scanner finds it.
+/// A stretch of units the scanner has passed over, `from..to`, in row
+/// `row`, starting in field `field` (from 0).
 ///
-/// HOOK(1.5): diagnostics are collected in this same pass (DESIGN §3.3).
-/// Ragged rows, blank lines and mixed line endings need exactly these facts.
-/// Field-level kinds (text after a closing quote, invalid encoding, NUL)
-/// need more; the places in [`Scanner::scan`] marked `HOOK(1.5)` are where
-/// the scanner learns about quotes. Tests use an observer to read each
-/// row's field count.
+/// Inside a quoted field (`quoted`), the whole stretch is in that field.
+/// Outside quotes, each delimiter in it starts the next field. A row's
+/// stretches, with the quotes, CRs and LFs between them, cover the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Segment {
+    pub row: usize,
+    pub field: usize,
+    pub from: usize,
+    pub to: usize,
+    pub quoted: bool,
+}
+
+/// Told what the scanner finds, as it finds it. Diagnostics are collected
+/// this way, in the same pass (DESIGN §3.3, [`crate::diagnostics`]). Tests
+/// use an observer to read each row's field count.
+///
+/// Every method but [`row`](RowObserver::row) does nothing by default. The
+/// scanner is generic over its observer, so with [`NoObserver`] the calls
+/// compile to nothing.
 pub(crate) trait RowObserver {
-    fn row(&mut self, facts: &RowFacts);
+    /// How many bytes past the point a scan stops at the observer needs to
+    /// see in [`chunk`](RowObserver::chunk)'s view. The chunked scan keeps
+    /// that many bytes (at least a unit) back for the next chunk.
+    const LOOKAHEAD: usize = 0;
+
+    /// The scanner is about to scan up to `to` of a `len`-byte file, through
+    /// `view`, which holds at least [`LOOKAHEAD`](RowObserver::LOOKAHEAD)
+    /// bytes past `to` (or up to the end of the file).
+    fn chunk<U: Units>(&mut self, _view: &View<'_, U>, _to: usize, _len: usize) {}
+
+    /// The scanner passed over a stretch of units; see [`Segment`].
+    fn content<U: Units>(&mut self, _view: &View<'_, U>, _segment: Segment) {}
+
+    /// A quoted field in row `row` closed and has text after its closing
+    /// quote, starting at `offset`.
+    fn text_after_quote(&mut self, _row: usize, _offset: usize) {}
+
+    /// The quoted field that opens at `offset`, in row `row`, never closes.
+    /// Called at the end of the file, just before that row ends.
+    fn unterminated_quote(&mut self, _row: usize, _offset: usize) {}
+
+    /// A row ended. `counts` already includes it, unless it is blank.
+    fn row(&mut self, facts: &RowFacts, counts: &FieldCounts);
+
+    /// After a chunk, the index published its rows, `rows` of them so far;
+    /// `done` if that was the last chunk.
+    fn published(&mut self, _rows: usize, _done: bool) {}
 }
 
 /// Ignores every row. The compiler removes the calls entirely.
 pub(crate) struct NoObserver;
 
 impl RowObserver for NoObserver {
-    fn row(&mut self, _facts: &RowFacts) {}
+    fn row(&mut self, _facts: &RowFacts, _counts: &FieldCounts) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +344,8 @@ impl RowObserver for NoObserver {
 /// (ties go to the count seen first). Most files have one or two distinct
 /// counts, and most rows have the same count as the row before, so that
 /// case skips the hash map.
-#[derive(Default)]
-struct FieldCounts {
+#[derive(Debug, Default)]
+pub(crate) struct FieldCounts {
     /// `(field count, rows)`, in the order each count was first seen.
     seen: Vec<(usize, u64)>,
     /// Where each field count is in `seen`.
@@ -299,6 +354,8 @@ struct FieldCounts {
     last: Option<usize>,
     /// The position of the most common count so far.
     best: Option<usize>,
+    /// Rows counted.
+    total: u64,
 }
 
 impl FieldCounts {
@@ -311,6 +368,7 @@ impl FieldCounts {
             }),
         };
         self.seen[i].1 += 1;
+        self.total += 1;
         self.last = Some(i);
         // Only count `i` changed, so it is the only one that can overtake
         // the best. An equal count wins only if it was seen first.
@@ -323,6 +381,16 @@ impl FieldCounts {
 
     fn mode(&self) -> Option<usize> {
         self.best.map(|b| self.seen[b].0)
+    }
+
+    /// The most common field count, and how many rows have it.
+    pub(crate) fn leader(&self) -> Option<(usize, u64)> {
+        self.best.map(|b| self.seen[b])
+    }
+
+    /// How many rows have been counted.
+    pub(crate) fn total(&self) -> u64 {
+        self.total
     }
 }
 
@@ -386,10 +454,13 @@ impl<U: Units> Scanner<U> {
     /// file if that is sooner.
     fn scan<O: RowObserver>(&mut self, view: &View<'_, U>, to: usize, observer: &mut O) {
         let w = U::WIDTH;
+        observer.chunk(view, to, self.len);
         while self.pos < to {
             if self.open_quote.is_some() {
                 // Inside a quoted field: only a quote matters.
-                let Some(q) = view.find1(self.pos, to, self.quote) else {
+                let found = view.find1(self.pos, to, self.quote);
+                observer.content(view, self.segment(found.unwrap_or(to), true));
+                let Some(q) = found else {
                     self.pos = to;
                     break;
                 };
@@ -397,12 +468,21 @@ impl<U: Units> Scanner<U> {
                     // `""`: an escaped quote.
                     self.pos = q + 2 * w;
                 } else {
-                    // The closing quote. HOOK(1.5): if the unit after it
-                    // isn't a delimiter, CR, LF or the end of the file, the
-                    // field has text after its closing quote, starting at
-                    // `q + w`. `open_quote` is the field's start.
+                    // The closing quote. If the unit after it isn't a
+                    // delimiter, CR, LF or the end of the file, the field
+                    // has text after its closing quote. In UTF-16 a final
+                    // odd byte counts as text, as it does for the row
+                    // parser (1.4).
                     self.open_quote = None;
                     self.pos = q + w;
+                    let after = q + w;
+                    let text_follows = after < self.len
+                        && !view.is(after, self.delimiter)
+                        && !view.is(after, CR)
+                        && !view.is(after, LF);
+                    if text_follows {
+                        observer.text_after_quote(self.row, after);
+                    }
                 }
                 continue;
             }
@@ -410,6 +490,7 @@ impl<U: Units> Scanner<U> {
             // Outside quotes: the next quote, CR or LF.
             let found = view.find3(self.pos, to, [self.quote, CR, LF]);
             let end = found.map_or(to, |(at, _)| at);
+            observer.content(view, self.segment(end, false));
             self.fields += view.count(self.pos, end, self.delimiter);
             let Some((at, value)) = found else {
                 self.pos = to;
@@ -435,11 +516,22 @@ impl<U: Units> Scanner<U> {
         }
     }
 
+    /// The stretch from `pos` to `to`, in the current row and field.
+    fn segment(&self, to: usize, quoted: bool) -> Segment {
+        Segment {
+            row: self.row,
+            field: self.fields - 1,
+            from: self.pos,
+            to,
+            quoted,
+        }
+    }
+
     /// The end of the file: the last row, if it has no line ending.
     fn finish<O: RowObserver>(&mut self, observer: &mut O) {
         let len = self.len;
         if let Some(open) = self.open_quote.take() {
-            // HOOK(1.5): the unterminated quote diagnostic.
+            observer.unterminated_quote(self.row, open);
             self.unterminated_quote = Some(open);
             self.end_row(len, None, len, observer);
         } else if self.row_start < len {
@@ -460,13 +552,16 @@ impl<U: Units> Scanner<U> {
         if !blank {
             self.counts.add(self.fields);
         }
-        observer.row(&RowFacts {
-            row: self.row,
-            span: self.row_start..content_end,
-            line_ending,
-            next_start: next,
-            fields: self.fields,
-        });
+        observer.row(
+            &RowFacts {
+                row: self.row,
+                span: self.row_start..content_end,
+                line_ending,
+                next_start: next,
+                fields: self.fields,
+            },
+            &self.counts,
+        );
         self.new_starts.push(to_u32(next));
         self.row += 1;
         self.row_start = next;
@@ -515,6 +610,7 @@ pub(crate) fn run<U: Units, O: RowObserver>(
         }
         let summary = scanner.summary();
         let progress = index.publish(&mut scanner.new_starts, &summary, done);
+        observer.published(progress.rows, done);
         on_progress(progress);
         if done {
             return Ok(());
@@ -569,11 +665,12 @@ impl<U: Units> Chunked<U> {
         let w = U::WIDTH;
         self.window.extend_from_slice(chunk);
         let end = self.received();
-        // Leave the last unit for the next chunk, and stop on a unit
-        // boundary (units start at the end of the BOM).
+        // Leave the last few bytes for the next chunk (the observer's
+        // `LOOKAHEAD`, and at least a unit), and stop on a unit boundary
+        // (units start at the end of the BOM).
         let bom_len = self.dialect.bom_len;
         let to = end
-            .saturating_sub(w)
+            .saturating_sub(O::LOOKAHEAD.max(w))
             .checked_sub(bom_len)
             .map(|past| bom_len + past - past % w);
         if let Some(to) = to.filter(|&to| to > self.scanner.pos) {
@@ -581,8 +678,8 @@ impl<U: Units> Chunked<U> {
             self.scanner.scan(&view, to, observer);
         }
         // Keep the unit before the scanner's position and everything after
-        // it: at most a few units, since the scan got to within two of the
-        // end.
+        // it: at most a few units, since the scan got to within
+        // `O::LOOKAHEAD` of the end.
         let keep_from = self
             .scanner
             .pos
@@ -591,7 +688,9 @@ impl<U: Units> Chunked<U> {
         self.window.drain(..keep_from - self.window_base);
         self.window_base = keep_from;
         let summary = self.scanner.summary();
-        index.publish(&mut self.scanner.new_starts, &summary, false)
+        let progress = index.publish(&mut self.scanner.new_starts, &summary, false);
+        observer.published(progress.rows, false);
+        progress
     }
 
     /// Scans what is left once every chunk has arrived, ends the last row
@@ -604,7 +703,9 @@ impl<U: Units> Chunked<U> {
         }
         self.scanner.finish(observer);
         let summary = self.scanner.summary();
-        index.publish(&mut self.scanner.new_starts, &summary, true)
+        let progress = index.publish(&mut self.scanner.new_starts, &summary, true);
+        observer.published(progress.rows, true);
+        progress
     }
 }
 

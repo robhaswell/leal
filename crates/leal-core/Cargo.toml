@@ -22,6 +22,10 @@ memmap2 = "0.9.11"
 memchr = "2.8.3"
 # The background pool for P2 and P3 work (PLAN 1.3a, DESIGN §3.10 rule 4).
 rayon = "1.12.0"
+# Diagnostics (PLAN 1.5): finding invalid UTF-8 during the index's pass,
+# about twice as fast as `std::str::from_utf8` on the reference file, with
+# the same error positions (`compat`). encoding_rs already depends on it.
+simdutf8 = "0.1.5"
 
 [dev-dependencies]
 leal-testkit.workspace = true

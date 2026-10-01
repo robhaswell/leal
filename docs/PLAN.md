@@ -206,7 +206,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
     position is a byte offset into the file as stored (UTF-16 included),
     and an unpaired surrogate displays as U+FFFD.
-- [ ] **1.5 Diagnostics** — all kinds in §3.5, collected during indexing.
+- [~] **1.5 Diagnostics** — all kinds in §3.5, collected during indexing.
   - Follows ADR-0003 decisions 4, 5 and 7, and matches every corpus
     sidecar (the kinds table in `tests/corpus/README.md`): one occurrence
     per row, field or file as listed; ties go to the first seen; blank

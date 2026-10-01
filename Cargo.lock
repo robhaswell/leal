@@ -485,6 +485,7 @@ dependencies = [
  "memmap2",
  "proptest",
  "rayon",
+ "simdutf8",
 ]
 
 [[package]]

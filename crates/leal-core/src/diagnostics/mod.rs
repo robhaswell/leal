@@ -1,0 +1,416 @@
+//! Diagnostics: the irregularities of messy input (DESIGN §3.5).
+//!
+//! Leal's rule for irregular input is **show it faithfully, warn clearly,
+//! never fix it silently**. This module only describes: it reads the bytes
+//! and never changes them.
+//!
+//! Diagnostics are collected during the row index's single pass (DESIGN
+//! §3.3), not in a pass of their own:
+//!
+//! ```
+//! use leal_core::diagnostics::{DiagnosticKind, Location, Severity};
+//! use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
+//! use leal_core::dialect::Encoding;
+//!
+//! let bytes = b"id,name\n1,\"Jo\"x\n2\n";
+//! let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+//! let (index, report) = RowIndex::build_with_diagnostics(bytes, dialect, Encoding::Utf8)?;
+//!
+//! assert!(report.is_complete());
+//! let kinds: Vec<_> = report.diagnostics().iter().map(|d| d.kind()).collect();
+//! assert_eq!(kinds, [DiagnosticKind::RaggedRows, DiagnosticKind::TextAfterClosingQuote]);
+//!
+//! let text = report.get(DiagnosticKind::TextAfterClosingQuote).unwrap();
+//! assert_eq!(text.severity(), Severity::Warning);
+//! assert_eq!(text.count(), 1);
+//! assert_eq!(text.first(), [Location { row: 1, offset: 14 }]);
+//! assert!(report.shows_banner());
+//! # Ok::<(), leal_core::index::IndexError>(())
+//! ```
+//!
+//! The app indexes on a background thread, and reads the diagnostics found
+//! so far while it runs, with [`RowIndex::start_with_diagnostics`]:
+//!
+//! [`RowIndex::start_with_diagnostics`]: crate::index::RowIndex::start_with_diagnostics
+//!
+//! ```
+//! use std::sync::atomic::AtomicBool;
+//! use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
+//! use leal_core::dialect::Encoding;
+//!
+//! let bytes = b"a,b\n\n1,2\n";
+//! let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+//! let (index, diagnostics, indexer) = RowIndex::start_with_diagnostics(dialect, Encoding::Utf8)?;
+//! // (On the indexing thread.)
+//! indexer.run(bytes, &AtomicBool::new(false), |progress| {
+//!     // Tell the UI that rows and diagnostics changed. A reader calls
+//!     // `diagnostics.report()` whenever it likes.
+//!     let _ = progress.rows;
+//! })?;
+//! let report = diagnostics.report();
+//! assert!(report.is_complete());
+//! assert_eq!(report.rows(), index.row_count());
+//! assert_eq!(report.diagnostics().len(), 1); // one blank line
+//! # Ok::<(), leal_core::index::IndexError>(())
+//! ```
+//!
+//! # What counts as one occurrence
+//!
+//! ADR-0003 decisions 4, 5 and 7, as the testkit and the corpus sidecars
+//! (`tests/corpus/README.md`) pin them. Each kind's docs say what one
+//! occurrence is and which byte its location points at. In short:
+//!
+//! - per **row**: ragged rows, blank lines, mixed line endings;
+//! - per **field**: text after a closing quote, invalid encoding, NUL;
+//! - per **file**: unterminated quote, BOM.
+//!
+//! Every location is a 0-based physical row and a byte offset into the file
+//! as stored, the BOM included, in UTF-16 too (ADR-0003 decision 6). Each
+//! diagnostic keeps its count and its first [`MAX_LOCATIONS`] locations in
+//! file order (DESIGN §3.5).
+//!
+//! # While indexing
+//!
+//! A [`Report`] read while the indexer runs describes exactly the rows
+//! indexed so far ([`Report::rows`]): it is what a complete index of just
+//! those rows would report. So it can change as more rows arrive:
+//!
+//! - the dominant field count, and with it which rows are **ragged**, is the
+//!   most common count *so far*; the same goes for the dominant line ending
+//!   and **mixed line endings**. They are final once the report
+//!   [is complete](Report::is_complete);
+//! - an **unterminated quote** can only be known at the end of the file;
+//! - the other kinds only ever gain occurrences.
+//!
+//! # Not in this module
+//!
+//! The whole-file encoding count (ADR-0003 decision 1) is detection's P2
+//! work (ADR-0005 decision 4). If it suggests another encoding and the user
+//! accepts, the file is re-indexed with it, which gives new diagnostics.
+
+mod collect;
+mod marks;
+#[cfg(test)]
+mod tests;
+
+use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+
+use crate::dialect::Encoding;
+use crate::index::{IndexDialect, IndexError};
+
+pub(crate) use collect::Collector;
+use marks::RowMarks;
+
+/// The most locations a diagnostic keeps (DESIGN §3.5). The count covers
+/// every occurrence.
+pub const MAX_LOCATIONS: usize = 1000;
+
+/// A kind of irregularity (DESIGN §3.5). Each variant says what one
+/// occurrence is and where its location points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DiagnosticKind {
+    /// Error. At most one: the quoted field whose opening quote never
+    /// closes, so it runs to the end of the file. Location: the opening
+    /// quote.
+    UnterminatedQuote,
+    /// Warning. One per non-blank row whose field count differs from the
+    /// most common field count among non-blank rows (ties go to the count
+    /// seen first). Blank lines are never ragged. Location: the row's start.
+    RaggedRows,
+    /// Warning. One per field with units between its closing quote and the
+    /// next delimiter or line ending (`"a"b`). Location: the first of them.
+    TextAfterClosingQuote,
+    /// Warning. One per field containing text that doesn't decode, and so
+    /// displays as U+FFFD: invalid UTF-8 (split into sequences the way
+    /// `String::from_utf8_lossy` splits them), an unpaired UTF-16 surrogate
+    /// or a final odd byte in a UTF-16 file, or a byte a single-byte
+    /// encoding doesn't map. Location: the first invalid byte (in UTF-16,
+    /// the first byte of the code unit).
+    InvalidEncoding,
+    /// Warning. One per field containing a NUL: a 0x00 byte, or in UTF-16 a
+    /// U+0000 code unit (ADR-0003 decision 7). Location: the first NUL (its
+    /// code unit's first byte).
+    NulBytes,
+    /// Info. One per row whose line ending differs from the most common one
+    /// (ties go to the one seen first). Location: the first byte of the
+    /// row's line ending.
+    MixedLineEndings,
+    /// Info. One per row with no bytes before its line ending, anywhere in
+    /// the file, including at the end (ADR-0003 decision 5). Location: the
+    /// row's start.
+    BlankLines,
+    /// Info. One if the file starts with a BOM. Location: row 0, offset 0.
+    BomPresent,
+}
+
+impl DiagnosticKind {
+    /// Every kind, errors first, in the order a [`Report`] lists them.
+    pub const ALL: [DiagnosticKind; 8] = [
+        DiagnosticKind::UnterminatedQuote,
+        DiagnosticKind::RaggedRows,
+        DiagnosticKind::TextAfterClosingQuote,
+        DiagnosticKind::InvalidEncoding,
+        DiagnosticKind::NulBytes,
+        DiagnosticKind::MixedLineEndings,
+        DiagnosticKind::BlankLines,
+        DiagnosticKind::BomPresent,
+    ];
+
+    /// How serious this kind is (DESIGN §3.5).
+    #[must_use]
+    pub const fn severity(self) -> Severity {
+        match self {
+            DiagnosticKind::UnterminatedQuote => Severity::Error,
+            DiagnosticKind::RaggedRows
+            | DiagnosticKind::TextAfterClosingQuote
+            | DiagnosticKind::InvalidEncoding
+            | DiagnosticKind::NulBytes => Severity::Warning,
+            DiagnosticKind::MixedLineEndings
+            | DiagnosticKind::BlankLines
+            | DiagnosticKind::BomPresent => Severity::Info,
+        }
+    }
+}
+
+/// How serious a diagnostic is. Warnings and errors show the banner;
+/// info-level ones appear in the status bar and the details view only
+/// (DESIGN §3.5, ADR-0002 question 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Severity {
+    /// Status bar and details view only.
+    Info,
+    /// Shows the banner.
+    Warning,
+    /// Shows the banner, prominently.
+    Error,
+}
+
+/// Where one occurrence is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Location {
+    /// The 0-based physical row.
+    pub row: usize,
+    /// The byte offset into the file as stored, BOM included.
+    pub offset: usize,
+}
+
+/// One kind of irregularity found in a file: how many times, and the first
+/// places.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    kind: DiagnosticKind,
+    count: usize,
+    first: Vec<Location>,
+}
+
+impl Diagnostic {
+    /// What was found.
+    #[must_use]
+    pub fn kind(&self) -> DiagnosticKind {
+        self.kind
+    }
+
+    /// The kind's severity.
+    #[must_use]
+    pub fn severity(&self) -> Severity {
+        self.kind.severity()
+    }
+
+    /// How many occurrences there are: at least 1, and in every row the
+    /// report covers, not only the ones in [`first`](Diagnostic::first).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The first occurrences in file order: all of them, up to
+    /// [`MAX_LOCATIONS`].
+    #[must_use]
+    pub fn first(&self) -> &[Location] {
+        &self.first
+    }
+}
+
+/// The diagnostics of a file, or of the rows indexed so far.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    diagnostics: Vec<Diagnostic>,
+    rows: usize,
+    complete: bool,
+}
+
+impl Report {
+    /// Every kind found, in [`DiagnosticKind::ALL`] order. Kinds not found
+    /// aren't listed.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// The diagnostic of one kind, if any was found.
+    #[must_use]
+    pub fn get(&self, kind: DiagnosticKind) -> Option<&Diagnostic> {
+        self.diagnostics.iter().find(|d| d.kind == kind)
+    }
+
+    /// How many rows this report covers: the rows indexed when it was made.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// True once the whole file is indexed. Until then the report covers
+    /// only [`rows`](Report::rows) rows, and ragged rows and mixed line
+    /// endings are relative to those rows (see the module docs).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// How many kinds have at least `severity`. With
+    /// [`Severity::Warning`], that is the kinds the banner counts ("This
+    /// file has N kinds of irregularity").
+    #[must_use]
+    pub fn kinds_at_least(&self, severity: Severity) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity() >= severity)
+            .count()
+    }
+
+    /// True if there is a warning or an error, which shows the banner
+    /// (DESIGN §3.5).
+    #[must_use]
+    pub fn shows_banner(&self) -> bool {
+        self.kinds_at_least(Severity::Warning) > 0
+    }
+}
+
+/// The diagnostics of a file being indexed, shared between the indexer and
+/// its readers. Made by [`RowIndex::start_with_diagnostics`]; the
+/// [`Indexer`](crate::index::Indexer) publishes a new [`Report`] and the
+/// new rows' marks after each chunk, before its progress callback.
+///
+/// [`RowIndex::start_with_diagnostics`]: crate::index::RowIndex::start_with_diagnostics
+pub struct Diagnostics {
+    dialect: IndexDialect,
+    encoding: Encoding,
+    shared: RwLock<Shared>,
+}
+
+/// What readers see, replaced or extended once per chunk.
+#[derive(Debug, Default)]
+struct Shared {
+    report: Arc<Report>,
+    marks: RowMarks,
+}
+
+impl fmt::Debug for Diagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Diagnostics")
+            .field("dialect", &self.dialect)
+            .field("encoding", &self.encoding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Diagnostics {
+    /// Diagnostics for a file indexed with `dialect`, whose text is in
+    /// `encoding`. The encoding must store characters the way the dialect
+    /// says ([`Encoding::code_unit`]).
+    pub(crate) fn new(dialect: IndexDialect, encoding: Encoding) -> Result<Self, IndexError> {
+        if encoding.code_unit() != dialect.code_unit {
+            return Err(IndexError::EncodingMismatch {
+                code_unit: dialect.code_unit,
+                encoding,
+            });
+        }
+        Ok(Diagnostics {
+            dialect,
+            encoding,
+            shared: RwLock::new(Shared::default()),
+        })
+    }
+
+    /// The latest report: empty and incomplete until the indexer has
+    /// scanned its first chunk, then the diagnostics of the rows indexed so
+    /// far, and complete once the indexer finishes. If indexing stops
+    /// early (cancelled or failed), the last report stays incomplete.
+    ///
+    /// It is shared (`Arc`), so reading it copies nothing.
+    #[must_use]
+    pub fn report(&self) -> Arc<Report> {
+        Arc::clone(&self.read().report)
+    }
+
+    /// True if row `row` has a warning or an error: the rows the gutter
+    /// marks (ADR-0002 question 7). Unlike a report's locations, which stop
+    /// at [`MAX_LOCATIONS`] per kind, this covers every row. Info-level
+    /// kinds don't mark a row. False for a row not indexed yet.
+    ///
+    /// While indexing, whether a row is ragged is decided against the most
+    /// common field count so far, as in [`Diagnostics::report`].
+    #[must_use]
+    pub fn row_has_diagnostic(&self, row: usize) -> bool {
+        self.read().marks.has(row)
+    }
+
+    /// The first row at or after `from` that
+    /// [has a diagnostic](Diagnostics::row_has_diagnostic), for **Next**.
+    /// It reads one byte per row, 64 at a time.
+    #[must_use]
+    pub fn next_row_with_diagnostic(&self, from: usize) -> Option<usize> {
+        self.read().marks.next(from)
+    }
+
+    /// The last row before `to` that
+    /// [has a diagnostic](Diagnostics::row_has_diagnostic), for
+    /// **Previous**.
+    #[must_use]
+    pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
+        self.read().marks.previous(to)
+    }
+
+    /// The encoding the diagnostics are for.
+    #[must_use]
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    pub(crate) fn dialect(&self) -> IndexDialect {
+        self.dialect
+    }
+
+    /// Publishes a chunk's results: the new report, and the marks of the
+    /// rows finished since the last publish (`codes` and `wide` are
+    /// emptied), with the mode they are judged against.
+    pub(crate) fn publish(
+        &self,
+        report: Report,
+        codes: &mut Vec<u8>,
+        wide: &mut Vec<(u32, u32)>,
+        mode: Option<usize>,
+    ) {
+        let report = Arc::new(report);
+        let mut shared = self.shared.write().unwrap_or_else(PoisonError::into_inner);
+        shared.report = report;
+        shared.marks.extend(codes, wide, mode);
+    }
+
+    /// The last report, moved out rather than copied. It takes `self`, so
+    /// the lock's reference to the report is the only one left.
+    pub(crate) fn into_report(self) -> Report {
+        let shared = self
+            .shared
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::unwrap_or_clone(shared.report)
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Shared> {
+        // A poisoned lock means a thread panicked while holding it. Every
+        // write leaves the state whole before anything that could panic.
+        self.shared.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}

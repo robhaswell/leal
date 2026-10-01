@@ -4,7 +4,7 @@
 //! The expected answers come from the testkit, which is checked against its
 //! own reference parser; that parser is never used here (0.2 notes).
 
-use super::scan::{RowFacts, RowObserver};
+use super::scan::{FieldCounts, RowFacts, RowObserver};
 use super::*;
 
 use std::sync::atomic::Ordering;
@@ -34,7 +34,7 @@ fn utf8(delimiter: u8) -> IndexDialect {
 struct Rows(Vec<RowFacts>);
 
 impl RowObserver for Rows {
-    fn row(&mut self, facts: &RowFacts) {
+    fn row(&mut self, facts: &RowFacts, _counts: &FieldCounts) {
         self.0.push(facts.clone());
     }
 }
