@@ -158,7 +158,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     and whether they gate or only report, since GitHub's runners are not
     the reference machine. If CI runs them, add the job and the regression
     alert DESIGN §5 asks for.
-- [~] **1.3 Row index** — quote-aware, progressive, `u32` offsets (§3.3).
+- [x] **1.3 Row index** — quote-aware, progressive, `u32` offsets (§3.3).
   Benchmark: 100 MB reference file (1.2b) indexed in < 500 ms.
   - The same pass produces the dominant field count (ADR-0003 decision 4).
   - The whole-file encoding count (ADR-0003 decision 1) runs as P2 work
