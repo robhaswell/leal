@@ -89,23 +89,32 @@ enforced.
 
 ### Why this split
 
-- AppKit's `NSTableView` only creates views for visible rows, has native text
-  editing, keyboard navigation, accessibility and dark mode, and handles
-  millions of rows. Rebuilding that in a Rust GUI toolkit would cost months.
+- AppKit gives Leal native windows, documents, text editing, menus, dark mode
+  and accessibility APIs. Rebuilding that in a Rust GUI toolkit would cost
+  months.
+- The grid itself is a custom AppKit view that draws only the visible cells
+  with Core Text (ADR-0001, option B). The phase 0 spike showed that
+  `NSTableView` makes a view for every column of each visible row, so it
+  slows down on wide files; the custom grid stays well inside the frame
+  budget at 200 columns. The fallback, if B hits a wall, is an `NSTableView`
+  whose rows draw their own cells (option C), reusing the same drawing code.
 - Keeping the core in Rust gives predictable memory use, fast byte scanning,
   and makes the fidelity guarantees testable without a UI.
 - Tauri or Electron would reintroduce the memory overhead Leal exists to avoid.
 
-**Risk:** `NSTableView` does not virtualize columns. Very wide files (hundreds
-of columns) may scroll poorly. Phase 0 includes a spike (PLAN 0.4) to measure
-this. If it fails, the fallback is a custom `NSView` grid that draws visible
-cells with Core Text. The decision is recorded as ADR-0001.
+**Cost of the custom grid:** the header, column resize, cell selection,
+keyboard navigation and accessibility are Leal's own code rather than
+`NSTableView`'s. ADR-0001 lists them with estimates, and PLAN 1.6, 1.8, 2.5,
+3.3 and 4.2 carry them.
 
 ---
 
 ## 3. Core design
 
 ### 3.1 Source: getting bytes without copying them
+
+> Open question, see ADR-0005 §7 (proposed): `clonefile` fails across
+> volumes, so where the clone lives and what EXDEV means.
 
 On open, the core never reads the whole file into its heap.
 
@@ -136,6 +145,10 @@ opened, and asks before overwriting a file changed elsewhere.
 > Exact rules for encoding choice and positions: ADR-0003 (§1, §6, §7) and
 > ADR-0004 §11 (the `com.apple.TextEncoding` attribute). The ADRs take
 > precedence over this section.
+>
+> Open questions, see ADR-0005 (proposed): §1 (remembering the delimiter and
+> header choice), §4 (encoding at first paint versus the whole-file rule),
+> §5 (the supported encodings) and §8 (the UI for changing them).
 
 Detected from the first 64 KB plus samples from the middle and end of the file:
 
@@ -144,8 +157,10 @@ Detected from the first 64 KB plus samples from the middle and end of the file:
 - **Quote character:** `"`. Other quote characters are out of scope for v1.
 - **Line endings:** LF, CRLF or CR, and whether they are mixed.
 - **BOM:** UTF-8, UTF-16 LE/BE.
-- **Encoding:** UTF-8 if valid; otherwise single-byte encodings chosen by
-  heuristic (Windows-1252 as the default). The user can override.
+- **Encoding:** UTF-8 if the file is pure ASCII, or if its valid multibyte
+  UTF-8 sequences outnumber its invalid bytes (with an invalid-encoding
+  warning for those). Otherwise single-byte, Windows-1252 by default
+  (ADR-0003 §1). The user can override.
 - **Header row:** heuristic (first row text, later rows typed differently).
   Only affects display.
 - **Trailing newline** at end of file: present or not.
@@ -193,7 +208,9 @@ rows for the visible area are kept in a small LRU cache.
 ### 3.5 Diagnostics (messy input)
 
 > What counts as one occurrence, tie-breaks, blank lines and UTF-16 rules:
-> ADR-0003 (§4, §5, §7). The ADR takes precedence over this section.
+> ADR-0003 (§4, §5, §7). How ragged rows and text after a closing quote are
+> shown in the grid (hatched cells, an extra "Column N", raw text): ADR-0002
+> (decisions 5 and 6). The ADRs take precedence over this section.
 
 Leal's rule for irregular input: **show it faithfully, warn clearly, never fix
 it silently.**
@@ -223,6 +240,9 @@ field says so before the change is committed.
 ### 3.6 Edits
 
 > Reverting by value, including cells with invalid bytes: ADR-0004 §9.
+>
+> Open question, see ADR-0005 §2 (proposed): editing a hatched (missing)
+> cell of a short or blank row.
 
 The original bytes are never modified. Edits live in an overlay:
 
@@ -244,6 +264,10 @@ so the original bytes (including their quoting) come back.
 > blank lines, empty rows, BOM-like starts, unterminated quotes, the reopen
 > guarantee and remembering guessed encodings): ADR-0004. The ADR takes
 > precedence over this section.
+>
+> Open questions, see ADR-0005 (proposed): §1 (what the reopen guarantee in
+> ADR-0004 §10 covers), §2 (saving an edit to a hatched cell) and §3 (exactly
+> when a new field is quoted per column).
 
 Saving streams the document out:
 
@@ -285,6 +309,9 @@ of physical row numbers to show, in order.
 
 ### 3.9 Threading and the FFI boundary
 
+> Open question, see ADR-0005 §6 (proposed): UniFFI doesn't pass Swift task
+> cancellation through to Rust, so cancellation must be explicit.
+
 - A document is an `Arc`-shared object. Reads for visible cells are synchronous
   and must take under 1 ms. They are safe to call on the main thread.
 - Indexing, filtering, sorting and saving are async (UniFFI async functions
@@ -293,6 +320,9 @@ of physical row numbers to show, in order.
   count is "rows indexed so far".
 
 ### 3.10 First paint and work priority
+
+> Open question, see ADR-0005 §4 (proposed): the encoding at P0 comes from
+> the first 64 KB, and the whole-file check runs later.
 
 Opening a file starts several jobs. They run in a strict priority order, and
 lower-priority work must never delay higher-priority work.
@@ -350,13 +380,19 @@ to run concurrently and asserts first paint is still under 150 ms.
 
 ### 4.1 Window
 
-- **Grid:** row-number gutter, sticky header row, columns auto-sized from the
-  first 1,000 rows (with a maximum width), numbers right-aligned, subtle
-  alternate row shading, optional monospaced font.
+- **Grid:** a custom-drawn view (ADR-0001) with a row-number gutter, sticky
+  header row, columns auto-sized (with a maximum width) from the first
+  screen of rows at first paint and then from the first 1,000 rows as P2
+  work (§3.10), numbers right-aligned, subtle alternate row shading,
+  optional monospaced font.
 - **Filter bar:** hidden until used (⌘F for find, ⌥⌘F for filters).
 - **Cell inspector:** a bottom pane for long or multiline values, with editing.
 - **Status bar:** `1,000,000 rows × 12 columns · Comma · CRLF · UTF-8 (BOM)`,
   filter count (`12,345 of 1,000,000`), and the diagnostics indicator.
+
+> Open question, see ADR-0005 §8 (proposed): the status-bar encoding source,
+> the **Treat as** delimiter menu, **Reopen with encoding…** and the
+> suggestion banners.
 
 ### 4.2 Interaction
 
@@ -386,6 +422,9 @@ to run concurrently and asserts first paint is still under 150 ms.
 ### 4.4 Accessibility and localization
 
 - Grid, banner and inspector work with VoiceOver and full keyboard access.
+  The grid draws its own cells (ADR-0001), so its accessibility is custom:
+  lightweight row and cell elements for the visible area, the table
+  protocols, rotors and announcements, listed in ADR-0001 (PLAN 4.2).
 - Respects Increase Contrast and Reduce Motion.
 - All user-facing strings are in a String Catalog, English only for v1.
 
@@ -394,6 +433,9 @@ to run concurrently and asserts first paint is still under 150 ms.
 ## 5. Fidelity contract and testing
 
 ### The contract
+
+> Open question, see ADR-0005 §2 (proposed): F2 for an edit to a hatched
+> cell, which appends bytes at the end of that row.
 
 - **F1** Save As with no edits writes a byte-identical file.
 - **F2** Editing field *(r, c)* changes only that field's bytes. Every other
@@ -448,19 +490,26 @@ leal/
 ├── rust-toolchain.toml
 ├── justfile                task runner: check, test, bench, run, release
 ├── crates/
-│   ├── leal-core/
-│   ├── leal-ffi/
-│   └── leal-cli/
+│   ├── leal-core/          the engine (everything in §3)
+│   ├── leal-ffi/           UniFFI wrapper for Swift
+│   ├── leal-cli/           the `leal` command
+│   ├── leal-testkit/       test-only: corpus loader, oracles, proptest
+│   │                       strategies (a dev-dependency, never shipped)
+│   └── uniffi-bindgen/     host-only tool that generates the Swift bindings
 ├── app/
 │   ├── project.yml         XcodeGen spec (the .xcodeproj is generated)
 │   ├── Sources/
-│   └── Resources/
-├── tests/corpus/
-├── fuzz/
+│   ├── Resources/
+│   └── Tests/              XCTest
+├── tests/corpus/           hand-made files with expected-result sidecars
+├── fuzz/                   cargo-fuzz targets (PLAN 2.7)
+├── spikes/                 throwaway experiments (the grid spike, until PLAN 1.6)
 ├── docs/
 │   ├── DESIGN.md           this file
 │   ├── PLAN.md             build plan and task status
-│   └── adr/                architecture decision records
+│   ├── adr/                architecture decision records
+│   ├── mockups/            approved UI mockups (ADR-0002)
+│   └── tasks/              notes written by each task
 └── .github/workflows/
 ```
 

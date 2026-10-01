@@ -3,7 +3,8 @@
 A fast, low-memory CSV viewer and editor for macOS that never changes the bytes
 you didn't edit.
 
-> **Status:** pre-alpha, in design. Nothing to download yet.
+> **Status:** pre-alpha, being built (foundations done, the viewer is next).
+> Nothing to download yet.
 
 - **Faithful:** saving changes only the cells you edited. Quoting, line
   endings, encoding and odd formatting are left exactly as they were.
