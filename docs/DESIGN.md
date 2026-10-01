@@ -114,13 +114,13 @@ keyboard navigation and accessibility are Leal's own code rather than
 
 ### 3.1 Source: getting bytes without copying them
 
-> Open question, see ADR-0005 §7 (proposed): `clonefile` fails across
-> volumes, so where the clone lives and what EXDEV means.
-
 On open, the core never reads the whole file into its heap.
 
-1. **Clone** the file into Leal's temporary directory with `clonefile(2)`. On
-   APFS this is nearly instant and uses no extra disk space (copy-on-write).
+1. **Clone** the file with `clonefile(2)` into a temporary folder **on the
+   file's own volume** (`FileManager.url(for: .itemReplacementDirectory, …,
+   appropriateFor:)`), because `clonefile` only works within one volume
+   (ADR-0005 decision 7). On APFS this is nearly instant and uses no extra
+   disk space (copy-on-write).
 2. **Memory-map** the clone read-only (`memmap2`).
 
 Mapping the *clone* rather than the original solves a real problem: if another
@@ -128,13 +128,13 @@ program truncates a mapped file, reading the missing pages crashes the process
 (SIGBUS). The clone cannot be changed by other programs, so Leal cannot crash
 this way, and it always has a stable snapshot of what it opened.
 
-Fallbacks, when the volume does not support cloning (network shares, exFAT,
-some USB drives):
+Fallbacks, only when the volume can't clone at all (network shares, exFAT,
+some USB drives). An EXDEV error means "clone elsewhere", not "no cloning":
 - up to 512 MB: read the file into memory, and show a small status bar note;
 - above that: copy to the temporary directory, then map the copy.
 
 Clones are deleted when the document closes. Leftover clones from a crash are
-removed at launch.
+removed at launch, from every folder Leal recorded.
 
 The original file is watched with a dispatch source (kqueue). If it changes or
 is deleted, the window shows a banner with **Reload** and **Keep editing**.
@@ -143,13 +143,9 @@ opened, and asks before overwriting a file changed elsewhere.
 
 ### 3.2 Dialect and encoding detection
 
-> Exact rules for encoding choice and positions: ADR-0003 (§1, §6, §7) and
-> ADR-0004 §11 (the `com.apple.TextEncoding` attribute). The ADRs take
-> precedence over this section.
->
-> Open questions, see ADR-0005 (proposed): §1 (remembering the delimiter and
-> header choice), §4 (encoding at first paint versus the whole-file rule),
-> §5 (the supported encodings) and §8 (the UI for changing them).
+> Exact rules for encoding choice and positions: ADR-0003 (§1, §6, §7),
+> ADR-0004 §11 (the `com.apple.TextEncoding` attribute) and ADR-0005 (§1,
+> §4, §5). The ADRs take precedence over this section.
 
 Detected from the first 64 KB plus samples from the middle and end of the file:
 
@@ -161,18 +157,49 @@ Detected from the first 64 KB plus samples from the middle and end of the file:
 - **Encoding:** UTF-8 if the file is pure ASCII, or if its valid multibyte
   UTF-8 sequences outnumber its invalid bytes (with an invalid-encoding
   warning for those). Otherwise single-byte, Windows-1252 by default
-  (ADR-0003 §1). The user can override.
+  (ADR-0003 §1). The user can override it with **Reopen with encoding…**
+  (§4.1).
 - **Header row:** heuristic (first row text, later rows typed differently).
   Only affects display.
 - **Trailing newline** at end of file: present or not.
 
+**Supported encodings in v1** (ADR-0005 decision 5):
+- detected automatically: UTF-8 (with or without BOM), UTF-16 LE/BE with a
+  BOM (read-only, §4.3) and Windows-1252;
+- only from the attribute or **Reopen with encoding…**: the other
+  single-byte, ASCII-compatible encodings (Windows-1250, 1251 and
+  1253–1258, ISO-8859-1, -2 and -15, and Mac Roman), which are safe because
+  the delimiter, quote and line-ending bytes can't appear inside a
+  character;
+- not supported: multibyte encodings such as Shift_JIS, whose second bytes
+  can equal `|` or `\`.
+
+Attribute values are matched by their CFStringEncoding number. An
+unsupported or unreadable attribute is ignored, with a status bar note.
+
 Dialect is an *interpretation*. The user can change it (for example, "treat as
 semicolon-separated"), which re-indexes the file but never changes its bytes.
+
+**Remembering the interpretation** (ADR-0005 decision 1). The delimiter and
+header choice are guessed from the whole file, so an edit anywhere can
+change what a reopen guesses. Leal stores them in its own extended
+attribute, `io.github.robhaswell.leal.interpretation`, on save when a
+reopen would otherwise guess differently, or when the user chose them. On
+open, Leal honours the attribute if the file still parses sensibly with it.
+Other apps still guess for themselves.
 
 For first paint, the dialect is decided from the **first 64 KB only**. The
 middle and end samples are checked afterwards in the background. If they
 disagree, Leal does not re-lay out the grid under the user; it shows a
 suggestion instead ("This file looks semicolon-separated — Switch").
+
+The encoding at first paint is chosen in this order (ADR-0005 decision 4):
+the BOM, then the `com.apple.TextEncoding` attribute, then the encoding rule
+above applied to the first 64 KB. The whole-file rule runs afterwards as P2
+work. If it disagrees, Leal shows a suggestion ("This file looks like
+Windows-1252 — Reopen as Windows-1252") and never re-decodes silently. The
+encoding in use is the document's encoding for saving and for the reopen
+guarantee (§3.7).
 
 ### 3.3 Row index
 
@@ -241,9 +268,7 @@ field says so before the change is committed.
 ### 3.6 Edits
 
 > Reverting by value, including cells with invalid bytes: ADR-0004 §9.
->
-> Open question, see ADR-0005 §2 (proposed): editing a hatched (missing)
-> cell of a short or blank row.
+> Editing hatched cells: ADR-0005 §2.
 
 The original bytes are never modified. Edits live in an overlay:
 
@@ -259,16 +284,18 @@ saving, the saved file becomes the new base and the stored values still apply.
 Setting a cell back to exactly its original display value removes the edit,
 so the original bytes (including their quoting) come back.
 
+A **hatched cell** (a missing field of a short or blank row) can be edited
+(ADR-0005 decision 2). Saving appends the delimiters needed to reach that
+column, then the new value, at the end of the row before its line ending. A
+blank line edited in column *c* becomes a row of *c* + 1 fields. Edits past
+an unterminated quote are still rejected (ADR-0004 §8).
+
 ### 3.7 Saving
 
 > Edge cases (quoting new fields, end-of-file line endings, ragged rows and
 > blank lines, empty rows, BOM-like starts, unterminated quotes, the reopen
-> guarantee and remembering guessed encodings): ADR-0004. The ADR takes
-> precedence over this section.
->
-> Open questions, see ADR-0005 (proposed): §1 (what the reopen guarantee in
-> ADR-0004 §10 covers), §2 (saving an edit to a hatched cell) and §3 (exactly
-> when a new field is quoted per column).
+> guarantee and remembering guessed encodings): ADR-0004, refined by
+> ADR-0005 (§1, §2, §3). The ADRs take precedence over this section.
 
 Saving streams the document out:
 
@@ -278,9 +305,21 @@ Saving streams the document out:
    - edited fields: new value, encoded in the file's encoding, quoted if the
      value needs it (contains delimiter, quote, CR or LF) **or** the original
      field was quoted **or** the file quotes every field;
-   - delimiters and the line ending: the row's originals.
-3. **New rows** use the file's most common line ending and quoting style.
+   - delimiters and the line ending: the row's originals;
+   - an edited hatched cell: the delimiters needed to reach it and the new
+     value, appended before the line ending (§3.6).
+3. **New rows** use the file's most common line ending. A **new field** (in
+   an inserted row or column) is quoted if the value needs it, if the file
+   quotes every field, or if its column does: the column has at least one
+   non-empty field and every non-empty field in it is quoted. A column's
+   fields are the fields at that index in non-blank rows long enough to
+   have one, header row included (ADR-0004 §2, ADR-0005 decision 3).
 4. The trailing newline at end of file is kept as it was.
+
+**Reopening** the saved file gives the same BOM, quote character, line
+endings and row values (ADR-0004 §10, narrowed by ADR-0005 decision 1). The
+encoding, delimiter and header choice are guessed from the whole file, so
+Leal remembers them in extended attributes instead (§3.2).
 
 The app saves through `NSDocument`'s safe-save: the core writes to the
 temporary URL AppKit provides, which is then swapped in atomically. File
@@ -310,13 +349,16 @@ of physical row numbers to show, in order.
 
 ### 3.9 Threading and the FFI boundary
 
-> Open question, see ADR-0005 §6 (proposed): UniFFI doesn't pass Swift task
-> cancellation through to Rust, so ADR-0005 proposes explicit cancellation.
-
 - A document is an `Arc`-shared object. Reads for visible cells are synchronous
   and must take under 1 ms. They are safe to call on the main thread.
-- Indexing, filtering, sorting and saving are async (UniFFI async functions
-  exposed as Swift `async`), with progress callbacks and cancellation.
+- Indexing, filtering, sorting and saving are long jobs. They run on
+  Rust-owned threads or pools and report progress through callbacks. Their
+  UniFFI async functions (Swift `async`) only report completion.
+- **Cancellation is explicit** (ADR-0005 decision 6), because UniFFI doesn't
+  pass Swift task cancellation through to Rust. Each long job has a handle
+  object with `cancel()`, which sets a flag the job checks at its chunk
+  boundaries (§3.10 rule 3). Swift wraps each await in
+  `withTaskCancellationHandler`, which calls `cancel()`.
 - The main thread never waits on a long operation. While indexing, the row
   count is "rows indexed so far".
 - A Rust panic that UniFFI catches at the boundary reaches Swift as an
@@ -327,25 +369,23 @@ of physical row numbers to show, in order.
 
 ### 3.10 First paint and work priority
 
-> Open question, see ADR-0005 §4 (proposed): ADR-0005 proposes that the
-> encoding at P0 comes from the first 64 KB, with the whole-file check
-> running later.
-
 Opening a file starts several jobs. They run in a strict priority order, and
 lower-priority work must never delay higher-priority work.
 
 | Priority | Work | When | QoS |
 |---|---|---|---|
-| **P0** | Clone, map, detect dialect from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
+| **P0** | Clone, map, detect dialect and encoding from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
 | **P1** | Row index (§3.3); parsing rows as the user scrolls | Straight after P0 | User-initiated |
-| **P2** | Diagnostics details, dialect check on later samples, refined column widths, number detection for alignment | Alongside or after P1 | Utility |
+| **P2** | Diagnostics details, dialect check on later samples, whole-file encoding check, refined column widths, number detection for alignment | Alongside or after P1 | Utility |
 | **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, lowered to background during scrolling |
 
 Rules:
 
 1. **First paint does not wait for the index.** P0 parses the first rows
    directly from the start of the file. It touches only the first few pages of
-   the file.
+   the file. Its encoding comes from the BOM, the attribute or the first
+   64 KB; the whole-file rule runs as P2 work and can only suggest a change
+   (§3.2, ADR-0005 decision 4).
 2. **Scrolling never waits for filter preparation.** Filter and sort
    acceleration structures are never built during open. They are built
    lazily, when the user first opens the filter bar or sorts, or in idle time
@@ -396,10 +436,11 @@ to run concurrently and asserts first paint is still under 150 ms.
 - **Cell inspector:** a bottom pane for long or multiline values, with editing.
 - **Status bar:** `1,000,000 rows × 12 columns · Comma · CRLF · UTF-8 (BOM)`,
   filter count (`12,345 of 1,000,000`), and the diagnostics indicator.
-
-> Open question, see ADR-0005 §8 (proposed): the status-bar encoding source,
-> the **Treat as** delimiter menu, **Reopen with encoding…** and the
-> suggestion banners.
+- **Changing the interpretation** (ADR-0005 decision 8): the status bar says
+  where the encoding came from (BOM, attribute or guess); a **Treat as**
+  delimiter menu; **Reopen with encoding…**; and the delimiter and encoding
+  suggestion banners (§3.2). These use the ADR-0002 status-bar and banner
+  styles.
 
 ### 4.2 Interaction
 
@@ -441,12 +482,10 @@ to run concurrently and asserts first paint is still under 150 ms.
 
 ### The contract
 
-> Open question, see ADR-0005 §2 (proposed): F2 for an edit to a hatched
-> cell, which would append bytes at the end of that row, if accepted.
-
 - **F1** Save As with no edits writes a byte-identical file.
-- **F2** Editing field *(r, c)* changes only that field's bytes. Every other
-  byte is identical and in the same order.
+- **F2** Editing field *(r, c)* changes only that field's bytes, or, for a
+  hatched (missing) cell, bytes appended at the end of that row (ADR-0005
+  decision 2). Every other byte is identical and in the same order.
 - **F3** Undoing all edits, or setting a cell back to its original value,
   restores byte-identical output.
 - **F4** No irregular construct in §3.5 is ever normalized on save.

@@ -1,6 +1,6 @@
 # 0005 — Decisions from the phase 0 review
 
-- Status: proposed (Rob decides at the phase 0 gate)
+- Status: accepted (approved by Rob, 2026-10-01)
 - Date: 2026-10-01
 
 ## Context
@@ -8,8 +8,7 @@
 The phase 0 review (five reviewers, each finding independently verified)
 found places where accepted decisions contradict each other, rely on
 something that can't work, or leave a case undefined. Each needs an answer
-before phase 1 or 2 builds on it. Until Rob accepts this ADR, only docs and
-plan changes are made; no product or oracle code depends on it.
+before phase 1 or 2 builds on it.
 
 ## Decisions
 
@@ -101,8 +100,8 @@ accepted.
 
 ## Consequences
 
-- ADR-0004 decision 10 is narrowed by decision 1. DESIGN §3.1, §3.2, §3.9
-  and §5 (F2) are updated once this ADR is accepted.
+- ADR-0004 decision 10 is narrowed by decision 1. DESIGN §3.1, §3.2, §3.6,
+  §3.7, §3.9, §3.10, §4.1 and §5 (F2) are updated to match.
 - PLAN gains these obligations:
   - 1.1: decision 7;
   - 1.2: decisions 1, 4 and 5;

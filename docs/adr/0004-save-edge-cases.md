@@ -23,8 +23,8 @@ bytes as possible, and never change a value silently.
    like pandas' "quote text columns" style consistent. Otherwise it is
    quoted only when needed. *(The oracle checks only the whole file for
    now; task 2.4 adds per-column detection, in the oracle and the product.
-   ADR-0005 decision 3, still proposed, would make the rule precise for
-   inserted and empty columns.)*
+   ADR-0005 decision 3 makes the rule precise, including for inserted and
+   empty columns.)*
 3. **Line ending for a new row** in a file that has none (a single row with
    no line ending): LF.
 4. **End of file.** Whether the file ends with a line ending is kept.
@@ -59,10 +59,10 @@ bytes as possible, and never change a value silently.
    in an unchanged editor harmless. To actually replace the invalid bytes,
    the user types a different value, as the §3.5 editing notice explains.
 
-10. **Reopening gives the same file structure.** *(ADR-0005 decision 1,
-    still proposed, would narrow "the same dialect" here if accepted: the
-    delimiter and header choice are guessed from the whole file, so they
-    would be remembered rather than guaranteed.)* Opening a saved file must
+10. **Reopening gives the same file structure.** *(ADR-0005 decision 1
+    narrows "the same dialect" here: the delimiter and header choice are
+    guessed from the whole file, so they are remembered in an attribute
+    rather than guaranteed.)* Opening a saved file must
     give the same dialect, encoding, BOM and rows as the document had
     before saving. Where the smallest splice would break this, the
     serializer makes the smallest extra change next to the edit. Property

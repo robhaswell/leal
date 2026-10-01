@@ -13,9 +13,6 @@ explains what each task is for.
 - The bullets under a task are its acceptance criteria. They include what
   the ADRs and earlier task notes ask of it; read the ADRs and notes a task
   cites before starting it.
-- Criteria marked **(ADR-0005, pending: …)** depend on ADR-0005, which Rob
-  hasn't accepted yet. If he changes a decision, the criterion changes with
-  it, and product code for it waits until the ADR is accepted (CLAUDE.md).
 - A task is done only when every acceptance criterion holds,
   `just check` passes locally and in CI (`just check-all` for a task that
   touches `app/` or `crates/leal-ffi`), and its review findings are fixed.
@@ -74,7 +71,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     not "no cloning"; the read-into-memory and copy fallbacks are only for
     volumes that can't clone at all. Launch cleanup checks every folder
     Leal recorded. Tested with a file on a second APFS volume (a disk
-    image will do). (ADR-0005, pending: decision 7)
+    image will do). (ADR-0005 decision 7)
   - Temporary files go only where a sandboxed app may write (DESIGN §4.3);
     1.6 checks this with the sandbox on.
   - Reads the `com.apple.TextEncoding` extended attribute on open and passes
@@ -108,22 +105,22 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     first 64 KB for first paint. The whole-file rule runs later as P2 work,
     and a disagreement becomes a suggestion, never a silent re-decode. A
     corpus or generated case over 64 KB whose later bytes change the guess
-    tests this. (ADR-0005, pending: decision 4)
-  - The v1 encodings: UTF-8, UTF-16 with a BOM and Windows-1252 are
-    detected; the other single-byte encodings ADR-0005 lists are used only
-    from the attribute or **Reopen with encoding…**. Attribute values are
-    matched by their CFStringEncoding number, and an unsupported or
-    unreadable attribute is ignored with a status bar note. (ADR-0005,
-    pending: decision 5)
+    tests this. (ADR-0005 decision 4)
+  - The v1 encodings (DESIGN §3.2): UTF-8, UTF-16 with a BOM and
+    Windows-1252 are detected; the other single-byte encodings listed there
+    are used only from the attribute or **Reopen with encoding…**.
+    Attribute values are matched by their CFStringEncoding number, and an
+    unsupported or unreadable attribute is ignored with a status bar note.
+    (ADR-0005 decision 5)
   - Reads Leal's own `io.github.robhaswell.leal.interpretation` attribute
     (remembered delimiter and header choice) and honours it if the file
-    still parses sensibly with it. (ADR-0005, pending: decision 1)
+    still parses sensibly with it. (ADR-0005 decision 1)
   - The core accepts a user-chosen delimiter, header choice or encoding in
     place of the detected one, without changing any bytes (DESIGN §3.2).
   - From the 0.2 notes ("Obligations for later tasks"):
     - The testkit's reopen property also checks the delimiter and header
       decision after an edit, with the interpretation attribute modelled
-      the way the encoding hint already is. (ADR-0005, pending: decision 1)
+      the way the encoding hint already is. (ADR-0005 decision 1)
     - The encoding attribute is tested on real reads: one that contradicts
       the guess, a UTF-16 one on a file without a BOM, and a UTF-8 one over
       invalid bytes.
@@ -165,7 +162,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   Benchmark: 100 MB reference file (1.2b) indexed in < 500 ms.
   - The same pass produces the dominant field count (ADR-0003 decision 4).
   - The whole-file encoding count (ADR-0003 decision 1) runs as P2 work
-    after first paint, not in this pass. (ADR-0005, pending: decision 4)
+    after first paint, not in this pass. (ADR-0005 decision 4)
   - Re-indexing with a different delimiter or encoding (1.2) works without
     reopening the file.
 - [ ] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
@@ -177,8 +174,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     which sets a flag the Rust job checks at its chunk boundaries. Long
     work runs on Rust-owned threads or pools; the async function only
     reports completion. A Rust test shows that calling `cancel()` stops a
-    running job within one chunk. The Swift side is 1.6. (ADR-0005,
-    pending: decision 6)
+    running job within one chunk. The Swift side is 1.6. (ADR-0005
+    decision 6)
 - [ ] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
   - Follows ADR-0003 decisions 2, 3, 6 and 7: text after a closing quote
     displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
@@ -212,6 +209,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Column drag-to-reorder (1–2 days) isn't in the mockups, so the notes
       ask Rob at the phase 1 gate whether it is in v1.
   - The status-bar "Header row" toggle (ADR-0002 question 13, mockup 06b).
+  - The status bar says where the encoding came from (BOM, attribute or
+    guess), as 1.2 reports it; 1.7 adds the controls for changing the
+    interpretation. (ADR-0005 decision 8)
   - UTF-16 files open read-only with the info banner, lock glyph and
     "Read-only" in the status bar (mockup 06a); its Save As UTF-8 button
     is wired up in 2.3.
@@ -239,8 +239,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       shows an error and offers to reopen the file. A test covers it.
   - Swift wraps each await on a long job in `withTaskCancellationHandler`,
     which calls the job handle's `cancel()` from 1.3a, and an XCTest shows
-    that cancelling the Swift task stops the Rust job. (ADR-0005, pending:
-    decision 6)
+    that cancelling the Swift task stops the Rust job. (ADR-0005 decision 6)
   - Deletes `spikes/grid-spike/` once the grid is in and re-measured. Its
     results stay in `docs/tasks/0.4-results.md` and the code at the
     `phase-0` tag (ADR-0001). No code, script or CI job may refer to the
@@ -248,18 +247,18 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
 - [ ] **1.7 App: diagnostics banner** — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
-  - Changing the interpretation:
-    - The status bar says when the encoding came from the file's attribute,
-      with **Reopen with encoding…** to override it (ADR-0004 decision 11).
+  - Changing the interpretation (ADR-0005 decision 8):
+    - **Reopen with encoding…** overrides the encoding, including one from
+      the file's attribute (ADR-0004 decision 11).
     - A **Treat as** delimiter menu that re-indexes the file, and the
       "This file looks semicolon-separated — Switch" suggestion when later
       samples disagree (DESIGN §3.2).
     - The encoding suggestion when the whole-file rule disagrees with first
       paint, and the status bar note for an unsupported attribute.
-      (ADR-0005, pending: decisions 4 and 5)
+      (ADR-0005 decisions 4 and 5)
     - These follow the existing ADR-0002 status-bar and banner styles with
       no separate mockup round, and Rob sees screenshots at the phase 1
-      gate. (ADR-0005, pending: decision 8)
+      gate. (ADR-0005 decision 8)
 - [ ] **1.8 App: find, go to row, copy, cell inspector.**
   - Cell selection, multi-cell selection (click, shift-click, drag, ⌘A)
     and keyboard navigation (arrows, Page Up/Down, ⌘↑/⌘↓, Tab, keeping the
@@ -283,8 +282,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     value, at the end of the row before its line ending. Edits past an
     unterminated quote are still rejected (ADR-0004 decision 8). The save
     oracle (`Document::apply`) and the edit strategy, which today reject or
-    never generate such edits, change to match. (ADR-0005, pending:
-    decision 2)
+    never generate such edits, change to match. (ADR-0005 decision 2)
 - [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
   - Replays the testkit's `EditCase` edits on the real document with
     `existing_hint` passed through, and requires the same bytes, splices,
@@ -294,17 +292,16 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - The reopen property (ADR-0004 decision 10) covers the BOM, quote
     character, line endings and every row's values, and the encoding
     through the `com.apple.TextEncoding` attribute (ADR-0004 decision 11).
-    ADR-0005 decision 1 would narrow decision 10 so that the delimiter and
-    header choice are covered through the remembered interpretation
-    attribute instead. (ADR-0005, pending: decision 1)
+    The delimiter and header choice are covered through the remembered
+    interpretation attribute instead (ADR-0005 decision 1, which narrows
+    ADR-0004 decision 10).
   - Saving an edit to a hatched cell appends the delimiters needed to
     reach that column, then the value, at the end of the row before its
     line ending, and nothing else in the file changes; the replay covers
-    it. (ADR-0005, pending: decision 2)
+    it. (ADR-0005 decision 2)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
-  - Covers every single-byte encoding Leal supports. (ADR-0005, pending:
-    decision 5)
+  - Covers every single-byte encoding Leal supports. (ADR-0005 decision 5)
   - The UTF-16 banner's Save As UTF-8 button works (mockup 06a).
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
@@ -313,7 +310,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     column's fields are those at that index in non-blank rows long enough
     to have one, header included, and a new field is quoted if the column
     has at least one non-empty field and all of them are quoted.
-    (ADR-0005, pending: decision 3)
+    (ADR-0005 decision 3)
   - 2.2's oracle replay is extended to every edit kind.
 - [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
   Save / Save As / Revert, safe-save with metadata preserved.
@@ -321,13 +318,13 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     commits and Esc cancels through the field editor (ADR-0001).
   - The invalid-bytes callout is a small view anchored to the edited cell
     (ADR-0001, mockup 05b).
-  - Hatched cells can be edited. (ADR-0005, pending: decision 2)
+  - Hatched cells can be edited. (ADR-0005 decision 2)
   - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
     guess a different encoding, and updates it if the file already has one
     (ADR-0004 decision 11).
   - Writes the interpretation attribute when a reopen would guess a
     different delimiter or header choice, or the user chose them.
-    (ADR-0005, pending: decision 1)
+    (ADR-0005 decision 1)
   - `Info.plist`'s document role becomes `Editor`.
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
@@ -339,7 +336,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     approves (ADR-0002).
 - [ ] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
   - Pasting over short rows follows the hatched-cell rule from 2.1.
-    (ADR-0005, pending: decision 2)
+    (ADR-0005 decision 2)
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
 
@@ -349,8 +346,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   streamed results (§3.8). Runs as P3 work: filters apply while indexing,
   lazy per-column acceleration, dropped under memory pressure (§3.10).
   Acceptance: scrolling stays smooth during a filter scan (Instruments).
-  - Cancellation uses the explicit job handles from 1.3a. (ADR-0005,
-    pending: decision 6)
+  - Cancellation uses the explicit job handles from 1.3a. (ADR-0005
+    decision 6)
 - [ ] **3.2 Sort** — multi-column, stable, numeric-aware.
 - [ ] **3.3 App: filter bar and quick search**, editing in filtered views.
   - The header's sort indicator and click-to-sort are drawn by the grid

@@ -60,10 +60,9 @@ there are no pull requests and no long-lived branches.
   contract seems wrong, stop and write an ADR for Rob.
 - **Design changes need an ADR** (`docs/adr/NNNN-title.md`, template in
   `docs/adr/0000-template.md`) approved by Rob before the code lands.
-  This rule stands as written until ADR-0005 is accepted. *ADR-0005
-  decision 9 (proposed)* would relax it: test and oracle code could land
-  against a proposed ADR, marked provisional, while product code that
-  depends on it waits until the ADR is accepted.
+  Test and oracle code may land against a proposed ADR, marked
+  provisional; product code that depends on it waits until the ADR is
+  accepted (ADR-0005 decision 9).
 - **Logic lives in `leal-core`.** Swift handles presentation and macOS
   integration only. `leal-ffi` only wraps.
 - **Performance budgets** in DESIGN §1 are requirements. Tasks that touch hot
