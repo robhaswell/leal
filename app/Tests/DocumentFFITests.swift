@@ -44,6 +44,41 @@ final class DocumentFFITests: XCTestCase {
         XCTAssertEqual(semicolon.interpretation.delimiterSource, .user)
     }
 
+    /// Task 1.5: the diagnostics the index collects reach Swift, with kinds,
+    /// severities, counts and locations, and the gutter's row marks.
+    func testDiagnosticsReachSwift() async throws {
+        // Row 2 is ragged, row 3 has text after a closing quote and a NUL,
+        // row 4 is blank.
+        let url = try temporaryFile(named: "messy.csv", contents: "a,b\n1,2\n3\n\"x\"y,\u{0}\n\n5,6\n")
+        let document = try openDocument(
+            path: url.path(percentEncoded: false),
+            volume: VolumeInfo(),
+            temp: temporaryLocations(),
+            scheduler: try Scheduler(),
+            options: OpenOptions(firstScreenRows: 10, maxChars: 100),
+            observer: nil
+        )
+        try await document.indexJob().wait()
+
+        let report = try document.diagnostics()
+        XCTAssertEqual(report.generation, 0)
+        XCTAssertEqual(report.rows, 6)
+        XCTAssertTrue(report.complete)
+        XCTAssertTrue(report.showsBanner)
+        XCTAssertEqual(report.bannerKinds, 3)
+        XCTAssertEqual(report.diagnostics.map(\.kind), [.raggedRows, .textAfterClosingQuote, .nulBytes, .blankLines])
+        XCTAssertEqual(report.diagnostics.map(\.severity), [.warning, .warning, .warning, .info])
+        XCTAssertEqual(report.diagnostics.map(\.count), [1, 1, 1, 1])
+        XCTAssertEqual(report.diagnostics[0].first, [DiagnosticLocation(row: 2, offset: 8)])
+        XCTAssertEqual(report.diagnostics[2].first, [DiagnosticLocation(row: 3, offset: 15)])
+
+        let marks = try (0..<7).map { try document.rowHasDiagnostic(row: $0) }
+        XCTAssertEqual(marks, [false, false, true, true, false, false, false])
+        XCTAssertEqual(try document.nextRowWithDiagnostic(from: 0), 2)
+        XCTAssertNil(try document.nextRowWithDiagnostic(from: 4))
+        XCTAssertEqual(try document.previousRowWithDiagnostic(to: 6), 3)
+    }
+
     /// ADR-0005 decision 6: `cancel()` on the handle stops the Rust job, and
     /// the awaiting Swift task gets `JobFailure.Cancelled`.
     func testCancellingAJobEndsItsWait() async throws {

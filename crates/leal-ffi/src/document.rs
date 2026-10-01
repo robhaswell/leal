@@ -14,6 +14,9 @@
 //!   (task 1.6) calls `cancel()` from `withTaskCancellationHandler`.
 //! - [`ProgressObserver`]: a Swift object told about indexing progress, on
 //!   the index's thread.
+//! - [`Document::diagnostics`] (task 1.5): the irregularities found so far,
+//!   for the banner and details; [`Document::row_has_diagnostic`] and its
+//!   next and previous for the gutter's markers.
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -247,6 +250,143 @@ pub struct ReviewResult {
     /// A delimiter the whole file fits better: "This file looks
     /// semicolon-separated — Switch".
     pub delimiter_suggestion: Option<Delimiter>,
+}
+
+/// A kind of irregularity (DESIGN §3.5). See
+/// [`leal_core::diagnostics::DiagnosticKind`] for what one occurrence of
+/// each is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DiagnosticKind {
+    /// A quote opened and never closed (error).
+    UnterminatedQuote,
+    /// A row with a different field count to most rows (warning).
+    RaggedRows,
+    /// `"a"b` (warning).
+    TextAfterClosingQuote,
+    /// Text that doesn't decode and shows as U+FFFD (warning).
+    InvalidEncoding,
+    /// NUL bytes, or U+0000 in UTF-16 (warning).
+    NulBytes,
+    /// A row whose line ending isn't the most common one (info).
+    MixedLineEndings,
+    /// An empty row (info).
+    BlankLines,
+    /// The file starts with a BOM (info).
+    BomPresent,
+}
+
+impl From<leal_core::diagnostics::DiagnosticKind> for DiagnosticKind {
+    fn from(kind: leal_core::diagnostics::DiagnosticKind) -> Self {
+        use leal_core::diagnostics::DiagnosticKind as Core;
+        match kind {
+            Core::UnterminatedQuote => DiagnosticKind::UnterminatedQuote,
+            Core::RaggedRows => DiagnosticKind::RaggedRows,
+            Core::TextAfterClosingQuote => DiagnosticKind::TextAfterClosingQuote,
+            Core::InvalidEncoding => DiagnosticKind::InvalidEncoding,
+            Core::NulBytes => DiagnosticKind::NulBytes,
+            Core::MixedLineEndings => DiagnosticKind::MixedLineEndings,
+            Core::BlankLines => DiagnosticKind::BlankLines,
+            Core::BomPresent => DiagnosticKind::BomPresent,
+        }
+    }
+}
+
+/// How serious a diagnostic is: warnings and errors show the banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Severity {
+    /// Status bar and details only.
+    Info,
+    /// Shows the banner.
+    Warning,
+    /// Shows the banner, prominently.
+    Error,
+}
+
+impl From<leal_core::diagnostics::Severity> for Severity {
+    fn from(severity: leal_core::diagnostics::Severity) -> Self {
+        use leal_core::diagnostics::Severity as Core;
+        match severity {
+            Core::Info => Severity::Info,
+            Core::Warning => Severity::Warning,
+            Core::Error => Severity::Error,
+        }
+    }
+}
+
+/// Where one occurrence is: a row, and a byte offset into the file as
+/// stored (ADR-0003 decision 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct DiagnosticLocation {
+    /// The 0-based physical row.
+    pub row: u64,
+    /// The byte offset into the file, BOM included.
+    pub offset: u64,
+}
+
+/// One kind of irregularity found in the file.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Diagnostic {
+    /// What was found.
+    pub kind: DiagnosticKind,
+    /// How serious it is.
+    pub severity: Severity,
+    /// How many occurrences, in every row the report covers.
+    pub count: u64,
+    /// The first occurrences in file order, at most 1,000, for **Previous**
+    /// and **Next** in the details popover.
+    pub first: Vec<DiagnosticLocation>,
+}
+
+/// The diagnostics of the rows indexed so far. See
+/// [`leal_core::diagnostics::Report`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DiagnosticsReport {
+    /// The reading these are for (as in [`FirstScreen::generation`]).
+    pub generation: u64,
+    /// The rows the report covers.
+    pub rows: u64,
+    /// Whether the whole file is indexed. Until then, ragged rows and mixed
+    /// line endings are relative to the rows so far.
+    pub complete: bool,
+    /// Every kind found, errors first.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Whether there is a warning or an error, which shows the banner.
+    pub shows_banner: bool,
+    /// How many kinds are warnings or errors: "This file has N kinds of
+    /// irregularity".
+    pub banner_kinds: u32,
+}
+
+impl DiagnosticsReport {
+    fn new(generation: u64, report: &leal_core::diagnostics::Report) -> Self {
+        DiagnosticsReport {
+            generation,
+            rows: to_u64(report.rows()),
+            complete: report.is_complete(),
+            diagnostics: report
+                .diagnostics()
+                .iter()
+                .map(|d| Diagnostic {
+                    kind: d.kind().into(),
+                    severity: d.severity().into(),
+                    count: to_u64(d.count()),
+                    first: d
+                        .first()
+                        .iter()
+                        .map(|l| DiagnosticLocation {
+                            row: to_u64(l.row),
+                            offset: to_u64(l.offset),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            shows_banner: report.shows_banner(),
+            banner_kinds: u32::try_from(
+                report.kinds_at_least(leal_core::diagnostics::Severity::Warning),
+            )
+            .unwrap_or(u32::MAX),
+        }
+    }
 }
 
 /// Why a job didn't finish.
@@ -673,6 +813,62 @@ impl Document {
         })
     }
 
+    /// What the index has found wrong with the file so far (DESIGN §3.5),
+    /// for the banner, the details popover and the status bar. Complete
+    /// once indexing is. It copies up to 1,000 locations per kind, so call
+    /// it when progress is reported, not for every frame.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn diagnostics(&self) -> Result<DiagnosticsReport, LealError> {
+        self.call(|| {
+            let (generation, report) = self.document.diagnostics_with_generation();
+            Ok(DiagnosticsReport::new(generation, &report))
+        })
+    }
+
+    /// Whether row `row` has a warning or an error: its gutter marker.
+    /// Every such row, not only the report's first locations. Fast enough
+    /// to ask for each visible row.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn row_has_diagnostic(&self, row: u64) -> Result<bool, LealError> {
+        self.call(|| Ok(self.document.row_has_diagnostic(to_index(row))))
+    }
+
+    /// The first row at or after `from` with a warning or an error, for
+    /// **Next**.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn next_row_with_diagnostic(&self, from: u64) -> Result<Option<u64>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .next_row_with_diagnostic(to_index(from))
+                .map(to_u64))
+        })
+    }
+
+    /// The last row before `to` with a warning or an error, for
+    /// **Previous**.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn previous_row_with_diagnostic(&self, to: u64) -> Result<Option<u64>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .previous_row_with_diagnostic(to_index(to))
+                .map(to_u64))
+        })
+    }
+
     /// Reads the file again with `options`' choices (**Treat as**, the
     /// header toggle, **Reopen with encoding…**), without reopening it.
     /// The old jobs are cancelled; [`index_job`](Self::index_job) and
@@ -751,6 +947,13 @@ fn to_usize(n: u32) -> usize {
 
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// A row number from Swift. One past every row is as good as any larger
+/// number, so a value too large for `usize` (impossible on a 64-bit Mac)
+/// saturates.
+fn to_index(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 fn document_error(path: &str, error: DocumentError) -> LealError {

@@ -509,6 +509,15 @@ impl Document {
         self.current().diagnostics.report()
     }
 
+    /// [`diagnostics`](Self::diagnostics) with the generation of the
+    /// reading they belong to, both from the same reading even if a
+    /// [`reinterpret`](Self::reinterpret) happens meanwhile.
+    #[must_use]
+    pub fn diagnostics_with_generation(&self) -> (u64, Arc<Report>) {
+        let reading = self.current();
+        (reading.generation, reading.diagnostics.report())
+    }
+
     /// True if row `row` has a warning or an error, for its gutter marker
     /// (every such row, not only the report's first locations). False for a
     /// row not indexed yet.

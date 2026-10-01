@@ -312,6 +312,87 @@ fn every_encoding_and_delimiter_converts_both_ways() {
     }
 }
 
+/// Diagnostics (task 1.5) reach Swift: the report with kinds, severities,
+/// counts and locations, and the row marks.
+#[test]
+fn diagnostics_reach_swift() {
+    let dir = TempDir::new("diagnostics");
+    // Row 2 is ragged, row 3 has text after a closing quote and a NUL,
+    // row 4 is blank.
+    let path = dir.file("messy.csv", b"a,b\n1,2\n3\n\"x\"y,\0\n\n5,6\n");
+    let scheduler = Scheduler::new().unwrap();
+    let document = open_document(
+        &path,
+        VolumeInfo::default(),
+        dir.locations(),
+        &scheduler,
+        options(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(block_on(document.index_job().unwrap().wait()), Ok(()));
+    let report = document.diagnostics().unwrap();
+    let at = |row, offset| DiagnosticLocation { row, offset };
+    assert_eq!(
+        report,
+        DiagnosticsReport {
+            generation: 0,
+            rows: 6,
+            complete: true,
+            diagnostics: vec![
+                Diagnostic {
+                    kind: DiagnosticKind::RaggedRows,
+                    severity: Severity::Warning,
+                    count: 1,
+                    first: vec![at(2, 8)],
+                },
+                Diagnostic {
+                    kind: DiagnosticKind::TextAfterClosingQuote,
+                    severity: Severity::Warning,
+                    count: 1,
+                    first: vec![at(3, 13)],
+                },
+                Diagnostic {
+                    kind: DiagnosticKind::NulBytes,
+                    severity: Severity::Warning,
+                    count: 1,
+                    first: vec![at(3, 15)],
+                },
+                Diagnostic {
+                    kind: DiagnosticKind::BlankLines,
+                    severity: Severity::Info,
+                    count: 1,
+                    first: vec![at(4, 17)],
+                },
+            ],
+            shows_banner: true,
+            banner_kinds: 3,
+        }
+    );
+    let marks: Vec<bool> = (0..7)
+        .map(|r| document.row_has_diagnostic(r).unwrap())
+        .collect();
+    assert_eq!(marks, [false, false, true, true, false, false, false]);
+    assert_eq!(document.next_row_with_diagnostic(0).unwrap(), Some(2));
+    assert_eq!(document.next_row_with_diagnostic(4).unwrap(), None);
+    assert_eq!(document.previous_row_with_diagnostic(6).unwrap(), Some(3));
+    assert_eq!(document.previous_row_with_diagnostic(2).unwrap(), None);
+    assert!(!document.row_has_diagnostic(u64::MAX).unwrap());
+}
+
+#[test]
+fn every_diagnostic_kind_and_severity_converts() {
+    use leal_core::diagnostics::DiagnosticKind as Core;
+    for kind in Core::ALL {
+        let ffi = DiagnosticKind::from(kind);
+        assert_eq!(format!("{ffi:?}"), format!("{kind:?}"));
+        assert_eq!(
+            format!("{:?}", Severity::from(kind.severity())),
+            format!("{:?}", kind.severity())
+        );
+    }
+}
+
 fn small_document(dir: &TempDir, scheduler: &Scheduler) -> Arc<Document> {
     let path = dir.file("small.csv", b"a,b\n1,2\n");
     open_document(
