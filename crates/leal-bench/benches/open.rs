@@ -207,8 +207,21 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// Reads the whole file once, so it is in the page cache however much
+/// memory the benchmarks before this one used. Without that, how long they
+/// ran before could change these results, since they read the file
+/// (docs/tasks/1.5.md, "First-paint regression"): the removable-drive
+/// opens and the load read it directly. An internal-volume open reads a
+/// fresh APFS clone, which has its own page cache, so it pages from disk
+/// whatever this does.
+fn prime_page_cache(path: &Path) {
+    let mut file = std::fs::File::open(path).expect("opening the reference file");
+    std::io::copy(&mut file, &mut std::io::sink()).expect("reading the reference file");
+}
+
 fn open(c: &mut Criterion) {
     let path = common::reference_file();
+    prime_page_cache(&path);
     let dir = scratch();
     let temp = TempFolders::new(dir.join("scratch"), dir.join("records"));
     let scheduler = Scheduler::new(SchedulerConfig::default()).expect("starting the scheduler");

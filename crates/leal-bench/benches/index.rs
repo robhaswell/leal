@@ -105,12 +105,13 @@ fn index(c: &mut Criterion) {
     group.finish();
 
     // The first half of the reference file as UTF-16 LE (about the same
-    // size). Without a BOM, read as Windows-1252 bytes, it is the worst
-    // case for NULs.
-    let text = std::str::from_utf8(&bytes[..bytes.len() / 2]).unwrap_or_else(|e| {
-        std::str::from_utf8(&bytes[..e.valid_up_to()]).expect("a valid prefix")
-    });
-    let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    // size), after a BOM. Without the BOM, read as Windows-1252 bytes, it is
+    // the worst case for NULs. One buffer serves both, and the reference
+    // file's bytes are freed first, so this binary holds at most about
+    // 200 MB at once (the "First-paint regression" in `docs/tasks/1.5.md`).
+    let with_bom = utf16_with_bom(&bytes);
+    drop(bytes);
+    let utf16 = &with_bom[2..];
     let mut group = c.benchmark_group("index");
     common::whole_file(&mut group, utf16.len() as u64);
     group.bench_function("run_diagnostics_nul_heavy", |b| {
@@ -119,7 +120,7 @@ fn index(c: &mut Criterion) {
                 RowIndex::start_with_diagnostics(DIALECT, Encoding::Windows1252)
                     .expect("a valid dialect");
             indexer
-                .run(black_box(&utf16), &AtomicBool::new(false), |_| {})
+                .run(black_box(utf16), &AtomicBool::new(false), |_| {})
                 .expect("indexing");
             let report = diagnostics.report();
             let nul = report.get(DiagnosticKind::NulBytes).expect("NULs");
@@ -127,8 +128,6 @@ fn index(c: &mut Criterion) {
             report
         });
     });
-    let mut with_bom = vec![0xFF, 0xFE];
-    with_bom.extend_from_slice(&utf16);
     let utf16_dialect = IndexDialect {
         code_unit: CodeUnit::Utf16Le,
         bom_len: 2,
@@ -159,11 +158,27 @@ fn index(c: &mut Criterion) {
     group.finish();
 }
 
-/// One pathological 100 MB file for [`worst`].
+/// A BOM (FF FE), then the first half of `bytes` (cut back to whole UTF-8
+/// characters) as UTF-16 LE. Each UTF-8 byte gives at most one UTF-16 code
+/// unit, so the buffer is allocated once, at its final size or a little
+/// more.
+fn utf16_with_bom(bytes: &[u8]) -> Vec<u8> {
+    let half = &bytes[..bytes.len() / 2];
+    let text = std::str::from_utf8(half)
+        .unwrap_or_else(|e| std::str::from_utf8(&half[..e.valid_up_to()]).expect("a valid prefix"));
+    let mut out = Vec::with_capacity(2 + 2 * text.len());
+    out.extend_from_slice(&[0xFF, 0xFE]);
+    out.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    out
+}
+
+/// One pathological file for [`worst`].
 struct Worst {
     name: &'static str,
     /// Repeated to fill the file.
     pattern: &'static [u8],
+    /// The file's length.
+    len: usize,
     encoding: Encoding,
 }
 
@@ -174,36 +189,51 @@ struct Worst {
 /// reference file. Before benchmarking, each prints the longest chunk
 /// (`DIAGNOSTICS_CHUNK_BYTES`) it took, for DESIGN §3.10 rule 3 (chunks of
 /// at most about 5 ms).
+///
+/// The files are small, and the cost is per byte, so compare throughput,
+/// not time, with the 100 MB files these once were. Big files here pushed
+/// CI's 7 GB runner into memory pressure just before the `open` benchmarks
+/// ran ("First-paint regression" in `docs/tasks/1.5.md`). A file of blank
+/// lines has as many rows as bytes. macOS's allocator keeps large freed
+/// blocks counted against the process until the system needs the memory.
+/// So an index of 100M rows (400 MB), made and dropped on every
+/// iteration, added that much each time, up to several GB. With 1M rows
+/// nothing builds up; with 2M, diagnostics' buffers already build up to
+/// about 500 MB. The field-level cases are a single row, so only their own
+/// bytes count: 25 MB each.
 fn worst(c: &mut Criterion) {
-    const LEN: usize = 100_000_000;
     let cases = [
         Worst {
             name: "invalid_utf8",
             pattern: b"\xFF,",
+            len: 25_000_000,
             encoding: Encoding::Utf8,
         },
         Worst {
             name: "invalid_and_nul",
             pattern: b"\xFF\0,",
+            len: 25_000_000,
             encoding: Encoding::Utf8,
         },
         Worst {
             name: "unmapped_1253",
             pattern: b"\xAA,",
+            len: 25_000_000,
             encoding: Encoding::Windows1253,
         },
         Worst {
             name: "blank_lines",
             pattern: b"\n",
+            len: 1_000_000,
             encoding: Encoding::Utf8,
         },
     ];
     let mut group = c.benchmark_group("worst");
-    common::whole_file(&mut group, LEN as u64);
-    // Each iteration takes up to about a second.
-    group.sample_size(10);
     for case in cases {
-        let bytes: Vec<u8> = case.pattern.iter().copied().cycle().take(LEN).collect();
+        common::whole_file(&mut group, case.len as u64);
+        // Made at its final size, with no doubling on the way.
+        let mut bytes = case.pattern.repeat(case.len.div_ceil(case.pattern.len()));
+        bytes.truncate(case.len);
         let run = || {
             let (index, diagnostics, indexer) =
                 RowIndex::start_with_diagnostics(DIALECT, case.encoding).expect("a valid dialect");
@@ -219,18 +249,21 @@ fn worst(c: &mut Criterion) {
             (index, longest)
         };
         // The longest chunk of the slower of two warm runs: the first run
-        // after making the file also pays to fault in fresh memory.
+        // after making the file also pays to fault in fresh memory. Only
+        // one index is alive at a time.
         drop(run());
-        let (index, first) = run();
-        let (_, second) = run();
+        let (rows, first) = {
+            let (index, longest) = run();
+            (index.row_count(), longest)
+        };
+        let second = run().1;
         let longest = first.max(second);
         eprintln!(
-            "worst/{}: {} rows, longest chunk {:.2} ms",
+            "worst/{}: {} bytes, {rows} rows, longest chunk {:.2} ms",
             case.name,
-            index.row_count(),
+            case.len,
             longest.as_secs_f64() * 1e3
         );
-        drop(index);
         group.bench_function(case.name, |b| b.iter(run));
         group.bench_function(format!("{}_plain", case.name), |b| {
             b.iter(|| {
@@ -263,6 +296,9 @@ fn marks(c: &mut Criterion) {
             .expect("indexing");
         assert_eq!(index.row_count(), ROWS);
         assert!(!diagnostics.report().shows_banner());
+        // Only the marks are searched: the file (100 MB for the wide rows)
+        // and the index can go.
+        drop((index, bytes));
         group.bench_function(format!("next_{name}"), |b| {
             b.iter(|| {
                 let found = diagnostics.next_row_with_diagnostic(black_box(0));
