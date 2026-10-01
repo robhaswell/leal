@@ -215,7 +215,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     stored.
   - The dominant field count is final only once indexing finishes, so the
     notes say how ragged rows and hatched cells behave before then.
-- [ ] **1.6 App: document and grid** — `NSDocument`, grid bound to the core,
+- [~] **1.6 App: document and grid** — `NSDocument`, grid bound to the core,
   gutter, header row, column sizing, status bar (§4.1). Grid appears from
   the P0 first screen; scrollbar uses the estimated row count while
   indexing (§3.10).

@@ -560,10 +560,10 @@ leal/
 │   ├── project.yml         XcodeGen spec (the .xcodeproj is generated)
 │   ├── Sources/
 │   ├── Resources/
-│   └── Tests/              XCTest
+│   ├── Tests/              XCTest of the bindings (not hosted)
+│   └── AppTests/           XCTest hosted in Leal.app (documents, grid)
 ├── tests/corpus/           hand-made files with expected-result sidecars
 ├── fuzz/                   cargo-fuzz targets (PLAN 2.7)
-├── spikes/                 throwaway experiments (the grid spike, until PLAN 1.6)
 ├── docs/
 │   ├── DESIGN.md           this file
 │   ├── PLAN.md             build plan and task status
