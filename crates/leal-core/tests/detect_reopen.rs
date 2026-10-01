@@ -20,6 +20,7 @@ mod common;
 use common::detect;
 use leal_core::attributes::{Fingerprint, Interpretation};
 use leal_core::detect::{Choices, Detection, DialectSource, Hints, Note};
+use leal_core::dialect::Delimiter;
 use leal_testkit::strategies::csv::CsvConfig;
 use leal_testkit::strategies::edits::{EditCase, edit_case};
 use proptest::prelude::*;
@@ -177,4 +178,106 @@ fn the_sensible_check_rarely_rejects_a_remembered_interpretation() {
         "{rejected} rejected of {}",
         honoured + rejected
     );
+}
+
+/// How `delimiter` splits a small file's non-blank rows, by the test's own
+/// count: (the most common field count, ties to the first seen; the rows
+/// with it; all non-blank rows), or `None` with no non-blank rows.
+///
+/// It follows DESIGN §3.4 independently of the product's scanner: a quote
+/// opens a quoted field only as its first byte, `""` inside is a quote,
+/// anything after the closing quote is literal, CR LF is one line ending,
+/// and an open quote runs to the end.
+fn split(bytes: &[u8], delimiter: u8) -> Option<(usize, usize, usize)> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let mut counts: Vec<usize> = Vec::new(); // each non-blank row's fields
+    let mut i = 0;
+    while i < bytes.len() {
+        let row_start = i;
+        let mut fields = 1;
+        loop {
+            if bytes.get(i) == Some(&b'"') {
+                i += 1;
+                while i < bytes.len() {
+                    i += 1;
+                    if bytes[i - 1] == b'"' {
+                        if bytes.get(i) != Some(&b'"') {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            while i < bytes.len() && ![delimiter, b'\r', b'\n'].contains(&bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&delimiter) {
+                break;
+            }
+            fields += 1;
+            i += 1;
+        }
+        let blank = i == row_start;
+        if bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+        }
+        i += 1;
+        if !blank {
+            counts.push(fields);
+        }
+    }
+    let rows_with = |c: usize| counts.iter().filter(|d| **d == c).count();
+    // `max_by_key` keeps the last of equals; reversed, the first seen.
+    let mode = counts.iter().rev().copied().max_by_key(|c| rows_with(*c))?;
+    Some((mode, rows_with(mode), counts.len()))
+}
+
+proptest! {
+    /// ADR-0005 decision 1's "parses sensibly" check itself, on saved
+    /// files: for every delimiter other than the guess, an attribute
+    /// remembering it (without a fingerprint, so the check applies) is used
+    /// exactly when it splits the rows at least as consistently as the
+    /// guess, by the test's own count, or when the guess splits nothing
+    /// (a one-column file, whose `,` is only the default). Every case
+    /// reaches the comparison three times (re-review finding 3).
+    #[test]
+    fn a_remembered_delimiter_is_used_exactly_when_it_fits(case in cases()) {
+        let Ok(saved) = &case.saved else {
+            return Ok(());
+        };
+        let bytes = &saved.bytes;
+        let guess = detect(bytes, Hints::default(), Choices::default())
+            .unwrap()
+            .delimiter;
+        for remembered in Delimiter::ALL.into_iter().filter(|d| *d != guess) {
+            let value = Interpretation {
+                delimiter: Some(remembered),
+                header: None,
+                file: None,
+            }
+            .to_attribute_value();
+            let hints = Hints {
+                interpretation: Some(value.as_bytes()),
+                ..Hints::default()
+            };
+            let reopened = detect(bytes, hints, Choices::default()).unwrap();
+            let fits = match (split(bytes, remembered.byte()), split(bytes, guess.byte())) {
+                (Some((_, r, r_rows)), Some((g_mode, g, g_rows))) => {
+                    g_mode < 2 || r * g_rows >= g * r_rows
+                }
+                _ => true,
+            };
+            if fits {
+                prop_assert_eq!(reopened.delimiter, remembered);
+                prop_assert_eq!(reopened.delimiter_source, DialectSource::Attribute);
+                prop_assert_eq!(&reopened.notes, &[]);
+            } else {
+                prop_assert_eq!(reopened.delimiter, guess);
+                prop_assert_eq!(
+                    &reopened.notes,
+                    &[Note::InterpretationNotSensible { delimiter: remembered }]
+                );
+            }
+        }
+    }
 }

@@ -65,10 +65,12 @@ use units::Units;
 pub const FIRST_PAINT_BYTES: usize = 64 * 1024;
 
 /// How many bytes [`review`] reads between checks of its cancel flag:
-/// 512 KiB, about 3 ms' work when all four delimiters are checked (the
-/// slowest case, ~185 MB/s on an M5 Pro), so that it stops within the
-/// ~5 ms DESIGN §3.10 rule 3 allows.
-pub const REVIEW_CHUNK_BYTES: usize = 512 * 1024;
+/// 128 KiB. With all four delimiters checked, the review runs at about
+/// 155 MB/s on an M5 Pro's performance cores, and slower on short rows or
+/// at utility QoS (512 KiB of 2-byte rows took 6.5 ms and 11.7 ms). So a
+/// chunk is under 3 ms of work even then, within the ~5 ms DESIGN §3.10
+/// rule 3 allows.
+pub const REVIEW_CHUNK_BYTES: usize = 128 * 1024;
 
 /// The raw values of the file's extended attributes, as the `source`
 /// module reads them. `None` means the attribute isn't there.

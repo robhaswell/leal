@@ -101,23 +101,38 @@ fn run_large<S: Strategy>(strategy: &S, test: impl Fn(S::Value) -> Result<(), Te
     }
 }
 
-/// A tidy file, plus a row whose every field is a multi-line quoted value
-/// full of the other delimiters, repeated past 192 KB: first paint finds
-/// its delimiter, and the whole-file review, which reads quotes from the
+/// A tidy file, plus more rows than it has whose every field is a
+/// multi-line quoted value, repeated past 192 KB: first paint finds its
+/// delimiter, and the whole-file review, which reads quotes from the
 /// start, never suggests another one (review finding 1).
+///
+/// Each quoted value's lines are `a?b?c`, with `?` another delimiter. A
+/// review that lost track of the quotes would read those lines as rows of
+/// three fields under that delimiter, and, since they outnumber the tidy
+/// rows, suggest it. Checked by reintroducing the old sampled review: it
+/// failed this test at the default case count in every one of 10 runs.
 #[test]
 fn multi_line_fields_past_64_kb_get_no_delimiter_suggestion() {
     run_large(&tidy_file(), |(delimiter, columns, bytes)| {
-        let field = b"\"one, two;\nthree|four\tfive\n\"";
-        let mut extra = Vec::new();
+        let other = Delimiter::ALL
+            .into_iter()
+            .find(|d| *d != delimiter)
+            .unwrap()
+            .byte();
+        let line = [b'a', other, b'b', other, b'c'];
+        // The closing quote starts a line, as in the reviewer's repro: read
+        // the wrong way round, it opens a quote, so the misreading lasts.
+        let field = [&b"\""[..], &line, b"\n", &line, b"\n\""].concat();
+        let mut row = Vec::new();
         for i in 0..columns {
             if i > 0 {
-                extra.push(delimiter.byte());
+                row.push(delimiter.byte());
             }
-            extra.extend_from_slice(field);
+            row.extend_from_slice(&field);
         }
-        extra.push(b'\n');
-        let copy = [bytes, extra].concat();
+        row.push(b'\n');
+        // The tidy file has at most 11 rows; these are 12.
+        let copy = [bytes, row.repeat(12)].concat();
         let mut file = Vec::new();
         while file.len() <= FIRST_PAINT_BYTES * 3 {
             file.extend_from_slice(&copy);
