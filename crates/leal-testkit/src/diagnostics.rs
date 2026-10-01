@@ -207,7 +207,7 @@ pub fn utf16_nul_and_invalid_offsets(
 /// - UTF-8: NUL is a 0x00 byte; invalid encoding is invalid UTF-8.
 /// - Windows-1252: NUL is a 0x00 byte; every byte is valid.
 /// - UTF-16: NUL is a U+0000 code unit; invalid encoding is an unpaired
-///   surrogate (ADR-0003 decision 7).
+///   surrogate (ADR-0003 decision 7) or a final odd byte.
 #[must_use]
 pub fn derive(layout: &Layout, bytes: &[u8], encoding: Encoding) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -445,6 +445,21 @@ mod tests {
         assert_eq!(
             utf16_nul_and_invalid_offsets(&be, 2, false),
             (vec![2], vec![4])
+        );
+    }
+
+    /// A high surrogate followed by one stray byte (a file cut off mid-way
+    /// through a pair): the surrogate is unpaired, and the byte is invalid
+    /// on its own. Looking for a low surrogate must not read past the end.
+    #[test]
+    fn utf16_high_surrogate_then_a_stray_byte() {
+        assert_eq!(
+            utf16_nul_and_invalid_offsets(&[0xFF, 0xFE, 0x00, 0xD8, 0x41], 2, true),
+            (vec![], vec![2, 4])
+        );
+        assert_eq!(
+            utf16_nul_and_invalid_offsets(&[0xFE, 0xFF, 0xD8, 0x00, 0xDC], 2, false),
+            (vec![], vec![2, 4])
         );
     }
 

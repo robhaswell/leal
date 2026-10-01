@@ -223,6 +223,19 @@ case("diagnostics/unpaired-surrogate-utf16be.csv", d,
      cells=[(1, 1, "x�y�", False), (2, 1, "�", False),
             (3, 1, "😀", False)])
 
+# A UTF-16 file cut off mid-way through its last code unit: the final odd byte
+# is invalid_encoding at its own offset, and displays as U+FFFD (README.md).
+# "b" in UTF-16 LE is 62 00; only the 62 is left.
+d = BOM_UTF16LE + "id,v\n1,a".encode("utf-16-le") + b"b"
+case("diagnostics/utf16le-odd-length.csv", d,
+     "UTF-16 LE with an odd number of bytes, as if truncated mid-way through the last "
+     "code unit and with no trailing newline. The stray final byte is invalid text: "
+     "U+FFFD, flagged at its own offset.",
+     rows=2, fields=[2, 2], bom="utf-16le", encoding="utf-16le", trailing_newline=False,
+     diagnostics=[("invalid_encoding", [(1, at(d, b"b"))]), bom_present()],
+     cells=[(1, 1, "a�", False)])
+assert at(d, b"b") == len(d) - 1
+
 # UTF-16 offsets are byte offsets into the file as stored (ADR-0003 decision 6).
 # "😀" is a surrogate pair (4 bytes), so a wrong offset mapping shows up here.
 d = BOM_UTF16LE + "name,qty\nÄpfel 😀,1\npear\nplum,3\n".encode("utf-16-le")

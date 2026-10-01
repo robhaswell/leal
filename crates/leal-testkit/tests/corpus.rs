@@ -146,10 +146,21 @@ fn check_case(case: &CorpusCase, problems: &mut Vec<String>) {
     if rule != s.dialect.encoding {
         fail(format!("ADR-0003 gives encoding {rule:?}"));
     }
+    // A final odd byte in UTF-16 is not a whole code unit, so it is invalid
+    // text at its own offset (tests/corpus/README.md). Corpus files keep the
+    // rest of that field valid, so the field's first invalid byte is it.
     if matches!(s.dialect.encoding, Encoding::Utf16Le | Encoding::Utf16Be)
         && !case.bytes.len().is_multiple_of(2)
     {
-        fail("a UTF-16 file has an even number of bytes".into());
+        let last = case.bytes.len() - 1;
+        let flagged = s
+            .diagnostic(DiagnosticKind::InvalidEncoding)
+            .is_some_and(|d| d.first.iter().any(|l| l.offset == last));
+        if !flagged {
+            fail(format!(
+                "an odd-length UTF-16 file must expect invalid_encoding at offset {last}"
+            ));
+        }
     }
 }
 
@@ -180,6 +191,13 @@ fn corpus_covers_every_dialect_and_diagnostic() {
     ] {
         assert!(has(&|c| c.sidecar.dialect.encoding == enc), "{enc:?}");
     }
+    assert!(
+        has(&|c| matches!(
+            c.sidecar.dialect.encoding,
+            Encoding::Utf16Le | Encoding::Utf16Be
+        ) && !c.bytes.len().is_multiple_of(2)),
+        "a UTF-16 file with an odd number of bytes"
+    );
     assert!(has(&|c| c.sidecar.dialect.mixed_line_endings));
     assert!(has(&|c| c.sidecar.dialect.header));
     assert!(has(

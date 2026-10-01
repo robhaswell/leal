@@ -130,13 +130,21 @@ offset points at. The definitions live in
 | `unterminated_quote` | file (the field whose quote never closes) | the opening quote |
 | `ragged_rows` | non-blank row whose field count differs from the mode | row start |
 | `text_after_closing_quote` | field with bytes after its closing quote | first such byte |
-| `invalid_encoding` | field containing invalid text: invalid UTF-8 in UTF-8 files, an unpaired surrogate in UTF-16 files, never in Windows-1252 | first invalid byte in the field (UTF-16: first byte of the code unit) |
+| `invalid_encoding` | field containing invalid text: invalid UTF-8 in UTF-8 files, an unpaired surrogate or a final odd byte in UTF-16 files, never in Windows-1252 | first invalid byte in the field (UTF-16: first byte of the code unit) |
 | `nul_bytes` | field containing a NUL: a 0x00 byte, or in UTF-16 a U+0000 code unit (the 0x00 bytes of other characters don't count) | first NUL in the field (UTF-16: first byte of the code unit) |
 | `mixed_line_endings` | row whose line ending differs from the most common | first byte of that line ending |
 | `blank_lines` | blank row | row start |
 | `bom_present` | file with a BOM (at most one) | 0 (row 0) |
 
 Invalid text displays as U+FFFD in every encoding.
+
+A UTF-16 file with an odd number of bytes (for example, one cut off mid-way
+through a code unit) ends in a byte that is not a whole code unit. That byte
+is invalid text: it displays as U+FFFD and is `invalid_encoding` at its own
+offset, the file's length minus one. ADR-0003 decision 7 covers U+0000 and
+unpaired surrogates; this rule is the testkit's
+(`utf16_nul_and_invalid_offsets`), and `diagnostics/utf16le-odd-length.csv`
+pins it.
 
 ## Adding a file
 
