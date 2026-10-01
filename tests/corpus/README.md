@@ -132,11 +132,11 @@ offset points at. The definitions live in
 | `text_after_closing_quote` | field with bytes after its closing quote | first such byte |
 | `invalid_encoding` | field containing invalid text: invalid UTF-8 in UTF-8 files, an unpaired surrogate in UTF-16 files, never in Windows-1252 | first invalid byte in the field (UTF-16: first byte of the code unit) |
 | `nul_bytes` | field containing a NUL: a 0x00 byte, or in UTF-16 a U+0000 code unit (the 0x00 bytes of other characters don't count) | first NUL in the field (UTF-16: first byte of the code unit) |
-
-Invalid text displays as U+FFFD in every encoding.
 | `mixed_line_endings` | row whose line ending differs from the most common | first byte of that line ending |
 | `blank_lines` | blank row | row start |
 | `bom_present` | file with a BOM (at most one) | 0 (row 0) |
+
+Invalid text displays as U+FFFD in every encoding.
 
 ## Adding a file
 
