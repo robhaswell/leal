@@ -311,7 +311,7 @@ of physical row numbers to show, in order.
 ### 3.9 Threading and the FFI boundary
 
 > Open question, see ADR-0005 §6 (proposed): UniFFI doesn't pass Swift task
-> cancellation through to Rust, so cancellation must be explicit.
+> cancellation through to Rust, so ADR-0005 proposes explicit cancellation.
 
 - A document is an `Arc`-shared object. Reads for visible cells are synchronous
   and must take under 1 ms. They are safe to call on the main thread.
@@ -322,8 +322,9 @@ of physical row numbers to show, in order.
 
 ### 3.10 First paint and work priority
 
-> Open question, see ADR-0005 §4 (proposed): the encoding at P0 comes from
-> the first 64 KB, and the whole-file check runs later.
+> Open question, see ADR-0005 §4 (proposed): ADR-0005 proposes that the
+> encoding at P0 comes from the first 64 KB, with the whole-file check
+> running later.
 
 Opening a file starts several jobs. They run in a strict priority order, and
 lower-priority work must never delay higher-priority work.
@@ -436,7 +437,7 @@ to run concurrently and asserts first paint is still under 150 ms.
 ### The contract
 
 > Open question, see ADR-0005 §2 (proposed): F2 for an edit to a hatched
-> cell, which appends bytes at the end of that row.
+> cell, which would append bytes at the end of that row, if accepted.
 
 - **F1** Save As with no edits writes a byte-identical file.
 - **F2** Editing field *(r, c)* changes only that field's bytes. Every other

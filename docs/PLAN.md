@@ -120,7 +120,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - The testkit conventions no ADR records are confirmed, or taken to Rob
     as an ADR: `,` for files with no delimiter, `header = false` for a
     single-row file, and a final odd byte in a UTF-16 file reported as
-    `invalid_encoding` (0.2 notes, "Still open").
+    `invalid_encoding` (0.2 notes, the "Open when written" list).
 - [ ] **1.2a Real-world exports in the corpus** (DESIGN §5, layer 2).
   *Rob supplies the files.*
   - Real exports replace or verify the seven imitations in
@@ -141,6 +141,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     It is generated on demand (a `just` recipe) and never committed.
   - `criterion` benchmarks run against it, and `just bench` runs them.
     1.3, 1.3a and later tasks add their benchmarks here.
+  - Its own benchmark is the speed-of-light baseline: generating the file,
+    then timing a plain sequential read and a `memchr` scan for quote, CR
+    and LF bytes over it. The numbers go in the task notes, and later
+    benchmarks are compared with them.
   - Decide, and record in the task notes, whether CI runs the benchmarks
     and whether they gate or only report, since GitHub's runners are not
     the reference machine. If CI runs them, add the job and the regression
@@ -148,9 +152,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] **1.3 Row index** — quote-aware, progressive, `u32` offsets (§3.3).
   Benchmark: 100 MB reference file (1.2b) indexed in < 500 ms.
   - The same pass produces the dominant field count (ADR-0003 decision 4).
-    The whole-file encoding count (ADR-0003 decision 1) is gathered in this
-    pass or as separate P2 work, whichever keeps the index within budget.
-    (ADR-0005, pending: decision 4)
+  - The whole-file encoding count (ADR-0003 decision 1) runs as P2 work
+    after first paint, not in this pass. (ADR-0005, pending: decision 4)
   - Re-indexing with a different delimiter or encoding (1.2) works without
     reopening the file.
 - [ ] **1.3a Work scheduler** — P0–P3 priorities, separate pools, pause and
@@ -159,11 +162,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   rows < 150 ms with P1–P3 work forced to run concurrently (in the 1.2b
   harness).
   - Cancellation is explicit: each long job has a handle with `cancel()`,
-    which sets a flag the Rust job checks at its chunk boundaries. Swift
-    wraps each await in `withTaskCancellationHandler`, which calls
-    `cancel()`. Long work runs on Rust-owned threads or pools; the async
-    function only reports completion. A test shows a cancelled Swift task
-    stops the Rust job. (ADR-0005, pending: decision 6)
+    which sets a flag the Rust job checks at its chunk boundaries. Long
+    work runs on Rust-owned threads or pools; the async function only
+    reports completion. A Rust test shows that calling `cancel()` stops a
+    running job within one chunk. The Swift side is 1.6. (ADR-0005,
+    pending: decision 6)
 - [ ] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
   - Follows ADR-0003 decisions 2, 3, 6 and 7: text after a closing quote
     displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
@@ -219,9 +222,14 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Every FFI export that can fail, or could panic, returns `Result`
       (0.3 notes). Decide whether to add a permanent test that a Rust
       panic reaches Swift as an error (0.3 open questions).
+  - Swift wraps each await on a long job in `withTaskCancellationHandler`,
+    which calls the job handle's `cancel()` from 1.3a, and an XCTest shows
+    that cancelling the Swift task stops the Rust job. (ADR-0005, pending:
+    decision 6)
   - Deletes `spikes/grid-spike/` once the grid is in and re-measured. Its
     results stay in `docs/tasks/0.4-results.md` and the code at the
-    `phase-0` tag (ADR-0001). Nothing else may refer to the folder.
+    `phase-0` tag (ADR-0001). No code, script or CI job may refer to the
+    folder afterwards, and the `spikes/` line comes out of DESIGN §7.
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
 - [ ] **1.7 App: diagnostics banner** — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
@@ -268,10 +276,16 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     `line_endings`, `encoding_hint` and `fixes` as the oracle (0.2 notes).
     Until 2.4 lands, the replay is limited to cell edits, because
     `EditCase` also generates row and column inserts and deletes.
-  - The reopen property covers the BOM, quote character, line endings and
-    every row's values (ADR-0004 decision 10); the delimiter and header
-    choice are covered through the remembered interpretation. (ADR-0005,
-    pending: decision 1)
+  - The reopen property (ADR-0004 decision 10) covers the BOM, quote
+    character, line endings and every row's values, and the encoding
+    through the `com.apple.TextEncoding` attribute (ADR-0004 decision 11).
+    ADR-0005 decision 1 would narrow decision 10 so that the delimiter and
+    header choice are covered through the remembered interpretation
+    attribute instead. (ADR-0005, pending: decision 1)
+  - Saving an edit to a hatched cell appends the delimiters needed to
+    reach that column, then the value, at the end of the row before its
+    line ending, and nothing else in the file changes; the replay covers
+    it. (ADR-0005, pending: decision 2)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
   - Covers every single-byte encoding Leal supports. (ADR-0005, pending:
