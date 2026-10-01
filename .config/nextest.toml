@@ -25,6 +25,11 @@ removable::a_completed_copy_survives_the_drive_vanishing|\
 removable::a_drive_that_cant_clone_is_streamed_not_read_at_open|\
 removable::a_drive_that_cant_clone_detached_mid_copy_is_disconnected|\
 removable::changes_to_the_file_without_a_clone_are_reported_and_block_save\
+)$/) | package(leal-core) & test(/^document::tests::(\
+a_drive_that_comes_back_is_reconnected_and_save_is_allowed|\
+a_file_changed_while_its_drive_was_away_is_reported|\
+a_copied_file_on_an_ejected_drive_can_be_saved_once_it_is_back|\
+a_write_to_a_file_read_without_a_clone_is_caught_by_its_event\
 )$/)
 """
 test-group = "disk-images"

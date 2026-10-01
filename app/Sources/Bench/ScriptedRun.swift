@@ -23,7 +23,9 @@ import os
 ///   03b); `-LealFind text` searches for `text` from the selected cell in
 ///   the find bar (04a); `-LealInspector YES` shows the cell inspector
 ///   (05a); `-LealShortcuts YES` draws the shortcut sheet (06c) instead
-///   of the window.
+///   of the window; `-LealWaitForChange YES` waits (up to 45 s) until the
+///   file has changed on disk, so the task 1.9 banner shows. The app
+///   changes nothing: whoever runs it changes the file.
 /// - `-LealAppearance light|dark` and `-LealWindowSize 1000x640` (the
 ///   content size, in points) for either.
 ///
@@ -105,6 +107,12 @@ final class ScriptedRun {
         if !has("LealSnapshotEarly") {
             let deadline = Date().addingTimeInterval(60)
             while !content.model.isIndexComplete, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        if has("LealWaitForChange") {
+            let deadline = Date().addingTimeInterval(45)
+            while content.model.original.state == .unchanged, !content.model.changedOnDisk, Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(20))
             }
         }

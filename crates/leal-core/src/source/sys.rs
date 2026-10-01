@@ -1,6 +1,8 @@
 //! The system calls [`super`] needs that the standard library doesn't wrap:
 //! cloning a file, reading an extended attribute, clearing `O_NONBLOCK`, a
-//! volume's mount flags, and the memory map itself. (Ordinary reads at an
+//! volume's mount flags, the memory map itself, and for watching the
+//! user's file, a kernel event queue (`kqueue`) and an open file's current
+//! path (`F_GETPATH`). (Ordinary reads at an
 //! offset, `pread`, need no `unsafe`: the standard library has them as
 //! `FileExt::read_at`.)
 //!
@@ -8,12 +10,13 @@
 //! (CLAUDE.md). Each function wraps exactly one unsafe operation in a safe
 //! signature, with a `// SAFETY:` comment saying why the call is sound.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use memmap2::Mmap;
 
@@ -177,6 +180,189 @@ pub(super) fn volume_flags(file: &File) -> io::Result<u32> {
     // SAFETY: `fstatfs` returned 0, so it filled in the whole struct.
     let stats = unsafe { stats.assume_init() };
     Ok(stats.f_flags)
+}
+
+/// The path the open file `file` has now, with `fcntl(F_GETPATH)`. It
+/// follows renames: after the file is moved, it gives the new path. For a
+/// file that has been deleted it may still give the old one.
+pub(super) fn path_of(file: &File) -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u8; usize::try_from(libc::MAXPATHLEN).unwrap_or(1024)];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most
+    // `MAXPATHLEN` bytes, including the NUL, into the buffer it is given;
+    // `buffer` is exactly that long and owned by this function. The
+    // descriptor is open and borrowed from `file` for the length of the
+    // call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    buffer.truncate(len);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+/// A kernel event queue (`kqueue(2)`), for watching the user's file
+/// (task 1.9). The descriptor is closed when it is dropped.
+pub(super) struct Kqueue(OwnedFd);
+
+/// One event [`Kqueue::wait`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Event {
+    /// The descriptor (for a file) or the number (for a user event) it is
+    /// about.
+    pub ident: usize,
+    /// Whether it is a user event ([`Kqueue::trigger`]) rather than a
+    /// file's.
+    pub user: bool,
+    /// For a file, what happened: `NOTE_WRITE`, `NOTE_DELETE` and so on.
+    pub fflags: u32,
+}
+
+impl Kqueue {
+    /// A new, empty queue.
+    pub(super) fn new() -> io::Result<Self> {
+        // SAFETY: `kqueue` takes no arguments and returns a new descriptor,
+        // or -1.
+        let fd = unsafe { libc::kqueue() };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a descriptor `kqueue` just opened, which nothing
+        // else owns, so `OwnedFd` may close it.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Reports `fflags` (`NOTE_WRITE`, …) about `file` until `file` is
+    /// closed, which removes it from the queue. Each kind is reported once
+    /// however often it happens before [`wait`](Self::wait) collects it
+    /// (`EV_CLEAR`).
+    pub(super) fn watch(&self, file: &File, fflags: u32) -> io::Result<()> {
+        self.change(libc::kevent {
+            ident: usize::try_from(file.as_raw_fd()).unwrap_or(usize::MAX),
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+    }
+
+    /// Adds the user event `ident`, which [`trigger`](Self::trigger) fires.
+    pub(super) fn add_user(&self, ident: usize) -> io::Result<()> {
+        self.change(libc::kevent {
+            ident,
+            filter: libc::EVFILT_USER,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: libc::NOTE_FFNOP,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+    }
+
+    /// Fires the user event `ident`, waking a [`wait`](Self::wait).
+    pub(super) fn trigger(&self, ident: usize) -> io::Result<()> {
+        self.change(libc::kevent {
+            ident,
+            filter: libc::EVFILT_USER,
+            flags: 0,
+            fflags: libc::NOTE_TRIGGER,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+    }
+
+    /// Registers one change with the kernel.
+    fn change(&self, change: libc::kevent) -> io::Result<()> {
+        // SAFETY: `kevent` reads one `struct kevent` from `&change`, which
+        // lives until the end of this function, and writes no events (the
+        // event list is null with a length of 0). A null timeout is not
+        // used when there are no events to wait for. The queue's
+        // descriptor is open and owned by `self`.
+        let result = unsafe {
+            libc::kevent(
+                self.0.as_raw_fd(),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Waits for events, for at most `timeout` (`None`: as long as it
+    /// takes), and returns them; none if the time ran out. A signal
+    /// interrupting the wait (`EINTR`) also gives none.
+    pub(super) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<Event>> {
+        const CAPACITY: usize = 16;
+        let mut events: Vec<libc::kevent> = Vec::with_capacity(CAPACITY);
+        let timeout = timeout.map(|timeout| libc::timespec {
+            tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+        });
+        let timeout_ptr = timeout
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: `kevent` writes at most `CAPACITY` events into `events`'
+        // spare capacity, which is that long, and returns how many it wrote
+        // (or -1); no changes are passed. `timeout_ptr` is null or points at
+        // `timeout`, which lives until the end of this function. The queue's
+        // descriptor is open and owned by `self`.
+        let count = unsafe {
+            libc::kevent(
+                self.0.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                libc::c_int::try_from(CAPACITY).unwrap_or(1),
+                timeout_ptr,
+            )
+        };
+        let Ok(count) = usize::try_from(count) else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        };
+        // SAFETY: `kevent` initialised the first `count` events, and
+        // `count <= CAPACITY`, the vector's capacity.
+        unsafe { events.set_len(count.min(CAPACITY)) };
+        Ok(events
+            .iter()
+            .map(|event| Event {
+                ident: event.ident,
+                user: event.filter == libc::EVFILT_USER,
+                fflags: event.fflags,
+            })
+            .collect())
+    }
+}
+
+/// Swaps the files at `a` and `b` atomically (`renamex_np` with
+/// `RENAME_SWAP`), as `FileManager.replaceItemAt` does for a safe save.
+/// Tests only: they reproduce that save.
+#[cfg(test)]
+pub(super) fn swap(a: &Path, b: &Path) -> io::Result<()> {
+    let a = c_path(a)?;
+    let b = c_path(b)?;
+    // SAFETY: `renamex_np` reads the two NUL-terminated strings, which live
+    // until the end of this function, and doesn't keep the pointers.
+    // `RENAME_SWAP` is a plain flag.
+    let result = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// `path` as a NUL-terminated C string.

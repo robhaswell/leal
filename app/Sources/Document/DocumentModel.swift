@@ -18,6 +18,14 @@ enum DocumentChange: Equatable, Sendable {
     /// The file was read again with other choices (the Header row toggle):
     /// every value, title and count may be different.
     case content
+    /// Rows already shown may read differently now (the file changed while
+    /// it was read, or it is read again after its drive came back): redraw
+    /// every cell, keeping the selection and scroll position.
+    case rows
+    /// **Reload** (task 1.9) opened the file again: every value, title and
+    /// count may be different. The window keeps its scroll position and
+    /// selection where they still fit.
+    case reloaded
     /// The document failed after a panic in the core (DESIGN §3.9).
     case failed
 }
@@ -58,12 +66,27 @@ final class DocumentModel: GridDataSource {
     /// Rows per block of the row-flags cache (gutter markers and hatching).
     nonisolated static let flagBlockRows = 64
 
-    let url: URL
+    /// Where the file is: where it was opened from, or where it was moved
+    /// to since (task 1.9).
+    private(set) var url: URL
     private var handle: LealFFI.Document?
-    private let scheduler: Scheduler
+    /// Goes up by one each time **Reload** replaces `handle`, so a late
+    /// report about the old core document is ignored.
+    private var handleNumber = 0
+
+    /// Which core document and which reading of it the model shows. A
+    /// background answer is used only if this hasn't changed meanwhile: a
+    /// generation alone isn't enough, since a reloaded document starts at
+    /// generation 0 again (task 1.9).
+    var readingID: ReadingID { ReadingID(handle: handleNumber, generation: generation) }
+    private let environment: DocumentEnvironment
+    private var scheduler: Scheduler { environment.scheduler }
 
     /// Called on the main actor when something the window shows changed.
     var onChange: ((DocumentChange) -> Void)?
+    /// Called when the file was moved, with its new place (task 1.9), so
+    /// the `NSDocument` follows it.
+    var onMoved: ((URL) -> Void)?
 
     private(set) var interpretation: Interpretation
     private(set) var generation: UInt64
@@ -81,8 +104,19 @@ final class DocumentModel: GridDataSource {
     /// shown may mix two versions.
     private(set) var changedOnDisk = false
     /// Whether Save could write over the file: not after a disconnection
-    /// or a change while reading (ADR-0006). Save As always can.
+    /// or a change while reading, nor while its drive is away (ADR-0006).
+    /// Save As always can.
     private(set) var canSave = true
+    /// The user's file as last seen (task 1.9): changed, moved or deleted
+    /// elsewhere, or on a drive that isn't connected.
+    private(set) var original: OriginalStatus
+    /// A `checkOriginal` is under way.
+    private var checkingOriginal: Task<Void, Never>?
+    /// Another check was asked for meanwhile (a volume unmounting, then
+    /// mounting): it runs when this one ends.
+    private var checkAgain = false
+    /// Notifications that make the model look at the file again.
+    private var observers: [(NotificationCenter, any NSObjectProtocol)] = []
     /// What the index has found wrong with the file so far (DESIGN §3.5),
     /// for the current reading.
     private(set) var diagnostics: DiagnosticsReport?
@@ -127,13 +161,28 @@ final class DocumentModel: GridDataSource {
     /// returns, and the index (P1) and review (P2) start in the background.
     static func open(url: URL, environment: DocumentEnvironment) throws -> DocumentModel {
         let reference = ModelReference()
-        let relay = ProgressRelay { progress in reference.model?.progressArrived(progress) }
         // The first screen's rows are read below, through `cells`, with a
         // cap on the fields; the core's first screen need only bring the
         // first row, for the header titles.
         let options = OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters)
+        let handle = try openHandle(url: url, environment: environment, options: options, reference: reference, number: 0)
+        let model = try DocumentModel(url: url, handle: handle, environment: environment)
+        reference.model = model
+        return model
+    }
+
+    /// Opens `url` in the core, with progress for handle `number` relayed
+    /// to the model `reference` will point at.
+    private static func openHandle(
+        url: URL,
+        environment: DocumentEnvironment,
+        options: OpenOptions,
+        reference: ModelReference,
+        number: Int
+    ) throws -> LealFFI.Document {
+        let relay = ProgressRelay { progress in reference.model?.progressArrived(progress, handle: number) }
         let path = url.path(percentEncoded: false)
-        let handle = try openForTesting?(path, environment, options, relay) ?? openDocument(
+        return try openForTesting?(path, environment, options, relay) ?? openDocument(
             path: path,
             volume: TemporaryFolders.volume(for: url),
             temp: environment.temp,
@@ -141,15 +190,13 @@ final class DocumentModel: GridDataSource {
             options: options,
             observer: relay
         )
-        let model = try DocumentModel(url: url, handle: handle, scheduler: environment.scheduler)
-        reference.model = model
-        return model
     }
 
-    private init(url: URL, handle: LealFFI.Document, scheduler: Scheduler) throws {
+    private init(url: URL, handle: LealFFI.Document, environment: DocumentEnvironment) throws {
         self.url = url
         self.handle = handle
-        self.scheduler = scheduler
+        self.environment = environment
+        original = OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
         let screen = try handle.firstScreen()
         interpretation = screen.interpretation
         generation = screen.generation
@@ -166,6 +213,7 @@ final class DocumentModel: GridDataSource {
         )
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
         applyFirstScreen(screen)
+        original = call({ try $0.original() }) ?? original
         refreshDriveState()
         if let hook = Self.afterFirstPaintForTesting {
             _ = call { try hook($0) }
@@ -176,6 +224,8 @@ final class DocumentModel: GridDataSource {
     func start() {
         guard failure == nil, tasks.isEmpty else { return }
         startWaiting()
+        watchOriginal()
+        observeVolumesAndActivation()
         progressArrived(progress)
     }
 
@@ -187,8 +237,10 @@ final class DocumentModel: GridDataSource {
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
+        stopObserving()
         handle = nil
         onChange = nil
+        onMoved = nil
     }
 
     var isFailed: Bool { failure != nil }
@@ -260,6 +312,7 @@ final class DocumentModel: GridDataSource {
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
+        stopObserving()
         onChange?(.failed)
     }
 
@@ -268,10 +321,11 @@ final class DocumentModel: GridDataSource {
     private func startWaiting() {
         guard let indexJob = call({ try $0.indexJob() }), let reviewJob = call({ try $0.reviewJob() }) else { return }
         let generation = generation
+        let number = handleNumber
         tasks.append(Task { [weak self] in
             do {
                 try await indexJob.finish()
-                self?.indexFinished(generation: generation)
+                self?.indexFinished(generation: generation, handle: number)
             } catch {
                 self?.jobEnded(error)
             }
@@ -279,7 +333,7 @@ final class DocumentModel: GridDataSource {
         tasks.append(Task { [weak self] in
             do {
                 try await reviewJob.finish()
-                self?.reviewFinished(generation: generation)
+                self?.reviewFinished(generation: generation, handle: number)
             } catch {
                 self?.jobEnded(error)
             }
@@ -295,8 +349,8 @@ final class DocumentModel: GridDataSource {
             break
         case .DriveDisconnected?, .ChangedOnDisk?:
             // The drive-disconnected and changed-while-reading banners
-            // (ADR-0006, 1.1a). SEAM(1.9): Reload, and dropping rows read
-            // before a change.
+            // (ADR-0006, 1.1a). `refreshDriveState` drops rows read before
+            // a change (task 1.9); the banner offers Reload.
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
             if let progress = call({ try $0.progress() }) {
                 progressArrived(progress)
@@ -304,18 +358,23 @@ final class DocumentModel: GridDataSource {
                 refreshDriveState()
                 onChange?(.progress)
             }
+            if case .DriveDisconnected? = error as? JobFailure {
+                // The drive may be back already, before the copy noticed it
+                // had gone (a volume that mounts again quickly).
+                checkOriginal()
+            }
         case .Failed?:
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
         }
     }
 
-    private func indexFinished(generation: UInt64) {
-        guard generation == self.generation, let progress = call({ try $0.progress() }) else { return }
+    private func indexFinished(generation: UInt64, handle number: Int) {
+        guard number == handleNumber, generation == self.generation, let progress = call({ try $0.progress() }) else { return }
         progressArrived(progress)
     }
 
-    private func reviewFinished(generation: UInt64) {
-        guard generation == self.generation, let review = call({ try $0.review() }) else { return }
+    private func reviewFinished(generation: UInt64, handle number: Int) {
+        guard number == handleNumber, generation == self.generation, let review = call({ try $0.review() }) else { return }
         self.review = review
         reviewedLineEnding = review?.lineEnding ?? reviewedLineEnding
         onChange?(.progress)
@@ -324,9 +383,21 @@ final class DocumentModel: GridDataSource {
     /// Reads where the bytes are, whether the file changed while read, and
     /// whether Save is possible (ADR-0006).
     private func refreshDriveState() {
+        let changedBefore = changedOnDisk
         storage = call({ try $0.storage() }) ?? storage
         changedOnDisk = call({ try $0.changedOnDisk() }) ?? changedOnDisk
         canSave = call({ try $0.canSave() }) ?? canSave
+        if changedOnDisk, !changedBefore {
+            // The file changed while it was read (1.1a): rows read before
+            // the change was noticed may be from either version, so none
+            // are kept. The core now serves only rows from its checked copy
+            // (task 1.9), and the window redraws from those.
+            tiles.removeAll()
+            flagBlocks.removeAll()
+            if let current = call({ try $0.progress() }), current.generation == generation {
+                progress = current
+            }
+        }
     }
 
     /// A read failed because the drive went or the file changed: check the
@@ -351,6 +422,12 @@ final class DocumentModel: GridDataSource {
         diagnostics = report
         // The marks grew, and ragged rows may have changed with the mode.
         flagBlocks.removeAll()
+    }
+
+    /// A progress report from the relay for core document `number`.
+    private func progressArrived(_ report: IndexProgress, handle number: Int) {
+        guard number == handleNumber else { return }
+        progressArrived(report)
     }
 
     /// A progress report from the relay (or a fresh one).
@@ -450,7 +527,7 @@ final class DocumentModel: GridDataSource {
     /// none, or if the file was read again meanwhile.
     func find(_ kind: DiagnosticKind, forward: Bool, from: UInt64) async -> DiagnosticPlace? {
         guard failure == nil, let handle else { return nil }
-        let generation = generation
+        let reading = readingID
         coreCalls += 1
         let result = await Task.detached(priority: .userInitiated) { () -> Result<DiagnosticPlace?, any Error> in
             Result {
@@ -459,7 +536,7 @@ final class DocumentModel: GridDataSource {
                     : try handle.previousWithKind(kind: kind, to: from)
             }
         }.value
-        guard generation == self.generation, failure == nil else { return nil }
+        guard reading == readingID, failure == nil else { return nil }
         switch result {
         case let .success(place):
             return place
@@ -605,7 +682,7 @@ final class DocumentModel: GridDataSource {
     private func startRefinedSizing() {
         guard let handle, failure == nil else { return }
         refinedSizingStarted = true
-        let generation = generation
+        let reading = readingID
         let first = UInt64(headerOffset)
         let columns = max(columnCount, 1)
         let rowCount = Self.sizingRows(wanted: Self.sizingRows, columns: columns)
@@ -641,13 +718,13 @@ final class DocumentModel: GridDataSource {
             } catch {
                 result = .failure(error)
             }
-            await self?.applyRefinedSizing(result, generation: generation)
+            await self?.applyRefinedSizing(result, reading: reading)
         }
         tasks.append(task)
     }
 
-    private func applyRefinedSizing(_ result: Result<RefinedColumns, any Error>, generation: UInt64) {
-        guard generation == self.generation, failure == nil else { return }
+    private func applyRefinedSizing(_ result: Result<RefinedColumns, any Error>, reading: ReadingID) {
+        guard reading == readingID, failure == nil else { return }
         switch result {
         case let .success(refined):
             numeric = refined.numeric
@@ -765,6 +842,205 @@ final class DocumentModel: GridDataSource {
         progressArrived(progress)
     }
 
+    // MARK: The user's file (task 1.9)
+
+    /// Asks the core to report changes to the file, through a relay that
+    /// ignores reports about an older core document.
+    private func watchOriginal() {
+        let reference = ModelReference()
+        reference.model = self
+        let number = handleNumber
+        let relay = OriginalRelay { status in reference.model?.originalArrived(status, handle: number) }
+        _ = call { try $0.watchOriginal(observer: relay) }
+    }
+
+    /// Looks at the file again when a volume mounts or unmounts (a
+    /// removable drive coming back, ADR-0006) and when Leal becomes active
+    /// (a change the watcher can't see, such as a file put back at a
+    /// deleted file's path while Leal was in the background).
+    private func observeVolumesAndActivation() {
+        guard observers.isEmpty else { return }
+        let workspace = NSWorkspace.shared.notificationCenter
+        let names = [
+            (workspace, NSWorkspace.didMountNotification),
+            (workspace, NSWorkspace.didUnmountNotification),
+            (NotificationCenter.default, NSApplication.didBecomeActiveNotification),
+        ]
+        for (center, name) in names {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { _ = self?.checkOriginal() }
+            }
+            observers.append((center, observer))
+        }
+    }
+
+    private func stopObserving() {
+        for (center, observer) in observers { center.removeObserver(observer) }
+        observers.removeAll()
+        checkingOriginal?.cancel()
+        checkingOriginal = nil
+        checkAgain = false
+    }
+
+    private func originalArrived(_ status: OriginalStatus, handle number: Int) {
+        guard number == handleNumber, failure == nil else { return }
+        apply(original: status)
+    }
+
+    /// The file is now as `status` says: follow a move, and update what
+    /// Save may do.
+    private func apply(original status: OriginalStatus) {
+        let moved = status.path != original.path
+        original = status
+        // A file moved to the Trash is deleted, as far as the window says;
+        // the document keeps its place. A path in a temporary-items folder
+        // is a safe save's staging area, never the document's new home (the
+        // core doesn't report one either).
+        let staging = URL(filePath: status.path).pathComponents.contains { $0 == "TemporaryItems" || $0 == ".TemporaryItems" }
+        if moved, status.state != .deleted, !staging {
+            url = URL(filePath: status.path)
+            onMoved?(url)
+        }
+        refreshDriveState()
+        onChange?(.progress)
+    }
+
+    /// Looks at the file now, off the main thread (it can block on a
+    /// network volume): a removable drive that is back reconnects, and the
+    /// core reads the file again to carry on copying it. Returns the task,
+    /// for tests; `nil` if one is already under way, in which case another
+    /// runs after it.
+    @discardableResult
+    func checkOriginal() -> Task<Void, Never>? {
+        guard failure == nil, let handle else { return nil }
+        guard checkingOriginal == nil else {
+            checkAgain = true
+            return nil
+        }
+        let number = handleNumber
+        coreCalls += 1
+        let task = Task { [weak self] in
+            let result = await Task.detached(priority: .utility) { () -> Result<OriginalStatus, any Error> in
+                Result { try handle.checkOriginal() }
+            }.value
+            // After a Reload, `checkingOriginal` is the new handle's.
+            guard let self, number == handleNumber else { return }
+            checkingOriginal = nil
+            guard failure == nil else { return }
+            switch result {
+            case let .success(status):
+                if let current = call({ try $0.progress() }), current.generation != generation {
+                    restarted(current)
+                }
+                apply(original: status)
+            case let .failure(error):
+                // Handled as any core call's error.
+                let _: Void? = call { _ -> Void in throw error }
+            }
+            if checkAgain {
+                checkAgain = false
+                checkOriginal()
+            }
+        }
+        checkingOriginal = task
+        return task
+    }
+
+    /// The core read the file again the same way (its drive came back):
+    /// new jobs and diagnostics, the same interpretation and columns.
+    private func restarted(_ report: IndexProgress) {
+        for task in tasks { task.cancel() }
+        tasks.removeAll()
+        generation = report.generation
+        progress = report
+        diagnostics = nil
+        review = nil
+        reviewedLineEnding = nil
+        flagBlocks.removeAll()
+        tiles.removeAll()
+        refinedSizingStarted = false
+        refreshDriveState()
+        onChange?(.rows)
+        startWaiting()
+        progressArrived(report)
+    }
+
+    /// **Reload** (task 1.9): opens the file again through the core, so
+    /// the window shows it as it is now. The user's own choices (Treat As,
+    /// Reopen with Encoding, the Header row) are kept where they still fit
+    /// the file, and so are the widths of columns they resized. Every
+    /// cache is dropped. The old core document is released, which deletes
+    /// its snapshot.
+    ///
+    /// Throws the open error if the file can't be opened (deleted, moved
+    /// out of reach, or its drive away); the document is then unchanged.
+    func reload() throws {
+        guard failure == nil else { return }
+        let current = interpretation
+        let chosen = OpenOptions(
+            delimiter: current.delimiterSource == .user ? current.delimiter : nil,
+            header: current.headerSource == .user ? current.header : nil,
+            encoding: current.encodingSource == .user ? current.encoding : nil,
+            firstScreenRows: 1,
+            maxChars: GridMetrics.maxCellCharacters
+        )
+        let number = handleNumber + 1
+        let reference = ModelReference()
+        let new: LealFFI.Document
+        do {
+            new = try Self.openHandle(url: url, environment: environment, options: chosen, reference: reference, number: number)
+        } catch LealError.EncodingDoesNotFit {
+            // The chosen encoding no longer fits the file's BOM.
+            let plain = OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters)
+            new = try Self.openHandle(url: url, environment: environment, options: plain, reference: reference, number: number)
+        }
+        let screen = try new.firstScreen()
+
+        // From here on, the new core document.
+        for task in tasks { task.cancel() }
+        tasks.removeAll()
+        checkingOriginal?.cancel()
+        checkingOriginal = nil
+        handle = new
+        handleNumber = number
+        reference.model = self
+        interpretation = screen.interpretation
+        generation = screen.generation
+        fileColumnCount = Int(screen.columnCount)
+        progress = IndexProgress(
+            generation: screen.generation,
+            rows: screen.rowCount,
+            estimatedRows: screen.estimatedRowCount,
+            bytesScanned: 0,
+            bytesTotal: 0,
+            complete: false
+        )
+        reviewedLineEnding = nil
+        review = nil
+        diagnostics = nil
+        flagBlocks.removeAll()
+        tiles.removeAll()
+        let resized = columnWidths
+        columnWidths = []
+        widestText = []
+        widestSampleRow = 0
+        columnCount = 0
+        refinedSizingStarted = false
+        storage = .clone
+        changedOnDisk = false
+        canSave = true
+        original = call({ try $0.original() }) ?? OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
+        applyFirstScreen(screen)
+        for column in resizedColumns where column < columnWidths.count && column < resized.count {
+            columnWidths[column] = resized[column]
+        }
+        refreshDriveState()
+        onChange?(.reloaded)
+        startWaiting()
+        watchOriginal()
+        progressArrived(progress)
+    }
+
     // MARK: Status bar
 
     var status: StatusSummary {
@@ -782,6 +1058,7 @@ final class DocumentModel: GridDataSource {
             readOnly: isReadOnly,
             storage: storage,
             changedOnDisk: changedOnDisk,
+            original: original.state,
             infoKinds: diagnostics?.diagnostics.filter { $0.severity == .info }.map(\.kind) ?? [],
             warningKinds: Int(diagnostics?.bannerKinds ?? 0),
             notes: interpretation.notes,
@@ -792,6 +1069,13 @@ final class DocumentModel: GridDataSource {
     /// The whole file's most common line ending, once the review knows it,
     /// else first paint's.
     var lineEnding: LineEnding? { reviewedLineEnding ?? interpretation.lineEnding }
+}
+
+/// A core document (by `DocumentModel`'s count of Reloads) and a reading
+/// of it (its generation).
+struct ReadingID: Equatable, Sendable {
+    let handle: Int
+    let generation: UInt64
 }
 
 /// The refined sizing's result, from the background.

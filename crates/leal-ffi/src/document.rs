@@ -17,6 +17,9 @@
 //! - [`Document::diagnostics`] (task 1.5): the irregularities found so far,
 //!   for the banner and details; [`Document::row_has_diagnostic`] and its
 //!   next and previous for the gutter's markers.
+//! - [`Document::watch_original`] (task 1.9): the user's file is watched
+//!   for changes made elsewhere, and an [`OriginalObserver`] is told;
+//!   [`Document::check_original`] looks again when a volume mounts.
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -29,7 +32,7 @@ use leal_core::detect::{self, Choices, Detection};
 use leal_core::dialect;
 use leal_core::document::{self, DocumentError};
 use leal_core::schedule::{self, JobControl, JobError, SchedulerConfig};
-use leal_core::source::{ReadError, ReadErrorKind, TempFolders};
+use leal_core::source::{self, ReadError, ReadErrorKind, TempFolders};
 
 use crate::platform::MacPlatform;
 use crate::{LealError, SourceStorage, TempLocations, VolumeInfo};
@@ -86,6 +89,59 @@ impl Scheduler {
 pub trait ProgressObserver: Send + Sync {
     /// The index has got to `progress`.
     fn index_progressed(&self, progress: IndexProgress);
+}
+
+/// Told when the user's file changes, moves, is deleted or its volume goes
+/// away (task 1.9), on a watching thread of the document's own. Keep it
+/// short: hop to the main thread.
+#[uniffi::export(with_foreign)]
+pub trait OriginalObserver: Send + Sync {
+    /// The file is now as `status` says.
+    fn original_changed(&self, status: OriginalStatus);
+}
+
+/// What has happened to the user's file since it was opened. See
+/// [`leal_core::source::OriginalState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OriginalState {
+    /// As it was when opened (perhaps moved).
+    Unchanged,
+    /// Changed, or replaced by another file: the app offers **Reload** and
+    /// **Keep editing**.
+    Changed,
+    /// Deleted, or moved to the Trash.
+    Deleted,
+    /// Its volume isn't mounted. Save is refused until it is back.
+    Unavailable,
+}
+
+/// The user's file as last seen. See
+/// [`leal_core::source::OriginalStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OriginalStatus {
+    /// What has happened to it.
+    pub state: OriginalState,
+    /// Where it is now: it follows renames.
+    pub path: String,
+    /// Whether it has changed or been deleted at any time since it was
+    /// opened, even if the user chose **Keep editing** (for Save's check,
+    /// phase 2).
+    pub diverged: bool,
+}
+
+impl From<source::OriginalStatus> for OriginalStatus {
+    fn from(status: source::OriginalStatus) -> Self {
+        Self {
+            state: match status.state {
+                source::OriginalState::Unchanged => OriginalState::Unchanged,
+                source::OriginalState::Changed => OriginalState::Changed,
+                source::OriginalState::Deleted => OriginalState::Deleted,
+                source::OriginalState::Unavailable => OriginalState::Unavailable,
+            },
+            path: status.path.to_string_lossy().into_owned(),
+            diverged: status.diverged,
+        }
+    }
 }
 
 /// A field delimiter (DESIGN §3.2).
@@ -1153,6 +1209,63 @@ impl Document {
         self.call(|| Ok(self.document.changed_on_disk()))
     }
 
+    /// The user's file as last seen (task 1.9). No system calls.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn original(&self) -> Result<OriginalStatus, LealError> {
+        self.call(|| Ok(self.document.original().into()))
+    }
+
+    /// Starts watching the user's file (task 1.9): `observer` is told each
+    /// time what has happened to it changes. A second call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::Internal`] if the kernel's event queue or the watching
+    /// thread can't be made; the document works without them, and
+    /// [`check_original`](Self::check_original) still notices changes.
+    /// [`LealError::DocumentFailed`].
+    pub fn watch_original(&self, observer: Arc<dyn OriginalObserver>) -> Result<(), LealError> {
+        self.call(|| {
+            self.document
+                .watch_original(Arc::new(move |status| {
+                    observer.original_changed(status.clone().into());
+                }))
+                .map_err(|error| LealError::Internal {
+                    message: format!("couldn't watch {}: {error}", self.path),
+                })
+        })
+    }
+
+    /// Looks at the user's file now (task 1.9): the app calls it when a
+    /// volume mounts or the app becomes active. If the file's removable
+    /// drive is back and the file is unchanged, a disconnected document
+    /// reconnects and is read again, with a new generation (its jobs are
+    /// new: [`index_job`](Self::index_job)), to carry on copying; Save is
+    /// allowed again. It makes a few system calls, which a network volume
+    /// can slow down: call it off the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn check_original(&self) -> Result<OriginalStatus, LealError> {
+        self.call(|| {
+            let before = self.document.generation();
+            let status = self.document.check_original();
+            let after = self.document.generation();
+            if after != before {
+                self.watch_jobs();
+                self.first_screen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .generation = after;
+            }
+            Ok(status.into())
+        })
+    }
+
     /// Reads the file again with `options`' choices (**Treat as**, the
     /// header toggle, **Reopen with encoding…**), without reopening it.
     /// The old jobs are cancelled; [`index_job`](Self::index_job) and
@@ -1206,6 +1319,14 @@ impl Document {
     /// document fails.
     pub fn debug_watch(&self, job: &Job) {
         self.failure.watch(&job.control);
+    }
+
+    /// For a document from [`debug_open_document_with_fault`]: its
+    /// simulated drive is plugged back in (task 1.9). The next
+    /// [`check_original`](Self::check_original) reconnects it, as for a
+    /// real drive.
+    pub fn debug_simulate_drive_back(&self) {
+        self.document.source().simulate_drive_back();
     }
 }
 

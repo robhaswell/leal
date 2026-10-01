@@ -61,13 +61,13 @@ extension DocumentModel {
     func cellValue(row: Int, column: Int) async -> CellValue? {
         guard let handle = backgroundHandle() else { return nil }
         let physical = UInt64(row + headerRows)
-        let generation = generation
+        let reading = readingID
         let result = await Task.detached(priority: .userInitiated) { () -> Result<CellValue?, any Error> in
             Result {
                 try handle.cellValue(row: physical, column: UInt32(clamping: column), maxChars: Self.inspectorMaxCharacters)
             }
         }.value
-        guard generation == self.generation, !isFailed else { return nil }
+        guard reading == readingID, !isFailed else { return nil }
         switch result {
         case let .success(value):
             return value

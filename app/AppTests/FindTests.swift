@@ -460,16 +460,64 @@ final class FindTests: XCTestCase {
         }
     }
 
-    /// 1.9's reload isn't on this branch: this reopens the file through
-    /// `NSDocumentController`, as the failure sheet's Reopen does, which
-    /// releases the core document and makes a new one, as a reload will.
-    func testACopyStillPastesItsCellsAfterTheFileIsReopened() async throws {
-        try await copyThenPaste("reopened.csv") { document, _ in
-            let reopened = await withCheckedContinuation { continuation in
-                document.reopenAfterFailure(display: false) { continuation.resume(returning: $0) }
-            }
-            XCTAssertNotNil(reopened)
+    /// **Reload** (task 1.9) releases the core document and opens a new one
+    /// of the file as it is now. A copy promised before it still pastes
+    /// exactly the cells it was made from, though the file has changed.
+    func testACopyStillPastesItsCellsAfterTheFileIsReloaded() async throws {
+        try await copyThenPaste("reloaded.csv") { document, content in
+            let url = try XCTUnwrap(document.fileURL)
+            try Data("id,customer,notes\n0,Changed Elsewhere,x\n".utf8).write(to: url, options: .atomic)
+            content.reloadFromDisk(nil)
+            XCTAssertEqual(content.model.cell(row: 0, column: 1), .text("Changed Elsewhere", truncated: false))
         }
+    }
+
+    // MARK: Reload with the find bar and the inspector open (task 1.9)
+
+    /// An open find runs again on the reloaded file: its matches are the new
+    /// file's, not the old one's.
+    func testReloadRunsAnOpenFindAgain() async throws {
+        let url = try file("orders.csv", Self.orders)
+        let (document, model, content) = try open(url)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        content.showFind(nil)
+        content.findBar.field.stringValue = "MARLOW"
+        content.search(for: "MARLOW")
+        try await searchSettled(content)
+        XCTAssertEqual(content.find.matchCount, 6)
+
+        let fewer = "order,customer,email,notes\n1,Marlow Foods,orders@example,\n2,Ostrava Tools,o@example,\n"
+        try Data(fewer.utf8).write(to: url, options: .atomic)
+        try await waitUntil("the change is seen") { model.original.state == .changed }
+        content.reloadFromDisk(nil)
+        try await waitUntil("indexed again") { model.isIndexComplete }
+        try await searchSettled(content)
+        XCTAssertTrue(content.isFindBarShown)
+        XCTAssertEqual(content.find.query, "MARLOW")
+        XCTAssertEqual(content.find.matchCount, 1, "the new file's matches")
+        XCTAssertNotNil(content.find.highlight(row: 0, column: 1))
+        XCTAssertNil(content.find.highlight(row: 2, column: 1), "no match from the old file")
+        document.close()
+    }
+
+    /// The inspector shows the restored cell's value as it is after Reload.
+    func testReloadRefreshesTheInspector() async throws {
+        let url = try file("notes.csv", "id,notes\n1,old note\n2,second\n")
+        let (document, model, content) = try open(url)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        content.grid.select(CellPosition(row: 0, column: 1))
+        content.toggleCellInspector(nil)
+        await content.inspectorTask?.value
+        XCTAssertEqual(content.inspector.textView.string, "old note")
+
+        try Data("id,notes\n1,new note\n2,second\n".utf8).write(to: url, options: .atomic)
+        try await waitUntil("the change is seen") { model.original.state == .changed }
+        content.reloadFromDisk(nil)
+        XCTAssertTrue(content.isInspectorShown)
+        XCTAssertEqual(content.grid.activeCell, CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        try await waitUntil("the new value is shown") { content.inspector.textView.string == "new note" }
+        document.close()
     }
 
     /// A new copy replaces a promise still running: the pasteboard lets go

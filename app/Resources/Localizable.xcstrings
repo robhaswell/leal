@@ -167,6 +167,9 @@
     "Another app changed it while Leal was reading it." : {
       "comment" : "Open error: the file changed while it was being read without a snapshot"
     },
+    "Another app changed this file after Leal opened it. Leal shows the version it opened; File ▸ Reload from Disk shows the new one." : {
+      "comment" : "Status bar tooltip: the file changed on disk (task 1.9)"
+    },
     "Blank lines" : {
       "comment" : "Diagnostic kind: empty rows (DESIGN §3.5)\nStatus bar: the file has empty rows"
     },
@@ -184,6 +187,9 @@
     },
     "Cell value" : {
       "comment" : "VoiceOver name of the cell inspector's text"
+    },
+    "Changed on disk" : {
+      "comment" : "Status bar: another app changed the open file; Leal shows the version it opened (task 1.9)"
     },
     "Changed while reading" : {
       "comment" : "Status bar: the file changed on its drive while Leal read it (1.1a)"
@@ -212,6 +218,9 @@
     "Delete" : {
       "comment" : "Edit menu"
     },
+    "Deleted" : {
+      "comment" : "Status bar: the open file was deleted or moved to the Trash (task 1.9)"
+    },
     "Delimiter: %@, menu" : {
       "comment" : "VoiceOver: the status bar's Treat As button; the delimiter's name"
     },
@@ -226,6 +235,9 @@
     },
     "Drive disconnected" : {
       "comment" : "Status bar: the file's removable drive was disconnected (ADR-0006)"
+    },
+    "Drive not connected" : {
+      "comment" : "Status bar: the open file's drive was ejected after Leal had copied the file (task 1.9)"
     },
     "Edit" : {
       "comment" : "Menu title"
@@ -330,6 +342,9 @@
     "It’s a folder, not a file." : {
       "comment" : "Open error: the path is a folder"
     },
+    "Keep Editing" : {
+      "comment" : "Banner button: keep the version Leal opened, and hide the banner (task 1.9)"
+    },
     "Leal can’t show “%@” any more." : {
       "comment" : "Alert title after a panic in the core (DESIGN §3.9); the file's name"
     },
@@ -338,6 +353,9 @@
     },
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
+    },
+    "Leal couldn’t reload “%@”." : {
+      "comment" : "Alert title: Reload failed (task 1.9); the file's name"
     },
     "Leal guessed the encoding from the start of the file." : {
       "comment" : "Status bar tooltip: encoding source"
@@ -439,6 +457,12 @@
     "Redo" : {
       "comment" : "Edit menu"
     },
+    "Reload" : {
+      "comment" : "Banner button: open the file again as it is on disk now (task 1.9)"
+    },
+    "Reload from Disk" : {
+      "comment" : "File menu: open the file again as it is on disk now (task 1.9)"
+    },
     "Remembered settings ignored" : {
       "comment" : "Status bar: Leal's own remembered delimiter and header choice were ignored (ADR-0005 decision 1)"
     },
@@ -517,11 +541,14 @@
     "The drive was disconnected before Leal had read the whole file. Save is off until it’s back; Save As keeps a copy." : {
       "comment" : "Status bar tooltip: the removable drive was disconnected (ADR-0006)"
     },
+    "The drive with this file isn’t connected. Leal has the whole file; Save is off until the drive is back." : {
+      "comment" : "Status bar tooltip: the file's drive was ejected after Leal had copied the file (task 1.9)"
+    },
     "The drive with this file was disconnected. Leal shows the rows it had read; Save is off until the drive is back, and Save As keeps a copy." : {
       "comment" : "Banner: the file's removable drive was disconnected before Leal had read it all (ADR-0006)"
     },
-    "The file changed on its drive while Leal was reading it, so what’s shown may mix two versions." : {
-      "comment" : "Status bar tooltip: the file changed while Leal read it (1.1a)"
+    "The file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change." : {
+      "comment" : "Status bar tooltip: the file changed while Leal read it (1.1a, task 1.9)"
     },
     "The file changed since Leal remembered its delimiter (%@), so Leal guessed again." : {
       "comment" : "Status bar tooltip: Leal's remembered delimiter no longer fits; its name"
@@ -558,8 +585,11 @@
     "The selected cells make a lot of text. Copying them takes a while and puts all of it on the clipboard." : {
       "comment" : "Sheet before a very large Copy"
     },
-    "This file changed on its drive while Leal was reading it, so what’s shown may mix two versions. Save is off; Save As keeps a copy." : {
-      "comment" : "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a)"
+    "This file changed on disk. Leal still shows it as it was when you opened it." : {
+      "comment" : "Banner: another app changed or replaced the open file (task 1.9, DESIGN §3.1)"
+    },
+    "This file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change and Save is off. Reload reads the file as it is now." : {
+      "comment" : "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a, task 1.9)"
     },
     "This file has %@ kinds of irregularity. It’s shown exactly as written." : {
       "comment" : "Diagnostics banner (DESIGN §3.5, mockup 03a); the number of kinds of warning or error"
@@ -584,6 +614,12 @@
     },
     "This file looks tab-separated." : {
       "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This file was deleted or moved to the Trash after Leal opened it. Leal shows the version it opened." : {
+      "comment" : "Status bar tooltip: the file was deleted (task 1.9)"
+    },
+    "This file was deleted or moved to the Trash. Leal still shows it as it was; Save As keeps a copy." : {
+      "comment" : "Banner: the open file was deleted or moved to the Trash (task 1.9)"
     },
     "This row has no field here: it is shorter than the others." : {
       "comment" : "Cell inspector on a short (ragged) row's missing cell"

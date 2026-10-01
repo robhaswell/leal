@@ -5,12 +5,14 @@ import LealFFI
 /// and the status bar. It binds the grid to the `DocumentModel` and passes
 /// the user's scrolling and typing to the core's scheduler.
 ///
-/// The banners, top to bottom: a removable drive that was disconnected or
-/// whose file changed while it was read (ADR-0006), the UTF-16 notice
-/// (mockup 06a), the diagnostics banner (03a), and the delimiter and
-/// encoding suggestions (DESIGN §3.2, ADR-0005 decision 4). Each stays
-/// until dismissed; reading the file again (Treat As, Reopen with
-/// Encoding, the Header row toggle) starts them afresh.
+/// The banners, top to bottom: the file's own (`FileBanner`: it changed
+/// while read from a drive that can't make a snapshot, it changed or was
+/// deleted elsewhere, or its removable drive was disconnected; ADR-0006,
+/// task 1.9), the UTF-16 notice (mockup 06a), the diagnostics banner (03a),
+/// and the delimiter and encoding suggestions (DESIGN §3.2, ADR-0005
+/// decision 4). Each stays until dismissed; reading the file again (Treat
+/// As, Reopen with Encoding, the Header row toggle) starts all but the
+/// file's afresh, and **Reload** starts every one afresh.
 @MainActor
 final class DocumentViewController: NSViewController, NSMenuItemValidation {
     let model: DocumentModel
@@ -22,6 +24,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// The document failed (DESIGN §3.9).
     var onFailure: (() -> Void)?
 
+    /// The file's banner (`FileBanner`), if one shows.
     private(set) var driveBanner: BannerView?
     private(set) var readOnlyBanner: BannerView?
     private(set) var diagnosticsBanner: BannerView?
@@ -189,6 +192,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // pasteboard, and keeps what it reads (`CopyPromise`).
             if isFindBarShown { find.restart(from: grid.activeCell) }
             updateInspector()
+        case .rows:
+            // The same reading with fresh rows (after a change while reading),
+            // or the file read again after its drive came back: matches and
+            // the inspected value may differ.
+            grid.invalidateContent()
+            if isFindBarShown { find.restart(from: grid.activeCell) }
+            updateInspector()
+        case .reloaded:
+            // A new snapshot: every banner may show again. `reloadFromDisk`
+            // puts the selection and scroll position back, then re-runs an
+            // open find and refreshes the inspector. A promised copy keeps
+            // the cells it was made from (`CopyPromise`).
+            dismissed.removeAll()
+            detailsPopover?.close()
+            navigation.reset()
+            grid.setColumnWidths(model.columnWidths)
+            grid.invalidateContent()
         case .failed:
             grid.invalidateContent()
             detailsPopover?.close()
@@ -206,9 +226,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     func updateBanners() {
         if bannerGeneration != model.generation {
             // A new reading of the file: suggestions and the diagnostics
-            // banner start afresh. The drive's state is the file's, not the
-            // reading's.
-            dismissed = dismissed.filter { $0.hasPrefix("drive") }
+            // banner start afresh. The file's banners are about the file,
+            // not the reading.
+            dismissed = dismissed.filter { $0.hasPrefix("drive") || $0.hasPrefix("file") }
             bannerGeneration = model.generation
         }
         guard !model.isFailed else {
@@ -220,22 +240,29 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             return
         }
 
-        // A removable drive (ADR-0006, 1.1a).
-        let drive: (key: String, message: String)? = if model.changedOnDisk {
-            ("drive-changed", DiagnosticsText.changedWhileReading)
-        } else if model.storage == .disconnected {
-            ("drive-disconnected", DiagnosticsText.disconnected)
-        } else {
-            nil
-        }
+        // The file itself (ADR-0006, 1.1a, task 1.9): the first that
+        // applies and wasn't dismissed.
+        let file = FileBanner.applicable(
+            changedWhileReading: model.changedOnDisk,
+            original: model.original.state,
+            storage: model.storage
+        ).first { !dismissed.contains($0.key) }
         driveBanner = banner(
             driveBanner,
-            key: drive?.key,
+            key: file?.key,
             make: { key in
-                makeBanner(kind: .warning, message: drive?.message ?? "", button: DiagnosticsText.saveAs, action: #selector(saveACopy(_:)), key: key)
+                makeBanner(
+                    kind: .warning,
+                    message: file?.message ?? "",
+                    button: file?.buttonTitle,
+                    action: file?.reloads == true ? #selector(reloadFromDisk(_:)) : #selector(saveACopy(_:)),
+                    key: key,
+                    secondaryTitle: file?.secondaryTitle,
+                    secondaryAction: #selector(keepEditing(_:))
+                )
             }
         )
-        driveBanner?.message = drive?.message ?? ""
+        driveBanner?.message = file?.message ?? ""
 
         // UTF-16 (mockup 06a).
         readOnlyBanner = banner(readOnlyBanner, key: model.isReadOnly ? "read-only" : nil) { key in
@@ -313,15 +340,81 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         button: String?,
         prominent: Bool = true,
         action: Selector,
-        key: String
+        key: String,
+        secondaryTitle: String? = nil,
+        secondaryAction: Selector? = nil
     ) -> BannerView {
-        let banner = BannerView(kind: kind, message: message, buttonTitle: button, prominent: prominent, target: self, action: action)
+        let banner = BannerView(
+            kind: kind,
+            message: message,
+            buttonTitle: button,
+            prominent: prominent,
+            target: self,
+            action: action,
+            secondaryTitle: secondaryTitle,
+            secondaryAction: secondaryAction
+        )
         banner.identifier = NSUserInterfaceItemIdentifier(key)
         banner.onDismiss = { [weak self] in
             self?.dismissed.insert(key)
             self?.updateBanners()
         }
         return banner
+    }
+
+    // MARK: The file changed elsewhere (task 1.9, DESIGN §3.1)
+
+    /// **Reload**, from the file's banner or File ▸ Reload from Disk: open
+    /// the file again as it is now. The active cell and scroll position
+    /// stay where they were, as far as the new file reaches. If the file
+    /// can't be opened, the window says why and keeps what it shows.
+    @objc func reloadFromDisk(_ sender: Any?) {
+        scheduler.noteUserInput()
+        let cell = grid.activeCell
+        let origin = grid.scrollView.contentView.bounds.origin
+        do {
+            try model.reload()
+        } catch {
+            showReloadError(error)
+            return
+        }
+        if let cell, model.rowCount > 0, model.columnCount > 0 {
+            grid.activeCell = CellPosition(row: min(cell.row, model.rowCount - 1), column: min(cell.column, model.columnCount - 1))
+        } else {
+            grid.activeCell = model.rowCount > 0 ? CellPosition(row: 0, column: 0) : nil
+        }
+        let clip = grid.scrollView.contentView
+        let maxX = max(0, grid.gridView.frame.width - clip.bounds.width)
+        let maxY = max(0, grid.gridView.frame.height - clip.bounds.height)
+        clip.scroll(to: NSPoint(x: min(origin.x, maxX), y: min(origin.y, maxY)))
+        grid.scrollView.reflectScrolledClipView(clip)
+        // Task 1.8's tools follow the new snapshot: an open find runs again
+        // from the restored cell, and the inspector shows that cell's value
+        // as it is now. A copy already promised keeps the cells it was made
+        // from (`CopyPromise` holds its own core job).
+        if isFindBarShown { find.restart(from: grid.activeCell) }
+        updateInspector()
+    }
+
+    /// **Keep Editing**: keep the version Leal opened and hide the banner.
+    /// The core remembers that the file diverged, for Save's check (phase
+    /// 2), and the status bar keeps a note.
+    @objc func keepEditing(_ sender: Any?) {
+        guard let key = driveBanner?.identifier?.rawValue else { return }
+        dismissed.insert(key)
+        updateBanners()
+    }
+
+    private func showReloadError(_ error: any Error) {
+        guard let window = view.window else { return }
+        let failure = CSVDocument.openError(error, url: model.url)
+        let alert = NSAlert()
+        alert.messageText = String(
+            localized: "Leal couldn’t reload “\(model.url.lastPathComponent)”.",
+            comment: "Alert title: Reload failed (task 1.9); the file's name"
+        )
+        alert.informativeText = failure.localizedRecoverySuggestion ?? ""
+        alert.beginSheetModal(for: window)
     }
 
     /// "Switch": read the file with the suggested delimiter.
@@ -393,6 +486,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case #selector(toggleCellInspector(_:)):
             menuItem.title = isInspectorShown ? MainMenu.hideInspector : MainMenu.showInspector
             return !model.isFailed
+        case #selector(reloadFromDisk(_:)):
+            // There must be a file to open again.
+            return !model.isFailed && model.original.state != .deleted && model.original.state != .unavailable
         default:
             return true
         }

@@ -63,6 +63,7 @@
 //! does that.
 
 mod error;
+mod original;
 mod removable;
 // The one place in leal-core that may use `unsafe` (CLAUDE.md): the system
 // calls the standard library doesn't wrap, and the memory map.
@@ -70,7 +71,7 @@ mod removable;
 mod sys;
 mod temp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod volume;
 
 use std::borrow::Cow;
@@ -88,6 +89,7 @@ use memmap2::Mmap;
 
 use error::Step;
 pub use error::{OpenError, OpenErrorKind, ReadError, ReadErrorKind};
+pub use original::{MOVE_WINDOW, Original, OriginalState, OriginalStatus, PENDING_POLL};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use removable::SimulatedFault;
 use removable::{Origin, Removable};
@@ -647,6 +649,51 @@ impl Source {
         match &self.bytes {
             Bytes::Removable(removable) => removable.changed_on_disk(),
             Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    /// The watcher saw the user's file written to ([`Original`], task
+    /// 1.9). For a file on a removable drive that can't clone, which is
+    /// read from the user's file itself, that is a change while reading
+    /// ([`changed_on_disk`](Self::changed_on_disk) becomes `true`): the
+    /// kernel's write event catches a same-size write that the size and
+    /// modification time checks can miss. Everything else holds a snapshot
+    /// (a clone, a complete copy, or memory), which a write can't reach, so
+    /// for them this does nothing.
+    pub fn note_original_written(&self) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.note_original_written();
+        }
+    }
+
+    /// The file's removable drive is back (task 1.9; the app notices a
+    /// volume mounting). If the source was [`Storage::Disconnected`] before
+    /// its copy was complete, it reopens the clone on the drive, or failing
+    /// that the user's file at `original` (where it is now) if its inode,
+    /// size and modification time are what they were when it was opened.
+    /// The source is then [`Storage::Reading`] again, Save is allowed again,
+    /// and the next [`stream`](Self::stream) carries on copying from
+    /// [`available_len`](Self::available_len). Returns whether it
+    /// reconnected; `false` for every other source, and if the drive's file
+    /// can't be found or has changed.
+    pub fn reconnect(&self, original: &Path) -> bool {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.reconnect(original, &self.identity),
+            Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    /// TEST HOOK, not for product code: the drive of a source opened with
+    /// [`open_simulating_fault`](Self::open_simulating_fault) is plugged
+    /// back in. A simulated drive stays away until then, so the app's
+    /// checks (on activation, on a volume mounting) can't bring it back by
+    /// themselves. [`reconnect`](Self::reconnect) then works as for a real
+    /// drive.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn simulate_drive_back(&self) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.simulate_drive_back();
         }
     }
 

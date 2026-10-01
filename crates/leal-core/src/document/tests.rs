@@ -19,6 +19,7 @@ use crate::diagnostics::{DiagnosticKind, MAX_LOCATIONS};
 use crate::dialect::{Delimiter, Encoding};
 use crate::schedule::{Platform, SchedulerConfig, ThreadClass};
 use crate::source::SimulatedFault;
+use crate::source::tests::DiskImage;
 
 const LONG: Duration = Duration::from_secs(30);
 
@@ -1478,6 +1479,406 @@ fn a_newer_search_stops_an_older_one() {
         2,
     );
     assert_eq!(current.unwrap(), Some(Place { row: 1, column: 1 }));
+}
+
+// ---------------------------------------------------------------------------
+// The user's file changing elsewhere (task 1.9)
+
+/// Waits until `reports` gives a status `done` accepts.
+fn wait_for_status(
+    reports: &mpsc::Receiver<OriginalStatus>,
+    what: &str,
+    done: impl Fn(&OriginalStatus) -> bool,
+) -> OriginalStatus {
+    let deadline = std::time::Instant::now() + LONG;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match reports.recv_timeout(left) {
+            Ok(status) if done(&status) => return status,
+            Ok(_) => {}
+            Err(_) => panic!("the document didn't report {what}"),
+        }
+    }
+}
+
+/// Starts watching `document`'s file, reporting each new status.
+fn watch(document: &Document) -> mpsc::Receiver<OriginalStatus> {
+    let (send, receive) = mpsc::channel();
+    let send = Mutex::new(send);
+    document
+        .watch_original(Arc::new(move |status| {
+            let _ = send.lock().unwrap().send(status.clone());
+        }))
+        .unwrap();
+    receive
+}
+
+#[test]
+fn a_changed_file_is_reported_and_the_snapshot_kept() {
+    let dir = Dir::new("original-changed");
+    let bytes = b"a,b\n1,2\n3,4\n";
+    let (document, _) = open_bytes(&dir, "a.csv", bytes);
+    wait_for_index(&document);
+    let reports = watch(&document);
+    assert_eq!(document.original().state, OriginalState::Unchanged);
+
+    std::fs::write(dir.0.join("a.csv"), b"x,y\n9,9\n").unwrap();
+    let status = wait_for_status(&reports, "the change", |s| {
+        s.state == OriginalState::Changed
+    });
+    assert!(status.diverged);
+    assert_eq!(document.original(), status);
+    // **Keep editing**: the snapshot is what was opened, and Save is still
+    // allowed (phase 2 asks first, from `diverged`).
+    assert_eq!(
+        text(&document.rows(0..3, 100).unwrap()),
+        [["a", "b"], ["1", "2"], ["3", "4"]]
+    );
+    assert!(document.can_save());
+    assert!(!document.changed_on_disk());
+    // A check agrees, and changes nothing.
+    assert_eq!(document.check_original(), status);
+    assert_eq!(document.generation(), 0);
+}
+
+#[test]
+fn a_deleted_or_moved_file_is_reported() {
+    let dir = Dir::new("original-moved");
+    let (document, _) = open_bytes(&dir, "a.csv", b"a,b\n1,2\n");
+    let reports = watch(&document);
+    let moved = dir.0.join("b.csv");
+    std::fs::rename(dir.0.join("a.csv"), &moved).unwrap();
+    let status = wait_for_status(&reports, "the move", |s| {
+        s.path.file_name() == moved.file_name()
+    });
+    assert_eq!(status.state, OriginalState::Unchanged);
+
+    std::fs::remove_file(&moved).unwrap();
+    wait_for_status(&reports, "the deletion", |s| {
+        s.state == OriginalState::Deleted
+    });
+    assert_eq!(
+        text(&document.rows(0..2, 100).unwrap()),
+        [["a", "b"], ["1", "2"]]
+    );
+}
+
+#[test]
+fn a_simulated_disconnection_reconnects_when_the_drive_is_back() {
+    let dir = Dir::new("fault-reconnect");
+    let bytes = sample(300 * 1024);
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Disconnect { at: 150 * 1024 });
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    assert!(!document.can_save());
+    let rows_before = document.row_count();
+    // A simulated drive stays away until it is brought back.
+    document.check_original();
+    assert_eq!(document.storage(), Storage::Disconnected);
+    assert_eq!(document.generation(), 0);
+    document.source().simulate_drive_back();
+
+    // The app checks when a volume mounts.
+    let status = document.check_original();
+    assert_eq!(status.state, OriginalState::Unchanged);
+    assert_eq!(document.generation(), 1, "read again, to carry on copying");
+    assert_ne!(document.storage(), Storage::Disconnected);
+    assert!(document.can_save());
+
+    let summary = wait_for_index(&document);
+    assert_eq!(document.storage(), Storage::Copy);
+    assert!(summary.rows > rows_before);
+    let parser = document.current().parser;
+    let all = expected_rows(&bytes, parser, 1000);
+    assert_eq!(summary.rows, all.len());
+    assert_eq!(document.rows(0..all.len(), 1000).unwrap(), all);
+    assert!(document.can_save());
+    // Nothing more to reconnect.
+    document.check_original();
+    assert_eq!(document.generation(), 1);
+}
+
+#[test]
+fn a_disconnected_file_that_changed_meanwhile_isnt_reconnected() {
+    let dir = Dir::new("fault-reconnect-changed");
+    let bytes = sample(300 * 1024);
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Disconnect { at: 150 * 1024 });
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    std::fs::write(dir.0.join("usb.csv"), b"other\n").unwrap();
+    document.source().simulate_drive_back();
+    let status = document.check_original();
+    assert_eq!(status.state, OriginalState::Changed);
+    assert_eq!(document.storage(), Storage::Disconnected);
+    assert_eq!(document.generation(), 0);
+    assert!(!document.can_save());
+}
+
+/// The 1.1a re-review's obligation: once the file is known to have changed
+/// while it was read without a snapshot, rows read before that (the first
+/// 64 KB, and the row cache) aren't trusted, and only rows from the checked
+/// copy are served.
+#[test]
+fn after_a_change_while_reading_only_the_copy_is_trusted() {
+    let dir = Dir::new("fault-change-rows");
+    let bytes = sample(300 * 1024);
+    let path = dir.file("usb.csv", &bytes);
+    let source = Source::open_simulating_fault(
+        &path,
+        &dir.temp(),
+        4096,
+        Some(SimulatedFault::Change { at: 16 * 1024 }),
+    )
+    .unwrap();
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (document, screen) = Document::from_source(source, &scheduler, options(30), None).unwrap();
+    // Before the index runs: rows from the first 64 KB, cached.
+    let head_rows = screen.row_count;
+    assert_eq!(document.rows(0..30, 100).unwrap().len(), 30);
+    assert_eq!(document.current().cache.lock().unwrap().len(), 30);
+
+    gate.open();
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    assert!(document.changed_on_disk());
+    assert!(!document.can_save());
+    let indexed = document.current().index.row_count();
+    assert!(
+        indexed < head_rows,
+        "the change came inside the first 64 KB"
+    );
+    assert_eq!(document.row_count(), indexed);
+    assert_eq!(document.progress().rows, indexed);
+    // The cache is dropped once, then refilled from the copy.
+    assert_eq!(document.rows(0..5, 100).unwrap().len(), 5);
+    assert_eq!(document.current().cache.lock().unwrap().len(), 5);
+    let rows = document.rows(0..head_rows, 100).unwrap();
+    assert_eq!(rows.len(), indexed);
+    let parser = document.current().parser;
+    assert_eq!(rows, expected_rows(&bytes, parser, 100)[..indexed]);
+}
+
+#[test]
+fn watching_stops_when_the_document_is_dropped() {
+    let dir = Dir::new("original-drop");
+    let (document, _) = open_bytes(&dir, "a.csv", b"a,b\n");
+    let reports = watch(&document);
+    drop(document);
+    assert!(matches!(
+        reports.recv_timeout(Duration::from_secs(5)),
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// A removable drive that comes back (task 1.9), with real disk images. In
+// the `disk-images` test group.
+
+/// Opens `bytes` as `a.csv` on `image`, as the app would: with a folder for
+/// the clone on the image.
+fn open_on_image(
+    image: &DiskImage,
+    dir: &Dir,
+    bytes: &[u8],
+    scheduler: &Scheduler,
+) -> (Document, PathBuf) {
+    let path = image.root().join("a.csv");
+    std::fs::write(&path, bytes).unwrap();
+    let folder = image.root().join("NSIRD_Leal_test");
+    std::fs::create_dir_all(&folder).unwrap();
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo {
+            folder: Some(folder),
+            ..VolumeInfo::default()
+        },
+        scheduler,
+        options(30),
+        None,
+    )
+    .unwrap();
+    assert_eq!(document.storage(), Storage::Reading);
+    (document, path)
+}
+
+/// Detached before the copy began, then attached again: the drive is back,
+/// the copy carries on, and Save is allowed again. On APFS the clone on the
+/// drive is reopened (if it survived the forced detach) or else the user's
+/// file; on exFAT, which can't clone, the user's file.
+#[test]
+fn a_drive_that_comes_back_is_reconnected_and_save_is_allowed() {
+    for fs_type in ["APFS", "ExFAT"] {
+        let image = DiskImage::new(fs_type);
+        let dir = Dir::new("image-reconnect");
+        let bytes = sample(2 * 1024 * 1024);
+        let gate = Gate::closed();
+        let scheduler = scheduler_with(Arc::clone(&gate));
+        let (document, path) = open_on_image(&image, &dir, &bytes, &scheduler);
+        let reports = watch(&document);
+
+        image.force_detach();
+        let gone = wait_for_status(&reports, "the drive going", |s| {
+            s.state == OriginalState::Unavailable
+        });
+        assert!(!gone.diverged, "{fs_type}");
+        assert!(
+            !document.can_save(),
+            "{fs_type}: Save is off while the drive is away"
+        );
+        gate.open();
+        assert_eq!(
+            document.index_job().control().wait_timeout(LONG),
+            Some(Err(JobError::Read(ReadErrorKind::Disconnected))),
+            "{fs_type}"
+        );
+        assert_eq!(document.storage(), Storage::Disconnected, "{fs_type}");
+        // Still away: nothing to reconnect to.
+        assert_eq!(
+            document.check_original().state,
+            OriginalState::Unavailable,
+            "{fs_type}"
+        );
+        assert_eq!(document.generation(), 0, "{fs_type}");
+
+        image.attach();
+        let status = document.check_original();
+        assert_eq!(status.state, OriginalState::Unchanged, "{fs_type}");
+        assert_eq!(status.path, path, "{fs_type}");
+        assert_eq!(document.generation(), 1, "{fs_type}");
+        assert!(document.can_save(), "{fs_type}: Save is allowed again");
+
+        let summary = wait_for_index(&document);
+        assert_eq!(document.storage(), Storage::Copy, "{fs_type}");
+        let parser = document.current().parser;
+        let all = expected_rows(&bytes, parser, 1000);
+        assert_eq!(summary.rows, all.len(), "{fs_type}");
+        assert_eq!(document.rows(0..all.len(), 1000).unwrap(), all, "{fs_type}");
+        assert!(document.can_save(), "{fs_type}");
+        drop(document);
+        drop(image);
+    }
+}
+
+/// Detached, changed on "another Mac" (the image attached elsewhere), and
+/// attached again: the change is found, the copy isn't resumed from a file
+/// that is no longer the one opened, and Save stays off.
+#[test]
+fn a_file_changed_while_its_drive_was_away_is_reported() {
+    for fs_type in ["APFS", "ExFAT"] {
+        let image = DiskImage::new(fs_type);
+        let dir = Dir::new("image-changed-away");
+        let bytes = sample(2 * 1024 * 1024);
+        let gate = Gate::closed();
+        let scheduler = scheduler_with(Arc::clone(&gate));
+        let (document, path) = open_on_image(&image, &dir, &bytes, &scheduler);
+
+        image.force_detach();
+        gate.open();
+        assert_eq!(
+            document.index_job().control().wait_timeout(LONG),
+            Some(Err(JobError::Read(ReadErrorKind::Disconnected))),
+            "{fs_type}"
+        );
+        let elsewhere = image.attach_elsewhere().join("a.csv");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&elsewhere)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"99,added,elsewhere\n").unwrap();
+        drop(file);
+        image.attach();
+
+        let status = document.check_original();
+        assert_eq!(status.state, OriginalState::Changed, "{fs_type}");
+        assert!(status.diverged, "{fs_type}");
+        assert_eq!(status.path, path, "{fs_type}");
+        assert_eq!(document.storage(), Storage::Disconnected, "{fs_type}");
+        assert_eq!(document.generation(), 0, "{fs_type}");
+        assert!(!document.can_save(), "{fs_type}");
+        drop(document);
+        drop(image);
+    }
+}
+
+/// A file whose copy is complete, on a drive that is then ejected: all of
+/// it can still be read, Save is off until the drive is back, and on again
+/// once it is.
+#[test]
+fn a_copied_file_on_an_ejected_drive_can_be_saved_once_it_is_back() {
+    let image = DiskImage::new("APFS");
+    let dir = Dir::new("image-ejected");
+    let bytes = sample(512 * 1024);
+    let scheduler = scheduler();
+    let (document, _) = open_on_image(&image, &dir, &bytes, &scheduler);
+    let reports = watch(&document);
+    wait_for_index(&document);
+    assert_eq!(document.storage(), Storage::Copy);
+
+    // An ordinary eject works: Leal only watches the file (`O_EVTONLY`).
+    assert!(image.detach_all().is_empty());
+    wait_for_status(&reports, "the eject", |s| {
+        s.state == OriginalState::Unavailable
+    });
+    assert!(!document.can_save());
+    let parser = document.current().parser;
+    let all = expected_rows(&bytes, parser, 1000);
+    assert_eq!(document.rows(0..all.len(), 1000).unwrap(), all);
+
+    image.attach();
+    assert_eq!(document.check_original().state, OriginalState::Unchanged);
+    assert!(document.can_save());
+    assert_eq!(document.generation(), 0, "nothing to read again");
+    drop(document);
+    drop(image);
+}
+
+/// On a drive that can't clone, Leal reads the user's file itself until
+/// the copy is complete. A same-size write that keeps the modification time
+/// passes the size and time checks; the watcher's write event catches it,
+/// so nothing more is read from the changed file.
+#[test]
+fn a_write_to_a_file_read_without_a_clone_is_caught_by_its_event() {
+    let image = DiskImage::new("ExFAT");
+    let dir = Dir::new("image-same-size");
+    let bytes = sample(2 * 1024 * 1024);
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (document, path) = open_on_image(&image, &dir, &bytes, &scheduler);
+    let before = std::fs::metadata(&path).unwrap();
+
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, b"XX", 1024 * 1024).unwrap();
+    file.set_modified(before.modified().unwrap()).unwrap();
+    drop(file);
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert!(
+        !document.changed_on_disk(),
+        "the size and time checks can't tell"
+    );
+
+    // Watching starts after the change, so the queued write event is all
+    // there is to go on.
+    let reports = watch(&document);
+    wait_for_status(&reports, "the write", |s| s.state == OriginalState::Changed);
+    assert!(document.changed_on_disk());
+    assert!(!document.can_save());
+    gate.open();
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    drop(document);
+    drop(image);
 }
 
 mod find;

@@ -623,3 +623,94 @@ fn jobs_that_end_normally_leave_the_document_working() {
     assert!(!document.is_failed());
     assert_eq!(document.row_count(), Ok(2));
 }
+
+/// Collects what the watcher reports about the user's file.
+#[derive(Default)]
+struct Statuses(Mutex<Vec<OriginalStatus>>);
+
+impl OriginalObserver for Statuses {
+    fn original_changed(&self, status: OriginalStatus) {
+        self.0.lock().unwrap().push(status);
+    }
+}
+
+impl Statuses {
+    fn wait_for(&self, state: OriginalState) -> OriginalStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.lock().unwrap().iter().find(|s| s.state == state) {
+                return status.clone();
+            }
+            assert!(Instant::now() < deadline, "never reported {state:?}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Task 1.9: the user's file is watched, and Swift is told when it changes.
+#[test]
+fn the_original_is_watched_and_swift_is_told() {
+    let dir = TempDir::new("original");
+    let scheduler = Scheduler::new().unwrap();
+    let document = small_document(&dir, &scheduler);
+    let first = document.original().unwrap();
+    assert_eq!(first.state, OriginalState::Unchanged);
+    assert!(!first.diverged);
+    assert!(first.path.ends_with("small.csv"));
+
+    let statuses = Arc::new(Statuses::default());
+    document.watch_original(statuses.clone()).unwrap();
+    std::fs::write(dir.0.join("small.csv"), b"a,b\n3,4\n5,6\n").unwrap();
+    let changed = statuses.wait_for(OriginalState::Changed);
+    assert!(changed.diverged);
+    assert_eq!(document.original().unwrap(), changed);
+    assert_eq!(document.check_original().unwrap(), changed);
+    // The snapshot is unchanged: Keep editing.
+    assert_eq!(
+        text(&document.rows(0, 2, 100).unwrap()),
+        [["a", "b"], ["1", "2"]]
+    );
+    assert!(document.can_save().unwrap());
+
+    std::fs::remove_file(dir.0.join("small.csv")).unwrap();
+    statuses.wait_for(OriginalState::Deleted);
+}
+
+/// Task 1.9: a document whose drive went away reconnects when Swift checks
+/// after the drive is back, with a new generation and new jobs.
+#[test]
+fn a_disconnected_document_reconnects_when_checked() {
+    let dir = TempDir::new("reconnect");
+    let mut bytes = b"id,name\n".to_vec();
+    for i in 0..20_000 {
+        bytes.extend_from_slice(format!("{i},name {i}\n").as_bytes());
+    }
+    let path = dir.file("usb.csv", &bytes);
+    let scheduler = Scheduler::new().unwrap();
+    let document = debug_open_document_with_fault(
+        &path,
+        dir.locations(),
+        &scheduler,
+        options(),
+        None,
+        4096,
+        Some(SimulatedFault::Disconnect { at: 100_000 }),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(document.index_job().unwrap().wait()),
+        Err(JobFailure::DriveDisconnected)
+    );
+    assert!(!document.can_save().unwrap());
+    document.check_original().unwrap();
+    assert_eq!(document.progress().unwrap().generation, 0, "still away");
+    document.debug_simulate_drive_back();
+    let status = document.check_original().unwrap();
+    assert_eq!(status.state, OriginalState::Unchanged);
+    assert_eq!(document.progress().unwrap().generation, 1);
+    assert_eq!(document.first_screen().unwrap().generation, 1);
+    assert!(document.can_save().unwrap());
+    assert_eq!(block_on(document.index_job().unwrap().wait()), Ok(()));
+    assert_eq!(document.storage().unwrap(), SourceStorage::Copy);
+    assert_eq!(document.row_count().unwrap(), 20_001);
+}

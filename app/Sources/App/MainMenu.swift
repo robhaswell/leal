@@ -61,6 +61,13 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(withTitle: String(localized: "Close", comment: "File menu"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         menu.addItem(.separator())
+        // Task 1.9: open the file again as it is on disk now, also after
+        // Keep Editing hid the banner. Validated by the view controller.
+        menu.addItem(
+            withTitle: String(localized: "Reload from Disk", comment: "File menu: open the file again as it is on disk now (task 1.9)"),
+            action: #selector(DocumentViewController.reloadFromDisk(_:)),
+            keyEquivalent: ""
+        )
         // ADR-0005 decision 8. Each item is validated by the document's
         // view controller: the encodings its BOM allows, the one in use
         // ticked.

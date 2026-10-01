@@ -94,9 +94,10 @@ pub(super) struct Removable {
     streaming: Mutex<()>,
     chunk_len: usize,
     /// TEST HOOK: a disconnection or change to pretend happens when the
-    /// copy reaches a given offset.
+    /// copy reaches a given offset. A simulated drive stays away until
+    /// `simulate_drive_back` clears it.
     #[cfg(any(test, feature = "test-hooks"))]
-    fault: Option<SimulatedFault>,
+    fault: Mutex<Option<SimulatedFault>>,
 }
 
 /// TEST HOOK, not for product code: what to pretend happens to a file on a
@@ -269,21 +270,22 @@ impl Removable {
             // A zero chunk length would never get anywhere.
             chunk_len: chunk_len.max(1),
             #[cfg(any(test, feature = "test-hooks"))]
-            fault: None,
+            fault: Mutex::new(None),
         })
     }
 
     /// TEST HOOK: pretend `fault` happens during the copy.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn set_fault(&mut self, fault: Option<SimulatedFault>) {
-        self.fault = fault;
+        *self.fault.get_mut().unwrap_or_else(PoisonError::into_inner) = fault;
     }
 
     /// TEST HOOK: the simulated fault's error, if a read of the drive up to
     /// `end` reaches it. It sets the state a real fault would.
     #[cfg(any(test, feature = "test-hooks"))]
     fn simulated_fault(&self, end: usize) -> Option<ReadError> {
-        match self.fault? {
+        let fault = *self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+        match fault? {
             SimulatedFault::Disconnect { at } if end > at => {
                 self.disconnected.store(true, Ordering::Release);
                 Some(ReadError::disconnected(io::Error::from_raw_os_error(
@@ -331,6 +333,104 @@ impl Removable {
         } else {
             self.len
         }
+    }
+
+    /// The watcher saw the user's file written to (task 1.9). Without a
+    /// clone, what is still to be read from it is a different version, so
+    /// this is a change, as if a read's own check had found it: nothing
+    /// more is read from the file and Save is refused. A clone is a
+    /// snapshot, and a complete copy is too, so for them this does nothing.
+    pub(super) fn note_original_written(&self) {
+        if self.map.get().is_some() {
+            return;
+        }
+        let reads_the_original = self
+            .lock_external()
+            .as_ref()
+            .is_some_and(|external| external.watched.is_some());
+        if reads_the_original {
+            self.changed.store(true, Ordering::Release);
+        }
+    }
+
+    /// The drive is back (task 1.9): if the source was disconnected before
+    /// its copy was complete, read the rest from the drive again. `original`
+    /// is where the user's file is now, and `opened` what it was when it
+    /// was opened. Returns whether the source is reading again.
+    ///
+    /// It reopens, in order:
+    /// 1. **The clone on the drive**, if it survived the disconnection and
+    ///    is the same file (inode and size). It is a snapshot, so it serves
+    ///    the rest of the bytes as they were when the file was opened.
+    /// 2. **The user's file**, if its inode, size and modification time are
+    ///    still the ones it had when opened (its device number changes with
+    ///    each mount, so isn't compared). From then on it is read as on a
+    ///    drive that can't clone: checked after every read.
+    ///
+    /// Nothing is reopened after the file changed while it was read, and
+    /// nothing is needed once the copy is complete.
+    pub(super) fn reconnect(&self, original: &Path, opened: &FileIdentity) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if matches!(
+            *self.fault.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(SimulatedFault::Disconnect { .. })
+        ) {
+            // A simulated drive is away until the test brings it back.
+            return false;
+        }
+        if !self.disconnected.load(Ordering::Acquire)
+            || self.changed_on_disk()
+            || self.map.get().is_some()
+        {
+            return false;
+        }
+        // No stream is running: it stopped when the drive went. Holding its
+        // lock keeps a new one from starting until this is done.
+        let _streaming = self
+            .streaming
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut external = self.lock_external();
+        let Some(external) = external.as_mut() else {
+            return false;
+        };
+        let reopened = if external.folder.is_some()
+            && let Ok(clone) = File::open(&external.path)
+            && let Ok(now) = clone.metadata()
+            && now.ino() == external.id.1
+            && usize::try_from(now.len()) == Ok(self.len)
+        {
+            external.file = Arc::new(clone);
+            external.id = (now.dev(), now.ino());
+            true
+        } else if let Ok(file) = File::open(original)
+            && let Ok(now) = file.metadata()
+            && now.ino() == opened.inode
+            && now.len() == opened.len
+            && now.modified().ok() == opened.modified
+        {
+            external.file = Arc::new(file);
+            external.path = original.to_owned();
+            external.id = (now.dev(), now.ino());
+            external.watched = Some(FileIdentity {
+                device: now.dev(),
+                ..*opened
+            });
+            true
+        } else {
+            false
+        };
+        if reopened {
+            self.disconnected.store(false, Ordering::Release);
+        }
+        reopened
+    }
+
+    /// TEST HOOK: the simulated drive is plugged back in. Nothing changes
+    /// until `reconnect`, as for a real drive.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn simulate_drive_back(&self) {
+        *self.fault.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// The bytes in `range`, which the caller has already clamped to the

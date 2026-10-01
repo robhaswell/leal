@@ -408,8 +408,9 @@ check-no-test-exports app="build/DerivedData/Build/Products/Release/Leal.app":
     # Plain `nm` (not `-gU`, which skips hidden symbols) sees the Rust
     # symbols, and `strings` UniFFI's metadata names, in either spelling
     # (`debug_panic`, `debugPanic`). Every test-only export starts `debug_`;
-    # the test hooks are `open_simulating_*` and `SimulatedFault`.
-    pattern='debug_?(panic|watch|open_?document)|open_?simulating|simulated_?fault|set_?fault'
+    # the test hooks are `open_simulating_*`, `SimulatedFault` and
+    # `simulate_drive_back`.
+    pattern='debug_?(panic|watch|open_?document|simulate)|open_?simulating|simulated_?fault|set_?fault|simulate_?drive'
     for binary in "{{ app }}/Contents/Frameworks/LealFFI.framework/LealFFI" "{{ app }}/Contents/MacOS/Leal"; do
         if nm "$binary" | grep -Ei "$pattern" || strings "$binary" | grep -Ei "$pattern"; then
             echo "error: $binary has test-only exports or test hooks" >&2

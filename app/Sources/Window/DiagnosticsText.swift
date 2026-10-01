@@ -236,8 +236,8 @@ enum DiagnosticsText {
 
     static var changedWhileReading: String {
         String(
-            localized: "This file changed on its drive while Leal was reading it, so what’s shown may mix two versions. Save is off; Save As keeps a copy.",
-            comment: "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a)"
+            localized: "This file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change and Save is off. Reload reads the file as it is now.",
+            comment: "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a, task 1.9)"
         )
     }
 

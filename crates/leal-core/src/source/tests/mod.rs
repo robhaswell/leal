@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
+mod original;
 mod removable;
 
 /// A temporary directory that is deleted when the test ends.
@@ -71,9 +72,11 @@ impl Drop for TempDir {
 /// `.config/nextest.toml`, which runs them one at a time: `hdiutil`
 /// sometimes fails with "Resource busy" when several images are created or
 /// attached at once. [`DiskImage::new`] checks that its test is in the group.
-struct DiskImage {
+pub(crate) struct DiskImage {
     image: PathBuf,
     mount: PathBuf,
+    /// Another empty folder to mount it at, as another Mac would.
+    elsewhere: PathBuf,
     // Dropped after `Drop::drop` has detached the image.
     _dir: TempDir,
 }
@@ -100,7 +103,7 @@ impl DiskImage {
     /// Creates and attaches a 16 MB image formatted as `fs` (`"APFS"`, `"ExFAT"` or
     /// `"HFS+"`), mounted inside a temporary directory, not in `/Volumes`,
     /// and hidden from Finder (`-nobrowse`).
-    fn new(fs_type: &str) -> Self {
+    pub(crate) fn new(fs_type: &str) -> Self {
         // Under nextest, a disk-image test outside the group would run in
         // parallel with the others.
         if std::env::var_os("NEXTEST").is_some() {
@@ -116,6 +119,7 @@ impl DiskImage {
         let dir = TempDir::new("image");
         let image = dir.path().join("volume.dmg");
         let mount = dir.folder("mnt");
+        let elsewhere = dir.folder("elsewhere");
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         // At most 11 characters, the limit for an exFAT label: a process ID
         // is at most 5 hex digits.
@@ -140,29 +144,49 @@ impl DiskImage {
         let disk_image = Self {
             image,
             mount,
+            elsewhere,
             _dir: dir,
         };
-        hdiutil_with_retries("attach", || {
-            disk_image.detach_all();
-            let mut command = Command::new("/usr/bin/hdiutil");
-            command
-                .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
-                .arg("-mountpoint")
-                .arg(&disk_image.mount)
-                .arg(&disk_image.image);
-            command
-        });
+        disk_image.attach();
         disk_image
     }
 
     /// The root of the mounted volume.
-    fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.mount
+    }
+
+    /// Attaches the image (again) at its usual mount point, [`root`](Self::root),
+    /// as when a drive is plugged back in.
+    pub(crate) fn attach(&self) {
+        self.attach_at(&self.mount);
+    }
+
+    /// Attaches the image at another mount point, as another Mac would see
+    /// it, and returns that point.
+    pub(crate) fn attach_elsewhere(&self) -> &Path {
+        self.attach_at(&self.elsewhere);
+        &self.elsewhere
+    }
+
+    fn attach_at(&self, mount: &Path) {
+        hdiutil_with_retries("attach", || {
+            self.detach_all();
+            // A forced detach can leave the mount point removed.
+            let _ = fs::create_dir_all(mount);
+            let mut command = Command::new("/usr/bin/hdiutil");
+            command
+                .args(["attach", "-nobrowse", "-noverify", "-noautoopen"])
+                .arg("-mountpoint")
+                .arg(mount)
+                .arg(&self.image);
+            command
+        });
     }
 
     /// Detaches every device attached from this image, trying a normal
     /// detach first and then `-force`. Returns the devices still attached.
-    fn detach_all(&self) -> Vec<String> {
+    pub(crate) fn detach_all(&self) -> Vec<String> {
         for force in [false, false, true, true] {
             let devices = attached_devices(&self.image);
             if devices.is_empty() {
@@ -185,7 +209,7 @@ impl DiskImage {
     /// Detaches the image with `-force` straight away, as if the drive were
     /// unplugged with files on it still open (a normal detach is refused
     /// then). Panics if the image is still attached afterwards.
-    fn force_detach(&self) {
+    pub(crate) fn force_detach(&self) {
         let mut backoff = HDIUTIL_FIRST_BACKOFF;
         for _ in 0..HDIUTIL_ATTEMPTS {
             let devices = attached_devices(&self.image);

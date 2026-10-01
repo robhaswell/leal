@@ -61,6 +61,12 @@ final class CSVDocument: NSDocument {
                 opened.close()
                 throw failure
             }
+            // The core follows the file when it is moved (task 1.9), and
+            // the document's title and Open Recent follow too.
+            opened.onMoved = { [weak self] url in
+                guard let self, url != fileURL else { return }
+                fileURL = url
+            }
             model = opened
         } catch {
             throw Self.openError(error, url: url)
@@ -113,8 +119,11 @@ final class CSVDocument: NSDocument {
     }
 
     /// Whether Save may write over the file: not once its removable drive
-    /// was disconnected before Leal had read it all, or once it changed
-    /// while Leal read it (ADR-0006, 1.1a). Save As is always allowed.
+    /// was disconnected before Leal had read it all, once it changed while
+    /// Leal read it, or while its drive isn't connected (ADR-0006, 1.1a,
+    /// 1.9). Save As is always allowed. SEAM(2.5): Save asks before writing
+    /// over a file that changed elsewhere (`model.original.diverged`, which
+    /// stays true after Keep Editing; DESIGN §3.1).
     var canSave: Bool { model?.canSave ?? false }
 
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {

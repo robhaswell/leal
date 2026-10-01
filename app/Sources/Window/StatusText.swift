@@ -23,6 +23,9 @@ struct StatusSummary: Equatable, Sendable {
     var storage: SourceStorage = .clone
     /// The file changed on its drive while it was read (1.1a).
     var changedOnDisk = false
+    /// What has happened to the user's file since it was opened (task
+    /// 1.9): changed or deleted elsewhere, or its drive not connected.
+    var original: OriginalState = .unchanged
     /// The info-level kinds found, for their notes (ADR-0002 question 7).
     var infoKinds: [DiagnosticKind] = []
     /// How many kinds of warning or error: the badge (mockup 03a).
@@ -74,6 +77,9 @@ enum StatusText {
         if let note = storageNote(status) {
             items.append(StatusItem(text: note))
         }
+        if let note = originalNote(status) {
+            items.append(StatusItem(text: note))
+        }
         if let note = notesSegment(status.notes) {
             items.append(StatusItem(text: note))
         }
@@ -107,6 +113,25 @@ enum StatusText {
             String(localized: "Reading from the drive", comment: "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)")
         case .disconnected:
             String(localized: "Drive disconnected", comment: "Status bar: the file's removable drive was disconnected (ADR-0006)")
+        }
+    }
+
+    /// What has happened to the file elsewhere (task 1.9), which stays in
+    /// the bar after **Keep Editing** hides the banner. Nothing when the
+    /// storage note already says it: a change while reading, or a drive
+    /// disconnected before the copy was complete.
+    static func originalNote(_ status: StatusSummary) -> String? {
+        if status.changedOnDisk { return nil }
+        return switch status.original {
+        case .unchanged: nil
+        case .changed:
+            String(localized: "Changed on disk", comment: "Status bar: another app changed the open file; Leal shows the version it opened (task 1.9)")
+        case .deleted:
+            String(localized: "Deleted", comment: "Status bar: the open file was deleted or moved to the Trash (task 1.9)")
+        case .unavailable:
+            status.storage == .disconnected
+                ? nil
+                : String(localized: "Drive not connected", comment: "Status bar: the open file's drive was ejected after Leal had copied the file (task 1.9)")
         }
     }
 
@@ -269,8 +294,8 @@ enum StatusText {
         var lines = [encodingHelp(status.encodingSource)]
         if status.changedOnDisk {
             lines.append(String(
-                localized: "The file changed on its drive while Leal was reading it, so what’s shown may mix two versions.",
-                comment: "Status bar tooltip: the file changed while Leal read it (1.1a)"
+                localized: "The file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change.",
+                comment: "Status bar tooltip: the file changed while Leal read it (1.1a, task 1.9)"
             ))
         } else {
             switch status.storage {
@@ -298,8 +323,34 @@ enum StatusText {
                 ))
             }
         }
+        if let help = originalHelp(status) {
+            lines.append(help)
+        }
         lines += status.notes.map(noteHelp)
         return lines.joined(separator: "\n")
+    }
+
+    /// The tooltip line for `originalNote`.
+    static func originalHelp(_ status: StatusSummary) -> String? {
+        guard originalNote(status) != nil else { return nil }
+        return switch status.original {
+        case .unchanged: nil
+        case .changed:
+            String(
+                localized: "Another app changed this file after Leal opened it. Leal shows the version it opened; File ▸ Reload from Disk shows the new one.",
+                comment: "Status bar tooltip: the file changed on disk (task 1.9)"
+            )
+        case .deleted:
+            String(
+                localized: "This file was deleted or moved to the Trash after Leal opened it. Leal shows the version it opened.",
+                comment: "Status bar tooltip: the file was deleted (task 1.9)"
+            )
+        case .unavailable:
+            String(
+                localized: "The drive with this file isn’t connected. Leal has the whole file; Save is off until the drive is back.",
+                comment: "Status bar tooltip: the file's drive was ejected after Leal had copied the file (task 1.9)"
+            )
+        }
     }
 
     /// "31%".

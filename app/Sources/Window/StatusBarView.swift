@@ -287,7 +287,8 @@ final class EncodingBox: NSObject {
 /// A non-modal banner under the title bar (ADR-0002): an icon, a message,
 /// an optional button and a dismiss button. The UTF-16 notice (mockup
 /// 06a), the diagnostics banner (03a), the suggestions and the
-/// removable-drive banners (task 1.7) all use it.
+/// removable-drive banners (task 1.7) all use it. The file's banners
+/// (task 1.9) have a second, plain button: **Keep Editing**.
 @MainActor
 final class BannerView: NSView {
     enum Kind {
@@ -299,15 +300,28 @@ final class BannerView: NSView {
     private let label: NSTextField
     /// The banner's button, if it has one.
     let button: NSButton?
+    /// A second, plain button after it, if it has one.
+    let secondaryButton: NSButton?
     var onDismiss: (() -> Void)?
 
     /// `prominent` gives the button the primary, accent-coloured look
     /// (mockup 06a); otherwise it is a plain push button ("Details" in
-    /// mockup 03a).
-    init(kind: Kind, message: String, buttonTitle: String?, prominent: Bool = true, target: AnyObject?, action: Selector?) {
+    /// mockup 03a). `secondaryTitle` adds a plain button after it, which
+    /// sends `secondaryAction`.
+    init(
+        kind: Kind,
+        message: String,
+        buttonTitle: String?,
+        prominent: Bool = true,
+        target: AnyObject?,
+        action: Selector?,
+        secondaryTitle: String? = nil,
+        secondaryAction: Selector? = nil
+    ) {
         self.kind = kind
         label = NSTextField(wrappingLabelWithString: message)
         button = buttonTitle.map { NSButton(title: $0, target: target, action: action) }
+        secondaryButton = secondaryTitle.map { NSButton(title: $0, target: target, action: secondaryAction) }
         super.init(frame: .zero)
         let symbol = kind == .info ? "info.circle" : "exclamationmark.triangle"
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
@@ -329,6 +343,10 @@ final class BannerView: NSView {
                 }
             }
             views.append(button)
+        }
+        if let secondaryButton {
+            secondaryButton.bezelStyle = .push
+            views.append(secondaryButton)
         }
         let close = NSButton(
             image: NSImage(systemSymbolName: "xmark", accessibilityDescription: String(localized: "Dismiss", comment: "Banner's close button, for VoiceOver")) ?? NSImage(),
