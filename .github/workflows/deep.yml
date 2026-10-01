@@ -1,0 +1,46 @@
+name: Deep tests
+
+# `just test-deep`: every Rust test, with far more property-test cases than
+# the 256 per test that `just check` runs. On each push to `main` (20,000
+# cases, beside the CI workflow's jobs) and nightly (100,000 cases). Deep runs
+# found bugs that 256-case runs missed (docs/tasks/0.2.md).
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 03:17 UTC, away from the top of the hour, when scheduled runs queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-deep:
+    name: just test-deep
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Install just and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      # proptest picks a new random seed each run. When a case fails, the
+      # log shows the minimal failing input.
+      - name: Run deep tests
+        env:
+          CASES: ${{ github.event_name == 'schedule' && '100000' || '20000' }}
+        run: just test-deep "$CASES"
