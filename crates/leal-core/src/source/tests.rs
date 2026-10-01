@@ -50,7 +50,15 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if fs::remove_dir_all(&self.0).is_err() {
+            // A failed test may leave a locked (`uchg`) file behind.
+            let _ = Command::new("/usr/bin/chflags")
+                .arg("-R")
+                .arg("0")
+                .arg(&self.0)
+                .status();
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -664,4 +672,94 @@ fn cleanup_keeps_records_of_unmounted_volumes() {
 /// lock is released, and nothing is deleted.
 fn crash(mut source: Source) {
     source.temp.take().unwrap().abandon();
+}
+
+// ---------------------------------------------------------------------------
+// Locked and append-only originals
+
+/// Sets BSD file flags with the `chflags` tool (`uchg`, `uappnd`, or `0`).
+/// A user may set and clear the `u…` flags on their own files.
+fn chflags(flags: &str, path: &Path) {
+    run(Command::new("/usr/bin/chflags").arg(flags).arg(path));
+}
+
+fn file_flags(path: &Path) -> u32 {
+    use std::os::macos::fs::MetadataExt as _;
+    fs::symlink_metadata(path).unwrap().st_flags()
+}
+
+/// Clears an original's flags when the test ends, so its `TempDir` can be
+/// deleted.
+struct Unlock(PathBuf);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/chflags")
+            .arg("0")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// `fclonefileat` copies the original's flags. A Finder-locked (`uchg`) or
+/// append-only (`uappnd`) original must still give a read-only clone that
+/// is deleted with the source, not one that leaks on every open.
+#[test]
+fn locked_and_append_only_originals_give_a_deletable_read_only_clone() {
+    for flag in ["uchg", "uappnd"] {
+        let dir = TempDir::new(flag);
+        let path = dir.file("a.csv", b"a,b\n1,2\n");
+        chflags(flag, &path);
+        let _unlock = Unlock(path.clone());
+        assert_ne!(
+            file_flags(&path) & (libc::UF_IMMUTABLE | libc::UF_APPEND),
+            0
+        );
+        let temp = dir.temp_folders();
+
+        let source = Source::open(&path, &temp, None).unwrap();
+        assert_eq!(source.storage(), Storage::Clone, "{flag}");
+        assert_eq!(source.bytes(), b"a,b\n1,2\n", "{flag}");
+        let clone = source.temp.as_ref().unwrap().file_path();
+        assert_eq!(
+            file_flags(&clone) & (libc::UF_IMMUTABLE | libc::UF_APPEND),
+            0,
+            "{flag}"
+        );
+        assert_eq!(
+            fs::metadata(&clone).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "{flag}"
+        );
+
+        drop(source);
+        assert!(
+            entries(temp.scratch()).is_empty(),
+            "{flag}: the clone leaked"
+        );
+        assert!(entries(temp.records()).is_empty(), "{flag}");
+        assert_ne!(
+            file_flags(&path) & (libc::UF_IMMUTABLE | libc::UF_APPEND),
+            0,
+            "{flag}: the original keeps its flag"
+        );
+    }
+}
+
+/// A clone left locked by a crash (before its flags were cleared) is still
+/// removed by cleanup.
+#[test]
+fn cleanup_removes_a_locked_leftover_clone() {
+    let dir = TempDir::new("locked-leftover");
+    let path = dir.file("a.csv", b"a\n");
+    let temp = dir.temp_folders();
+    let source = Source::open(&path, &temp, None).unwrap();
+    let clone = source.temp.as_ref().unwrap().file_path();
+    crash(source);
+    chflags("uchg", &clone);
+    let _unlock = Unlock(clone.clone());
+
+    assert_eq!(temp.remove_leftovers().unwrap(), 1);
+    assert!(entries(temp.scratch()).is_empty());
+    assert!(entries(temp.records()).is_empty());
 }

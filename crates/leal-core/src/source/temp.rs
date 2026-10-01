@@ -17,11 +17,14 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use super::sys;
 
 /// The extension of a record file.
 const RECORD_EXTENSION: &str = "record";
@@ -240,7 +243,12 @@ impl Drop for TempFolder {
 /// made), `false` if it is still there or might be (its volume isn't
 /// mounted).
 fn remove_folder(folder: &Path, file_name: &OsString) -> bool {
-    match fs::remove_file(folder.join(file_name)) {
+    let file = folder.join(file_name);
+    // A clone left locked (a crash between cloning and clearing its flags)
+    // can't be deleted until its flags are cleared. Any error here shows up
+    // as the `remove_file` error below.
+    let _ = unlock(&file);
+    match fs::remove_file(&file) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return false,
@@ -253,6 +261,25 @@ fn remove_folder(folder: &Path, file_name: &OsString) -> bool {
         // Not empty, or not removable: leave it.
         Err(_) => false,
     }
+}
+
+/// The BSD file flags that stop a file being changed or deleted: immutable
+/// (`uchg`, Finder's Locked; `schg`) and append-only (`uappnd`, `sappnd`).
+const LOCKING_FLAGS: u32 =
+    libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+
+/// Clears the flags in [`LOCKING_FLAGS`] on Leal's own clone at `path`,
+/// keeping its other flags (such as `UF_COMPRESSED`, which says how its
+/// data is stored).
+///
+/// Fails if the file can't be read, or its flags can't be changed: the
+/// system flags (`schg`, `sappnd`) need root to clear.
+pub(super) fn unlock(path: &Path) -> io::Result<()> {
+    let flags = fs::symlink_metadata(path)?.st_flags();
+    if flags & LOCKING_FLAGS == 0 {
+        return Ok(());
+    }
+    sys::set_file_flags(path, flags & !LOCKING_FLAGS)
 }
 
 /// Whether `path` is on an external volume that isn't mounted now: macOS

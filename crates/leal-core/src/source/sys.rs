@@ -74,6 +74,24 @@ pub(super) fn read_xattr(file: &File, name: &CStr, max_len: usize) -> io::Result
     Ok(Some(value))
 }
 
+/// Sets the BSD file flags (`chflags(2)`) of the file at `path` to `flags`.
+///
+/// `fclonefileat` copies the original's flags, so a clone of a Finder-locked
+/// (`uchg`) or append-only (`uappnd`) file can't have its mode changed or be
+/// deleted until they are cleared. See [`super::temp::unlock`].
+pub(super) fn set_file_flags(path: &Path, flags: u32) -> io::Result<()> {
+    let path = c_path(path)?;
+    // SAFETY: `chflags` reads the NUL-terminated string `path`, which lives
+    // until the end of this function, and doesn't keep the pointer. `flags`
+    // is a plain integer.
+    let result = unsafe { libc::chflags(path.as_ptr(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Reads the open file's status flags (`fcntl(F_GETFL)`).
 fn status_flags(file: &File) -> io::Result<libc::c_int> {
     // SAFETY: `F_GETFL` takes no argument and only reads the descriptor's
@@ -119,13 +137,21 @@ pub(super) fn map_read_only(file: &File) -> io::Result<Mmap> {
     //   writes or truncates the original, APFS gives the original new
     //   blocks and the clone keeps the old ones (copy-on-write).
     // - It lives in a temporary folder that Leal made or was given for it
-    //   alone, under a name no other program uses, and the file is made
-    //   read-only (mode 0400) before it is mapped.
+    //   alone, under a name no other program uses. Its locking flags are
+    //   cleared and it is made read-only (mode 0400) before it is mapped;
+    //   `open` fails if either step fails.
     // - Leal never writes it: `file` is opened read-only, and the map is
     //   read-only (`PROT_READ`).
     // Another process running as the same user could still deliberately
     // open and change it, as it could any of the user's files; we accept
     // that, as every macOS app that maps files does.
+    //
+    // Known gap (ADR-0006, proposed): a clone on a *removable* volume is
+    // mapped too (ADR-0005 decision 7). If that drive is unplugged or
+    // force-ejected while the file is open, the pages vanish and the next
+    // read of an unloaded page kills Leal with SIGBUS. A normal eject is
+    // refused while the clone is open. ADR-0006 decides the fix; until then
+    // this is the accepted behaviour.
     unsafe { Mmap::map(file) }
 }
 

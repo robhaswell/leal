@@ -234,12 +234,31 @@ impl Source {
     }
 
     /// The file's bytes, exactly as they were on disk when it was opened.
+    ///
+    /// This may change (ADR-0006, proposed): a file on a removable drive
+    /// might be served by ordinary reads until an internal copy is mapped,
+    /// and then there is no single slice to hand out at first. Code that
+    /// only needs the size should use [`len`](Self::len), and code that
+    /// holds on to the slice should be able to take it per read instead.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         match &self.bytes {
             Bytes::Mapped(map) => map,
             Bytes::Owned(bytes) => bytes,
         }
+    }
+
+    /// The snapshot's size in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        // A slice's length always fits in u64 on Apple's 64-bit platforms.
+        u64::try_from(self.bytes().len()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the file was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
     }
 
     /// The path the file was opened from.
@@ -396,11 +415,14 @@ fn clone(
 fn clone_into(file: &File, folder: &TempFolder) -> io::Result<()> {
     let clone = folder.file_path();
     sys::clone_file(file, &clone)?;
-    // The clone gets the original's permissions. Make it read-only for
-    // everyone, so nothing writes to it by accident while it is mapped. If
-    // the volume doesn't support that, the clone is still private.
-    let _ = fs::set_permissions(&clone, Permissions::from_mode(0o400));
-    Ok(())
+    // The clone gets the original's BSD flags. A Finder-locked (`uchg`) or
+    // append-only (`uappnd`) original would give a clone whose mode can't be
+    // changed and which can't be deleted, so clear those first.
+    temp::unlock(&clone)?;
+    // The clone also gets the original's permissions. Make it read-only for
+    // everyone, so nothing writes to it while it is mapped (`map_read_only`
+    // relies on this).
+    fs::set_permissions(&clone, Permissions::from_mode(0o400))
 }
 
 /// Maps the clone or copy at `path`, read-only. `original` is the user's
@@ -448,6 +470,6 @@ fn copy_to_scratch(
     let mut writer = BufWriter::with_capacity(1024 * 1024, copy);
     io::copy(&mut file.take(len), &mut writer).map_err(copy_error)?;
     writer.flush().map_err(copy_error)?;
-    let _ = fs::set_permissions(&copy_path, Permissions::from_mode(0o400));
+    fs::set_permissions(&copy_path, Permissions::from_mode(0o400)).map_err(copy_error)?;
     Ok(folder)
 }

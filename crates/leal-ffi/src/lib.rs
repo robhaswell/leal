@@ -200,8 +200,7 @@ impl Source {
     /// The file's size in bytes when it was opened.
     #[must_use]
     pub fn byte_count(&self) -> u64 {
-        // A slice's length always fits in u64 on Apple's 64-bit platforms.
-        u64::try_from(self.source.bytes().len()).unwrap_or(u64::MAX)
+        self.source.len()
     }
 
     /// Where the bytes are held.
