@@ -112,6 +112,28 @@ final class CSVDocument: NSDocument {
         throw NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError)
     }
 
+    /// Whether Save may write over the file: not once its removable drive
+    /// was disconnected before Leal had read it all, or once it changed
+    /// while Leal read it (ADR-0006, 1.1a). Save As is always allowed.
+    var canSave: Bool { model?.canSave ?? false }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(save(_:)), !canSave {
+            return false
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    /// Save is refused while `canSave` is false (ADR-0006): the banner
+    /// offers Save As instead.
+    override func save(_ sender: Any?) {
+        guard canSave else {
+            NSSound.beep()
+            return
+        }
+        super.save(sender)
+    }
+
     override func close() {
         model?.close()
         super.close()

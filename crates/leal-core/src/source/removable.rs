@@ -93,6 +93,39 @@ pub(super) struct Removable {
     /// Held for the whole of a stream, so only one runs at a time.
     streaming: Mutex<()>,
     chunk_len: usize,
+    /// TEST HOOK: a disconnection or change to pretend happens when the
+    /// copy reaches a given offset.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fault: Option<SimulatedFault>,
+}
+
+/// TEST HOOK, not for product code: what to pretend happens to a file on a
+/// removable drive while it is copied, so the app's tests can show the
+/// "drive disconnected" and "changed while reading" states without a real
+/// drive (task 1.7). See [`Source::open_simulating_fault`].
+///
+/// [`Source::open_simulating_fault`]: super::Source::open_simulating_fault
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimulatedFault {
+    /// The drive vanishes when the copy reaches byte `at`: the chunk that
+    /// would read it fails with [`ReadErrorKind::Disconnected`], as after an
+    /// unplug.
+    ///
+    /// [`ReadErrorKind::Disconnected`]: super::ReadErrorKind::Disconnected
+    Disconnect {
+        /// The first byte that can't be read.
+        at: usize,
+    },
+    /// The user's file changes when the copy reaches byte `at`: the chunk
+    /// that would read it fails with [`ReadErrorKind::ChangedOnDisk`], as
+    /// for a drive that can't clone.
+    ///
+    /// [`ReadErrorKind::ChangedOnDisk`]: super::ReadErrorKind::ChangedOnDisk
+    Change {
+        /// The first byte read after the change.
+        at: usize,
+    },
 }
 
 /// The file on the removable drive.
@@ -235,7 +268,34 @@ impl Removable {
             streaming: Mutex::new(()),
             // A zero chunk length would never get anywhere.
             chunk_len: chunk_len.max(1),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fault: None,
         })
+    }
+
+    /// TEST HOOK: pretend `fault` happens during the copy.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn set_fault(&mut self, fault: Option<SimulatedFault>) {
+        self.fault = fault;
+    }
+
+    /// TEST HOOK: the simulated fault's error, if a read of the drive up to
+    /// `end` reaches it. It sets the state a real fault would.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn simulated_fault(&self, end: usize) -> Option<ReadError> {
+        match self.fault? {
+            SimulatedFault::Disconnect { at } if end > at => {
+                self.disconnected.store(true, Ordering::Release);
+                Some(ReadError::disconnected(io::Error::from_raw_os_error(
+                    libc::ENXIO,
+                )))
+            }
+            SimulatedFault::Change { at } if end > at => {
+                self.changed.store(true, Ordering::Release);
+                Some(ReadError::changed_on_disk())
+            }
+            SimulatedFault::Disconnect { .. } | SimulatedFault::Change { .. } => None,
+        }
     }
 
     pub(super) fn len(&self) -> usize {
@@ -367,6 +427,10 @@ impl Removable {
     fn copy_chunk(&self, chunk: &mut [u8], offset: usize) -> Result<(), ReadError> {
         if self.disconnected.load(Ordering::Acquire) {
             return Err(ReadError::already_disconnected());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(error) = self.simulated_fault(offset + chunk.len()) {
+            return Err(error);
         }
         let Some(external) = self.external_file() else {
             return Err(ReadError::other(io::Error::other(

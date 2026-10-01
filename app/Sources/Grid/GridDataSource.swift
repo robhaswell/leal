@@ -5,8 +5,9 @@ enum GridCell: Equatable, Sendable {
     /// A value, perhaps empty. `truncated` says the core gave only its
     /// start (`GridMetrics.maxCellCharacters`).
     case text(String, truncated: Bool)
-    /// The row has fewer fields than this column has (a short row). Task
-    /// 1.7 draws these hatched once the core says the row is ragged.
+    /// The row has fewer fields than this column has (a short row). Drawn
+    /// hatched when the core says the row is ragged
+    /// (`GridDataSource.isHatched`).
     case missing
     /// The row hasn't been read yet: it is past the indexed region. The
     /// grid draws a skeleton (mockup 02b).
@@ -47,6 +48,17 @@ protocol GridDataSource: AnyObject {
     func cell(row: Int, column: Int) -> GridCell
     /// Called before a region is drawn, so the source can read it in one go.
     func prepare(rows: Range<Int>, columns: Range<Int>)
+    /// Whether the row's gutter has a diagnostics marker (ADR-0002
+    /// question 7).
+    func rowHasMarker(_ row: Int) -> Bool
+    /// Whether a `.missing` cell is drawn hatched: the row is ragged
+    /// (ADR-0002 question 5).
+    func isHatched(row: Int, column: Int) -> Bool
+}
+
+extension GridDataSource {
+    func rowHasMarker(_ row: Int) -> Bool { false }
+    func isHatched(row: Int, column: Int) -> Bool { false }
 }
 
 /// One row of a tile: the row's whole field count, and its cells in the

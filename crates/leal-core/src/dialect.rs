@@ -148,6 +148,25 @@ impl Bom {
         }
     }
 
+    /// Whether a file with this BOM can be read in `encoding`: only the
+    /// BOM's own encoding, and without a BOM any ASCII-compatible one (so
+    /// not UTF-16). **Reopen with encoding…** offers these.
+    ///
+    /// ```
+    /// use leal_core::dialect::{Bom, Encoding};
+    /// assert!(Bom::None.allows(Encoding::MacRoman));
+    /// assert!(!Bom::None.allows(Encoding::Utf16Le));
+    /// assert!(Bom::Utf8.allows(Encoding::Utf8));
+    /// assert!(!Bom::Utf8.allows(Encoding::Windows1252));
+    /// ```
+    #[must_use]
+    pub fn allows(self, encoding: Encoding) -> bool {
+        match self.encoding() {
+            Some(own) => own == encoding,
+            None => encoding.is_ascii_compatible(),
+        }
+    }
+
     /// The encoding this BOM means, or `None` for [`Bom::None`].
     #[must_use]
     pub const fn encoding(self) -> Option<Encoding> {

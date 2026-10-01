@@ -192,6 +192,12 @@ targets:
       - target: LealFFI
     sources:
       - path: AppTests
+      # The diagnostics corpus (tests/corpus/README.md), copied into the
+      # test bundle as a folder: the sandboxed host can read its own
+      # bundle, not the repository (task 1.7's banner tests).
+      - path: ../tests/corpus/diagnostics
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.robhaswell.leal.apptests

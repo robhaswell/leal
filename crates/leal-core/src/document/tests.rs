@@ -18,6 +18,7 @@ use crate::detect::{EncodingSource, REVIEW_CHUNK_BYTES};
 use crate::diagnostics::{DiagnosticKind, MAX_LOCATIONS};
 use crate::dialect::{Delimiter, Encoding};
 use crate::schedule::{Platform, SchedulerConfig, ThreadClass};
+use crate::source::SimulatedFault;
 
 const LONG: Duration = Duration::from_secs(30);
 
@@ -1074,4 +1075,407 @@ fn numeric_columns_include_the_first_row_without_a_header() {
     assert!(!document.detection().header);
     assert_eq!(document.numeric_columns(100).unwrap(), [true, false, false]);
     assert_eq!(document.numeric_columns(2).unwrap(), [true, false, true]);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.7: each kind's Previous and Next, row flags, Save and faults
+
+/// Every place `kind` is found from the start, walking with
+/// `next_with_kind`.
+fn walk_forward(document: &Document, kind: DiagnosticKind) -> Vec<Place> {
+    let mut places = Vec::new();
+    let mut from = 0;
+    while let Some(place) = document.next_with_kind(kind, from).unwrap() {
+        places.push(place);
+        from = place.row + 1;
+    }
+    places
+}
+
+/// The same, from the end with `previous_with_kind`, in file order.
+fn walk_backward(document: &Document, kind: DiagnosticKind) -> Vec<Place> {
+    let mut places = Vec::new();
+    let mut to = usize::MAX;
+    while let Some(place) = document.previous_with_kind(kind, to).unwrap() {
+        places.push(place);
+        to = place.row;
+    }
+    places.reverse();
+    places
+}
+
+/// `messy_sample`'s rows that have each kind, from how it was made: row
+/// `i` of the data (physical row `i + 1`) has invalid UTF-8 in field 1 if
+/// `i % 50 == 7`, a NUL in field 1 and text after a quote in field 2 if
+/// `i % 50 == 13`, and only 2 of the 3 fields if `i % 50 == 21`.
+fn messy_places(bytes: &[u8], residue: usize, column: usize) -> Vec<Place> {
+    let rows = RowIndex::build(
+        bytes,
+        IndexDialect {
+            delimiter: b',',
+            quote: QUOTE,
+            code_unit: crate::index::CodeUnit::Byte,
+            bom_len: 0,
+        },
+    )
+    .unwrap()
+    .row_count();
+    (1..rows)
+        .filter(|row| (row - 1) % 50 == residue)
+        .map(|row| Place { row, column })
+        .collect()
+}
+
+#[test]
+fn each_kind_is_found_in_every_row_past_the_first_1000() {
+    let dir = Dir::new("kind-navigation");
+    // About 3,000 rows of each kind: three times the report's locations.
+    let bytes = messy_sample(4 << 20);
+    let path = dir.file("messy.csv", &bytes);
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler(),
+        options(5),
+        None,
+    )
+    .unwrap();
+    wait_for_index(&document);
+    let report = document.diagnostics();
+    for (kind, residue, column) in [
+        (DiagnosticKind::InvalidEncoding, 7, 1),
+        (DiagnosticKind::NulBytes, 13, 1),
+        (DiagnosticKind::TextAfterClosingQuote, 13, 2),
+        (DiagnosticKind::RaggedRows, 21, 2),
+    ] {
+        let want = messy_places(&bytes, residue, column);
+        assert!(want.len() > 2 * MAX_LOCATIONS, "{kind:?}: {}", want.len());
+        let found = walk_forward(&document, kind);
+        assert_eq!(found, want, "{kind:?} forward");
+        assert_eq!(walk_backward(&document, kind), want, "{kind:?} backward");
+        // The report's first locations are the same rows.
+        let first: Vec<usize> = report
+            .get(kind)
+            .unwrap()
+            .first()
+            .iter()
+            .map(|l| l.row)
+            .collect();
+        let rows: Vec<usize> = want.iter().map(|p| p.row).take(first.len()).collect();
+        assert_eq!(first, rows, "{kind:?} against the report");
+        assert_eq!(report.get(kind).unwrap().count(), want.len());
+    }
+    // Info-level kinds have no navigation (mockup 03b).
+    for kind in [DiagnosticKind::BlankLines, DiagnosticKind::MixedLineEndings] {
+        assert!(report.get(kind).is_some());
+        assert_eq!(document.next_with_kind(kind, 0).unwrap(), None);
+        assert_eq!(document.previous_with_kind(kind, usize::MAX).unwrap(), None);
+    }
+}
+
+#[test]
+fn a_kind_found_alone_needs_no_check_of_each_row() {
+    let dir = Dir::new("kind-alone");
+    let mut bytes = b"a,b\n".to_vec();
+    for i in 0..3000 {
+        if i % 3 == 0 {
+            bytes.extend_from_slice(format!("{i},n\0l\n").as_bytes());
+        } else {
+            bytes.extend_from_slice(format!("{i},ok\n").as_bytes());
+        }
+    }
+    let (document, _) = open_bytes(&dir, "nul.csv", &bytes);
+    wait_for_index(&document);
+    let found = walk_forward(&document, DiagnosticKind::NulBytes);
+    let want: Vec<Place> = (0..3000)
+        .filter(|i| i % 3 == 0)
+        .map(|i| Place {
+            row: i + 1,
+            column: 1,
+        })
+        .collect();
+    assert_eq!(found, want);
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::InvalidEncoding, 0)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::RaggedRows, 0)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn the_unterminated_quote_and_ragged_columns_are_placed() {
+    let dir = Dir::new("kind-places");
+    let (document, _) = open_bytes(&dir, "ragged.csv", RAGGED);
+    wait_for_index(&document);
+    // Row 2 is short (2 of 4 fields): its first missing cell. Row 4 is
+    // long (6): its first extra cell.
+    assert_eq!(
+        walk_forward(&document, DiagnosticKind::RaggedRows),
+        [Place { row: 2, column: 2 }, Place { row: 4, column: 4 }]
+    );
+    let (document, _) = open_bytes(&dir, "open.csv", b"a,b\n1,\"never\n2,closed\n");
+    wait_for_index(&document);
+    assert_eq!(
+        walk_forward(&document, DiagnosticKind::UnterminatedQuote),
+        [Place { row: 1, column: 1 }]
+    );
+}
+
+#[test]
+fn row_flags_mark_rows_and_say_which_are_ragged() {
+    let dir = Dir::new("row-flags");
+    let (document, _) = open_bytes(
+        &dir,
+        "ragged.csv",
+        b"a,b,c\n1,2,3\n4,\"x\"y,6\n7\n\n8,9,10\n",
+    );
+    wait_for_index(&document);
+    let flags = document.row_flags(0..8);
+    let flag = |marked, ragged| RowFlags { marked, ragged };
+    assert_eq!(
+        flags,
+        [
+            flag(false, false),
+            flag(false, false),
+            flag(true, false),  // text after a closing quote
+            flag(true, true),   // one field of three
+            flag(false, false), // a blank line is never ragged
+            flag(false, false),
+            flag(false, false), // past the last row
+            flag(false, false),
+        ]
+    );
+    for (row, flags) in flags.iter().enumerate() {
+        assert_eq!(flags.marked, document.row_has_diagnostic(row));
+    }
+}
+
+#[test]
+fn encoding_choices_follow_the_bom() {
+    let dir = Dir::new("encoding-choices");
+    let (plain, _) = open_bytes(&dir, "plain.csv", b"a,b\n1,2\n");
+    let choices = plain.detection().encoding_choices();
+    assert_eq!(choices.len(), 14);
+    assert!(!choices.contains(&Encoding::Utf16Le));
+    assert!(choices.contains(&Encoding::MacRoman));
+    let (bom, _) = open_bytes(&dir, "bom.csv", b"\xEF\xBB\xBFa,b\n1,2\n");
+    assert_eq!(bom.detection().encoding_choices(), [Encoding::Utf8]);
+    let (utf16, _) = open_bytes(&dir, "utf16.csv", b"\xFF\xFEa\0,\0b\0\n\0");
+    assert_eq!(utf16.detection().encoding_choices(), [Encoding::Utf16Le]);
+}
+
+/// Opens `bytes` as if on a removable drive, with `fault` happening as the
+/// copy reaches its offset.
+fn open_with_fault(dir: &Dir, bytes: &[u8], fault: SimulatedFault) -> Document {
+    let path = dir.file("usb.csv", bytes);
+    let source = Source::open_simulating_fault(&path, &dir.temp(), 4096, Some(fault)).unwrap();
+    Document::from_source(source, &scheduler(), options(30), None)
+        .unwrap()
+        .0
+}
+
+#[test]
+fn a_simulated_disconnection_refuses_save_and_keeps_what_was_read() {
+    let dir = Dir::new("fault-disconnect");
+    let bytes = sample(300 * 1024);
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Disconnect { at: 150 * 1024 });
+    assert!(document.can_save());
+    let job = document.index_job();
+    assert_eq!(
+        job.control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    assert_eq!(document.storage(), Storage::Disconnected);
+    assert!(!document.can_save());
+    assert!(!document.changed_on_disk());
+    assert!(document.source().available_len() <= 150 * 1024);
+    // The rows indexed before the drive went can still be read.
+    let rows = document.row_count();
+    assert!(rows > 100);
+    assert_eq!(document.rows(0..5, 100).unwrap().len(), 5);
+    assert_eq!(
+        document.review_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+}
+
+#[test]
+fn a_simulated_change_refuses_save() {
+    let dir = Dir::new("fault-change");
+    let bytes = sample(300 * 1024);
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Change { at: 100 * 1024 });
+    let job = document.index_job();
+    assert_eq!(
+        job.control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    assert!(document.changed_on_disk());
+    assert!(!document.can_save());
+    assert_eq!(document.storage(), Storage::Reading);
+}
+
+#[test]
+fn a_mapped_file_can_be_saved() {
+    let dir = Dir::new("can-save");
+    let (document, _) = open_bytes(&dir, "plain.csv", b"a,b\n1,2\n");
+    assert!(document.can_save());
+    assert!(!document.changed_on_disk());
+}
+
+/// On every corpus file, each kind's Previous and Next visit exactly the
+/// rows the index pass reported, and select the field each location is in:
+/// the row checks (`diagnostics::find`) agree with the collector, in every
+/// encoding the corpus has, UTF-16 included.
+#[test]
+fn kind_navigation_agrees_with_the_report_on_the_corpus() {
+    let dir = Dir::new("kind-corpus");
+    let cases = leal_testkit::corpus::load().unwrap();
+    let mut checked = 0;
+    for case in &cases {
+        let file = case.name.replace('/', "-");
+        let (document, _) = open_bytes(&dir, &file, &case.bytes);
+        wait_for_index(&document);
+        let report = document.diagnostics();
+        let reading = document.current();
+        let index = RowIndex::build(&case.bytes, reading.parser.dialect()).unwrap();
+        for diagnostic in report.diagnostics() {
+            let kind = diagnostic.kind();
+            let found = walk_forward(&document, kind);
+            assert_eq!(
+                found,
+                walk_backward(&document, kind),
+                "{}: {kind:?}",
+                case.name
+            );
+            if diagnostic.severity() == crate::diagnostics::Severity::Info {
+                assert!(found.is_empty(), "{}: {kind:?}", case.name);
+                continue;
+            }
+            let mut rows: Vec<usize> = diagnostic.first().iter().map(|l| l.row).collect();
+            rows.dedup();
+            let got: Vec<usize> = found.iter().map(|p| p.row).collect();
+            assert_eq!(got, rows, "{}: {kind:?}", case.name);
+            for place in &found {
+                let parsed = reading
+                    .parser
+                    .parse_row(&index, place.row, &case.bytes)
+                    .unwrap();
+                if kind == DiagnosticKind::RaggedRows {
+                    let mode = index.field_count_mode().unwrap();
+                    assert_eq!(
+                        place.column,
+                        parsed.fields().len().min(mode),
+                        "{}",
+                        case.name
+                    );
+                } else {
+                    // The first location in the row is in the chosen field.
+                    let at = diagnostic
+                        .first()
+                        .iter()
+                        .find(|l| l.row == place.row)
+                        .unwrap()
+                        .offset;
+                    let field = &parsed.fields()[place.column];
+                    assert!(
+                        field.span().contains(&at) || field.start() == at,
+                        "{}: {kind:?} at {at} isn't in field {} ({:?})",
+                        case.name,
+                        place.column,
+                        field.span()
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 8, "only {checked} kinds checked");
+}
+
+/// While indexing, the report and the row marks are read at different
+/// moments, so a report can be older than the marks. Such a report (here,
+/// an empty, incomplete one, as before the first chunk) must not let a
+/// search take every flagged row as its kind: row 1 has a NUL and row 3
+/// text after a quote, and each search must still find its own row.
+#[test]
+fn a_report_older_than_the_marks_is_not_trusted() {
+    let dir = Dir::new("kind-race");
+    let (document, _) = open_bytes(&dir, "race.csv", b"a,b\n1,n\0l\n2,3\n\"q\"x,4\n");
+    wait_for_index(&document);
+    let reading = document.current();
+    let diagnostics = reading.diagnostics.get().unwrap();
+    let stale = Report::default();
+    assert!(!stale.is_complete());
+    let search = |kind, start, direction| {
+        document
+            .search_kind(&reading, diagnostics, &stale, kind, start, direction, 0)
+            .unwrap()
+    };
+    // Backward, through the marks: the last flagged row is the quote's.
+    assert_eq!(
+        search(DiagnosticKind::NulBytes, usize::MAX, Direction::Backward),
+        Some(Place { row: 1, column: 1 })
+    );
+    // Forward for the quote: the first flagged row is the NUL's.
+    assert_eq!(
+        search(DiagnosticKind::TextAfterClosingQuote, 0, Direction::Forward),
+        Some(Place { row: 3, column: 0 })
+    );
+    // With the complete report, the same answers.
+    assert_eq!(
+        document
+            .previous_with_kind(DiagnosticKind::NulBytes, usize::MAX)
+            .unwrap(),
+        Some(Place { row: 1, column: 1 })
+    );
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::TextAfterClosingQuote, 0)
+            .unwrap(),
+        Some(Place { row: 3, column: 0 })
+    );
+}
+
+/// A newer search stops an older one: the older one sees the count move
+/// on and gives up with `Cancelled`.
+#[test]
+fn a_newer_search_stops_an_older_one() {
+    let dir = Dir::new("kind-cancel");
+    let (document, _) = open_bytes(&dir, "cancel.csv", b"a,b\n1,\"q\"x\n2,n\0l\n");
+    wait_for_index(&document);
+    let reading = document.current();
+    let diagnostics = reading.diagnostics.get().unwrap();
+    let report = diagnostics.report();
+    // As if search 1 were still running when search 2 started. (The
+    // empty report keeps search 1 off the report shortcut, to the marks.)
+    document.searches.store(2, Ordering::Relaxed);
+    let kind = DiagnosticKind::TextAfterClosingQuote;
+    let old = document.search_kind(
+        &reading,
+        diagnostics,
+        &Report::default(),
+        kind,
+        2,
+        Direction::Backward,
+        1,
+    );
+    assert_eq!(old.unwrap_err().kind(), ReadErrorKind::Cancelled);
+    let current = document.search_kind(
+        &reading,
+        diagnostics,
+        &report,
+        kind,
+        3,
+        Direction::Backward,
+        2,
+    );
+    assert_eq!(current.unwrap(), Some(Place { row: 1, column: 1 }));
 }

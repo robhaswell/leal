@@ -301,4 +301,33 @@ enum CellPainter {
         context.setFillColor(palette.gridLine)
         context.fill(CGRect(x: x - 1, y: minY, width: 1, height: maxY - minY))
     }
+
+    /// A short ragged row's missing cell (ADR-0002 question 5, mockup 03a):
+    /// thin diagonal lines. Only ragged rows have these, so the colour is
+    /// resolved here rather than in the palette every frame.
+    static func drawHatch(in rect: CGRect, context: CGContext) {
+        let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        context.saveGState()
+        context.clip(to: rect.insetBy(dx: 0, dy: 1))
+        context.setStrokeColor(NSColor.labelColor.withAlphaComponent(dark ? 0.16 : 0.12).cgColor)
+        context.setLineWidth(1)
+        let spacing: CGFloat = 6
+        var x = rect.minX - rect.height
+        while x < rect.maxX {
+            context.move(to: CGPoint(x: x, y: rect.maxY))
+            context.addLine(to: CGPoint(x: x + rect.height, y: rect.minY))
+            x += spacing
+        }
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    /// The gutter's marker for a row with a warning or an error (ADR-0002
+    /// question 7, mockup 03a): an orange dot at the gutter's leading edge.
+    static func drawGutterMarker(rowRect rect: CGRect, context: CGContext) {
+        let size: CGFloat = 6
+        let dot = CGRect(x: rect.minX + 6, y: rect.midY - size / 2, width: size, height: size)
+        context.setFillColor(NSColor.systemOrange.cgColor)
+        context.fillEllipse(in: dot)
+    }
 }

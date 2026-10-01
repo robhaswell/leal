@@ -30,6 +30,19 @@ const FLAG: u8 = 0x80;
 /// The field-count code for 127 fields or more.
 pub(crate) const WIDE: u8 = 0x7F;
 
+/// Which marked rows a search looks for (task 1.7): any, for the gutter;
+/// ragged or flagged ones, for each kind's **Previous** and **Next** in the
+/// details popover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// Any warning or error: ragged, or flagged.
+    Any,
+    /// Ragged rows only: a field count other than the mode's.
+    Ragged,
+    /// Rows with a field-level warning or the unterminated quote (bit 7).
+    Flagged,
+}
+
 /// A row's code. `fields` is the row's field count (ignored for a blank
 /// line). For [`WIDE`] rows, the caller also records the exact count.
 pub(crate) fn code(fields: usize, blank: bool, flagged: bool) -> u8 {
@@ -82,15 +95,31 @@ impl RowMarks {
     /// True if `row` has a warning or an error. False for a row that isn't
     /// indexed yet.
     pub(crate) fn has(&self, row: usize) -> bool {
+        self.is(row, Mark::Any)
+    }
+
+    /// True if `row` is marked as `which` says. False for a row that isn't
+    /// indexed yet.
+    pub(crate) fn is(&self, row: usize, which: Mark) -> bool {
         self.codes
             .get(row)
-            .is_some_and(|&code| self.marked(row, code))
+            .is_some_and(|&code| self.marked(row, code, which))
     }
 
     /// The first marked row at or after `from`.
     pub(crate) fn next(&self, from: usize) -> Option<usize> {
+        self.next_where(from, Mark::Any)
+    }
+
+    /// The last marked row before `to`.
+    pub(crate) fn previous(&self, to: usize) -> Option<usize> {
+        self.previous_where(to, Mark::Any)
+    }
+
+    /// The first row at or after `from` marked as `which` says.
+    pub(crate) fn next_where(&self, from: usize, which: Mark) -> Option<usize> {
         let tail = self.codes.get(from..)?;
-        match self.byte_test() {
+        match self.byte_test(which) {
             Some(test) => {
                 // Skip blocks with no marked row, 64 codes at a time: a loop
                 // without an early exit, which the compiler vectorises.
@@ -115,7 +144,7 @@ impl RowMarks {
                 let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < from);
                 for (row, &code) in (from..).zip(tail) {
                     let fields = self.step_wide(code, &mut w, row);
-                    if self.marked_with(code, fields) {
+                    if self.marked_with(code, fields, which) {
                         return Some(row);
                     }
                 }
@@ -124,10 +153,10 @@ impl RowMarks {
         }
     }
 
-    /// The last marked row before `to`.
-    pub(crate) fn previous(&self, to: usize) -> Option<usize> {
+    /// The last row before `to` marked as `which` says.
+    pub(crate) fn previous_where(&self, to: usize, which: Mark) -> Option<usize> {
         let head = &self.codes[..to.min(self.codes.len())];
-        match self.byte_test() {
+        match self.byte_test(which) {
             Some(test) => {
                 let mut end = head.len();
                 for block in head.rchunks(BLOCK) {
@@ -153,7 +182,7 @@ impl RowMarks {
                     } else {
                         None
                     };
-                    if self.marked_with(code, fields) {
+                    if self.marked_with(code, fields, which) {
                         return Some(row);
                     }
                 }
@@ -162,20 +191,23 @@ impl RowMarks {
         }
     }
 
-    /// True if the row with this code has a warning or an error.
-    fn marked(&self, row: usize, code: u8) -> bool {
+    /// True if the row with this code is marked as `which` says.
+    fn marked(&self, row: usize, code: u8, which: Mark) -> bool {
         let fields = if code & !FLAG == WIDE {
             self.wide_fields(row)
         } else {
             None
         };
-        self.marked_with(code, fields)
+        self.marked_with(code, fields, which)
     }
 
     /// [`marked`](Self::marked), given a [`WIDE`] row's exact field count.
-    fn marked_with(&self, code: u8, wide_fields: Option<usize>) -> bool {
-        if code & FLAG != 0 {
-            return true;
+    fn marked_with(&self, code: u8, wide_fields: Option<usize>, which: Mark) -> bool {
+        let flagged = code & FLAG != 0;
+        match which {
+            Mark::Flagged => return flagged,
+            Mark::Any if flagged => return true,
+            Mark::Any | Mark::Ragged => {}
         }
         let count = code & !FLAG;
         if count == 0 {
@@ -218,14 +250,21 @@ impl RowMarks {
             .map(|delimiters| delimiters + 1)
     }
 
-    /// A test that needs only the code, when the mode isn't wide.
-    fn byte_test(&self) -> Option<ByteTest> {
+    /// A test that needs only the code: when the mode isn't wide, or when
+    /// only the flag matters.
+    fn byte_test(&self, which: Mark) -> Option<ByteTest> {
+        if which == Mark::Flagged {
+            return Some(ByteTest { mode: None, which });
+        }
         match self.mode {
-            None => Some(ByteTest { mode: None }),
+            None => Some(ByteTest { mode: None, which }),
             Some(mode) => u8::try_from(mode)
                 .ok()
                 .filter(|&m| m < WIDE)
-                .map(|m| ByteTest { mode: Some(m) }),
+                .map(|m| ByteTest {
+                    mode: Some(m),
+                    which,
+                }),
         }
     }
 }
@@ -239,15 +278,23 @@ fn row_of(row: u32) -> usize {
 const BLOCK: usize = 64;
 
 /// [`RowMarks::marked`] when the mode is below [`WIDE`] (or there is none),
-/// so every wide row is ragged and the code alone decides.
+/// so every wide row is ragged and the code alone decides; or when only the
+/// flag matters.
 #[derive(Clone, Copy)]
 struct ByteTest {
     mode: Option<u8>,
+    which: Mark,
 }
 
 impl ByteTest {
     fn marked(self, code: u8) -> bool {
         let count = code & !FLAG;
-        code & FLAG != 0 || (count != 0 && self.mode.is_some_and(|m| count != m))
+        let flagged = code & FLAG != 0;
+        let ragged = count != 0 && self.mode.is_some_and(|m| count != m);
+        match self.which {
+            Mark::Any => flagged | ragged,
+            Mark::Ragged => ragged,
+            Mark::Flagged => flagged,
+        }
     }
 }

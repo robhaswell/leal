@@ -18,7 +18,9 @@ import os
 /// - `-LealSnapshot <file.png>`: once indexing is done (or at once with
 ///   `-LealSnapshotEarly YES`), the window is drawn offscreen to a PNG at
 ///   1×, then the app quits. `-LealSelect row,column` picks the active
-///   cell; `-LealJumpEnd YES` presses ⌘↓ first.
+///   cell; `-LealJumpEnd YES` presses ⌘↓ first; `-LealDetails YES` opens
+///   the diagnostics popover on its first kind's first occurrence (mockup
+///   03b).
 /// - `-LealAppearance light|dark` and `-LealWindowSize 1000x640` (the
 ///   content size, in points) for either.
 ///
@@ -108,8 +110,28 @@ final class ScriptedRun {
         }
         // Let sizing, the review and drawing settle.
         try? await Task.sleep(for: .milliseconds(has("LealSnapshotEarly") ? 30 : 600))
+        if has("LealDetails") {
+            // The details popover (mockup 03b), on its first kind's first
+            // occurrence.
+            content.showDetails(nil)
+            if let kind = content.details?.entries.first?.kind {
+                await content.navigate(kind, forward: true).value
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        }
         guard let window = content.view.window else { return }
-        Snapshot.writePNG(of: window, to: url)
+        // The popover is a window of its own, placed by the system, whose
+        // glass doesn't draw offscreen: draw its content on a plain panel
+        // under the Details button, where the mockup has it.
+        var panels: [(NSView, NSRect)] = []
+        if let details = content.details?.view, content.detailsPopover != nil,
+           case let anchor = content.detailsAnchor {
+            let button = anchor.convert(anchor.bounds, to: nil)
+            let size = details.fittingSize
+            let x = min(button.maxX + 12, window.frame.width - 8) - size.width
+            panels.append((details, NSRect(x: x, y: button.minY - 8 - size.height, width: size.width, height: size.height)))
+        }
+        Snapshot.writePNG(of: window, panels: panels, to: url)
         Logger.open.info("Snapshot written to \(url.path(percentEncoded: false), privacy: .public)")
     }
 
@@ -138,10 +160,19 @@ enum Snapshot {
         return rep
     }
 
-    static func writePNG(of window: NSWindow, to url: URL, scale: CGFloat = 1) {
+    /// `panels` are views drawn over the window on a plain rounded panel,
+    /// each at a rectangle in the window's coordinates: the details
+    /// popover's content.
+    static func writePNG(of window: NSWindow, panels: [(NSView, NSRect)] = [], to url: URL, scale: CGFloat = 1) {
         guard let rep = image(of: window) else { return }
         let size = NSSize(width: (CGFloat(rep.pixelsWide) / window.backingScaleFactor * scale).rounded(),
                           height: (CGFloat(rep.pixelsHigh) / window.backingScaleFactor * scale).rounded())
+        let panels = panels.compactMap { view, frame -> (NSBitmapImageRep, NSRect)? in
+            view.layoutSubtreeIfNeeded()
+            guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+            view.cacheDisplay(in: view.bounds, to: image)
+            return (image, NSRect(x: frame.minX * scale, y: frame.minY * scale, width: frame.width * scale, height: frame.height * scale))
+        }
         guard let small = NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: Int(size.width),
@@ -158,6 +189,23 @@ enum Snapshot {
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: small)
         NSGraphicsContext.current?.imageInterpolation = .high
         rep.draw(in: NSRect(origin: .zero, size: size))
+        window.effectiveAppearance.performAsCurrentDrawingAppearance {
+            for (image, frame) in panels {
+                let panel = NSBezierPath(roundedRect: frame, xRadius: 10, yRadius: 10)
+                NSGraphicsContext.saveGraphicsState()
+                let shadow = NSShadow()
+                shadow.shadowBlurRadius = 12
+                shadow.shadowOffset = NSSize(width: 0, height: -3)
+                shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+                shadow.set()
+                NSColor.windowBackgroundColor.setFill()
+                panel.fill()
+                NSGraphicsContext.restoreGraphicsState()
+                NSColor.separatorColor.setStroke()
+                panel.stroke()
+                image.draw(in: frame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil)
+            }
+        }
         NSGraphicsContext.restoreGraphicsState()
         try? small.representation(using: .png, properties: [:])?.write(to: url)
     }

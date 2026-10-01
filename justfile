@@ -401,6 +401,23 @@ _app-scripted profile: (ffi profile) xcodeproj
         build 2>&1 | tee "$log"
     just _no_warnings "$log"
 
+# Fail if a Release app has leal-ffi's test-only exports (`test-exports`) or leal-core's test hooks (`test-hooks`): a test can make a document panic or pretend a drive vanished. CI runs it after `just app release`.
+check-no-test-exports app="build/DerivedData/Build/Products/Release/Leal.app":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Plain `nm` (not `-gU`, which skips hidden symbols) sees the Rust
+    # symbols, and `strings` UniFFI's metadata names, in either spelling
+    # (`debug_panic`, `debugPanic`). Every test-only export starts `debug_`;
+    # the test hooks are `open_simulating_*` and `SimulatedFault`.
+    pattern='debug_?(panic|watch|open_?document)|open_?simulating|simulated_?fault|set_?fault'
+    for binary in "{{ app }}/Contents/Frameworks/LealFFI.framework/LealFFI" "{{ app }}/Contents/MacOS/Leal"; do
+        if nm "$binary" | grep -Ei "$pattern" || strings "$binary" | grep -Ei "$pattern"; then
+            echo "error: $binary has test-only exports or test hooks" >&2
+            exit 1
+        fi
+    done
+    echo "check-no-test-exports: no test-only exports or test hooks in {{ app }}"
+
 # Fail if a Release app has the scripted runs (`LEAL_BENCH`): they write files and quit when given launch arguments. CI runs it after `just app release`.
 check-no-bench app="build/DerivedData/Build/Products/Release/Leal.app":
     #!/usr/bin/env bash

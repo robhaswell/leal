@@ -4,17 +4,41 @@ import LealFFI
 /// A document window's content (DESIGN §4.1): banners at the top, the grid,
 /// and the status bar. It binds the grid to the `DocumentModel` and passes
 /// the user's scrolling and typing to the core's scheduler.
+///
+/// The banners, top to bottom: a removable drive that was disconnected or
+/// whose file changed while it was read (ADR-0006), the UTF-16 notice
+/// (mockup 06a), the diagnostics banner (03a), and the delimiter and
+/// encoding suggestions (DESIGN §3.2, ADR-0005 decision 4). Each stays
+/// until dismissed; reading the file again (Treat As, Reopen with
+/// Encoding, the Header row toggle) starts them afresh.
 @MainActor
 final class DocumentViewController: NSViewController, NSMenuItemValidation {
     let model: DocumentModel
     private let scheduler: Scheduler
     let grid = GridContainerView()
     let statusBar = StatusBarView()
-    /// The banners, top to bottom. SEAM(1.7): the diagnostics and drive
-    /// banners join the UTF-16 one here.
+    /// The banners, top to bottom.
     let banners = NSStackView()
     /// The document failed (DESIGN §3.9).
     var onFailure: (() -> Void)?
+
+    private(set) var driveBanner: BannerView?
+    private(set) var readOnlyBanner: BannerView?
+    private(set) var diagnosticsBanner: BannerView?
+    private(set) var delimiterBanner: BannerView?
+    private(set) var encodingBanner: BannerView?
+    /// What was dismissed, for the current reading.
+    private var dismissed = Set<String>()
+    /// The reading the banners are for.
+    private var bannerGeneration: UInt64?
+
+    /// The details popover (mockup 03b), while it is open.
+    private(set) var detailsPopover: NSPopover?
+    private(set) var details: DiagnosticsDetailsController?
+    /// Where each kind's Previous and Next are.
+    private(set) var navigation = KindNavigation()
+    /// Navigations started, so a late answer is dropped.
+    private var navigationCount = 0
 
     init(model: DocumentModel, scheduler: Scheduler) {
         self.model = model
@@ -70,10 +94,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         grid.dataSource = model
         grid.setColumnWidths(model.columnWidths)
         statusBar.onToggleHeader = { [weak self] in self?.setHeaderRow(true) }
+        statusBar.onTreatAs = { [weak self] in self?.treatAs($0) }
+        statusBar.onReopen = { [weak self] in self?.reopen(encoding: $0) }
+        statusBar.onBadge = { [weak self] in self?.showDetails(nil) }
         model.onChange = { [weak self] change in self?.modelChanged(change) }
-        if model.isReadOnly {
-            showReadOnlyBanner()
-        }
+        updateBanners()
         statusBar.show(model.status)
         if model.rowCount > 0 {
             grid.activeCell = CellPosition(row: 0, column: 0)
@@ -94,18 +119,168 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
             grid.activeCell = model.rowCount > 0 ? CellPosition(row: 0, column: 0) : nil
+            navigation.reset()
         case .failed:
             grid.invalidateContent()
+            detailsPopover?.close()
             onFailure?()
         }
+        updateBanners()
         statusBar.show(model.status)
+        updateDetails()
     }
 
-    // MARK: The Header row toggle (ADR-0002 question 13)
+    // MARK: Banners
+
+    /// Shows the banners the document's state calls for, in their order.
+    func updateBanners() {
+        if bannerGeneration != model.generation {
+            // A new reading of the file: suggestions and the diagnostics
+            // banner start afresh. The drive's state is the file's, not the
+            // reading's.
+            dismissed = dismissed.filter { $0.hasPrefix("drive") }
+            bannerGeneration = model.generation
+        }
+        guard !model.isFailed else {
+            for banner in [driveBanner, diagnosticsBanner, delimiterBanner, encodingBanner] { banner?.removeFromSuperview() }
+            driveBanner = nil
+            diagnosticsBanner = nil
+            delimiterBanner = nil
+            encodingBanner = nil
+            return
+        }
+
+        // A removable drive (ADR-0006, 1.1a).
+        let drive: (key: String, message: String)? = if model.changedOnDisk {
+            ("drive-changed", DiagnosticsText.changedWhileReading)
+        } else if model.storage == .disconnected {
+            ("drive-disconnected", DiagnosticsText.disconnected)
+        } else {
+            nil
+        }
+        driveBanner = banner(
+            driveBanner,
+            key: drive?.key,
+            make: { key in
+                makeBanner(kind: .warning, message: drive?.message ?? "", button: DiagnosticsText.saveAs, action: #selector(saveACopy(_:)), key: key)
+            }
+        )
+        driveBanner?.message = drive?.message ?? ""
+
+        // UTF-16 (mockup 06a).
+        readOnlyBanner = banner(readOnlyBanner, key: model.isReadOnly ? "read-only" : nil) { key in
+            makeBanner(
+                kind: .info,
+                message: String(
+                    localized: "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it.",
+                    comment: "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
+                ),
+                button: String(localized: "Save As UTF-8…", comment: "Banner button on a UTF-16 file"),
+                action: #selector(saveAsUTF8(_:)),
+                key: key
+            )
+        }
+
+        // The irregularities (mockup 03a).
+        let kinds = Int(model.diagnostics?.bannerKinds ?? 0)
+        let showsDiagnostics = model.diagnostics?.showsBanner == true
+        diagnosticsBanner = banner(diagnosticsBanner, key: showsDiagnostics ? "diagnostics" : nil) { key in
+            makeBanner(
+                kind: .warning,
+                message: DiagnosticsText.banner(kinds: kinds),
+                button: DiagnosticsText.details,
+                prominent: false,
+                action: #selector(showDetails(_:)),
+                key: key
+            )
+        }
+        diagnosticsBanner?.message = DiagnosticsText.banner(kinds: kinds)
+
+        // The suggestions (DESIGN §3.2, ADR-0005 decision 4).
+        let delimiter = model.review?.delimiterSuggestion
+        delimiterBanner = banner(delimiterBanner, key: delimiter.map { "delimiter-\($0)" }) { key in
+            makeBanner(
+                kind: .info,
+                message: delimiter.map(DiagnosticsText.delimiterSuggestion) ?? "",
+                button: DiagnosticsText.switchDelimiter,
+                action: #selector(acceptDelimiterSuggestion(_:)),
+                key: key
+            )
+        }
+        let encoding = model.review?.encodingSuggestion
+        encodingBanner = banner(encodingBanner, key: encoding.map { "encoding-\($0)" }) { key in
+            makeBanner(
+                kind: .info,
+                message: encoding.map(DiagnosticsText.encodingSuggestion) ?? "",
+                button: encoding.map(DiagnosticsText.reopenAs),
+                action: #selector(acceptEncodingSuggestion(_:)),
+                key: key
+            )
+        }
+
+        let order = [driveBanner, readOnlyBanner, diagnosticsBanner, delimiterBanner, encodingBanner].compactMap { $0 }
+        if banners.arrangedSubviews != order {
+            for view in banners.arrangedSubviews { banners.removeArrangedSubview(view); view.removeFromSuperview() }
+            for view in order { banners.addArrangedSubview(view) }
+        }
+    }
+
+    /// The banner for `key` (`nil`: none), made if needed, unless it was
+    /// dismissed.
+    private func banner(_ existing: BannerView?, key: String?, make: (String) -> BannerView) -> BannerView? {
+        guard let key, !dismissed.contains(key) else {
+            existing?.removeFromSuperview()
+            return nil
+        }
+        if let existing, existing.identifier?.rawValue == key { return existing }
+        existing?.removeFromSuperview()
+        return make(key)
+    }
+
+    private func makeBanner(
+        kind: BannerView.Kind,
+        message: String,
+        button: String?,
+        prominent: Bool = true,
+        action: Selector,
+        key: String
+    ) -> BannerView {
+        let banner = BannerView(kind: kind, message: message, buttonTitle: button, prominent: prominent, target: self, action: action)
+        banner.identifier = NSUserInterfaceItemIdentifier(key)
+        banner.onDismiss = { [weak self] in
+            self?.dismissed.insert(key)
+            self?.updateBanners()
+        }
+        return banner
+    }
+
+    /// "Switch": read the file with the suggested delimiter.
+    @objc func acceptDelimiterSuggestion(_ sender: Any?) {
+        guard let delimiter = model.review?.delimiterSuggestion else { return }
+        treatAs(delimiter)
+    }
+
+    /// "Reopen as …": read the file in the suggested encoding.
+    @objc func acceptEncodingSuggestion(_ sender: Any?) {
+        guard let encoding = model.review?.encodingSuggestion else { return }
+        reopen(encoding: encoding)
+    }
+
+    // MARK: Changing the interpretation (ADR-0005 decision 8)
 
     private func setHeaderRow(_ header: Bool) {
         scheduler.noteUserInput()
         model.setHeaderRow(header)
+    }
+
+    func treatAs(_ delimiter: Delimiter) {
+        scheduler.noteUserInput()
+        model.treatAs(delimiter)
+    }
+
+    func reopen(encoding: TextEncoding) {
+        scheduler.noteUserInput()
+        model.reopen(encoding: encoding)
     }
 
     /// View > Use First Row as Header.
@@ -113,40 +288,161 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         setHeaderRow(!model.interpretation.header)
     }
 
+    /// View > Treat As > a delimiter.
+    @objc func treatAsDelimiter(_ sender: NSMenuItem) {
+        guard let delimiter = MainMenu.delimiter(of: sender) else { return }
+        treatAs(delimiter)
+    }
+
+    /// File > Reopen with Encoding > an encoding.
+    @objc func reopenWithEncoding(_ sender: NSMenuItem) {
+        guard let encoding = MainMenu.encoding(of: sender) else { return }
+        reopen(encoding: encoding)
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(toggleHeaderRow(_:)) {
+        switch menuItem.action {
+        case #selector(toggleHeaderRow(_:)):
             menuItem.state = model.interpretation.header ? .on : .off
             return !model.isFailed
+        case #selector(treatAsDelimiter(_:)):
+            menuItem.state = MainMenu.delimiter(of: menuItem) == model.interpretation.delimiter ? .on : .off
+            return !model.isFailed
+        case #selector(reopenWithEncoding(_:)):
+            let encoding = MainMenu.encoding(of: menuItem)
+            menuItem.state = encoding == model.interpretation.encoding ? .on : .off
+            return !model.isFailed && encoding.map(model.interpretation.encodingChoices.contains) == true
+        case #selector(showDetails(_:)):
+            return model.diagnostics?.diagnostics.isEmpty == false
+        default:
+            return true
         }
-        return true
     }
 
-    // MARK: UTF-16 (mockup 06a)
+    // MARK: The details popover (mockup 03b)
 
-    private func showReadOnlyBanner() {
-        let banner = BannerView(
-            kind: .info,
-            message: String(
-                localized: "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it.",
-                comment: "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
-            ),
-            buttonTitle: String(localized: "Save As UTF-8…", comment: "Banner button on a UTF-16 file"),
-            target: self,
-            action: #selector(saveAsUTF8(_:))
+    /// Shows the details of the irregularities: from the banner's Details
+    /// button, or the status bar's badge once the banner is dismissed.
+    @objc func showDetails(_ sender: Any?) {
+        if let popover = detailsPopover, popover.isShown {
+            popover.close()
+            return
+        }
+        guard model.diagnostics?.diagnostics.isEmpty == false else { return }
+        let controller = DiagnosticsDetailsController()
+        controller.onNavigate = { [weak self] kind, forward in self?.navigate(kind, forward: forward) }
+        details = controller
+        updateDetails()
+        let popover = NSPopover()
+        popover.contentViewController = controller
+        popover.behavior = .transient
+        popover.animates = false
+        detailsPopover = popover
+        // The banner's Details button; once it is dismissed, the badge; for
+        // a file with only info-level kinds, their note in the status bar.
+        let anchor = detailsAnchor
+        if anchor.window != nil {
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: anchor === diagnosticsBanner?.button ? .minY : .maxY)
+        }
+    }
+
+    /// What the details popover points at: always a view on screen.
+    var detailsAnchor: NSView {
+        if let button = diagnosticsBanner?.button, !button.isHiddenOrHasHiddenAncestor {
+            return button
+        }
+        return statusBar.detailsAnchor
+    }
+
+    private func updateDetails() {
+        guard let details, let report = model.diagnostics else { return }
+        details.show(
+            report: report,
+            navigation: navigation,
+            fileName: model.url.lastPathComponent,
+            headerRows: model.headerRows,
+            lineEnding: model.lineEnding,
+            encoding: model.interpretation.encoding
         )
-        banner.onDismiss = { [weak banner] in banner?.removeFromSuperview() }
-        banners.addArrangedSubview(banner)
     }
+
+    /// A kind's **Previous** or **Next** (mockup 03b): the core finds the
+    /// occurrence, in every row, and the grid selects its cell. Returns
+    /// once it is shown (for tests).
+    @discardableResult
+    func navigate(_ kind: DiagnosticKind, forward: Bool) -> Task<Void, Never> {
+        scheduler.noteUserInput()
+        navigationCount += 1
+        let count = navigationCount
+        let start: UInt64? = forward ? navigation.nextStart(kind) : navigation.previousEnd(kind)
+        return Task { @MainActor [weak self] in
+            guard let self, let start else { return }
+            guard let place = await model.find(kind, forward: forward, from: start), count == navigationCount else {
+                if count == navigationCount {
+                    // Nothing further: Next stops here, arrow off (no wrap).
+                    if forward, navigation.row(of: kind) != nil { navigation.reachedEnd(kind) }
+                    NSSound.beep()
+                    updateDetails()
+                }
+                return
+            }
+            navigation.visit(kind, row: place.row)
+            let column = min(Int(place.column), max(0, model.columnCount - 1))
+            if place.row < UInt64(model.headerRows) {
+                // In the header row, which isn't a grid row: show the header
+                // at that column, with no cell selected.
+                showHeader(column: column)
+            } else {
+                grid.select(CellPosition(row: model.gridRow(ofPhysical: place.row), column: column))
+            }
+            updateDetails()
+        }
+    }
+
+    /// Scrolls to the top, with `column` in view, and selects no cell: an
+    /// occurrence in the header row.
+    private func showHeader(column: Int) {
+        grid.activeCell = nil
+        let clip = grid.scrollView.contentView
+        let cell = grid.geometry.cellRect(row: 0, column: column)
+        let maxX = max(0, grid.gridView.frame.width - clip.bounds.width)
+        let visible = clip.bounds
+        let x = cell.minX >= visible.minX && cell.maxX <= visible.maxX ? visible.minX : min(cell.minX, maxX)
+        clip.scroll(to: NSPoint(x: x, y: 0))
+        grid.scrollView.reflectScrolledClipView(clip)
+    }
+
+    // MARK: Saving (ADR-0006)
 
     /// SEAM(2.3): Save As UTF-8 is built in task 2.3.
     @objc func saveAsUTF8(_ sender: Any?) {
+        showNotYet(
+            String(localized: "Save As UTF-8 isn’t available yet.", comment: "Alert: the UTF-16 banner's button before task 2.3"),
+            String(
+                localized: "A later version of Leal saves a UTF-8 copy of the file that you can edit.",
+                comment: "Alert: the UTF-16 banner's button before task 2.3"
+            )
+        )
+    }
+
+    /// The drive banners' Save As…: Save is refused (`DocumentModel.canSave`)
+    /// but a copy may be saved elsewhere. SEAM(2.5): Leal writes files from
+    /// task 2.5; until then this says so.
+    @objc func saveACopy(_ sender: Any?) {
+        showNotYet(
+            String(localized: "Save As isn’t available yet.", comment: "Alert: the drive banner's Save As button before task 2.5"),
+            String(
+                localized: "A later version of Leal saves a copy of what it shows, wherever you choose.",
+                comment: "Alert: the drive banner's Save As button before task 2.5"
+            )
+        )
+    }
+
+    private func showNotYet(_ message: String, _ information: String) {
         guard let window = view.window else { return }
         let alert = NSAlert()
-        alert.messageText = String(localized: "Save As UTF-8 isn’t available yet.", comment: "Alert: the UTF-16 banner's button before task 2.3")
-        alert.informativeText = String(
-            localized: "A later version of Leal saves a UTF-8 copy of the file that you can edit.",
-            comment: "Alert: the UTF-16 banner's button before task 2.3"
-        )
+        alert.messageText = message
+        alert.informativeText = information
         alert.beginSheetModal(for: window)
     }
 }

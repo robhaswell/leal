@@ -50,6 +50,13 @@ final class DocumentModel: GridDataSource {
     /// Called after first paint inside `init`, on the core's document. Only
     /// tests set it, to make the document fail while it opens.
     static var afterFirstPaintForTesting: ((LealFFI.Document) throws -> Void)?
+    /// Opens the core's document in place of `openDocument`. Only tests set
+    /// it, to open a file as if on a removable drive that vanishes, or
+    /// whose file changes, part-way through (`debugOpenDocumentWithFault`,
+    /// task 1.7).
+    static var openForTesting: ((_ path: String, _ environment: DocumentEnvironment, _ options: OpenOptions, _ observer: any ProgressObserver) throws -> LealFFI.Document)?
+    /// Rows per block of the row-flags cache (gutter markers and hatching).
+    nonisolated static let flagBlockRows = 64
 
     let url: URL
     private var handle: LealFFI.Document?
@@ -65,9 +72,26 @@ final class DocumentModel: GridDataSource {
     private(set) var reviewedLineEnding: LineEnding?
     /// The most common field count: the "× N columns" of the status bar.
     private(set) var fileColumnCount: Int
-    /// Where the file's bytes are held (DESIGN §3.1): a clone, or a copy in
-    /// memory when the volume can't clone, which the status bar notes.
+    /// Where the file's bytes are held (DESIGN §3.1): a clone, in memory or
+    /// a copy when the volume can't clone, and for a removable drive, being
+    /// read, copied, or disconnected (ADR-0006). The status bar notes all
+    /// but the clone.
     private(set) var storage: SourceStorage = .clone
+    /// The file changed on its drive while it was read (1.1a): the rows
+    /// shown may mix two versions.
+    private(set) var changedOnDisk = false
+    /// Whether Save could write over the file: not after a disconnection
+    /// or a change while reading (ADR-0006). Save As always can.
+    private(set) var canSave = true
+    /// What the index has found wrong with the file so far (DESIGN §3.5),
+    /// for the current reading.
+    private(set) var diagnostics: DiagnosticsReport?
+    /// What the review (P2) suggests, once it has finished.
+    private(set) var review: ReviewResult?
+    /// Row flags read from the core, by block of `flagBlockRows` grid rows.
+    private var flagBlocks: [Int: [RowFlags]] = [:]
+    /// A drive-state check is queued (see `call`).
+    private var driveCheckQueued = false
     /// Why the document failed, once it has.
     private(set) var failure: (any Error)?
     /// How many calls the model has made on the core's document, so a test
@@ -104,15 +128,17 @@ final class DocumentModel: GridDataSource {
     static func open(url: URL, environment: DocumentEnvironment) throws -> DocumentModel {
         let reference = ModelReference()
         let relay = ProgressRelay { progress in reference.model?.progressArrived(progress) }
-        let handle = try openDocument(
-            path: url.path(percentEncoded: false),
+        // The first screen's rows are read below, through `cells`, with a
+        // cap on the fields; the core's first screen need only bring the
+        // first row, for the header titles.
+        let options = OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters)
+        let path = url.path(percentEncoded: false)
+        let handle = try openForTesting?(path, environment, options, relay) ?? openDocument(
+            path: path,
             volume: TemporaryFolders.volume(for: url),
             temp: environment.temp,
             scheduler: environment.scheduler,
-            // The first screen's rows are read below, through `cells`, with
-            // a cap on the fields; the core's first screen need only bring
-            // the first row, for the header titles.
-            options: OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters),
+            options: options,
             observer: relay
         )
         let model = try DocumentModel(url: url, handle: handle, scheduler: environment.scheduler)
@@ -140,7 +166,7 @@ final class DocumentModel: GridDataSource {
         )
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
         applyFirstScreen(screen)
-        storage = call({ try $0.storage() }) ?? storage
+        refreshDriveState()
         if let hook = Self.afterFirstPaintForTesting {
             _ = call { try hook($0) }
         }
@@ -197,9 +223,14 @@ final class DocumentModel: GridDataSource {
         do {
             return try body(handle)
         } catch let error as LealError {
-            if case .DocumentFailed = error {
+            switch error {
+            case .DocumentFailed:
                 fail(error)
-            } else {
+            case .DriveDisconnected, .ChangedOnDisk:
+                // A read found the drive gone or the file changed: show it
+                // (task 1.7). Not now, though: this may be inside a draw.
+                queueDriveCheck()
+            default:
                 Logger.document.error("Core call failed for \(self.url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
             }
             return nil
@@ -252,9 +283,18 @@ final class DocumentModel: GridDataSource {
         case .Cancelled?, nil:
             // Closing, re-reading or a cancelled task.
             break
-        case .DriveDisconnected?, .ChangedOnDisk?, .Failed?:
-            // SEAM(1.7, 1.9): the drive-disconnected and changed-elsewhere
-            // banners.
+        case .DriveDisconnected?, .ChangedOnDisk?:
+            // The drive-disconnected and changed-while-reading banners
+            // (ADR-0006, 1.1a). SEAM(1.9): Reload, and dropping rows read
+            // before a change.
+            Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
+            if let progress = call({ try $0.progress() }) {
+                progressArrived(progress)
+            } else {
+                refreshDriveState()
+                onChange?(.progress)
+            }
+        case .Failed?:
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
         }
     }
@@ -266,9 +306,41 @@ final class DocumentModel: GridDataSource {
 
     private func reviewFinished(generation: UInt64) {
         guard generation == self.generation, let review = call({ try $0.review() }) else { return }
+        self.review = review
         reviewedLineEnding = review?.lineEnding ?? reviewedLineEnding
-        // SEAM(1.7): the encoding and delimiter suggestion banners.
         onChange?(.progress)
+    }
+
+    /// Reads where the bytes are, whether the file changed while read, and
+    /// whether Save is possible (ADR-0006).
+    private func refreshDriveState() {
+        storage = call({ try $0.storage() }) ?? storage
+        changedOnDisk = call({ try $0.changedOnDisk() }) ?? changedOnDisk
+        canSave = call({ try $0.canSave() }) ?? canSave
+    }
+
+    /// A read failed because the drive went or the file changed: check the
+    /// drive state soon, outside whatever is running now.
+    private func queueDriveCheck() {
+        guard !driveCheckQueued else { return }
+        driveCheckQueued = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            driveCheckQueued = false
+            guard failure == nil, handle != nil else { return }
+            refreshDriveState()
+            onChange?(.progress)
+        }
+    }
+
+    /// The latest diagnostics report, unless the one held is already the
+    /// complete report of this reading.
+    private func refreshDiagnostics() {
+        if let held = diagnostics, held.generation == generation, held.complete { return }
+        guard let report = call({ try $0.diagnostics() }), report.generation == generation else { return }
+        diagnostics = report
+        // The marks grew, and ragged rows may have changed with the mode.
+        flagBlocks.removeAll()
     }
 
     /// A progress report from the relay (or a fresh one).
@@ -279,8 +351,9 @@ final class DocumentModel: GridDataSource {
             fileColumnCount = Int(count)
         }
         // A removable drive's file moves from being read to a copy as the
-        // index pass copies it. SEAM(1.7): Copy, Reading and Disconnected.
-        storage = call({ try $0.storage() }) ?? storage
+        // index pass copies it, or is disconnected (ADR-0006).
+        refreshDriveState()
+        refreshDiagnostics()
         loadHeaderTitlesIfNeeded()
         updateColumnCount()
         let enough = Int(report.rows) >= Int(Self.sizingRows) + headerOffset
@@ -320,6 +393,72 @@ final class DocumentModel: GridDataSource {
 
     func cell(row: Int, column: Int) -> GridCell {
         tiles.cell(row: row, column: column, loadedRows: loadedRowCount)
+    }
+
+    /// A marker in the gutter: the row has a warning or an error (ADR-0002
+    /// question 7), for every row, not only the report's first 1,000.
+    func rowHasMarker(_ row: Int) -> Bool {
+        flags(row: row).marked
+    }
+
+    /// A short row's missing cell is hatched once the core says the row is
+    /// ragged (ADR-0002 question 5). Columns past the most common field
+    /// count belong to longer rows, so they stay blank.
+    func isHatched(row: Int, column: Int) -> Bool {
+        column < fileColumnCount && flags(row: row).ragged
+    }
+
+    /// The grid row's flags, from the core one block at a time.
+    private func flags(row: Int) -> RowFlags {
+        guard failure == nil, row >= 0, row < loadedRowCount else { return RowFlags(marked: false, ragged: false) }
+        let block = row / Self.flagBlockRows
+        if flagBlocks[block] == nil {
+            if flagBlocks.count > 64 { flagBlocks.removeAll() }
+            let start = UInt64(block * Self.flagBlockRows + headerOffset)
+            flagBlocks[block] = call({ try $0.rowFlags(start: start, count: UInt32(Self.flagBlockRows)) }) ?? []
+        }
+        let offset = row - block * Self.flagBlockRows
+        guard let flags = flagBlocks[block], offset < flags.count else { return RowFlags(marked: false, ragged: false) }
+        return flags[offset]
+    }
+
+    // MARK: Diagnostics navigation (mockup 03b)
+
+    /// The first row of the file is the header row, which isn't a grid row.
+    var headerRows: Int { headerOffset }
+
+    /// The grid row a data row (physical row `row`, not the header row) is
+    /// shown in.
+    func gridRow(ofPhysical row: UInt64) -> Int {
+        max(0, Int(row) - headerOffset)
+    }
+
+    /// The next (`forward`) occurrence of `kind` at or after physical row
+    /// `from`, or the previous one before it. The core searches every row
+    /// with the row marks, past the report's first 1,000 locations; it may
+    /// read many rows, so it runs off the main actor. `nil` if there is
+    /// none, or if the file was read again meanwhile.
+    func find(_ kind: DiagnosticKind, forward: Bool, from: UInt64) async -> DiagnosticPlace? {
+        guard failure == nil, let handle else { return nil }
+        let generation = generation
+        coreCalls += 1
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<DiagnosticPlace?, any Error> in
+            Result {
+                forward
+                    ? try handle.nextWithKind(kind: kind, from: from)
+                    : try handle.previousWithKind(kind: kind, to: from)
+            }
+        }.value
+        guard generation == self.generation, failure == nil else { return nil }
+        switch result {
+        case let .success(place):
+            return place
+        case let .failure(error):
+            // Handled as any core call's error: a failure fails the
+            // document, a vanished drive is shown.
+            let _: Void? = call { _ -> Void in throw error }
+            return nil
+        }
     }
 
     func prepare(rows: Range<Int>, columns: Range<Int>) {
@@ -561,11 +700,34 @@ final class DocumentModel: GridDataSource {
     /// choices. Nothing is reopened (PLAN 1.3).
     func setHeaderRow(_ header: Bool) {
         guard header != interpretation.header else { return }
+        reinterpret(header: header)
+    }
+
+    /// **Treat as** (ADR-0005 decision 8): reads the file again with
+    /// `delimiter`, keeping the user's other choices. The file is
+    /// re-indexed, and its diagnostics start again; no byte changes.
+    func treatAs(_ delimiter: Delimiter) {
+        guard delimiter != interpretation.delimiter else { return }
+        reinterpret(delimiter: delimiter)
+    }
+
+    /// **Reopen with encoding** (ADR-0005 decision 8): reads the file again
+    /// in `encoding`, in place of the guess, the BOM's or the file's
+    /// attribute's (ADR-0004 decision 11). Only the encodings the core
+    /// offers (`encodingChoices`) fit the file.
+    func reopen(encoding: TextEncoding) {
+        guard encoding != interpretation.encoding || interpretation.encodingSource != .user else { return }
+        reinterpret(encoding: encoding)
+    }
+
+    /// Reads the file again with the given choices, keeping the user's
+    /// earlier ones for the rest. Nothing is reopened (PLAN 1.3).
+    private func reinterpret(delimiter: Delimiter? = nil, header: Bool? = nil, encoding: TextEncoding? = nil) {
         let current = interpretation
         let options = OpenOptions(
-            delimiter: current.delimiterSource == .user ? current.delimiter : nil,
-            header: header,
-            encoding: current.encodingSource == .user ? current.encoding : nil,
+            delimiter: delimiter ?? (current.delimiterSource == .user ? current.delimiter : nil),
+            header: header ?? (current.headerSource == .user ? current.header : nil),
+            encoding: encoding ?? (current.encodingSource == .user ? current.encoding : nil),
             firstScreenRows: 1,
             maxChars: GridMetrics.maxCellCharacters
         )
@@ -576,6 +738,9 @@ final class DocumentModel: GridDataSource {
         generation = screen.generation
         fileColumnCount = Int(screen.columnCount)
         reviewedLineEnding = nil
+        review = nil
+        diagnostics = nil
+        flagBlocks.removeAll()
         tiles.removeAll()
         resizedColumns.removeAll()
         columnWidths = []
@@ -605,9 +770,18 @@ final class DocumentModel: GridDataSource {
             header: interpretation.header,
             headerSource: interpretation.headerSource,
             readOnly: isReadOnly,
-            storage: storage
+            storage: storage,
+            changedOnDisk: changedOnDisk,
+            infoKinds: diagnostics?.diagnostics.filter { $0.severity == .info }.map(\.kind) ?? [],
+            warningKinds: Int(diagnostics?.bannerKinds ?? 0),
+            notes: interpretation.notes,
+            encodingChoices: interpretation.encodingChoices
         )
     }
+
+    /// The whole file's most common line ending, once the review knows it,
+    /// else first paint's.
+    var lineEnding: LineEnding? { reviewedLineEnding ?? interpretation.lineEnding }
 }
 
 /// The refined sizing's result, from the background.

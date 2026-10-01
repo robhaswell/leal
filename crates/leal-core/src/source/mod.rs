@@ -88,6 +88,8 @@ use memmap2::Mmap;
 
 use error::Step;
 pub use error::{OpenError, OpenErrorKind, ReadError, ReadErrorKind};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use removable::SimulatedFault;
 use removable::{Origin, Removable};
 use temp::TempFolder;
 pub use temp::TempFolders;
@@ -251,6 +253,9 @@ struct Options {
     volume: VolumeCheck,
     /// The size of [`Source::stream`]'s chunks.
     chunk_len: usize,
+    /// A fault to pretend happens to a removable drive (tests only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    fault: Option<SimulatedFault>,
 }
 
 impl Default for Options {
@@ -259,6 +264,8 @@ impl Default for Options {
             memory_limit: MEMORY_FALLBACK_MAX_BYTES,
             volume: VolumeCheck::Detect,
             chunk_len: STREAM_CHUNK_BYTES,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fault: None,
         }
     }
 }
@@ -357,7 +364,8 @@ impl Source {
     /// then [`stream`](Self::stream) copying it in chunks of `chunk_len`)
     /// can be measured and tested without a real drive. Only built for
     /// leal-core's tests and with the `test-hooks` feature, which the
-    /// benchmarks turn on and the app never does.
+    /// benchmarks and the app's tests turn on, and the shipped app never
+    /// does.
     ///
     /// # Errors
     ///
@@ -376,6 +384,37 @@ impl Source {
             Options {
                 volume: VolumeCheck::Removable,
                 chunk_len,
+                ..Options::default()
+            },
+        )
+    }
+
+    /// TEST HOOK, not for product code: as
+    /// [`open_simulating_removable`](Self::open_simulating_removable), and
+    /// `fault` happens when the copy reaches its offset: the drive vanishes
+    /// ([`Storage::Disconnected`]) or the file changes
+    /// ([`changed_on_disk`](Self::changed_on_disk)). The app's tests use it
+    /// (through leal-ffi's `test-exports`) for the banners of task 1.7.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn open_simulating_fault(
+        path: &Path,
+        temp: &TempFolders,
+        chunk_len: usize,
+        fault: Option<SimulatedFault>,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_options(
+            path,
+            temp,
+            VolumeInfo::default(),
+            Options {
+                volume: VolumeCheck::Removable,
+                chunk_len,
+                fault,
                 ..Options::default()
             },
         )
@@ -400,7 +439,13 @@ impl Source {
         let removable_source = |origin| -> Result<_, OpenError> {
             let copy_error = |error| OpenError::new(path, Step::Copy, error);
             let copy = temp.create().map_err(copy_error)?;
-            let removable = Removable::new(path, origin, &copy, options.chunk_len)?;
+            #[cfg_attr(
+                not(any(test, feature = "test-hooks")),
+                expect(unused_mut, reason = "only the test hook changes it")
+            )]
+            let mut removable = Removable::new(path, origin, &copy, options.chunk_len)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            removable.set_fault(options.fault);
             Ok((
                 Bytes::Removable(Box::new(removable)),
                 Some(copy),

@@ -29,8 +29,10 @@ doctest = false
 [features]
 # Test-only exports (`debug_panic`) for the app's XCTest suite. `just ffi`
 # turns it on for debug builds and for `just app-test release`; the release
-# library that `just app release` links never has it.
-test-exports = []
+# library that `just app release` links never has it. It turns on
+# leal-core's test hooks, for `debug_open_document_with_fault` (task 1.7:
+# a removable drive disconnecting, or its file changing, in the app's tests).
+test-exports = ["leal-core/test-hooks"]
 
 [dependencies]
 leal-core.workspace = true

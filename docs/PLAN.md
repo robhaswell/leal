@@ -276,7 +276,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   of frames are late, and 0.5–0.8% at 200 columns. Find the cause, bring the cost close to the spike's, and
   meet DESIGN §1's scroll budget. Must be done before the phase 1 gate.
 
-- [ ] **1.7 App: diagnostics banner** (also the ADR-0006 "drive disconnected" banner) — banner, details popover, navigation,
+- [x] **1.7 App: diagnostics banner** (also the ADR-0006 "drive disconnected" banner) — banner, details popover, navigation,
   gutter markers (mockups 03a, 03b).
   - Status-bar notes for where the file's bytes are (`Document.storage()`):
     still being read from a removable drive (`Reading`), the internal copy

@@ -60,7 +60,10 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock};
 use crate::detect::{
     self, ChoiceError, Choices, Detection, FIRST_PAINT_BYTES, Hints, Review, detect, review_with,
 };
-use crate::diagnostics::{Diagnostics, Report};
+use crate::diagnostics::{
+    DiagnosticKind, Diagnostics, Hit, Mark, Report, RowFlags, decided_by_bytes, field_with,
+    next_hit, row_may_have,
+};
 use crate::dialect::{Encoding, QUOTE};
 use crate::index::{
     DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
@@ -73,6 +76,75 @@ use crate::schedule::{Interval, IntervalGuard, Job, JobError, JobHandle, Priorit
 use crate::source::{
     OpenError, ReadError, ReadErrorKind, Source, Storage, TempFolders, VolumeInfo,
 };
+
+/// Where an occurrence of a diagnostic is, for the details popover's
+/// **Previous** and **Next** (task 1.7): the cell to select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    /// The 0-based physical row (the header row, if any, is row 0).
+    pub row: usize,
+    /// The 0-based field: the one with the occurrence, or for a ragged row
+    /// its first missing or extra cell.
+    pub column: usize,
+}
+
+/// Which way [`Document::next_with_kind`] and its neighbour search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// The kinds a row mark's flag stands for (see `diagnostics::marks`).
+const FLAGGED_KINDS: [DiagnosticKind; 4] = [
+    DiagnosticKind::UnterminatedQuote,
+    DiagnosticKind::TextAfterClosingQuote,
+    DiagnosticKind::InvalidEncoding,
+    DiagnosticKind::NulBytes,
+];
+
+/// One row's bytes, read for a kind's search (`Document::row_bytes`).
+struct RowBytes<'a, 'r> {
+    /// The row, line ending included.
+    bytes: Cow<'a, [u8]>,
+    /// Where `bytes` start in the file.
+    base: usize,
+    /// The index the row is in (the first 64 KB's, or the file's).
+    index: &'r RowIndex,
+}
+
+/// How many candidate rows a kind's search takes from the row marks per
+/// lock.
+const SEARCH_BATCH: usize = 256;
+
+/// The row of the occurrence of `kind` that **Next** from `start`
+/// (`Forward`) or **Previous** before it would find, if the report's
+/// locations decide it. They list every occurrence in file order up to the
+/// last one listed, so a listed row past `start` is the next one, and
+/// before `start` the nearest listed row is the previous one when `start`
+/// is within the list or the list is complete.
+fn listed_row(
+    report: &Report,
+    kind: DiagnosticKind,
+    start: usize,
+    direction: Direction,
+) -> Option<usize> {
+    let diagnostic = report.get(kind)?;
+    let rows = diagnostic.first();
+    // The locations are in file order: the first one at or after `start`.
+    let at = rows.partition_point(|location| location.row < start);
+    match direction {
+        Direction::Forward => rows.get(at).map(|location| location.row),
+        Direction::Backward => {
+            let last = rows.last()?.row;
+            let complete = rows.len() == diagnostic.count();
+            if start > last && !complete {
+                return None;
+            }
+            Some(rows.get(at.checked_sub(1)?)?.row)
+        }
+    }
+}
 
 /// How to open a document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +315,9 @@ pub struct Document {
     /// Held by `reinterpret`, so two at once can't leave a reading whose
     /// jobs nobody cancels.
     reinterpreting: Mutex<()>,
+    /// Counts kind searches (`next_with_kind`): a search stops when a
+    /// newer one starts.
+    searches: AtomicU64,
     reading: RwLock<Arc<Reading>>,
 }
 
@@ -367,6 +442,7 @@ impl Document {
             progress,
             generations: AtomicU64::new(1),
             reinterpreting: Mutex::new(()),
+            searches: AtomicU64::new(0),
             reading: RwLock::new(Arc::new(reading)),
             source,
         };
@@ -512,9 +588,18 @@ impl Document {
     fn read_rows<T>(
         &self,
         rows: Range<usize>,
+        each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
+    ) -> Result<Vec<T>, ReadError> {
+        self.read_rows_of(&self.current(), rows, each)
+    }
+
+    /// [`read_rows`](Self::read_rows), in a given reading.
+    fn read_rows_of<T>(
+        &self,
+        reading: &Reading,
+        rows: Range<usize>,
         mut each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
     ) -> Result<Vec<T>, ReadError> {
-        let reading = self.current();
         let indexed = reading.index.row_count();
         // Both indexes cover a prefix of the file's rows; use the longer.
         let (index, available) = if indexed >= reading.head_rows {
@@ -659,6 +744,280 @@ impl Document {
             .diagnostics
             .get()?
             .previous_row_with_diagnostic(to)
+    }
+
+    /// Each of rows `rows`' marks (task 1.7): whether its gutter has a
+    /// marker, and whether it is ragged, so its missing cells are hatched
+    /// (ADR-0002 questions 5 and 7). Rows not indexed yet are unmarked.
+    #[must_use]
+    pub fn row_flags(&self, rows: Range<usize>) -> Vec<RowFlags> {
+        match self.current().diagnostics.get() {
+            Some(diagnostics) => diagnostics.row_flags(rows),
+            None => vec![RowFlags::default(); rows.len()],
+        }
+    }
+
+    /// The first occurrence of `kind` in a row at or after `from`, for
+    /// that kind's **Next** in the details popover (task 1.7): its row and
+    /// the column to select. Every row, not only the report's first
+    /// [`MAX_LOCATIONS`](crate::diagnostics::MAX_LOCATIONS): the row marks
+    /// find candidate rows, and a row with several field-level kinds is
+    /// checked for this one. `None` for the info-level kinds, which have
+    /// no navigation (mockup 03b), and past the last occurrence indexed so
+    /// far.
+    ///
+    /// It reads each candidate row, so it may take a while in a file where
+    /// most rows have some other field-level kind: call it off the main
+    /// thread.
+    ///
+    /// # Errors
+    ///
+    /// A [`ReadError`] if a candidate row can't be read (see
+    /// [`rows`](Self::rows)).
+    pub fn next_with_kind(
+        &self,
+        kind: DiagnosticKind,
+        from: usize,
+    ) -> Result<Option<Place>, ReadError> {
+        self.step_to_kind(kind, from, Direction::Forward)
+    }
+
+    /// The last occurrence of `kind` in a row before `to`, for **Previous**.
+    /// As for [`next_with_kind`](Self::next_with_kind).
+    ///
+    /// # Errors
+    ///
+    /// As for [`next_with_kind`](Self::next_with_kind).
+    pub fn previous_with_kind(
+        &self,
+        kind: DiagnosticKind,
+        to: usize,
+    ) -> Result<Option<Place>, ReadError> {
+        self.step_to_kind(kind, to, Direction::Backward)
+    }
+
+    fn step_to_kind(
+        &self,
+        kind: DiagnosticKind,
+        start: usize,
+        direction: Direction,
+    ) -> Result<Option<Place>, ReadError> {
+        // A newer search (another click on Previous or Next) stops this one.
+        let search = self
+            .searches
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let reading = self.current();
+        let Some(diagnostics) = reading.diagnostics.get() else {
+            return Ok(None);
+        };
+        let report = diagnostics.report();
+        self.search_kind(
+            &reading,
+            diagnostics,
+            &report,
+            kind,
+            start,
+            direction,
+            search,
+        )
+    }
+
+    /// [`step_to_kind`](Self::step_to_kind), with the report it trusts
+    /// passed in, so a test can pass an older one.
+    ///
+    /// 1. **The report's locations.** They are every occurrence up to the
+    ///    last one listed, so if one lies past `start` (Next), or `start`
+    ///    is within them (Previous), it is the answer, and only its row is
+    ///    read, for the column.
+    /// 2. **The bytes.** For NULs and invalid UTF-8 going forward over a
+    ///    mapped file, one fast search of the file from the row on finds
+    ///    the next one, however many rows have other kinds.
+    /// 3. **The row marks.** Otherwise candidate rows come from the marks,
+    ///    a batch per lock, and each is checked from its bytes; only text
+    ///    after a quote needs the row parsed, and only if it has a quote.
+    ///    No row goes through the grid's row cache.
+    ///
+    /// Shortcuts 1 and "every flagged row has this kind" are used only once
+    /// the report is complete: while indexing, the report and the marks are
+    /// read at different moments, and a kind found in between would be
+    /// missed.
+    #[allow(clippy::too_many_arguments)]
+    fn search_kind(
+        &self,
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        report: &Report,
+        kind: DiagnosticKind,
+        start: usize,
+        direction: Direction,
+        search: u64,
+    ) -> Result<Option<Place>, ReadError> {
+        let which = match kind {
+            DiagnosticKind::RaggedRows => Mark::Ragged,
+            DiagnosticKind::UnterminatedQuote
+            | DiagnosticKind::TextAfterClosingQuote
+            | DiagnosticKind::InvalidEncoding
+            | DiagnosticKind::NulBytes => Mark::Flagged,
+            DiagnosticKind::MixedLineEndings
+            | DiagnosticKind::BlankLines
+            | DiagnosticKind::BomPresent => return Ok(None),
+        };
+        let settled = report.is_complete();
+        let stopped = || self.searches.load(Ordering::Relaxed) != search;
+
+        // 1. The report's locations.
+        if settled && let Some(row) = listed_row(report, kind, start, direction) {
+            return self.place(reading, kind, row);
+        }
+
+        // 2. The bytes.
+        let encoding = reading.detection.encoding;
+        if direction == Direction::Forward
+            && let Some(bytes) = self.source.as_slice()
+            && let Some(extent) = reading.index.row_extent(start)
+        {
+            match next_hit(kind, encoding, bytes, extent.start, bytes.len(), &stopped) {
+                Hit::At(offset) => match reading.index.row_at_offset(offset) {
+                    Some(row) if diagnostics.row_is(row, Mark::Flagged) => {
+                        return self.place(reading, kind, row);
+                    }
+                    // Past the rows indexed so far: none before it.
+                    None => return Ok(None),
+                    // Indexed, but its marks not published yet (the index
+                    // publishes its rows a moment before the diagnostics):
+                    // ask the marks instead.
+                    Some(_) => {}
+                },
+                Hit::None => return Ok(None),
+                Hit::Unsupported if stopped() => return Err(ReadError::cancelled()),
+                Hit::Unsupported => {}
+            }
+        }
+
+        // 3. The row marks. If no other flagged kind was found, every
+        // flagged row has this one.
+        let alone = which == Mark::Ragged
+            || (settled
+                && FLAGGED_KINDS
+                    .iter()
+                    .all(|&other| other == kind || report.get(other).is_none()));
+        let forward = direction == Direction::Forward;
+        let mut at = start;
+        loop {
+            if stopped() {
+                return Err(ReadError::cancelled());
+            }
+            let rows = diagnostics.rows_where(at, which, forward, SEARCH_BATCH);
+            let Some(&last) = rows.last() else {
+                return Ok(None);
+            };
+            for row in rows {
+                if alone || self.row_has(reading, kind, row)? {
+                    return self.place(reading, kind, row);
+                }
+            }
+            // `rows_where` looks before `at` going backward.
+            at = if forward { last + 1 } else { last };
+        }
+    }
+
+    /// The bytes of row `row`, line ending included, from whichever index
+    /// holds it, without the row cache.
+    fn row_bytes<'r>(
+        &self,
+        reading: &'r Reading,
+        row: usize,
+    ) -> Result<Option<RowBytes<'_, 'r>>, ReadError> {
+        let index = if row < reading.index.row_count() {
+            &*reading.index
+        } else if row < reading.head_rows {
+            &reading.head_index
+        } else {
+            return Ok(None);
+        };
+        let Some(extent) = index.row_extent(row) else {
+            return Ok(None);
+        };
+        let bytes = match self.head.get(extent.clone()) {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => self.source.read_range(extent.clone())?,
+        };
+        Ok(Some(RowBytes {
+            bytes,
+            base: extent.start,
+            index,
+        }))
+    }
+
+    /// Whether row `row` has an occurrence of the field-level `kind`.
+    fn row_has(
+        &self,
+        reading: &Reading,
+        kind: DiagnosticKind,
+        row: usize,
+    ) -> Result<bool, ReadError> {
+        let Some(RowBytes { bytes, base, index }) = self.row_bytes(reading, row)? else {
+            return Ok(false);
+        };
+        let encoding = reading.detection.encoding;
+        if !row_may_have(kind, encoding, &bytes) {
+            return Ok(false);
+        }
+        if decided_by_bytes(kind) {
+            return Ok(true);
+        }
+        Ok(reading
+            .parser
+            .parse_row_in(index, row, &bytes, base)
+            .is_some_and(|parsed| field_with(kind, encoding, &bytes, base, &parsed).is_some()))
+    }
+
+    /// Where `kind` is in `row`, which has it: the row, and the column to
+    /// select. For a ragged row, its first missing cell (a short row) or
+    /// first extra one (a long row); otherwise the first field with the
+    /// kind.
+    fn place(
+        &self,
+        reading: &Reading,
+        kind: DiagnosticKind,
+        row: usize,
+    ) -> Result<Option<Place>, ReadError> {
+        let column = match self.row_bytes(reading, row)? {
+            Some(RowBytes { bytes, base, index }) => reading
+                .parser
+                .parse_row_in(index, row, &bytes, base)
+                .and_then(|parsed| {
+                    if kind == DiagnosticKind::RaggedRows {
+                        let fields = parsed.fields().len();
+                        let mode = reading.index.field_count_mode();
+                        Some(mode.map_or(fields, |mode| fields.min(mode)))
+                    } else {
+                        field_with(kind, reading.detection.encoding, &bytes, base, &parsed)
+                    }
+                }),
+            None => None,
+        };
+        Ok(Some(Place {
+            row,
+            column: column.unwrap_or(0),
+        }))
+    }
+
+    /// Whether Save (writing over the original) is possible: `false` once
+    /// the file's removable drive was disconnected before it was copied, or
+    /// once the file changed while it was read without a snapshot
+    /// ([`Source::can_save`]). Save As is always allowed (ADR-0006).
+    #[must_use]
+    pub fn can_save(&self) -> bool {
+        self.source.can_save()
+    }
+
+    /// Whether the file changed on its drive while Leal was reading it
+    /// ([`Source::changed_on_disk`]): the rows held may mix two versions.
+    #[must_use]
+    pub fn changed_on_disk(&self) -> bool {
+        self.source.changed_on_disk()
     }
 
     /// The current reading. A clone of the `Arc`, so the lock is held only

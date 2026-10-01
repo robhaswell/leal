@@ -1313,3 +1313,16 @@ fn diagnostics_are_shared_between_threads() {
     shareable::<Diagnostics>();
     shareable::<Report>();
 }
+
+#[test]
+fn rows_with_the_common_field_count_leave_out_blank_and_ragged_rows() {
+    // Six rows: a blank line, a short row and a long one; three have the
+    // common count of two fields.
+    let bytes = b"a,b\n1,2\n\n3\n4,5,6\n7,8\n";
+    let (_, report) =
+        RowIndex::build_with_diagnostics(bytes, dialect(b',', Encoding::Utf8, 0), Encoding::Utf8)
+            .unwrap();
+    assert_eq!(report.rows(), 6);
+    assert_eq!(report.rows_with_common_field_count(), 3);
+    assert_eq!(Report::default().rows_with_common_field_count(), 0);
+}

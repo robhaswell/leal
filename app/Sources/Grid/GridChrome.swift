@@ -223,6 +223,9 @@ final class GridGutterView: NSView {
                 numbers[row] = line
             }
             CellPainter.drawText(line, in: rect, font: font, alignment: .trailing, context: context, ellipsisColor: palette.secondaryText)
+            if source.rowHasMarker(row) {
+                CellPainter.drawGutterMarker(rowRect: rect, context: context)
+            }
         }
     }
 

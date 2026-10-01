@@ -33,8 +33,9 @@ proptest.workspace = true
 
 [features]
 # Test hooks for other crates' tests and benchmarks, such as
-# `Source::open_simulating_removable`. leal-bench turns it on; leal-ffi, and
-# so the app, never does.
+# `Source::open_simulating_removable` and `open_simulating_fault`.
+# leal-bench turns it on, and so does leal-ffi's `test-exports` feature, for
+# the app's tests only: the release library the app ships with never has it.
 test-hooks = []
 
 [lints]

@@ -134,6 +134,12 @@ fn open_document_gives_the_first_screen_then_rows() {
             header: true,
             header_source: DialectSource::Guess,
             line_ending: Some(LineEnding::Lf),
+            notes: vec![],
+            encoding_choices: leal_core::dialect::Encoding::ALL
+                .into_iter()
+                .filter(|e| e.is_ascii_compatible())
+                .map(TextEncoding::from)
+                .collect(),
         }
     );
     assert_eq!(screen.column_count, 2);
@@ -385,6 +391,7 @@ fn diagnostics_reach_swift() {
             ],
             shows_banner: true,
             banner_kinds: 3,
+            rows_with_common_field_count: 4,
         }
     );
     let marks: Vec<bool> = (0..7)
@@ -396,6 +403,127 @@ fn diagnostics_reach_swift() {
     assert_eq!(document.previous_row_with_diagnostic(6).unwrap(), Some(3));
     assert_eq!(document.previous_row_with_diagnostic(2).unwrap(), None);
     assert!(!document.row_has_diagnostic(u64::MAX).unwrap());
+
+    // Task 1.7: each kind's Previous and Next, and the row flags.
+    let place = |row, column| Some(DiagnosticPlace { row, column });
+    let next = |kind, from| document.next_with_kind(kind, from).unwrap();
+    assert_eq!(next(DiagnosticKind::RaggedRows, 0), place(2, 1));
+    assert_eq!(next(DiagnosticKind::TextAfterClosingQuote, 0), place(3, 0));
+    assert_eq!(next(DiagnosticKind::NulBytes, 0), place(3, 1));
+    assert_eq!(next(DiagnosticKind::NulBytes, 4), None);
+    assert_eq!(next(DiagnosticKind::BlankLines, 0), None);
+    assert_eq!(
+        document
+            .previous_with_kind(DiagnosticKind::RaggedRows, u64::MAX)
+            .unwrap(),
+        place(2, 1)
+    );
+    let flags = document.row_flags(1, 4).unwrap();
+    let flag = |marked, ragged| RowFlags { marked, ragged };
+    assert_eq!(
+        flags,
+        [
+            flag(false, false),
+            flag(true, true),
+            flag(true, false),
+            flag(false, false)
+        ]
+    );
+    assert!(document.can_save().unwrap());
+    assert!(!document.changed_on_disk().unwrap());
+}
+
+/// The test export opens a file as if on a removable drive that vanishes
+/// part-way through the copy (task 1.7's banner tests).
+#[test]
+fn a_simulated_disconnection_reaches_swift() {
+    let dir = TempDir::new("fault");
+    let mut bytes = b"id,name\n".to_vec();
+    for i in 0..20_000 {
+        bytes.extend_from_slice(format!("{i},name {i}\n").as_bytes());
+    }
+    let path = dir.file("usb.csv", &bytes);
+    let scheduler = Scheduler::new().unwrap();
+    let document = debug_open_document_with_fault(
+        &path,
+        dir.locations(),
+        &scheduler,
+        options(),
+        None,
+        4096,
+        Some(SimulatedFault::Disconnect { at: 100_000 }),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(document.index_job().unwrap().wait()),
+        Err(JobFailure::DriveDisconnected)
+    );
+    assert_eq!(document.storage().unwrap(), SourceStorage::Disconnected);
+    assert!(!document.can_save().unwrap());
+
+    let document = debug_open_document_with_fault(
+        &path,
+        dir.locations(),
+        &scheduler,
+        options(),
+        None,
+        4096,
+        Some(SimulatedFault::Change { at: 50_000 }),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(document.index_job().unwrap().wait()),
+        Err(JobFailure::ChangedOnDisk)
+    );
+    assert!(document.changed_on_disk().unwrap());
+    assert!(!document.can_save().unwrap());
+}
+
+#[test]
+fn every_interpretation_note_converts() {
+    use leal_core::detect::Note;
+    use leal_core::dialect::{Delimiter as CoreDelimiter, Encoding};
+    let notes = [
+        (
+            Note::TextEncodingUnreadable,
+            InterpretationNote::TextEncodingUnreadable,
+        ),
+        (
+            Note::TextEncodingUnsupported {
+                cf_string_encoding: 8,
+            },
+            InterpretationNote::TextEncodingUnsupported {
+                cf_string_encoding: 8,
+            },
+        ),
+        (
+            Note::TextEncodingUtf16WithoutBom,
+            InterpretationNote::TextEncodingUtf16WithoutBom,
+        ),
+        (
+            Note::TextEncodingDoesNotDecode {
+                encoding: Encoding::Windows1253,
+            },
+            InterpretationNote::TextEncodingDoesNotDecode {
+                encoding: TextEncoding::Windows1253,
+            },
+        ),
+        (
+            Note::InterpretationUnreadable,
+            InterpretationNote::InterpretationUnreadable,
+        ),
+        (
+            Note::InterpretationNotSensible {
+                delimiter: CoreDelimiter::Pipe,
+            },
+            InterpretationNote::InterpretationNotSensible {
+                delimiter: Delimiter::Pipe,
+            },
+        ),
+    ];
+    for (core, ffi) in notes {
+        assert_eq!(InterpretationNote::from(core), ffi);
+    }
 }
 
 #[test]
@@ -404,6 +532,7 @@ fn every_diagnostic_kind_and_severity_converts() {
     for kind in Core::ALL {
         let ffi = DiagnosticKind::from(kind);
         assert_eq!(format!("{ffi:?}"), format!("{kind:?}"));
+        assert_eq!(Core::from(ffi), kind);
         assert_eq!(
             format!("{:?}", Severity::from(kind.severity())),
             format!("{:?}", kind.severity())

@@ -158,8 +158,10 @@ final class GridView: NSView {
                 case .notLoaded:
                     CellPainter.drawSkeleton(row: row, column: column, in: rect, alignment: alignment, palette: palette, context: context)
                 case .missing:
-                    // SEAM(1.7): hatched once the core says the row is ragged.
-                    continue
+                    // A short ragged row's missing cells (ADR-0002 question 5).
+                    if source.isHatched(row: row, column: column) {
+                        CellPainter.drawHatch(in: rect, context: context)
+                    }
                 }
             }
         }

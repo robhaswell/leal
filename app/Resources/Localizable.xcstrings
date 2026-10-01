@@ -13,11 +13,80 @@
     "%@ (file attribute)" : {
       "comment" : "Status bar: the encoding, from the file's com.apple.TextEncoding attribute"
     },
+    "%@ cells, the first at %@" : {
+      "comment" : "Details popover: cells with this kind; their count, and where the first is",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ cells, the first at %2$@"
+          }
+        }
+      }
+    },
+    "%@ cells, the first at %@ — shown as �" : {
+      "comment" : "Details popover: cells with bytes that don't decode; their count, and where the first is",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ cells, the first at %2$@ — shown as �"
+          }
+        }
+      }
+    },
     "%@ columns" : {
       "comment" : "Status bar: the number of columns"
     },
+    "%@ empty rows, the first at %@" : {
+      "comment" : "Details popover: blank lines; their count, and where the first is",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ empty rows, the first at %2$@"
+          }
+        }
+      }
+    },
+    "%@ of %@" : {
+      "comment" : "Details popover: which occurrence is shown, as in 1 of 3 (mockup 03b)",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ of %2$@"
+          }
+        }
+      }
+    },
     "%@ rows" : {
       "comment" : "Status bar: the number of data rows"
+    },
+    "%@ rows end differently from the rest" : {
+      "comment" : "Details popover: rows with another line ending; their count"
+    },
+    "%@ rows end differently; the rest end with %@" : {
+      "comment" : "Details popover: rows with another line ending (mockup 03b); their count, then the most common one",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ rows end differently; the rest end with %2$@"
+          }
+        }
+      }
+    },
+    "%@ rows have a different number of fields to the other %@" : {
+      "comment" : "Details popover: ragged rows (mockup 03b); their count, then the number of rows with the usual field count",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ rows have a different number of fields to the other %2$@"
+          }
+        }
+      }
     },
     "%@ × %@" : {
       "comment" : "Status bar: rows, then columns, as in 1,000 rows × 12 columns",
@@ -30,14 +99,46 @@
         }
       }
     },
+    "%@+ of %@" : {
+      "comment" : "Details popover: an occurrence past the first ones Leal lists, as in 1,000+ of 3,000",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@+ of %2$@"
+          }
+        }
+      }
+    },
+    "1 cell, at %@" : {
+      "comment" : "Details popover: one cell has this kind (mockup 03b); where, such as row 17"
+    },
+    "1 cell, at %@ — shown as �" : {
+      "comment" : "Details popover: one cell with bytes that don't decode (mockup 03b); where, such as row 11"
+    },
     "1 column" : {
       "comment" : "Status bar: one column"
+    },
+    "1 empty row, at %@" : {
+      "comment" : "Details popover: one blank line; where"
     },
     "1 row" : {
       "comment" : "Status bar: one data row"
     },
+    "1 row ends differently; the rest end with %@" : {
+      "comment" : "Details popover: one row has another line ending; the most common one, such as CRLF"
+    },
+    "1 row has a different number of fields to the other %@" : {
+      "comment" : "Details popover: one ragged row; the number of rows with the usual field count"
+    },
     "A later version of Leal saves a UTF-8 copy of the file that you can edit." : {
       "comment" : "Alert: the UTF-16 banner's button before task 2.3"
+    },
+    "A later version of Leal saves a copy of what it shows, wherever you choose." : {
+      "comment" : "Alert: the drive banner's Save As button before task 2.5"
+    },
+    "A quote at %@ is never closed, so the rest of the file is one cell" : {
+      "comment" : "Details popover: the unterminated quote; where its opening quote is, such as row 12"
     },
     "About Leal" : {
       "comment" : "App menu"
@@ -48,8 +149,17 @@
     "Another app changed it while Leal was reading it." : {
       "comment" : "Open error: the file changed while it was being read without a snapshot"
     },
+    "Blank lines" : {
+      "comment" : "Diagnostic kind: empty rows (DESIGN §3.5)\nStatus bar: the file has empty rows"
+    },
     "Bring All to Front" : {
       "comment" : "Window menu"
+    },
+    "Byte order mark" : {
+      "comment" : "Diagnostic kind: the file starts with a BOM (DESIGN §3.5)"
+    },
+    "Changed while reading" : {
+      "comment" : "Status bar: the file changed on its drive while Leal read it (1.1a)"
     },
     "Clear Menu" : {
       "comment" : "File > Open Recent"
@@ -72,11 +182,26 @@
     "Delete" : {
       "comment" : "Edit menu"
     },
+    "Delimiter: %@, menu" : {
+      "comment" : "VoiceOver: the status bar's Treat As button; the delimiter's name"
+    },
+    "Details" : {
+      "comment" : "Diagnostics banner button: shows the details popover (mockup 03a)"
+    },
     "Dismiss" : {
       "comment" : "Banner's close button, for VoiceOver"
     },
+    "Drive disconnected" : {
+      "comment" : "Status bar: the file's removable drive was disconnected (ADR-0006)"
+    },
     "Edit" : {
       "comment" : "Menu title"
+    },
+    "Encoding attribute ignored" : {
+      "comment" : "Status bar: the file's com.apple.TextEncoding attribute was ignored (ADR-0005 decision 5)"
+    },
+    "Encoding: %@, menu" : {
+      "comment" : "VoiceOver: the status bar's Reopen with Encoding button; the encoding as the bar shows it"
     },
     "File" : {
       "comment" : "Menu title"
@@ -112,6 +237,12 @@
         }
       }
     },
+    "Invalid %@" : {
+      "comment" : "Diagnostic kind: bytes that aren't valid in the file's encoding, as in Invalid UTF-8 (mockup 03b)"
+    },
+    "Irregularities in %@" : {
+      "comment" : "Title of the diagnostics details popover (mockup 03b); the file's name"
+    },
     "It isn’t a regular file." : {
       "comment" : "Open error: the path is a named pipe, socket or device"
     },
@@ -127,6 +258,9 @@
     "Leal can’t show “%@” any more." : {
       "comment" : "Alert title after a panic in the core (DESIGN §3.9); the file's name"
     },
+    "Leal copied the file to this Mac and reads the copy, so the file’s drive or volume can go away safely." : {
+      "comment" : "Status bar tooltip: Leal reads its own copy (DESIGN §3.1, ADR-0006)"
+    },
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
     },
@@ -139,8 +273,20 @@
     "Leal read the encoding from the file’s encoding attribute, which the app that saved it set." : {
       "comment" : "Status bar tooltip: encoding source"
     },
+    "Leal’s remembered settings for this file couldn’t be read, so Leal ignored them." : {
+      "comment" : "Status bar tooltip: an ignored attribute"
+    },
     "Minimize" : {
       "comment" : "Window menu"
+    },
+    "Mixed line endings" : {
+      "comment" : "Diagnostic kind: some rows end with LF, some with CRLF (DESIGN §3.5)\nStatus bar: some rows end with another line ending (mockup 03a)"
+    },
+    "NUL bytes" : {
+      "comment" : "Diagnostic kind (DESIGN §3.5)"
+    },
+    "Next: %@" : {
+      "comment" : "Details popover: go to the next occurrence of a kind (VoiceOver and tooltip); the kind's name"
     },
     "No header row detected" : {
       "comment" : "Status bar: detection found no header row (mockup 06b)"
@@ -157,8 +303,14 @@
     "Pipe" : {
       "comment" : "Status bar: the delimiter"
     },
+    "Previous: %@" : {
+      "comment" : "Details popover: go to the previous occurrence of a kind (VoiceOver and tooltip); the kind's name"
+    },
     "Quit Leal" : {
       "comment" : "App menu"
+    },
+    "Ragged rows" : {
+      "comment" : "Diagnostic kind: rows with a different number of fields (DESIGN §3.5)"
     },
     "Reaching the end of the file… row %@ of about %@" : {
       "comment" : "Pill over skeleton rows after ⌘↓ before indexing is complete; the indexed row count, then the estimate",
@@ -177,17 +329,38 @@
     "Read-only" : {
       "comment" : "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)\nThe lock glyph by a read-only file's title, for VoiceOver"
     },
+    "Reading from the drive" : {
+      "comment" : "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)"
+    },
     "Redo" : {
       "comment" : "Edit menu"
     },
+    "Remembered settings ignored" : {
+      "comment" : "Status bar: Leal's own remembered delimiter and header choice were ignored (ADR-0005 decision 1)"
+    },
     "Reopen" : {
       "comment" : "Button: open the file again after a failure"
+    },
+    "Reopen as %@" : {
+      "comment" : "Suggestion banner button: read the file in the suggested encoding (ADR-0005 decision 4)"
+    },
+    "Reopen the file with another encoding" : {
+      "comment" : "Status bar tooltip of the encoding menu"
+    },
+    "Reopen with Encoding" : {
+      "comment" : "Menu: read the file in another encoding (ADR-0005 decision 8)"
     },
     "Save As UTF-8 isn’t available yet." : {
       "comment" : "Alert: the UTF-16 banner's button before task 2.3"
     },
     "Save As UTF-8…" : {
       "comment" : "Banner button on a UTF-16 file"
+    },
+    "Save As isn’t available yet." : {
+      "comment" : "Alert: the drive banner's Save As button before task 2.5"
+    },
+    "Save As…" : {
+      "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)"
     },
     "Select All" : {
       "comment" : "Edit menu"
@@ -198,11 +371,26 @@
     "Show All" : {
       "comment" : "App menu"
     },
+    "Show Irregularities" : {
+      "comment" : "View menu: the diagnostics details popover (mockup 03b)"
+    },
+    "Show the file’s irregularities" : {
+      "comment" : "Tooltip of a status bar note that opens the diagnostics details"
+    },
+    "Show the irregularities (%@ kinds)" : {
+      "comment" : "Tooltip of the status bar's diagnostics badge"
+    },
     "Something went wrong inside Leal. Close the file and open it again." : {
       "comment" : "Error after a panic in the Rust core: the document can't be used any more"
     },
+    "Switch" : {
+      "comment" : "Suggestion banner button: read the file with the suggested delimiter (DESIGN §3.2)"
+    },
     "Tab" : {
       "comment" : "Status bar: the delimiter"
+    },
+    "Text after closing quote" : {
+      "comment" : "Diagnostic kind: text such as \"a\"b (DESIGN §3.5)"
     },
     "That encoding doesn’t match the file’s byte order mark." : {
       "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
@@ -210,20 +398,91 @@
     "The drive it’s on was disconnected." : {
       "comment" : "Open error: the removable drive holding the file vanished"
     },
+    "The drive was disconnected before Leal had read the whole file. Save is off until it’s back; Save As keeps a copy." : {
+      "comment" : "Status bar tooltip: the removable drive was disconnected (ADR-0006)"
+    },
+    "The drive with this file was disconnected. Leal shows the rows it had read; Save is off until the drive is back, and Save As keeps a copy." : {
+      "comment" : "Banner: the file's removable drive was disconnected before Leal had read it all (ADR-0006)"
+    },
+    "The file changed on its drive while Leal was reading it, so what’s shown may mix two versions." : {
+      "comment" : "Status bar tooltip: the file changed while Leal read it (1.1a)"
+    },
+    "The file changed since Leal remembered its delimiter (%@), so Leal guessed again." : {
+      "comment" : "Status bar tooltip: Leal's remembered delimiter no longer fits; its name"
+    },
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"
+    },
+    "The file is on a removable drive. Leal reads it from the drive while it copies it to this Mac." : {
+      "comment" : "Status bar tooltip: the copy off a removable drive isn't finished (ADR-0006)"
+    },
+    "The file starts with a %@ byte order mark" : {
+      "comment" : "Details popover: the file has a BOM; its encoding, such as UTF-8"
+    },
+    "The file’s encoding attribute couldn’t be read, so Leal ignored it." : {
+      "comment" : "Status bar tooltip: an ignored attribute"
+    },
+    "The file’s encoding attribute names an encoding Leal doesn’t read (number %@), so Leal ignored it." : {
+      "comment" : "Status bar tooltip: an ignored attribute; its CFStringEncoding number"
+    },
+    "The file’s encoding attribute says %@, but some of its bytes aren’t valid %@, so Leal ignored it." : {
+      "comment" : "Status bar tooltip: an ignored attribute; the encoding it names, twice",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "The file’s encoding attribute says %1$@, but some of its bytes aren’t valid %2$@, so Leal ignored it."
+          }
+        }
+      }
+    },
+    "The file’s encoding attribute says UTF-16, but the file has no UTF-16 byte order mark, so Leal ignored it." : {
+      "comment" : "Status bar tooltip: an ignored attribute"
+    },
+    "This file changed on its drive while Leal was reading it, so what’s shown may mix two versions. Save is off; Save As keeps a copy." : {
+      "comment" : "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a)"
+    },
+    "This file has %@ kinds of irregularity. It’s shown exactly as written." : {
+      "comment" : "Diagnostics banner (DESIGN §3.5, mockup 03a); the number of kinds of warning or error"
+    },
+    "This file has 1 kind of irregularity. It’s shown exactly as written." : {
+      "comment" : "Diagnostics banner (DESIGN §3.5, mockup 03a) with one kind of warning or error"
     },
     "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it." : {
       "comment" : "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
     },
+    "This file looks comma-separated." : {
+      "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This file looks like %@." : {
+      "comment" : "Suggestion banner: the whole file fits another encoding (ADR-0005 decision 4); its name"
+    },
+    "This file looks pipe-separated." : {
+      "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This file looks semicolon-separated." : {
+      "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This file looks tab-separated." : {
+      "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
     "This volume can’t make a snapshot of the file, so Leal read the whole file into memory." : {
       "comment" : "Status bar tooltip: why the file was read into memory (DESIGN §3.1)"
+    },
+    "Treat As" : {
+      "comment" : "Menu: read the file with another delimiter (ADR-0005 decision 8)"
+    },
+    "Treat the file as separated by another delimiter" : {
+      "comment" : "Status bar tooltip of the delimiter menu"
     },
     "UTF-16 files are read-only in this version of Leal." : {
       "comment" : "Tooltip of the lock glyph by a read-only file's title"
     },
     "Undo" : {
       "comment" : "Edit menu"
+    },
+    "Unterminated quote" : {
+      "comment" : "Diagnostic kind (DESIGN §3.5)"
     },
     "Use First Row as Header" : {
       "comment" : "View menu: the Header row toggle (ADR-0002 question 13)"
@@ -237,6 +496,9 @@
     "Window" : {
       "comment" : "Menu title"
     },
+    "Working from a copy" : {
+      "comment" : "Status bar: Leal reads its own copy of the file on this Mac (DESIGN §3.1, ADR-0006)"
+    },
     "You chose this encoding." : {
       "comment" : "Status bar tooltip: encoding source"
     },
@@ -245,6 +507,12 @@
     },
     "Zoom" : {
       "comment" : "Window menu"
+    },
+    "row %@" : {
+      "comment" : "Where a diagnostic is: a row number as the gutter shows it"
+    },
+    "the header row" : {
+      "comment" : "Where a diagnostic is: in the file's header row"
     }
   },
   "version" : "1.0"

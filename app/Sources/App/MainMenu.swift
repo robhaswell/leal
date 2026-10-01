@@ -1,4 +1,5 @@
 import AppKit
+import LealFFI
 
 /// The menu bar, built in code because the app has no storyboard.
 @MainActor
@@ -59,7 +60,39 @@ enum MainMenu {
         menu.addItem(openRecent)
         menu.addItem(.separator())
         menu.addItem(withTitle: String(localized: "Close", comment: "File menu"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        menu.addItem(.separator())
+        // ADR-0005 decision 8. Each item is validated by the document's
+        // view controller: the encodings its BOM allows, the one in use
+        // ticked.
+        let reopen = NSMenuItem(title: StatusText.reopenWithEncoding, action: nil, keyEquivalent: "")
+        let encodings = NSMenu(title: reopen.title)
+        for encoding in Self.encodings {
+            let item = encodings.addItem(
+                withTitle: StatusText.encodingName(encoding),
+                action: #selector(DocumentViewController.reopenWithEncoding(_:)),
+                keyEquivalent: ""
+            )
+            item.representedObject = EncodingBox(encoding)
+        }
+        reopen.submenu = encodings
+        menu.addItem(reopen)
         return menu
+    }
+
+    /// Every encoding Leal reads (ADR-0005 decision 5), in the core's order.
+    static let encodings: [TextEncoding] = [
+        .utf8, .utf16Le, .utf16Be, .windows1252, .windows1250, .windows1251, .windows1253, .windows1254,
+        .windows1255, .windows1256, .windows1257, .windows1258, .iso88591, .iso88592, .iso885915, .macRoman,
+    ]
+
+    /// The delimiter of a View > Treat As item.
+    static func delimiter(of item: NSMenuItem) -> Delimiter? {
+        (item.representedObject as? DelimiterBox)?.delimiter
+    }
+
+    /// The encoding of a File > Reopen with Encoding item.
+    static func encoding(of item: NSMenuItem) -> TextEncoding? {
+        (item.representedObject as? EncodingBox)?.encoding
     }
 
     /// The standard items, which text fields need for their shortcuts (0.3
@@ -83,6 +116,24 @@ enum MainMenu {
         menu.addItem(
             withTitle: String(localized: "Use First Row as Header", comment: "View menu: the Header row toggle (ADR-0002 question 13)"),
             action: #selector(DocumentViewController.toggleHeaderRow(_:)),
+            keyEquivalent: ""
+        )
+        let treatAs = NSMenuItem(title: StatusText.treatAs, action: nil, keyEquivalent: "")
+        let delimiters = NSMenu(title: treatAs.title)
+        for delimiter in [Delimiter.comma, .semicolon, .tab, .pipe] {
+            let item = delimiters.addItem(
+                withTitle: StatusText.delimiter(delimiter),
+                action: #selector(DocumentViewController.treatAsDelimiter(_:)),
+                keyEquivalent: ""
+            )
+            item.representedObject = DelimiterBox(delimiter)
+        }
+        treatAs.submenu = delimiters
+        menu.addItem(treatAs)
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: String(localized: "Show Irregularities", comment: "View menu: the diagnostics details popover (mockup 03b)"),
+            action: #selector(DocumentViewController.showDetails(_:)),
             keyEquivalent: ""
         )
         return menu

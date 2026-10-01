@@ -196,6 +196,18 @@ impl Detection {
     pub const fn quote(&self) -> u8 {
         QUOTE
     }
+
+    /// The encodings **Reopen with encoding…** can choose for this file
+    /// (ADR-0005 decisions 5 and 8), in [`Encoding::ALL`] order: those its
+    /// BOM allows ([`Bom::allows`]). Any other choice is refused with
+    /// [`ChoiceError::EncodingDoesNotMatchBom`].
+    #[must_use]
+    pub fn encoding_choices(&self) -> Vec<Encoding> {
+        Encoding::ALL
+            .into_iter()
+            .filter(|&encoding| self.bom.allows(encoding))
+            .collect()
+    }
 }
 
 /// A user choice that can't apply to this file.
@@ -321,11 +333,7 @@ fn choose_encoding(
     notes: &mut Vec<Note>,
 ) -> Result<(Encoding, EncodingSource), ChoiceError> {
     if let Some(chosen) = chosen {
-        let fits = match bom.encoding() {
-            Some(e) => e == chosen,
-            None => chosen.is_ascii_compatible(),
-        };
-        if !fits {
+        if !bom.allows(chosen) {
             return Err(ChoiceError::EncodingDoesNotMatchBom {
                 encoding: chosen,
                 bom,

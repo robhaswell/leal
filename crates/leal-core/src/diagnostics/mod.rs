@@ -89,17 +89,21 @@
 //! accepts, the file is re-indexed with it, which gives new diagnostics.
 
 mod collect;
+mod find;
 mod marks;
 #[cfg(test)]
 mod tests;
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
 use crate::dialect::Encoding;
 use crate::index::{IndexDialect, IndexError};
 
 pub(crate) use collect::Collector;
+pub(crate) use find::{Hit, decided_by_bytes, field_with, next_hit, row_may_have};
+pub(crate) use marks::Mark;
 use marks::RowMarks;
 
 /// The most locations a diagnostic keeps (DESIGN §3.5). The count covers
@@ -285,6 +289,28 @@ impl Report {
     pub fn shows_banner(&self) -> bool {
         self.kinds_at_least(Severity::Warning) > 0
     }
+
+    /// How many rows have the most common field count: the rows that are
+    /// neither blank nor ragged. The details popover says "3 rows have a
+    /// different number of fields to the other 1,245" (mockup 03b).
+    #[must_use]
+    pub fn rows_with_common_field_count(&self) -> usize {
+        let count = |kind| self.get(kind).map_or(0, Diagnostic::count);
+        self.rows
+            .saturating_sub(count(DiagnosticKind::BlankLines))
+            .saturating_sub(count(DiagnosticKind::RaggedRows))
+    }
+}
+
+/// One row's marks (task 1.7): what its gutter shows, and whether its
+/// missing cells are hatched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowFlags {
+    /// The row has a warning or an error: its gutter marker
+    /// ([`Diagnostics::row_has_diagnostic`]).
+    pub marked: bool,
+    /// The row is ragged ([`Diagnostics::row_is_ragged`]).
+    pub ragged: bool,
 }
 
 /// The diagnostics of a file being indexed, shared between the indexer and
@@ -372,6 +398,56 @@ impl Diagnostics {
     #[must_use]
     pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
         self.read().marks.previous(to)
+    }
+
+    /// True if row `row` is ragged: not blank, and with a field count other
+    /// than the most common one (so far, while indexing). The grid hatches
+    /// a short ragged row's missing cells (ADR-0002 question 5).
+    #[must_use]
+    pub fn row_is_ragged(&self, row: usize) -> bool {
+        self.read().marks.is(row, Mark::Ragged)
+    }
+
+    /// Each of rows `rows`' marks, for the gutter and the hatched cells of
+    /// one screenful, under one lock. Rows not indexed yet are unmarked.
+    #[must_use]
+    pub fn row_flags(&self, rows: Range<usize>) -> Vec<RowFlags> {
+        let shared = self.read();
+        rows.map(|row| RowFlags {
+            marked: shared.marks.is(row, Mark::Any),
+            ragged: shared.marks.is(row, Mark::Ragged),
+        })
+        .collect()
+    }
+
+    /// Up to `max` rows marked as `which` says, under one lock: from `at`
+    /// on in file order if `forward`, else before `at`, nearest first.
+    pub(crate) fn rows_where(
+        &self,
+        at: usize,
+        which: Mark,
+        forward: bool,
+        max: usize,
+    ) -> Vec<usize> {
+        let shared = self.read();
+        let mut rows = Vec::new();
+        let mut at = at;
+        while rows.len() < max {
+            let found = if forward {
+                shared.marks.next_where(at, which)
+            } else {
+                shared.marks.previous_where(at, which)
+            };
+            let Some(row) = found else { break };
+            rows.push(row);
+            at = if forward { row + 1 } else { row };
+        }
+        rows
+    }
+
+    /// Whether row `row` is marked as `which` says.
+    pub(crate) fn row_is(&self, row: usize, which: Mark) -> bool {
+        self.read().marks.is(row, which)
     }
 
     /// The encoding the diagnostics are for.

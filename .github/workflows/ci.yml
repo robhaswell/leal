@@ -129,11 +129,8 @@ jobs:
             lipo "$binary" -verify_arch arm64
             lipo "$binary" -verify_arch x86_64
           done
-          framework="$contents/Frameworks/LealFFI.framework/LealFFI"
-          if nm "$framework" | grep -i debug_panic || strings "$framework" | grep -i debug_panic; then
-            echo "::error::the Release app contains leal-ffi's test-only exports"
-            exit 1
-          fi
+          # Nor leal-ffi's test-only exports, or leal-core's test hooks.
+          just check-no-test-exports
           # Nor the scripted runs (the bench and snapshot hooks, LEAL_BENCH).
           just check-no-bench
 

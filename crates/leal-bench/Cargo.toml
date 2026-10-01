@@ -51,6 +51,11 @@ harness = false
 name = "open"
 harness = false
 
+# Each diagnostic kind's Previous and Next on a wide file (PLAN 1.7).
+[[bench]]
+name = "navigate"
+harness = false
+
 [dependencies]
 # Reads criterion's `estimates.json` and `benchmark.json` (bench-report).
 # Criterion already depends on it, so it adds nothing to the build.

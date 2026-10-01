@@ -173,8 +173,56 @@ pub enum DialectSource {
     User,
 }
 
-/// How the file is read. See [`leal_core::detect::Detection`]; the status
-/// bar notes come with 1.7.
+/// An attribute Leal ignored, for the status bar note (ADR-0005 decision
+/// 5). See [`leal_core::detect::Note`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum InterpretationNote {
+    /// `com.apple.TextEncoding` isn't `name;number`.
+    TextEncodingUnreadable,
+    /// `com.apple.TextEncoding` names an encoding Leal doesn't read.
+    TextEncodingUnsupported {
+        /// Its `CFStringEncoding` number.
+        cf_string_encoding: u32,
+    },
+    /// `com.apple.TextEncoding` says UTF-16, but the file has no UTF-16 BOM.
+    TextEncodingUtf16WithoutBom,
+    /// `com.apple.TextEncoding` names a single-byte encoding in which some
+    /// of the file's bytes don't decode.
+    TextEncodingDoesNotDecode {
+        /// The encoding the attribute names.
+        encoding: TextEncoding,
+    },
+    /// Leal's interpretation attribute couldn't be read.
+    InterpretationUnreadable,
+    /// The file changed since Leal saved its interpretation attribute, and
+    /// the remembered delimiter no longer fits it.
+    InterpretationNotSensible {
+        /// The remembered delimiter.
+        delimiter: Delimiter,
+    },
+}
+
+impl From<detect::Note> for InterpretationNote {
+    fn from(note: detect::Note) -> Self {
+        use detect::Note as Core;
+        match note {
+            Core::TextEncodingUnreadable => Self::TextEncodingUnreadable,
+            Core::TextEncodingUnsupported { cf_string_encoding } => {
+                Self::TextEncodingUnsupported { cf_string_encoding }
+            }
+            Core::TextEncodingUtf16WithoutBom => Self::TextEncodingUtf16WithoutBom,
+            Core::TextEncodingDoesNotDecode { encoding } => Self::TextEncodingDoesNotDecode {
+                encoding: encoding.into(),
+            },
+            Core::InterpretationUnreadable => Self::InterpretationUnreadable,
+            Core::InterpretationNotSensible { delimiter } => Self::InterpretationNotSensible {
+                delimiter: delimiter.into(),
+            },
+        }
+    }
+}
+
+/// How the file is read. See [`leal_core::detect::Detection`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Interpretation {
     /// The encoding.
@@ -193,6 +241,11 @@ pub struct Interpretation {
     /// row there has one. [`ReviewResult::line_ending`] has the whole
     /// file's.
     pub line_ending: Option<LineEnding>,
+    /// Attributes that were ignored, for the status bar.
+    pub notes: Vec<InterpretationNote>,
+    /// The encodings **Reopen with encoding…** may choose: those the
+    /// file's BOM allows.
+    pub encoding_choices: Vec<TextEncoding>,
 }
 
 /// How to open (or re-read) a document.
@@ -385,6 +438,55 @@ pub struct DiagnosticsReport {
     /// How many kinds are warnings or errors: "This file has N kinds of
     /// irregularity".
     pub banner_kinds: u32,
+    /// How many rows have the most common field count: "3 rows have a
+    /// different number of fields to the other 1,245" (mockup 03b).
+    pub rows_with_common_field_count: u64,
+}
+
+/// Where an occurrence of a diagnostic is: the cell the details popover's
+/// **Previous** and **Next** select (task 1.7). See
+/// [`leal_core::document::Place`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct DiagnosticPlace {
+    /// The 0-based physical row (the header row, if any, is row 0).
+    pub row: u64,
+    /// The 0-based field.
+    pub column: u32,
+}
+
+/// One row's marks: its gutter marker, and whether its missing cells are
+/// hatched. See [`leal_core::diagnostics::RowFlags`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RowFlags {
+    /// The row has a warning or an error.
+    pub marked: bool,
+    /// The row is ragged.
+    pub ragged: bool,
+}
+
+impl From<document::Place> for DiagnosticPlace {
+    fn from(place: document::Place) -> Self {
+        DiagnosticPlace {
+            row: to_u64(place.row),
+            column: to_u32(place.column),
+        }
+    }
+}
+
+impl From<DiagnosticKind> for leal_core::diagnostics::DiagnosticKind {
+    fn from(kind: DiagnosticKind) -> Self {
+        use leal_core::diagnostics::DiagnosticKind as Core;
+        match kind {
+            DiagnosticKind::UnterminatedQuote => Core::UnterminatedQuote,
+            DiagnosticKind::RaggedRows => Core::RaggedRows,
+            DiagnosticKind::TextAfterClosingQuote => Core::TextAfterClosingQuote,
+            DiagnosticKind::InvalidEncoding => Core::InvalidEncoding,
+            DiagnosticKind::NulBytes => Core::NulBytes,
+            DiagnosticKind::MixedLineEndings => Core::MixedLineEndings,
+            DiagnosticKind::BlankLines => Core::BlankLines,
+            DiagnosticKind::BomPresent => Core::BomPresent,
+        }
+    }
 }
 
 impl DiagnosticsReport {
@@ -415,6 +517,7 @@ impl DiagnosticsReport {
                 report.kinds_at_least(leal_core::diagnostics::Severity::Warning),
             )
             .unwrap_or(u32::MAX),
+            rows_with_common_field_count: to_u64(report.rows_with_common_field_count()),
         }
     }
 }
@@ -677,6 +780,19 @@ impl Document {
         LealError::DocumentFailed {
             path: self.path.clone(),
             message,
+        }
+    }
+
+    /// A kind search's answer for Swift. A search stopped because a newer
+    /// one started gives `None`: its answer isn't wanted.
+    fn search_result(
+        &self,
+        found: Result<Option<document::Place>, ReadError>,
+    ) -> Result<Option<DiagnosticPlace>, LealError> {
+        match found {
+            Ok(place) => Ok(place.map(DiagnosticPlace::from)),
+            Err(error) if error.kind() == ReadErrorKind::Cancelled => Ok(None),
+            Err(error) => Err(read_error(&self.path, &error)),
         }
     }
 
@@ -950,6 +1066,85 @@ impl Document {
         })
     }
 
+    /// The first occurrence of `kind` in a row at or after `from`, for that
+    /// kind's **Next** in the details popover, past the report's first
+    /// 1,000 too. `None` for the info-level kinds and after the last one.
+    /// It may read many rows: call it off the main thread. Starting another
+    /// search stops this one, which then gives `None`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn next_with_kind(
+        &self,
+        kind: DiagnosticKind,
+        from: u64,
+    ) -> Result<Option<DiagnosticPlace>, LealError> {
+        self.call(|| {
+            let found = self.document.next_with_kind(kind.into(), to_index(from));
+            self.search_result(found)
+        })
+    }
+
+    /// The last occurrence of `kind` in a row before `to`, for
+    /// **Previous**. As for [`next_with_kind`](Self::next_with_kind).
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn previous_with_kind(
+        &self,
+        kind: DiagnosticKind,
+        to: u64,
+    ) -> Result<Option<DiagnosticPlace>, LealError> {
+        self.call(|| {
+            let found = self.document.previous_with_kind(kind.into(), to_index(to));
+            self.search_result(found)
+        })
+    }
+
+    /// The marks of rows `start` to `start + count`: their gutter markers,
+    /// and which are ragged. One call per screenful.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn row_flags(&self, start: u64, count: u32) -> Result<Vec<RowFlags>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .row_flags(to_range(start, count))
+                .into_iter()
+                .map(|flags| RowFlags {
+                    marked: flags.marked,
+                    ragged: flags.ragged,
+                })
+                .collect())
+        })
+    }
+
+    /// Whether Save (writing over the original) is possible: not after the
+    /// file's removable drive was disconnected, or the file changed while
+    /// it was read (ADR-0006). Save As always is.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_save(&self) -> Result<bool, LealError> {
+        self.call(|| Ok(self.document.can_save()))
+    }
+
+    /// Whether the file changed on its drive while Leal was reading it, so
+    /// the rows shown may mix two versions (the 1.1a "changed while
+    /// loading" state).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn changed_on_disk(&self) -> Result<bool, LealError> {
+        self.call(|| Ok(self.document.changed_on_disk()))
+    }
+
     /// Reads the file again with `options`' choices (**Treat as**, the
     /// header toggle, **Reopen with encoding…**), without reopening it.
     /// The old jobs are cancelled; [`index_job`](Self::index_job) and
@@ -1020,6 +1215,69 @@ pub fn debug_panicking_job(scheduler: &Scheduler) -> Arc<Job> {
     Arc::new(Job {
         control: handle.control().clone(),
     })
+}
+
+/// What to pretend happens to a file on a removable drive while it is
+/// copied, for the app's tests (`test-exports`). See
+/// `leal_core::source::SimulatedFault`.
+#[cfg(feature = "test-exports")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SimulatedFault {
+    /// The drive vanishes when the copy reaches byte `at`.
+    Disconnect {
+        /// The first byte that can't be read.
+        at: u64,
+    },
+    /// The file changes when the copy reaches byte `at`.
+    Change {
+        /// The first byte read after the change.
+        at: u64,
+    },
+}
+
+/// [`open_document`], as if the file were on a removable drive, copied in
+/// chunks of `chunk_bytes`, with `fault` happening during the copy: for the
+/// app's tests of the "drive disconnected" and "changed while reading"
+/// banners (task 1.7, `test-exports`).
+///
+/// # Errors
+///
+/// As for [`open_document`].
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+pub fn debug_open_document_with_fault(
+    path: &str,
+    temp: TempLocations,
+    scheduler: &Scheduler,
+    options: OpenOptions,
+    observer: Option<Arc<dyn ProgressObserver>>,
+    chunk_bytes: u32,
+    fault: Option<SimulatedFault>,
+) -> Result<Arc<Document>, LealError> {
+    use leal_core::source::{SimulatedFault as Core, Source};
+    let temp = TempFolders::from(temp);
+    let at = |at: u64| usize::try_from(at).unwrap_or(usize::MAX);
+    let fault = fault.map(|fault| match fault {
+        SimulatedFault::Disconnect { at: byte } => Core::Disconnect { at: at(byte) },
+        SimulatedFault::Change { at: byte } => Core::Change { at: at(byte) },
+    });
+    let source =
+        Source::open_simulating_fault(Path::new(path), &temp, to_usize(chunk_bytes), fault)
+            .map_err(|error| LealError::from_open(path, &error))?;
+    let progress = observer.map(|observer| -> document::ProgressCallback {
+        Arc::new(move |progress| observer.index_progressed(progress.into()))
+    });
+    let (document, screen) =
+        document::Document::from_source(source, &scheduler.scheduler, options.into(), progress)
+            .map_err(|error| document_error(path, error))?;
+    let document = Document {
+        document,
+        path: path.to_owned(),
+        first_screen: Mutex::new(screen.into()),
+        failure: Arc::default(),
+    };
+    document.watch_jobs();
+    Ok(Arc::new(document))
 }
 
 fn to_usize(n: u32) -> usize {
@@ -1146,6 +1404,17 @@ impl From<&Detection> for Interpretation {
             header: detection.header,
             header_source: detection.header_source.into(),
             line_ending: detection.line_ending.map(LineEnding::from),
+            notes: detection
+                .notes
+                .iter()
+                .copied()
+                .map(InterpretationNote::from)
+                .collect(),
+            encoding_choices: detection
+                .encoding_choices()
+                .into_iter()
+                .map(TextEncoding::from)
+                .collect(),
         }
     }
 }

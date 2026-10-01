@@ -556,6 +556,32 @@ impl RowIndex {
         })
     }
 
+    /// The row whose extent (line ending included) holds byte `offset`, or
+    /// `None` if that row isn't indexed (yet), or `offset` is before the
+    /// first row (in the BOM). A binary search.
+    ///
+    /// ```
+    /// use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
+    ///
+    /// let bytes = b"id,name\n1,Ada\n2,Bob\n";
+    /// let dialect = IndexDialect { delimiter: b',', quote: b'"', code_unit: CodeUnit::Byte, bom_len: 0 };
+    /// let index = RowIndex::build(bytes, dialect)?;
+    /// assert_eq!(index.row_at_offset(0), Some(0));
+    /// assert_eq!(index.row_at_offset(7), Some(0)); // its line ending
+    /// assert_eq!(index.row_at_offset(8), Some(1));
+    /// assert_eq!(index.row_at_offset(20), None);
+    /// # Ok::<(), leal_core::index::IndexError>(())
+    /// ```
+    #[must_use]
+    pub fn row_at_offset(&self, offset: usize) -> Option<usize> {
+        let state = self.read();
+        let after = state
+            .starts
+            .partition_point(|&start| to_usize(start) <= offset);
+        let row = after.checked_sub(1)?;
+        (row + 1 < state.starts.len()).then_some(row)
+    }
+
     /// The extent of rows `rows` together, from the first one's start to
     /// the last one's end, including its line ending: the one range to read
     /// for a screenful. `None` if `rows` is empty or its last row isn't
