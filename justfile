@@ -436,15 +436,25 @@ _run-scripted app file limit place *options:
     set -uo pipefail
     background=""
     if [ "{{ place }}" = back ]; then background="-g"; fi
+    # Other agents run Leal test hosts and benchmarks on the same Mac, so
+    # this never kills by name: only the Leal it started, by its PID. That
+    # is the one process of this app bundle that wasn't running before.
+    executable="{{ app }}/Contents/MacOS/Leal"
+    before=" $(pgrep -f "$executable" | tr '\n' ' ') "
     open -n $background -W -a "{{ app }}" "{{ file }}" --args -ApplePersistenceIgnoreState YES {{ options }} &
     waiting=$!
+    pid=""
     for _ in $(seq {{ limit }}); do
         sleep 1
+        if [ -z "$pid" ]; then
+            for candidate in $(pgrep -f "$executable"); do
+                case "$before" in *" $candidate "*) ;; *) pid=$candidate ;; esac
+            done
+        fi
         kill -0 "$waiting" 2>/dev/null || exit 0
     done
     echo "error: Leal didn't finish in {{ limit }} s; quitting it" >&2
-    # The newest Leal: the one this started.
-    pkill -n -x Leal
+    if [ -n "$pid" ]; then kill "$pid"; fi
     exit 1
 
 # The Xcode configuration for a Cargo profile.

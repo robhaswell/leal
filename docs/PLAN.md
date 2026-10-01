@@ -270,7 +270,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     `phase-0` tag (ADR-0001). No code, script or CI job may refer to the
     folder afterwards, and the `spikes/` line comes out of DESIGN §7.
   - Screenshots next to mockups 01a, 01b, 02a, 02b, 06a and 06b.
-- [ ] **1.6a Scroll performance.** The 1.6 grid's main-thread work per
+- [~] **1.6a Scroll performance.** The 1.6 grid's main-thread work per
   frame is about 3× the grid spike's (p50 about 4.5 ms against 1.4 ms on an
   M5 Pro), from Core Animation redrawing layers. On the reference file 0.05–0.15%
   of frames are late, and 0.5–0.8% at 200 columns. Find the cause, bring the cost close to the spike's, and

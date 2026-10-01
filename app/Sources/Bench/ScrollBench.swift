@@ -16,8 +16,14 @@ import QuartzCore
 /// flings there, back to the left, a jump to the last row and back to the
 /// top. Each frame also tells the scheduler the user is scrolling, as a
 /// real scroll does. Results: frame intervals, main-thread busy time (wall
-/// time less the time the run loop slept) and main-thread CPU time per
-/// stage, first paint, memory before and after.
+/// time less the time the run loop slept), main-thread CPU time, and the
+/// main thread's instructions and cycles per stage, first paint, memory
+/// before and after.
+///
+/// Busy and CPU time depend on which cores macOS runs the main thread on
+/// and at what clock, which differs between launches (docs/tasks/1.6.md,
+/// "Scroll performance"). Instructions per frame don't: compare builds, or
+/// Leal against another app, by those.
 @MainActor
 final class ScrollBench: NSObject {
     private let document: CSVDocument
@@ -40,6 +46,12 @@ final class ScrollBench: NSObject {
     /// grow when other processes compete for the cores.
     private var cpu: [String: [Double]] = [:]
     private var lastCPU: UInt64 = 0
+    /// The main thread's instructions and cycles per frame, in millions.
+    /// Instructions measure the work whatever the core and its clock;
+    /// cycles over CPU time give the clock it ran at.
+    private var instructions: [String: [Double]] = [:]
+    private var cycles: [String: [Double]] = [:]
+    private var lastCounts = ThreadCounts()
     /// The grid area drawn per frame, in screens.
     private var drawn: [String: [Double]] = [:]
     private var lastDrawn: CGFloat = 0
@@ -222,6 +234,7 @@ final class ScrollBench: NSObject {
         let timestamp = link.timestamp
         let wall = CACurrentMediaTime()
         let cpuNow = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+        let countsNow = ThreadCounts.current()
         refresh.append((link.targetTimestamp - link.timestamp) * 1000)
         var dt = 1.0 / 120
         if lastTimestamp > 0 {
@@ -233,6 +246,10 @@ final class ScrollBench: NSObject {
                 intervals[phase, default: []].append((timestamp - lastTimestamp) * 1000)
                 busy[phase, default: []].append(max(0, (wall - lastWall) - slept) * 1000)
                 cpu[phase, default: []].append(Double(cpuNow - lastCPU) / 1e6)
+                if let countsNow, lastCounts.instructions > 0 {
+                    instructions[phase, default: []].append(Double(countsNow.instructions - lastCounts.instructions) / 1e6)
+                    cycles[phase, default: []].append(Double(countsNow.cycles - lastCounts.cycles) / 1e6)
+                }
                 let screen = max(1, content.grid.scrollView.contentSize.width * content.grid.scrollView.contentSize.height)
                 drawn[phase, default: []].append(Double((content.grid.gridView.drawnArea - lastDrawn) / screen))
             }
@@ -242,6 +259,7 @@ final class ScrollBench: NSObject {
         lastTimestamp = timestamp
         lastWall = wall
         lastCPU = cpuNow
+        lastCounts = countsNow ?? ThreadCounts()
         lastDrawn = content.grid.gridView.drawnArea
         ticks += 1
         if ticks % 15 == 0 {
@@ -268,20 +286,27 @@ final class ScrollBench: NSObject {
         var scrollIntervals: [Double] = []
         var scrollBusy: [Double] = []
         var scrollCPU: [Double] = []
+        var scrollInstructions: [Double] = []
+        var scrollCycles: [Double] = []
         var phases: [String: Any] = [:]
         for (phase, values) in intervals {
             var stats = Self.stats(values, refresh: refreshMs, busy: busy[phase] ?? [], cpu: cpu[phase] ?? [])
             let area = drawn[phase] ?? []
             stats["drawnScreensPerFrame"] = area.isEmpty ? 0 : area.reduce(0, +) / Double(area.count)
+            Self.addCounts(to: &stats, instructions: instructions[phase] ?? [], cycles: cycles[phase] ?? [], cpu: cpu[phase] ?? [])
             phases[phase] = stats
             if phase != "jumpEnd", phase != "jumpTop" {
                 scrollIntervals += values
                 scrollBusy += busy[phase] ?? []
                 scrollCPU += cpu[phase] ?? []
+                scrollInstructions += instructions[phase] ?? []
+                scrollCycles += cycles[phase] ?? []
             }
         }
         result["phases"] = phases
-        result["scroll"] = Self.stats(scrollIntervals, refresh: refreshMs, busy: scrollBusy, cpu: scrollCPU)
+        var scroll = Self.stats(scrollIntervals, refresh: refreshMs, busy: scrollBusy, cpu: scrollCPU)
+        Self.addCounts(to: &scroll, instructions: scrollInstructions, cycles: scrollCycles, cpu: scrollCPU)
+        result["scroll"] = scroll
         result["jumpEndMs"] = intervals["jumpEnd"]?.first ?? 0
         let grid = content.grid
         result["cellsDrawn"] = grid.gridView.cellsDrawn
@@ -319,6 +344,24 @@ final class ScrollBench: NSObject {
             "cpuP99": percentile(cpuSorted, 0.99),
             "cpuMax": cpuSorted.last ?? 0,
         ]
+    }
+
+    /// The main thread's instructions and cycles per frame (millions), and
+    /// the clock it ran at: its cycles over its CPU time (GHz).
+    private static func addCounts(to stats: inout [String: Any], instructions: [Double], cycles: [Double], cpu: [Double]) {
+        guard !instructions.isEmpty else { return }
+        func percentile(_ sorted: [Double], _ p: Double) -> Double {
+            sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * p + 0.5))]
+        }
+        let instructionsSorted = instructions.sorted()
+        let cyclesSorted = cycles.sorted()
+        stats["instructionsMean"] = instructions.reduce(0, +) / Double(instructions.count)
+        stats["instructionsP50"] = percentile(instructionsSorted, 0.5)
+        stats["instructionsP99"] = percentile(instructionsSorted, 0.99)
+        stats["cyclesP50"] = percentile(cyclesSorted, 0.5)
+        stats["cyclesP99"] = percentile(cyclesSorted, 0.99)
+        let cpuMs = cpu.reduce(0, +)
+        stats["mainThreadGHz"] = cpuMs > 0 ? cycles.reduce(0, +) / cpuMs : 0
     }
 
     private static func median(_ values: [Double]) -> Double {
@@ -391,5 +434,27 @@ enum Memory {
         return Double(stats.size_in_use) / 1_048_576
     }
 }
+
+/// The calling thread's instructions retired and cycles so far, from the
+/// kernel's per-thread performance counters. `thread_selfcounts` is in
+/// libsystem_kernel but has no public header, so it is declared here; the
+/// public `proc_pid_rusage` counts only whole processes, and the bench
+/// needs the main thread alone. It is only in the bench builds, never in
+/// the shipped app (`just check-no-bench`).
+struct ThreadCounts {
+    var instructions: UInt64 = 0
+    var cycles: UInt64 = 0
+
+    static func current() -> ThreadCounts? {
+        var counts = ThreadCounts()
+        let result = withUnsafeMutableBytes(of: &counts) { buffer in
+            thread_selfcounts(1, buffer.baseAddress!, buffer.count)
+        }
+        return result == 0 ? counts : nil
+    }
+}
+
+@_silgen_name("thread_selfcounts")
+private func thread_selfcounts(_ type: Int32, _ buffer: UnsafeMutableRawPointer, _ size: Int) -> Int32
 
 #endif
