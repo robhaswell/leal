@@ -541,6 +541,8 @@ leal/
 │   ├── leal-cli/           the `leal` command
 │   ├── leal-testkit/       test-only: corpus loader, oracles, proptest
 │   │                       strategies (a dev-dependency, never shipped)
+│   ├── leal-bench/         benchmarks: reference file generator, criterion
+│   │                       benches, CI report (never shipped)
 │   └── uniffi-bindgen/     host-only tool that generates the Swift bindings
 ├── app/
 │   ├── project.yml         XcodeGen spec (the .xcodeproj is generated)

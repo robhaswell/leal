@@ -1,0 +1,52 @@
+[package]
+name = "leal-bench"
+description = "Leal's benchmarks: the reference file generator, the criterion benchmarks and the CI report."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never published or shipped. The app and the `leal` command don't depend on it.
+publish = false
+
+# Neither the library nor the binaries are benchmark targets, so
+# `cargo bench --package leal-bench -- <criterion flags>` reaches only the
+# criterion benches. Without this, Cargo would also run the library's and
+# binaries' libtest harnesses in bench mode, and they reject criterion's flags
+# (`--save-baseline` and so on).
+[lib]
+bench = false
+
+# Writes the reference file. `just reference-file` runs it.
+[[bin]]
+name = "leal-refgen"
+path = "src/bin/leal-refgen.rs"
+bench = false
+
+# Reads criterion's results and reports budgets and regressions.
+# `just bench-compare` (and so CI) runs it.
+[[bin]]
+name = "bench-report"
+path = "src/bin/bench-report.rs"
+bench = false
+
+# Every benchmark is a `[[bench]]` here, with `harness = false` so criterion
+# supplies `main`. Later tasks add theirs (DESIGN §5 layer 5, PLAN 1.2b).
+[[bench]]
+name = "baseline"
+harness = false
+
+[dependencies]
+# Reads criterion's `estimates.json` and `benchmark.json` (bench-report).
+# Criterion already depends on it, so it adds nothing to the build.
+serde_json = "1.0.151"
+
+[dev-dependencies]
+# Default features minus `plotters`: no charts (CI reads the JSON, and
+# `--noplot` would turn them off anyway), and a much smaller build.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "rayon"] }
+# The scan in the speed-of-light baseline.
+memchr = "2.8.3"
+
+[lints]
+workspace = true

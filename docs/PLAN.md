@@ -144,7 +144,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     real files showed.
   - Runs whenever the files arrive and blocks no other task. If they
     haven't arrived by the phase 1 gate, it moves to phase 4, before 4.1.
-- [ ] **1.2b Reference file and CI benchmarks** (DESIGN §1, §3.10, §5).
+- [~] **1.2b Reference file and CI benchmarks** (DESIGN §1, §3.10, §5).
   - A deterministic generator for the reference file: 100 MB, 1M rows × 12
     columns, UTF-8, quoted fields containing some newlines (DESIGN §1).
     It is generated on demand (a `just` recipe) and never committed.

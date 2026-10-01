@@ -51,9 +51,68 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run the benchmarks.
-bench:
-    cargo bench --workspace
+# Run the benchmarks (crates/leal-bench), passing any arguments to criterion: `just bench baseline/`.
+bench *args:
+    cargo bench --package leal-bench -- {{ args }}
+
+# Generate the reference file (DESIGN §1) into target/bench-data/ and check its SHA-256.
+reference-file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Always regenerate (it takes well under a second in release), so this
+    # checks the generator as it is now, not a file an older one cached.
+    cargo run --release --quiet --package leal-bench --bin leal-refgen
+    read -r expected name < crates/leal-bench/reference.sha256
+    file="${LEAL_BENCH_DATA:-target/bench-data}/$name"
+    actual="$(shasum -a 256 "$file" | cut -d ' ' -f 1)"
+    if [ "$actual" != "$expected" ]; then
+        echo "error: $file has SHA-256 $actual, expected $expected (crates/leal-bench/reference.sha256)" >&2
+        exit 1
+    fi
+    echo "reference-file: $file matches crates/leal-bench/reference.sha256"
+
+# Benchmark this checkout and `base` on this machine, one after the other, and report budgets and regressions. CI runs it on each push to main.
+bench-compare base="main" threshold="0.25":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Both runs share one criterion directory: `base` saves its results as
+    # the `base` baseline, and this checkout's run compares with it. Running
+    # both on the same machine within minutes is what makes the comparison
+    # meaningful on a shared CI runner (docs/tasks/1.2b.md).
+    root="$PWD"
+    work="$root/target/bench-compare"
+    export CRITERION_HOME="$work/criterion"
+    # One reference file for both runs. Its name carries the generator's
+    # version, so a base with a different generator writes its own file.
+    export LEAL_BENCH_DATA="$root/target/bench-data"
+    sha="$(git rev-parse --verify "{{ base }}^{commit}")"
+    rm -rf "$CRITERION_HOME" "$work/base"
+    mkdir -p "$CRITERION_HOME" "$work/base"
+
+    # The base commit's files, without touching this checkout or git's
+    # worktree list. `-m` gives the files the current time, so Cargo
+    # rebuilds whatever changed since the last base it built. The base has
+    # its own target directory: sharing one with this checkout could let
+    # Cargo reuse one side's build for the other.
+    git archive "$sha" | tar -x -m -C "$work/base"
+    compare=""
+    if [ ! -d "$work/base/crates/leal-bench/benches" ]; then
+        echo "bench-compare: ${sha:0:12} has no benchmarks; reporting without a comparison"
+    elif (cd "$work/base" && CARGO_TARGET_DIR="$work/base-target" \
+            cargo bench --package leal-bench -- --save-baseline base); then
+        compare="--baseline-lenient base"
+        # Keep only the saved baseline, so a benchmark that this checkout
+        # removed doesn't show up in the report with the base's numbers.
+        find "$CRITERION_HOME" -type d -name new -prune -exec rm -rf {} +
+    else
+        echo "bench-compare: the benchmarks at ${sha:0:12} failed; reporting without a comparison" >&2
+    fi
+
+    # $compare is unquoted on purpose: it is empty or two words.
+    cargo bench --package leal-bench -- $compare
+    if [ -n "$compare" ]; then echo "bench-compare: compared with ${sha:0:12} ({{ base }})"; fi
+    cargo run --release --quiet --package leal-bench --bin bench-report -- \
+        --threshold "{{ threshold }}" "$CRITERION_HOME"
 
 # Build the universal libleal_ffi.a and generate the Swift bindings (profile: debug or release).
 ffi profile="debug" test_exports="auto":

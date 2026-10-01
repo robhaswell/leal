@@ -1,0 +1,98 @@
+name: Benchmarks
+
+# The criterion benchmarks (crates/leal-bench) on each push to `main` that
+# touches code, compared with the commit before the push on the same runner.
+# The job fails when a benchmark is over its DESIGN §1 budget, or more than
+# 25% slower than before on a run whose noise canaries held still. Why it
+# works this way, and what to do when it fails: docs/tasks/1.2b.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "justfile"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit to compare with (default: the parent of the checked-out commit)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# No concurrency group: each push is compared with the push before it, so
+# cancelling a run would leave that push's changes never compared.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: just bench-compare
+    # The same image as the CI workflow's `check` job: an Apple silicon VM
+    # (M1-class, 3 cores), not the reference machine (a base M1 Air).
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      # The full history, so the base commit can be built.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Also checks that the generator writes the same bytes here as on the
+      # machine that pinned the SHA-256.
+      - name: Generate and check the reference file
+        run: just reference-file
+
+      # The commit before this push (`github.event.before`), the dispatch
+      # input, or else the parent commit.
+      - name: Choose the base commit
+        id: base
+        env:
+          BEFORE: ${{ github.event.before }}
+          REQUESTED: ${{ inputs.base }}
+        run: |
+          base="${REQUESTED:-${BEFORE:-}}"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing $(git rev-parse --short HEAD) with $(git rev-parse --short "$base")"
+
+      - name: Benchmark against the base commit
+        env:
+          BASE: ${{ steps.base.outputs.sha }}
+        run: just bench-compare "$BASE"
+
+      # The numbers, for the record: criterion's JSON for both sides.
+      - name: Upload criterion results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: criterion-${{ github.sha }}
+          path: target/bench-compare/criterion
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # Keep the 100 MB reference file and the base checkout out of the
+      # Rust cache, which is saved after the last step.
+      - name: Remove generated files
+        if: always()
+        run: rm -rf target/bench-data target/bench-compare/base target/bench-compare/criterion
