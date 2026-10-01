@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to `main` cancels a deep run still in progress; scheduled and
+# manual runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
 

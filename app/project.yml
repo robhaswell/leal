@@ -122,7 +122,13 @@ targets:
         # linker records the files it read and Xcode relinks when they change.
         LEAL_FFI_LIBRARY_DIR: $(PROJECT_DIR)/../target/universal/$(LEAL_RUST_PROFILE)
         LIBRARY_SEARCH_PATHS: $(inherited) $(LEAL_FFI_LIBRARY_DIR)
-        OTHER_LDFLAGS: $(inherited) -lleal_ffi
+        # Export only what Swift needs: hide the Rust-mangled symbols (`_R...`
+        # v0 and `_ZN...` legacy mangling; one more underscore in Mach-O)
+        # that the static library brings in. The UniFFI C functions
+        # (`uniffi_*`, `ffi_leal_ffi_*`) and the Swift module's symbols stay
+        # exported. Without this the framework exported about 1,900 symbols
+        # and the Release build was 3.2 MB.
+        OTHER_LDFLAGS: $(inherited) -lleal_ffi -Wl,-unexported_symbol,__R* -Wl,-unexported_symbol,__ZN*
 
   Leal:
     type: application

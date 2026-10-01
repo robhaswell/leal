@@ -7,6 +7,10 @@ macos_deployment_target := "14.0"
 # Xcode's build products, kept inside the repo (and git-ignored) so builds
 # don't depend on ~/Library/Developer/Xcode/DerivedData.
 derived_data := "build/DerivedData"
+# `app-test`'s own build products. `app-test release` links a release library
+# with leal-ffi's test-only exports, so its Leal.app must not land where
+# `just app release` puts the app.
+test_derived_data := "build/DerivedData-test"
 
 # List the recipes.
 default:
@@ -20,7 +24,7 @@ check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo nextest run --workspace --all-features
-    cargo test --workspace --doc
+    cargo test --workspace --doc --exclude leal-ffi
     just doc
 
 # Build the API docs, failing on any rustdoc warning (such as a broken intra-doc link).
@@ -33,7 +37,7 @@ check-all: check app-test
 # Run all tests. Nextest does not run doctests, so they run separately.
 test:
     cargo nextest run --workspace --all-features
-    cargo test --workspace --doc
+    cargo test --workspace --doc --exclude leal-ffi
 
 # Run all tests with many more property-test cases (the default is 256 per test).
 test-deep cases="20000":
@@ -162,8 +166,9 @@ app-test profile="debug": (ffi profile "on") xcodeproj
     set -euo pipefail
     # `release` runs the same tests against the Rust release profile and the
     # Release configuration, so the optimised build is tested too (CI runs
-    # both). Its library includes the test-only exports; the next `just app
-    # release` rebuilds it without them.
+    # both). Its library includes the test-only exports, so it builds into
+    # its own DerivedData; the next `just ffi release` (from `just app
+    # release` or an IDE build) rebuilds the library without them.
     configuration="$(just _configuration {{ profile }})"
     mkdir -p build
     log="build/xcodebuild-test.log"
@@ -172,7 +177,7 @@ app-test profile="debug": (ffi profile "on") xcodeproj
     status=0
     # LEAL_FFI_PREBUILT=1: see `app`.
     LEAL_FFI_PREBUILT=1 xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
-        -configuration "$configuration" -derivedDataPath {{ derived_data }} \
+        -configuration "$configuration" -derivedDataPath {{ test_derived_data }} \
         -destination "platform=macOS,arch=$(uname -m)" \
         -resultBundlePath "$results" \
         test 2>&1 | tee "$log" || status=$?

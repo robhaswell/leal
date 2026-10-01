@@ -116,8 +116,10 @@ jobs:
       # `check-all` builds Debug for the runner's architecture only. Also
       # build the universal (arm64 + x86_64) Release app, with the Rust
       # release profile, so the shipping configuration is always checked.
-      # This runs after `app-test release` and rebuilds the release library
-      # without leal-ffi's test-only exports, so check that they are gone.
+      # This runs after `app-test release`, which linked the release library
+      # with leal-ffi's test-only exports, so check that they are gone. Plain
+      # `nm` (not `-gU`, which skips hidden symbols) and `strings`, which also
+      # sees UniFFI's metadata names.
       - name: Build universal Release app
         run: |
           just app release
@@ -127,7 +129,8 @@ jobs:
             lipo "$binary" -verify_arch arm64
             lipo "$binary" -verify_arch x86_64
           done
-          if nm -gU "$contents/Frameworks/LealFFI.framework/LealFFI" | grep debug_panic; then
+          framework="$contents/Frameworks/LealFFI.framework/LealFFI"
+          if nm "$framework" | grep -i debug_panic || strings "$framework" | grep -i debug_panic; then
             echo "::error::the Release app contains leal-ffi's test-only exports"
             exit 1
           fi
