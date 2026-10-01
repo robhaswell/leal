@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicBool;
 use criterion::{Criterion, criterion_group, criterion_main};
 use leal_core::diagnostics::DiagnosticKind;
 use leal_core::dialect::Encoding;
-use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
+use leal_core::index::{CHUNK_BYTES, CodeUnit, IndexDialect, RowIndex};
 
 /// The reference file's dialect: comma, `"`, UTF-8, no BOM.
 const DIALECT: IndexDialect = IndexDialect {
@@ -275,7 +275,40 @@ fn worst(c: &mut Criterion) {
             });
         });
     }
+    plain_chunks();
     group.finish();
+}
+
+/// The plain index's longest chunk ([`CHUNK_BYTES`]) on its worst file:
+/// blank lines, a row per byte (1.5's open question, task 1.10). The app
+/// indexes with diagnostics, in smaller chunks, but a copy whose document's
+/// index stopped makes a plain index of its own, and the CLI and tests use
+/// one too. Eight chunks (2M rows at 256 KiB), printed like the cases
+/// above: the slower of two warm runs.
+fn plain_chunks() {
+    let bytes = vec![b'\n'; 8 * CHUNK_BYTES];
+    let run = || {
+        let (index, indexer) = RowIndex::start(DIALECT).expect("a valid dialect");
+        let mut longest = std::time::Duration::ZERO;
+        let mut last = std::time::Instant::now();
+        indexer
+            .run(black_box(&bytes), &AtomicBool::new(false), |_| {
+                longest = longest.max(last.elapsed());
+                last = std::time::Instant::now();
+            })
+            .expect("indexing");
+        assert_eq!(index.row_count(), bytes.len());
+        longest
+    };
+    // The first run also pays to fault in fresh memory.
+    let _ = run();
+    let longest = run().max(run());
+    eprintln!(
+        "worst/blank_lines_plain: {} bytes in {} KiB chunks, longest chunk {:.2} ms",
+        bytes.len(),
+        CHUNK_BYTES >> 10,
+        longest.as_secs_f64() * 1e3
+    );
 }
 
 /// **Next** and **Previous** over the row marks (1.5), which run on the

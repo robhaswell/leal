@@ -123,17 +123,21 @@ use crate::diagnostics::{Collector, Diagnostics, Report};
 use crate::dialect::Encoding;
 
 /// How much of the file the indexer scans between publishing rows and
-/// checking the cancel flag: 1 MiB, about 1 ms of work on the development
-/// Mac and a few on a base M1 Air, inside DESIGN §3.10's ~5 ms chunks.
-pub const CHUNK_BYTES: usize = 1 << 20;
+/// checking the cancel flag: 256 KiB. That is about 0.25 ms of work on an
+/// ordinary file on the development Mac. The worst file is blank lines, a
+/// row per byte: there a 1 MiB chunk took 3.6–4.1 ms, which would be over
+/// DESIGN §3.10's ~5 ms chunks (rule 3) on a base M1 Air two or three times
+/// slower, and 256 KiB takes about 1 ms (`docs/tasks/1.10.md`).
+pub const CHUNK_BYTES: usize = 256 << 10;
 
 /// The chunk size when diagnostics are collected too
-/// ([`RowIndex::start_with_diagnostics`]): 256 KiB. In the worst files, where
-/// every field or every row is an occurrence, diagnostics cost up to about
-/// 6 ns per row or field on the development Mac, so a 1 MiB chunk could take
-/// 7 ms there and more on a base M1 Air. A quarter of that stays inside
-/// DESIGN §3.10's ~5 ms chunks (rule 3), and costs nothing measurable on
-/// ordinary files (`docs/tasks/1.5.md`).
+/// ([`RowIndex::start_with_diagnostics`]): 256 KiB, the same as
+/// [`CHUNK_BYTES`]. In the worst files, where every field or every row is
+/// an occurrence, diagnostics cost up to about 6 ns per row or field on the
+/// development Mac, so a 1 MiB chunk could take 7 ms there and more on a
+/// base M1 Air. A quarter of that stays inside DESIGN §3.10's ~5 ms chunks
+/// (rule 3), and costs nothing measurable on ordinary files
+/// (`docs/tasks/1.5.md`).
 pub const DIAGNOSTICS_CHUNK_BYTES: usize = 256 << 10;
 
 /// The largest file the index can hold: offsets are `u32` (DESIGN §3.3), and
@@ -419,8 +423,8 @@ impl RowIndex {
     /// diagnostics found so far from the shared [`Diagnostics`], which the
     /// indexer updates after each chunk, before it calls its progress
     /// callback. See [`crate::diagnostics`]. Its chunks are
-    /// [`DIAGNOSTICS_CHUNK_BYTES`], not [`CHUNK_BYTES`], so it publishes,
-    /// calls back and checks the cancel flag four times as often.
+    /// [`DIAGNOSTICS_CHUNK_BYTES`], which is the same as [`CHUNK_BYTES`]
+    /// (once four times smaller; both are 256 KiB since task 1.10).
     ///
     /// It is [`RowIndex::start`] then [`Indexer::with_diagnostics`].
     ///

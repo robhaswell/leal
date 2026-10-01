@@ -112,10 +112,11 @@ pub const TEXT_ENCODING_ATTRIBUTE: &str = "com.apple.TextEncoding";
 /// choice (ADR-0005 decision 1).
 pub const INTERPRETATION_ATTRIBUTE: &str = "io.github.robhaswell.leal.interpretation";
 
-/// The size of the chunks [`Source::stream`] delivers: 1 MiB, the same as
-/// the index's chunks ([`crate::index::CHUNK_BYTES`]). Each chunk is a few
-/// milliseconds of reading even from a slow USB drive, so a cancel takes
-/// effect quickly.
+/// The size of the chunks [`Source::stream`] delivers: 1 MiB. Each chunk is
+/// a few milliseconds of reading even from a slow USB drive, so a cancel
+/// takes effect quickly. The index takes each in pieces of its own chunk
+/// size ([`crate::index::CHUNK_BYTES`], 256 KiB), so the work between two of
+/// its checkpoints stays small.
 pub const STREAM_CHUNK_BYTES: usize = 1 << 20;
 
 /// The longest attribute value [`Source::open`] reads. Both attributes are a
