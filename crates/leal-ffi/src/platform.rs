@@ -224,11 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn this_mac_has_performance_cores() {
+    fn performance_core_count_is_sane() {
+        // CI runs in virtual Macs that report few or no performance cores,
+        // so only check what holds everywhere: a reported count is never 0.
+        // The scheduler falls back to the logical core count when this is None.
         let cores = performance_cores();
-        if cfg!(target_arch = "aarch64") {
-            assert!(cores.is_some_and(|n| n >= 4), "{cores:?}");
-        }
+        assert!(cores.is_none_or(|n| n >= 1), "{cores:?}");
     }
 
     #[test]
