@@ -5,9 +5,14 @@ user didn't edit. Rust core (`crates/`) + thin Swift/AppKit app (`app/`).
 
 ## Read first
 
-- `docs/DESIGN.md` — what we're building and why. It is the source of truth.
+- `docs/DESIGN.md` — what we're building and why.
 - `docs/PLAN.md` — the task list. Work the next unticked task unless told otherwise.
-- `docs/adr/` — decisions that changed or refined the design.
+- `docs/adr/` — decisions that changed or refined the design. **An accepted
+  ADR takes precedence over DESIGN** where they disagree; DESIGN is updated
+  to match, but may lag. A proposed ADR decides nothing yet.
+- Before starting a task, read the ADRs its PLAN entry and its DESIGN
+  sections refer to, and the earlier task notes (`docs/tasks/`) its PLAN
+  entry names.
 
 ## How the build is run
 
@@ -24,7 +29,8 @@ there are no pull requests and no long-lived branches.
   branch. This happens before the task lands, so later tasks never build on
   unreviewed code.
 - **Landing.** The orchestrator rebases the branch onto `main`, runs
-  `just check`, fast-forwards `main`, pushes, and deletes the branch and
+  `just check` (and `just check-all` if the task touches `app/` or
+  `crates/leal-ffi`), fast-forwards `main`, pushes, and deletes the branch and
   worktree. CI runs on every push to `main`. The task is ticked in
   `docs/PLAN.md` once CI is green.
 - **Docs-only changes** (ADRs, plan updates, mockups) are committed straight
@@ -54,6 +60,9 @@ there are no pull requests and no long-lived branches.
   contract seems wrong, stop and write an ADR for Rob.
 - **Design changes need an ADR** (`docs/adr/NNNN-title.md`, template in
   `docs/adr/0000-template.md`) approved by Rob before the code lands.
+  *Pending ADR-0005 decision 9 (proposed):* test and oracle code may land
+  against a proposed ADR, marked provisional; product code that depends on
+  it waits until the ADR is accepted.
 - **Logic lives in `leal-core`.** Swift handles presentation and macOS
   integration only. `leal-ffi` only wraps.
 - **Performance budgets** in DESIGN §1 are requirements. Tasks that touch hot
@@ -71,7 +80,9 @@ there are no pull requests and no long-lived branches.
 
 ## Commands
 
-- `just check` — fmt check, clippy (`-D warnings`), all tests. Must pass before every commit.
+- `just check` — fmt check, clippy (`-D warnings`), all Rust tests. Must pass before every commit.
+- `just check-all` — `just check` plus the app's XCTest suite. Must pass
+  before landing any task that touches `app/` or `crates/leal-ffi`.
 - `just test` / `just bench` / `just run` (build and launch the app).
 - Rust toolchain is pinned in `rust-toolchain.toml`; the Xcode project is
   generated from `app/project.yml` by XcodeGen and is not committed.
@@ -91,7 +102,7 @@ new dependencies, deviations, and Rust notes. The phase report is compiled
 from these.
 
 - [ ] Acceptance criteria from `docs/PLAN.md` met; box ticked after review
-- [ ] `just check` passes
+- [ ] `just check` passes (and `just check-all` if `app/` or `crates/leal-ffi` changed)
 - [ ] Tests added (and fidelity tests, if the change touches parsing or saving)
 - [ ] Benchmarks included if a hot path changed
 - [ ] Rust notes for Rob
