@@ -43,7 +43,7 @@ use leal_bench::perf::{
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: leal-perf --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll] [--out DIR]";
+const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll] [--out DIR]";
 
 /// The app's sandbox container, where the scroll benchmark writes.
 const CONTAINER_TMP: &str = "Library/Containers/io.github.robhaswell.leal/Data/tmp";
@@ -121,6 +121,16 @@ fn options() -> Result<Options, String> {
 }
 
 fn run() -> Result<(), String> {
+    // `--report FILE`: print the table again from a run's JSON.
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, file] = args.as_slice()
+        && flag == "--report"
+    {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+        let raw: Value = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
+        println!("{}", render(&raw));
+        return Ok(());
+    }
     let options = options()?;
     for path in [&options.app, &options.bench_app, &options.file] {
         if !path.exists() {
@@ -156,7 +166,7 @@ fn run() -> Result<(), String> {
     drop(log);
 
     // Scrolling, in the bench build.
-    let mut scrolls: HashMap<&str, Vec<(Value, ScrollRun)>> = HashMap::new();
+    let mut scrolls: HashMap<&str, Vec<Value>> = HashMap::new();
     if options.scroll {
         let mut scenarios: Vec<(&str, &Path, Vec<String>)> = vec![
             ("afterLoad", &options.file, vec![]),
@@ -200,18 +210,24 @@ fn run() -> Result<(), String> {
                 let parsed = ScrollRun::parse(&json).ok_or(format!(
                     "the scroll benchmark's JSON has no results: {json}"
                 ))?;
-                if parsed.stalls > 0 || !parsed.visible {
+                if parsed.stalls > 0 {
                     eprintln!(
-                        "warning: scroll {name} run {run}: the display slept or the window was hidden; the run is kept but flagged"
+                        "warning: scroll {name} run {run}: the display link stopped for more than half a second; the run is kept but flagged"
                     );
                 }
-                scrolls.entry(name).or_default().push((json, parsed));
+                scrolls.entry(name).or_default().push(json);
             }
         }
     }
 
-    let rows = rows(&launches, &opens, &reopens, &scrolls);
-    let report = format_report(&environment, &rows, &launches, &opens, &scrolls);
+    let raw = json!({
+        "environment": environment,
+        "launches": launches,
+        "opens": opens,
+        "reopensMs": reopens,
+        "scrolls": scrolls,
+    });
+    let report = render(&raw);
     println!("{report}");
 
     std::fs::create_dir_all(&options.out).map_err(|e| format!("{}: {e}", options.out.display()))?;
@@ -219,13 +235,6 @@ fn run() -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let path = options.out.join(format!("perf-{stamp}.json"));
-    let raw = json!({
-        "environment": environment,
-        "launches": launches,
-        "opens": opens,
-        "reopensMs": reopens,
-        "scrolls": scrolls.iter().map(|(k, v)| (k.to_string(), v.iter().map(|(j, _)| j.clone()).collect::<Vec<_>>())).collect::<HashMap<_, _>>(),
-    });
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&raw).map_err(|e| e.to_string())?,
@@ -242,6 +251,51 @@ fn run() -> Result<(), String> {
 }
 
 // MARK: The table
+
+/// The report for a run's numbers, as `leal-perf` saves them.
+fn render(raw: &Value) -> String {
+    let maps = |key: &str| -> Vec<HashMap<String, f64>> {
+        raw[key]
+            .as_array()
+            .map(|runs| {
+                runs.iter()
+                    .filter_map(Value::as_object)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_f64()?)))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let launches = maps("launches");
+    let opens = maps("opens");
+    let reopens: Vec<f64> = raw["reopensMs"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default();
+    let mut scrolls: HashMap<&str, Vec<(Value, ScrollRun)>> = HashMap::new();
+    if let Some(all) = raw["scrolls"].as_object() {
+        for name in SCENARIOS {
+            for json in all
+                .get(name)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(run) = ScrollRun::parse(json) {
+                    scrolls.entry(name).or_default().push((json.clone(), run));
+                }
+            }
+        }
+    }
+    let rows = rows(&launches, &opens, &reopens, &scrolls);
+    format_report(&raw["environment"], &rows, &launches, &opens, &scrolls)
+}
+
+/// The scroll runs, in the order the report lists them.
+const SCENARIOS: [&str; 3] = ["afterLoad", "duringLoadWithFind", "bigFileNoPause"];
 
 fn rows(
     launches: &[HashMap<String, f64>],
@@ -282,8 +336,10 @@ fn rows(
             verdict: scroll_verdict(&runs),
         }
     };
-    let heap_peak: Vec<f64> = scrolls
-        .values()
+    // The budget is for the reference file: not the 1 GB variant.
+    let heap_peak: Vec<f64> = ["afterLoad", "duringLoadWithFind"]
+        .iter()
+        .filter_map(|name| scrolls.get(name))
         .flatten()
         .map(|(_, r)| r.heap_peak_mb)
         .filter(|&v| v > 0.0)
@@ -389,7 +445,7 @@ fn format_report(
         describe(opens, "firstPaintMs", "ms"),
         describe(opens, "footprintMB", "MB")
     );
-    for name in ["afterLoad", "duringLoadWithFind", "bigFileNoPause"] {
+    for name in SCENARIOS {
         let Some(runs) = scrolls.get(name) else {
             continue;
         };
@@ -410,10 +466,10 @@ fn format_report(
                 r.find_runs,
                 r.heap_peak_mb,
                 r.screen_fps,
-                if r.stalls > 0 || !r.visible {
-                    " (flagged: display slept or window hidden)"
-                } else {
-                    ""
+                match (r.stalls > 0, r.visible) {
+                    (true, _) => " (flagged: the display link stopped)",
+                    (false, false) => " (window not visible at the end: the screen was locked)",
+                    _ => "",
                 }
             );
         }

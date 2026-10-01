@@ -324,7 +324,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     shows the changed-elsewhere banner instead. Reads from the remounted
     drive go through `read_range`, which the 1.1a review measured at about
     2 µs per screenful of rows. (1.1a review)
-- [ ] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
+- [~] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
   measured and recorded in `docs/perf.md`, including first paint and scroll
   smoothness while background work runs.
   - Measure apps the same way they ship: launched with `open`, sandboxed.

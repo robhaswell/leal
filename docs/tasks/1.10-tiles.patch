@@ -1,0 +1,341 @@
+diff --git a/app/Sources/Grid/GridChrome.swift b/app/Sources/Grid/GridChrome.swift
+index e89fcf0..6ebaa24 100644
+--- a/app/Sources/Grid/GridChrome.swift
++++ b/app/Sources/Grid/GridChrome.swift
+@@ -346,4 +346,12 @@ final class GridScrollView: NSScrollView {
+         super.reflectScrolledClipView(clipView)
+         onScroll?()
+     }
++
++    /// The clip view and scrollers were laid out.
++    var onTile: (() -> Void)?
++
++    override func tile() {
++        super.tile()
++        onTile?()
++    }
+ }
+diff --git a/app/Sources/Grid/GridContainerView.swift b/app/Sources/Grid/GridContainerView.swift
+index 2c5d88c..5292720 100644
+--- a/app/Sources/Grid/GridContainerView.swift
++++ b/app/Sources/Grid/GridContainerView.swift
+@@ -18,6 +18,9 @@ final class GridContainerView: NSView {
+     let gutterClip = NSClipView()
+     let cornerView = GridCornerView()
+     let pill = IndexingPillView()
++    /// The tiles that draw the cells on screen (task 1.10). `-LealTiles NO`
++    /// draws them the way 1.6 did, in `GridView.draw(_:)`, to compare.
++    private(set) var tiles: GridTiles?
+ 
+     weak var dataSource: (any GridDataSource)? {
+         didSet {
+@@ -138,6 +141,15 @@ final class GridContainerView: NSView {
+         for view in [scrollView, headerView, gutterClip, cornerView, pill] as [NSView] {
+             addSubview(view)
+         }
++        let defaults = UserDefaults.standard
++        if defaults.object(forKey: "LealTiles") == nil || defaults.bool(forKey: "LealTiles") {
++            let tiles = GridTiles(grid: gridView)
++            // Over the clip view, under the scrollers.
++            scrollView.addSubview(tiles.view, positioned: .above, relativeTo: scrollView.contentView)
++            gridView.tiles = tiles
++            self.tiles = tiles
++            scrollView.onTile = { [weak self] in self?.placeTiles() }
++        }
+         pill.isHidden = true
+     }
+ 
+@@ -265,7 +277,18 @@ final class GridContainerView: NSView {
+         onUserInput?()
+     }
+ 
++    /// The tiles' view covers the clip view, and the tiles its bounds.
++    private func placeTiles() {
++        guard let tiles else { return }
++        let clip = scrollView.contentView
++        if tiles.view.frame != clip.frame {
++            tiles.view.frame = clip.frame
++        }
++        tiles.update(visible: clip.bounds)
++    }
++
+     private func followScroll() {
++        placeTiles()
+         let origin = scrollView.contentView.bounds.origin
+         headerView.offsetX = origin.x
+         // Set the origin directly: the grid's may be past the end while it
+diff --git a/app/Sources/Grid/GridTiles.swift b/app/Sources/Grid/GridTiles.swift
+new file mode 100644
+index 0000000..6e9a6c0
+--- /dev/null
++++ b/app/Sources/Grid/GridTiles.swift
+@@ -0,0 +1,225 @@
++import AppKit
++import QuartzCore
++
++/// The grid's cells drawn into tiles that scrolling moves instead of
++/// redrawing (task 1.10, the 1.6a opportunity).
++///
++/// AppKit backs a view in a scroll view with a layer the size of the
++/// visible rectangle, and on every scroll step rebuilds it from the view's
++/// recorded drawing: the whole visible grid, though only a strip of it is
++/// new. That was about half of every frame (docs/tasks/1.6.md, "Scroll
++/// performance"). Here `GridView` draws nothing on screen. Its cells are
++/// drawn by `GridView.drawContent` into fixed tiles of the grid, each a
++/// `CALayer` with its own backing store, in a layer-hosting view over the
++/// scroll view's clip view. A scroll only moves the tiles; a tile is drawn
++/// when it comes into view, or when something in it changes.
++///
++/// Tiles are placed relative to the visible rectangle, not the grid's
++/// origin: a grid of 40M rows is 880M points tall, past where Core
++/// Animation's single-precision positions are exact.
++@MainActor
++final class GridTiles: NSObject, CALayerDelegate {
++    /// A tile's size, in points.
++    nonisolated static let tileSize: CGSize = {
++        let d = UserDefaults.standard
++        let w = d.double(forKey: "LealTileWidth"), h = d.double(forKey: "LealTileHeight")
++        return CGSize(width: w > 0 ? w : 512, height: h > 0 ? h : 256)
++    }()
++    nonisolated static let async = UserDefaults.standard.bool(forKey: "LealTilesAsync")
++    nonisolated static let prefetch = UserDefaults.standard.integer(forKey: "LealTilePrefetch")
++
++    /// The layer-hosting view the tiles are in, over the clip view.
++    let view = GridTileView()
++    private unowned let grid: GridView
++    private var tiles: [Key: TileLayer] = [:]
++    private var spare: [TileLayer] = []
++    /// The visible rectangle, in the grid's coordinates, at the last update.
++    private var visible: CGRect = .zero
++
++    struct Key: Hashable {
++        let column: Int
++        let row: Int
++    }
++
++    init(grid: GridView) {
++        self.grid = grid
++        super.init()
++    }
++
++    /// Places the tiles for `visible` (the clip view's bounds, in the grid's
++    /// coordinates). Tiles in view are drawn now if they are new. A margin
++    /// of one tile round the view is drawn ahead, a few tiles a frame, so
++    /// that a tile coming into view is usually ready. Tiles further out are
++    /// kept for reuse.
++    func update(visible: CGRect) {
++        self.visible = visible
++        CATransaction.begin()
++        CATransaction.setDisableActions(true)
++        defer { CATransaction.commit() }
++        let size = Self.tileSize
++        let needed = keys(in: visible)
++        let wanted = Set(keys(in: visible.insetBy(dx: -size.width, dy: -size.height)))
++        for (key, tile) in tiles where !wanted.contains(key) {
++            tile.isHidden = true
++            tiles[key] = nil
++            spare.append(tile)
++        }
++        for key in needed where tiles[key] == nil {
++            place(key)
++        }
++        var budget = Self.prefetch
++        for key in wanted where tiles[key] == nil && budget > 0 {
++            place(key)
++            budget -= 1
++        }
++        let scale = view.window?.backingScaleFactor ?? 2
++        let height = view.bounds.height
++        for (key, tile) in tiles {
++            if tile.contentsScale != scale {
++                tile.contentsScale = scale
++                tile.setNeedsDisplay()
++            }
++            // The root layer isn't flipped: y goes up from the view's bottom.
++            let x = CGFloat(key.column) * size.width - visible.minX
++            let top = CGFloat(key.row) * size.height - visible.minY
++            tile.frame = CGRect(x: x, y: height - top - size.height, width: size.width, height: size.height)
++        }
++        // Only a screenful of spare tiles is kept.
++        if spare.count > wanted.count {
++            for tile in spare[wanted.count...] { tile.removeFromSuperlayer() }
++            spare.removeSubrange(wanted.count...)
++        }
++    }
++
++    /// Shows the part of the grid at `key` in a new or spare tile.
++    private func place(_ key: Key) {
++        let tile = spare.popLast() ?? makeTile()
++        tile.key = key
++        tile.isHidden = false
++        tile.setNeedsDisplay()
++        tiles[key] = tile
++        if tile.superlayer == nil { view.root.addSublayer(tile) }
++    }
++
++    /// Redraws the part of `rect` (in the grid's coordinates) in view.
++    func invalidate(_ rect: CGRect) {
++        let size = Self.tileSize
++        for (key, tile) in tiles {
++            let origin = CGPoint(x: CGFloat(key.column) * size.width, y: CGFloat(key.row) * size.height)
++            let part = rect.intersection(CGRect(origin: origin, size: size))
++            guard !part.isNull, !part.isEmpty else { continue }
++            // In the tile's own coordinates, which go up.
++            tile.setNeedsDisplay(CGRect(
++                x: part.minX - origin.x,
++                y: size.height - (part.maxY - origin.y),
++                width: part.width,
++                height: part.height
++            ))
++        }
++    }
++
++    func invalidateAll() {
++        for tile in tiles.values { tile.setNeedsDisplay() }
++    }
++
++    /// The tiles that cover `rect`.
++    private func keys(in rect: CGRect) -> [Key] {
++        guard rect.width > 0, rect.height > 0 else { return [] }
++        let size = Self.tileSize
++        func span(_ low: CGFloat, _ high: CGFloat, _ step: CGFloat) -> ClosedRange<Int> {
++            let first = Int((low / step).rounded(.down))
++            return first...max(first, Int((high / step).rounded(.up)) - 1)
++        }
++        let columns = span(rect.minX, rect.maxX, size.width)
++        let rows = span(rect.minY, rect.maxY, size.height)
++        return rows.flatMap { row in columns.map { Key(column: $0, row: row) } }
++    }
++
++    private func makeTile() -> TileLayer {
++        let tile = TileLayer()
++        tile.delegate = self
++        tile.isOpaque = true
++        tile.anchorPoint = .zero
++        tile.needsDisplayOnBoundsChange = false
++        tile.drawsAsynchronously = Self.async
++        return tile
++    }
++
++    // MARK: CALayerDelegate
++
++    nonisolated func draw(_ layer: CALayer, in context: CGContext) {
++        // Core Animation asks for a tile's drawing on the main thread, in
++        // its commit (`drawsAsynchronously` would only move the rendering
++        // of what is drawn here): the layer and context never leave it.
++        nonisolated(unsafe) let layer = layer
++        nonisolated(unsafe) let context = context
++        MainActor.assumeIsolated {
++            guard let tile = layer as? TileLayer else { return }
++            let size = Self.tileSize
++            let origin = CGPoint(x: CGFloat(tile.key.column) * size.width, y: CGFloat(tile.key.row) * size.height)
++            context.saveGState()
++            // The grid draws in its own coordinates, which go down, as in a
++            // flipped view.
++            context.translateBy(x: 0, y: size.height)
++            context.scaleBy(x: 1, y: -1)
++            context.translateBy(x: -origin.x, y: -origin.y)
++            let dirty = context.boundingBoxOfClipPath.intersection(CGRect(origin: origin, size: size))
++            NSGraphicsContext.saveGraphicsState()
++            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
++            grid.effectiveAppearance.performAsCurrentDrawingAppearance {
++                // Above the first row, while scrolling bounces.
++                context.setFillColor(GridPalette.current().rowBackgrounds[0])
++                context.fill(dirty)
++                grid.drawContent(in: dirty, context: context)
++            }
++            NSGraphicsContext.restoreGraphicsState()
++            context.restoreGState()
++        }
++    }
++
++    /// No implicit animations: tiles move and change at once.
++    nonisolated func action(for layer: CALayer, forKey event: String) -> (any CAAction)? {
++        NSNull()
++    }
++}
++
++/// One tile, which knows which part of the grid it shows.
++final class TileLayer: CALayer {
++    var key = GridTiles.Key(column: 0, row: 0)
++
++    override init() {
++        super.init()
++    }
++
++    override init(layer: Any) {
++        super.init(layer: layer)
++        if let other = layer as? TileLayer { key = other.key }
++    }
++
++    @available(*, unavailable)
++    required init?(coder: NSCoder) {
++        fatalError("not used")
++    }
++}
++
++/// The layer-hosting view the tiles are in. It takes no clicks: they go to
++/// the grid view under it.
++@MainActor
++final class GridTileView: NSView {
++    let root = CALayer()
++
++    override init(frame: NSRect) {
++        super.init(frame: frame)
++        // Layer-hosting: the layer is set before `wantsLayer`.
++        root.masksToBounds = true
++        layer = root
++        wantsLayer = true
++    }
++
++    @available(*, unavailable)
++    required init?(coder: NSCoder) {
++        fatalError("not used")
++    }
++
++    override func hitTest(_ point: NSPoint) -> NSView? { nil }
++}
+diff --git a/app/Sources/Grid/GridView.swift b/app/Sources/Grid/GridView.swift
+index fec8ded..d40da0c 100644
+--- a/app/Sources/Grid/GridView.swift
++++ b/app/Sources/Grid/GridView.swift
+@@ -92,8 +92,39 @@ final class GridView: NSView, NSMenuItemValidation {
+         needsDisplay = true
+     }
+ 
++    /// The tiles that draw the cells on screen (`GridTiles`), if any. Then
++    /// this view draws only offscreen (snapshots and tests,
++    /// `cacheDisplay`), and passes what needs redrawing on to them.
++    weak var tiles: GridTiles? {
++        didSet { needsDisplay = true }
++    }
++
++    override var wantsUpdateLayer: Bool { tiles != nil }
++
++    /// On screen the tiles draw the cells; this view's layer stays empty.
++    override func updateLayer() {}
++
++    override var needsDisplay: Bool {
++        get { super.needsDisplay }
++        set {
++            super.needsDisplay = newValue
++            if newValue { tiles?.invalidateAll() }
++        }
++    }
++
++    override func setNeedsDisplay(_ invalidRect: NSRect) {
++        super.setNeedsDisplay(invalidRect)
++        tiles?.invalidate(invalidRect)
++    }
++
+     override func draw(_ dirtyRect: NSRect) {
+         guard let context = NSGraphicsContext.current?.cgContext else { return }
++        drawContent(in: dirtyRect, context: context)
++    }
++
++    /// Draws the cells in `dirtyRect`, in this view's coordinates, into
++    /// `context`: for `draw(_:)`, and for each of the tiles.
++    func drawContent(in dirtyRect: CGRect, context: CGContext) {
+         draws += 1
+         drawnArea += dirtyRect.width * dirtyRect.height
+         let palette = GridPalette.current()
