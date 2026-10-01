@@ -23,8 +23,12 @@
 //!   delimiter check, which can only *suggest* a change (ADR-0005 decision
 //!   4). It runs alongside the index on a mapped file. On a removable drive
 //!   it waits for the index pass, because it needs the whole file mapped,
-//!   which happens when the copy is complete. Diagnostics details (task
-//!   1.5) are P2 work too; `start_checks` is where they join.
+//!   which happens when the copy is complete.
+//! - **Diagnostics** (task 1.5) are collected by the P1 index pass itself,
+//!   over the map or chunk by chunk, so they need no job of their own.
+//!   [`Document::diagnostics`] gives the report of the rows indexed so far,
+//!   and [`Document::row_has_diagnostic`] and its neighbours mark every
+//!   affected row.
 //! - **P3**: nothing yet. Filter and sort acceleration (phase 3) will be
 //!   started on first use, or when idle, with [`Priority::P3`].
 //!
@@ -53,8 +57,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use crate::detect::{
     self, ChoiceError, Choices, Detection, FIRST_PAINT_BYTES, Hints, Review, detect, review_with,
 };
+use crate::diagnostics::{Diagnostics, Report};
 use crate::dialect::QUOTE;
-use crate::index::{IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex, Status};
+use crate::index::{
+    DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
+    Status,
+};
 use crate::rows::{DEFAULT_CACHE_ROWS, ParsedRow, RowCache, RowParser};
 use crate::schedule::{Interval, IntervalGuard, Job, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{
@@ -230,6 +238,8 @@ struct Reading {
     /// may be cut, unless the file fits in 64 KB.
     head_rows: usize,
     index: Arc<RowIndex>,
+    /// What the index pass finds wrong with the file, so far.
+    diagnostics: Arc<Diagnostics>,
     index_job: JobHandle<IndexSummary>,
     review_job: JobHandle<Review>,
     cache: Mutex<RowCache>,
@@ -241,8 +251,10 @@ struct FirstPaint {
     parser: RowParser,
     head_index: RowIndex,
     head_rows: usize,
-    /// The real index, empty, and the indexer that will fill it.
+    /// The real index, empty, and the indexer that will fill it and
+    /// collect the diagnostics.
     index: Arc<RowIndex>,
+    diagnostics: Arc<Diagnostics>,
     indexer: Indexer,
 }
 
@@ -487,6 +499,38 @@ impl Document {
         self.source.storage()
     }
 
+    /// What the index pass has found wrong with the file so far
+    /// (DESIGN §3.5): the report of the rows indexed so far, complete once
+    /// indexing is. It is the current reading's, so after
+    /// [`reinterpret`](Self::reinterpret) it starts again, empty. Shared,
+    /// so reading it copies nothing.
+    #[must_use]
+    pub fn diagnostics(&self) -> Arc<Report> {
+        self.current().diagnostics.report()
+    }
+
+    /// True if row `row` has a warning or an error, for its gutter marker
+    /// (every such row, not only the report's first locations). False for a
+    /// row not indexed yet.
+    #[must_use]
+    pub fn row_has_diagnostic(&self, row: usize) -> bool {
+        self.current().diagnostics.row_has_diagnostic(row)
+    }
+
+    /// The first row at or after `from` with a warning or an error, for
+    /// **Next**.
+    #[must_use]
+    pub fn next_row_with_diagnostic(&self, from: usize) -> Option<usize> {
+        self.current().diagnostics.next_row_with_diagnostic(from)
+    }
+
+    /// The last row before `to` with a warning or an error, for
+    /// **Previous**.
+    #[must_use]
+    pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
+        self.current().diagnostics.previous_row_with_diagnostic(to)
+    }
+
     /// The current reading. A clone of the `Arc`, so the lock is held only
     /// for a moment, and a [`reinterpret`](Self::reinterpret) meanwhile
     /// doesn't pull it away from a caller using it.
@@ -545,7 +589,8 @@ fn read_first_paint(
         .map_err(|error| DocumentError::Internal(error.to_string()))?;
     let internal = |error: IndexError| DocumentError::Internal(error.to_string());
     let head_index = RowIndex::build(head, dialect).map_err(internal)?;
-    let (index, indexer) = RowIndex::start(dialect).map_err(internal)?;
+    let (index, diagnostics, indexer) =
+        RowIndex::start_with_diagnostics(dialect, detection.encoding).map_err(internal)?;
     let whole_file = u64::try_from(head.len()).is_ok_and(|len| len == source.len());
     let head_rows = if whole_file {
         head_index.row_count()
@@ -560,6 +605,7 @@ fn read_first_paint(
         head_index,
         head_rows,
         index,
+        diagnostics,
         indexer,
     })
 }
@@ -595,6 +641,7 @@ fn start_jobs(context: &Context<'_>, generation: u64, paint: FirstPaint) -> Read
         head_index,
         head_rows,
         index,
+        diagnostics,
         indexer,
     } = paint;
     let index_job = start_index(context, generation, &index, indexer);
@@ -606,6 +653,7 @@ fn start_jobs(context: &Context<'_>, generation: u64, paint: FirstPaint) -> Read
         head_index,
         head_rows,
         index,
+        diagnostics,
         index_job,
         review_job,
         cache: Mutex::new(RowCache::new(parser, DEFAULT_CACHE_ROWS)),
@@ -650,8 +698,7 @@ fn index_file(
     job: &Job,
     mut report: impl FnMut(Progress),
 ) -> Result<(), JobError> {
-    // SEAM(1.5): the diagnostics collector joins this pass, as an observer
-    // of both `run` and the chunked indexer.
+    // The indexer collects diagnostics in the same pass, in both cases.
     if let Some(bytes) = source.as_slice() {
         return Ok(indexer.run(bytes, job.cancel_flag(), report)?);
     }
@@ -663,9 +710,17 @@ fn index_file(
         if failed.is_some() {
             return;
         }
-        match chunked.push(chunk.bytes) {
-            Ok(progress) => report(progress),
-            Err(error) => failed = Some(error),
+        // The stream's chunks are 1 MiB; indexing with diagnostics works in
+        // smaller pieces (`DIAGNOSTICS_CHUNK_BYTES`), so that no stretch of
+        // work between checkpoints is longer than over a mapped file.
+        for piece in chunk.bytes.chunks(DIAGNOSTICS_CHUNK_BYTES) {
+            match chunked.push(piece) {
+                Ok(progress) => report(progress),
+                Err(error) => {
+                    failed = Some(error);
+                    return;
+                }
+            }
         }
     })?;
     if let Some(error) = failed {
@@ -677,10 +732,8 @@ fn index_file(
 
 /// P2: the whole-file checks. On a mapped file they run alongside the
 /// index; on a removable drive, once the index pass has copied the file and
-/// mapped the copy.
-///
-/// SEAM(1.5): diagnostics details are P2 work too. Their job starts here,
-/// and the [`Reading`] keeps its handle next to the review's.
+/// mapped the copy. (Diagnostics need no P2 job: the index pass collects
+/// all of them.)
 fn start_checks(
     context: &Context<'_>,
     index_job: &JobHandle<IndexSummary>,

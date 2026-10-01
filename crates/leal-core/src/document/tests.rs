@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::detect::{EncodingSource, REVIEW_CHUNK_BYTES};
+use crate::diagnostics::{DiagnosticKind, MAX_LOCATIONS};
 use crate::dialect::{Delimiter, Encoding};
 use crate::schedule::{Platform, SchedulerConfig, ThreadClass};
 
@@ -369,7 +370,7 @@ fn a_chosen_encoding_must_fit_the_bom() {
 #[test]
 fn progress_is_reported_as_the_index_grows() {
     let dir = Dir::new("progress");
-    let bytes = sample(3 * crate::index::CHUNK_BYTES + 1000);
+    let bytes = sample(3 * crate::index::DIAGNOSTICS_CHUNK_BYTES + 1000);
     let path = dir.file("p.csv", &bytes);
     let (sent, reports) = mpsc::channel();
     let sent = Mutex::new(sent);
@@ -385,7 +386,7 @@ fn progress_is_reported_as_the_index_grows() {
     .unwrap();
     let rows = wait_for_index(&document).rows;
     let reports: Vec<IndexProgress> = reports.try_iter().collect();
-    assert_eq!(reports.len(), 4, "one per 1 MiB chunk");
+    assert_eq!(reports.len(), 4, "one per 256 KiB chunk");
     assert!(reports.windows(2).all(|w| w[0].rows <= w[1].rows));
     assert!(reports.iter().all(|p| p.generation == 0));
     assert!(
@@ -653,6 +654,132 @@ fn a_removable_file_is_indexed_from_the_copy_pass() {
         document.review_job().wait().unwrap().delimiter_suggestion,
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics (task 1.5)
+
+/// [`sample`] with every diagnostic kind but the unterminated quote and the
+/// BOM, spread through the file so chunks cut them: invalid UTF-8 (one
+/// sequence cut by most chunk boundaries), NULs, text after a closing
+/// quote, ragged rows, blank lines and CRLFs among LFs.
+fn messy_sample(size: usize) -> Vec<u8> {
+    let mut bytes = b"id,name,notes\n".to_vec();
+    let mut i = 0;
+    while bytes.len() < size {
+        let row: Vec<u8> = match i % 50 {
+            7 => b"7,bad \xFF byte,x\n".to_vec(),
+            13 => b"13,nul \0 here,\"q\"after\n".to_vec(),
+            21 => b"21,short\n".to_vec(),
+            29 => b"\n".to_vec(),
+            37 => format!("{i},caf\u{e9} {i},crlf\r\n").into_bytes(),
+            _ => format!("{i},caf\u{e9} {i},\u{1F600}{i}\n").into_bytes(),
+        };
+        bytes.extend_from_slice(&row);
+        i += 1;
+    }
+    bytes
+}
+
+/// The diagnostics of `bytes` read as `document` reads them, from an index
+/// of the whole slice: what the document's must equal.
+fn reference_diagnostics(document: &Document, bytes: &[u8]) -> Arc<Diagnostics> {
+    let detection = document.detection();
+    let dialect = IndexDialect {
+        delimiter: detection.delimiter.byte(),
+        quote: QUOTE,
+        code_unit: detection.encoding.code_unit(),
+        bom_len: detection.bom.len(),
+    };
+    let (_, diagnostics, indexer) =
+        RowIndex::start_with_diagnostics(dialect, detection.encoding).unwrap();
+    indexer.run(bytes, &AtomicBool::new(false), |_| {}).unwrap();
+    diagnostics
+}
+
+/// Checks that `document`'s diagnostics, once indexed, equal the
+/// reference's: the report, and every row's mark and neighbours.
+fn check_document_diagnostics(document: &Document, bytes: &[u8]) {
+    let rows = wait_for_index(document).rows;
+    let want = reference_diagnostics(document, bytes);
+    let report = document.diagnostics();
+    assert!(report.is_complete());
+    assert_eq!(report.rows(), rows);
+    assert_eq!(*report, *want.report());
+    for kind in [
+        DiagnosticKind::InvalidEncoding,
+        DiagnosticKind::NulBytes,
+        DiagnosticKind::TextAfterClosingQuote,
+        DiagnosticKind::RaggedRows,
+        DiagnosticKind::MixedLineEndings,
+        DiagnosticKind::BlankLines,
+    ] {
+        assert!(report.get(kind).is_some(), "{kind:?} in {report:?}");
+    }
+    let mut marked = 0;
+    for row in 0..rows {
+        assert_eq!(
+            document.row_has_diagnostic(row),
+            want.row_has_diagnostic(row),
+            "row {row}"
+        );
+        marked += usize::from(want.row_has_diagnostic(row));
+    }
+    assert!(marked > MAX_LOCATIONS, "only {marked} marked rows");
+    for from in (0..=rows + 1).step_by(97) {
+        assert_eq!(
+            document.next_row_with_diagnostic(from),
+            want.next_row_with_diagnostic(from)
+        );
+        assert_eq!(
+            document.previous_row_with_diagnostic(from),
+            want.previous_row_with_diagnostic(from)
+        );
+    }
+}
+
+#[test]
+fn diagnostics_arrive_through_the_document() {
+    let dir = Dir::new("diagnostics");
+    // More than 1,000 occurrences of the commonest kinds, over many chunks.
+    let bytes = messy_sample(3 * crate::index::DIAGNOSTICS_CHUNK_BYTES + 1000);
+    let path = dir.file("messy.csv", &bytes);
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler(),
+        options(5),
+        None,
+    )
+    .unwrap();
+    assert_eq!(document.detection().encoding, Encoding::Utf8);
+    check_document_diagnostics(&document, &bytes);
+
+    // Reading the file again starts its diagnostics again, for the new
+    // reading: here, Windows-1252, where 0xFF is a valid byte.
+    let choices = Choices {
+        encoding: Some(Encoding::Windows1252),
+        ..Choices::default()
+    };
+    document.reinterpret(choices, 5, 1000).unwrap();
+    wait_for_index(&document);
+    let report = document.diagnostics();
+    assert!(report.is_complete());
+    assert!(report.get(DiagnosticKind::InvalidEncoding).is_none());
+    assert!(report.get(DiagnosticKind::NulBytes).is_some());
+}
+
+/// A removable drive's file is indexed from `Source::stream`'s chunks
+/// (1.3a), and its diagnostics are collected chunk by chunk, with chunks
+/// of an odd size so they cut multibyte characters, CRLFs and quotes.
+#[test]
+fn diagnostics_of_a_removable_file_arrive_chunk_by_chunk() {
+    let dir = Dir::new("diagnostics-removable");
+    let bytes = messy_sample(700 * 1024);
+    let (document, _) = open_removable(&dir, &bytes, 4093, &scheduler());
+    check_document_diagnostics(&document, &bytes);
+    assert_eq!(document.storage(), Storage::Copy);
 }
 
 #[test]
