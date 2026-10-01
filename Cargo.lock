@@ -442,6 +442,7 @@ name = "leal-bench"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "leal-core",
  "memchr",
  "serde_json",
 ]

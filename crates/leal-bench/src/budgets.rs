@@ -18,6 +18,18 @@ pub struct Budget {
     pub source: &'static str,
 }
 
-/// The budgets CI enforces. Empty until the benchmarks for them exist:
-/// 1.3 adds the full index (< 500 ms) and 1.3a first paint (< 150 ms).
-pub const BUDGETS: &[Budget] = &[];
+/// The budgets CI enforces. 1.3a adds first paint (< 150 ms).
+pub const BUDGETS: &[Budget] = &[
+    // "Full index built: < 500 ms" for the reference file, on the calling
+    // thread and through the progressive path the app uses.
+    Budget {
+        id: "index/build",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
+    Budget {
+        id: "index/run",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
+];
