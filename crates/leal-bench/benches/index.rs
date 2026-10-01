@@ -245,5 +245,39 @@ fn worst(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, index, worst);
+/// **Next** and **Previous** over the row marks (1.5), which run on the
+/// main thread: 400,000 rows with no warning, so each search reads every
+/// row. Narrow rows (3 fields) are checked from their code alone, 64 at a
+/// time; wide rows (130 fields, more than a code can hold) also need their
+/// exact count from the side list, walked alongside.
+fn marks(c: &mut Criterion) {
+    const ROWS: usize = 400_000;
+    let mut group = c.benchmark_group("marks");
+    for (name, fields) in [("narrow", 3), ("wide", 130)] {
+        let row = format!("{}\n", vec!["a"; fields].join(","));
+        let bytes = row.repeat(ROWS).into_bytes();
+        let (index, diagnostics, indexer) =
+            RowIndex::start_with_diagnostics(DIALECT, Encoding::Utf8).expect("a valid dialect");
+        indexer
+            .run(&bytes, &AtomicBool::new(false), |_| {})
+            .expect("indexing");
+        assert_eq!(index.row_count(), ROWS);
+        assert!(!diagnostics.report().shows_banner());
+        group.bench_function(format!("next_{name}"), |b| {
+            b.iter(|| {
+                let found = diagnostics.next_row_with_diagnostic(black_box(0));
+                assert_eq!(found, None);
+            });
+        });
+        group.bench_function(format!("previous_{name}"), |b| {
+            b.iter(|| {
+                let found = diagnostics.previous_row_with_diagnostic(black_box(ROWS));
+                assert_eq!(found, None);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, index, worst, marks);
 criterion_main!(benches);

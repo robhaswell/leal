@@ -392,10 +392,17 @@ impl Diagnostics {
         wide: &mut Vec<(u32, u32)>,
         mode: Option<usize>,
     ) {
+        let done = report.is_complete();
         let report = Arc::new(report);
         let mut shared = self.shared.write().unwrap_or_else(PoisonError::into_inner);
         shared.report = report;
-        shared.marks.extend(codes, wide, mode);
+        shared.marks.extend(codes, wide, mode, done);
+    }
+
+    /// How many bytes the row marks hold room for, for tests.
+    #[cfg(test)]
+    pub(crate) fn marks_capacity(&self) -> usize {
+        self.read().marks.capacity_bytes()
     }
 
     /// The last report, moved out rather than copied. It takes `self`, so

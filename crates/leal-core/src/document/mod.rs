@@ -683,11 +683,13 @@ fn start_index(
         .scheduler
         .spawn(Priority::P1, Interval::Index, move |job| {
             let report = |p: Progress| {
-                // Records how long the chunk took; the index never pauses.
-                let _ = job.checkpoint();
+                // Records how long the chunk took; the index never pauses,
+                // so this fails only if the job was cancelled.
+                let checkpoint = job.checkpoint();
                 if let Some(progress) = &progress {
                     progress(index_progress(generation, &readers, p));
                 }
+                checkpoint
             };
             index_file(&source, indexer, job, report)?;
             Ok(IndexSummary {
@@ -700,42 +702,58 @@ fn start_index(
 
 /// Indexes the whole file: over the map if there is one, otherwise from
 /// [`Source::stream`]'s chunks, which also copies a file on a removable
-/// drive to the internal disk (ADR-0006).
+/// drive to the internal disk (ADR-0006). `report` is told after each
+/// chunk, and its error (the job's checkpoint failing, because the job was
+/// cancelled) stops the pass.
 fn index_file(
     source: &Source,
     indexer: Indexer,
     job: &Job,
-    mut report: impl FnMut(Progress),
+    mut report: impl FnMut(Progress) -> Result<(), JobError>,
 ) -> Result<(), JobError> {
     // The indexer collects diagnostics in the same pass, in both cases.
     if let Some(bytes) = source.as_slice() {
-        return Ok(indexer.run(bytes, job.cancel_flag(), report)?);
+        // `run` checks the same cancel flag as the checkpoint before every
+        // chunk, so a failed checkpoint stops it there.
+        return Ok(indexer.run(bytes, job.cancel_flag(), |p| {
+            let _ = report(p);
+        })?);
     }
     let len =
         usize::try_from(source.len()).map_err(|_| IndexError::TooLarge { len: usize::MAX })?;
     let mut chunked = indexer.chunked(len)?;
-    let mut failed = None;
+    let mut failed: Option<JobError> = None;
     source.stream(job.cancel_flag(), |chunk| {
         if failed.is_some() {
             return;
         }
         // The stream's chunks are 1 MiB; indexing with diagnostics works in
         // smaller pieces (`DIAGNOSTICS_CHUNK_BYTES`), so that no stretch of
-        // work between checkpoints is longer than over a mapped file.
+        // work between checkpoints is longer than over a mapped file. The
+        // stream checks the cancel flag only between its chunks, so it is
+        // checked before each piece too: a cancel takes effect within one
+        // piece, as on a mapped file.
         for piece in chunk.bytes.chunks(DIAGNOSTICS_CHUNK_BYTES) {
-            match chunked.push(piece) {
-                Ok(progress) => report(progress),
-                Err(error) => {
-                    failed = Some(error);
-                    return;
-                }
+            if job.is_cancelled() {
+                failed = Some(JobError::Cancelled);
+                return;
+            }
+            let reported = chunked
+                .push(piece)
+                .map_err(JobError::from)
+                .and_then(&mut report);
+            if let Err(error) = reported {
+                failed = Some(error);
+                return;
             }
         }
     })?;
     if let Some(error) = failed {
-        return Err(error.into());
+        return Err(error);
     }
-    report(chunked.finish()?);
+    // The index is complete now, so a cancel that comes this late changes
+    // nothing, as on a mapped file.
+    let _ = report(chunked.finish()?);
     Ok(())
 }
 

@@ -1102,6 +1102,73 @@ fn wide_rows_are_marked_by_their_exact_field_count() {
     assert_eq!(diagnostics.previous_row_with_diagnostic(2), None);
 }
 
+/// Wide files: rows of 127 fields or more, most of them with the most
+/// common count, so `next` and `previous` walk the side list of wide rows.
+fn wide_rows() -> impl Strategy<Value = Vec<u8>> {
+    let row = (
+        prop_oneof![
+            8 => Just(130usize),
+            1 => Just(129usize),
+            1 => Just(131usize),
+            1 => Just(127usize),
+            1 => Just(126usize),
+            1 => Just(3usize),
+            1 => Just(0usize),
+        ],
+        prop::bool::weighted(0.05),
+    );
+    prop::collection::vec(row, 0..120).prop_map(|rows| {
+        let mut bytes = Vec::new();
+        for (fields, nul) in rows {
+            if fields > 0 {
+                let mut cells = vec![&b"a"[..]; fields];
+                if nul {
+                    cells[fields / 2] = b"\0";
+                }
+                bytes.extend_from_slice(&cells.join(&b","[..]));
+            }
+            bytes.push(b'\n');
+        }
+        bytes
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    #[test]
+    fn wide_files_are_marked_and_searched_correctly(bytes in wide_rows(), chunk in 1..2000usize) {
+        prop_assert_eq!(
+            &collect_tk(&bytes, utf8(), TkEncoding::Utf8, chunk)?,
+            &expected(&bytes, utf8(), TkEncoding::Utf8)
+        );
+        // From every row, not just a spread of them.
+        let (_, diagnostics, _) = collect_all(&bytes, utf8(), Encoding::Utf8, chunk);
+        let want = expected_marks(&bytes, utf8(), TkEncoding::Utf8);
+        for at in 0..=want.len() + 1 {
+            let next = (at.min(want.len())..want.len()).find(|&r| want[r]);
+            let previous = (0..at.min(want.len())).rev().find(|&r| want[r]);
+            prop_assert_eq!(diagnostics.next_row_with_diagnostic(at), next, "next from {}", at);
+            prop_assert_eq!(diagnostics.previous_row_with_diagnostic(at), previous, "before {}", at);
+        }
+    }
+}
+
+/// Once indexing is complete, the row marks give back the room they grew
+/// into, as the row index's offsets do.
+#[test]
+fn row_marks_are_shrunk_when_indexing_finishes() {
+    // 100,000 narrow rows and 10 wide ones (8 bytes each on the side).
+    let mut counts: Vec<usize> = vec![2; 100_000];
+    for i in 0..10 {
+        counts[i * 9000] = 150;
+    }
+    let bytes = rows_of_fields(counts);
+    let (_, diagnostics, report) = collect_all(&bytes, utf8(), Encoding::Utf8, 64 * 1024);
+    assert!(report.is_complete());
+    assert_eq!(diagnostics.marks_capacity(), 100_000 + 10 * 8);
+}
+
 /// Every affected row is marked, not just the first 1,000 of each kind,
 /// and info-level kinds (blank lines, mixed line endings, the BOM) mark
 /// nothing. Long runs of unmarked rows are skipped 64 rows at a time.

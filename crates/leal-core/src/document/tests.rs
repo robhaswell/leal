@@ -10,7 +10,7 @@ use super::*;
 
 use std::path::PathBuf;
 use std::sync::Condvar;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -780,6 +780,49 @@ fn diagnostics_of_a_removable_file_arrive_chunk_by_chunk() {
     let (document, _) = open_removable(&dir, &bytes, 4093, &scheduler());
     check_document_diagnostics(&document, &bytes);
     assert_eq!(document.storage(), Storage::Copy);
+}
+
+/// On a removable drive, `Source::stream` checks the cancel flag only
+/// between its 1 MiB chunks, but the index pushes each in 256 KiB pieces.
+/// A cancel during the first piece stops the index after that piece, not
+/// after the stream's chunk (1.5 integration review).
+#[test]
+fn cancelling_a_removable_index_stops_within_one_piece() {
+    let dir = Dir::new("removable-cancel");
+    let bytes = sample(3 * crate::source::STREAM_CHUNK_BYTES);
+    let path = dir.file("usb.csv", &bytes);
+    let source =
+        Source::open_simulating_removable(&path, &dir.temp(), crate::source::STREAM_CHUNK_BYTES)
+            .unwrap();
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    // The progress callback cancels the index job the first time it is
+    // called, after the first piece of the first stream chunk.
+    let job: Arc<Mutex<Option<JobHandle<IndexSummary>>>> = Arc::default();
+    let reports = Arc::new(AtomicU64::new(0));
+    let progress: ProgressCallback = {
+        let (job, reports) = (Arc::clone(&job), Arc::clone(&reports));
+        Arc::new(move |_| {
+            reports.fetch_add(1, Ordering::SeqCst);
+            if let Some(job) = job.lock().unwrap().as_ref() {
+                job.cancel();
+            }
+        })
+    };
+    let (document, _) =
+        Document::from_source(source, &scheduler, options(5), Some(progress)).unwrap();
+    *job.lock().unwrap() = Some(document.index_job());
+    gate.open();
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Cancelled))
+    );
+    assert_eq!(reports.load(Ordering::SeqCst), 1, "one piece, then stopped");
+    let scanned = document.progress().bytes_scanned;
+    assert!(
+        scanned <= u64::try_from(crate::index::DIAGNOSTICS_CHUNK_BYTES).unwrap(),
+        "scanned {scanned} bytes"
+    );
 }
 
 #[test]
