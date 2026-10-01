@@ -128,8 +128,10 @@ program truncates a mapped file, reading the missing pages crashes the process
 (SIGBUS). The clone cannot be changed by other programs, so Leal cannot crash
 this way, and it always has a stable snapshot of what it opened.
 
-Fallbacks, only when the volume can't clone at all (network shares, exFAT,
-some USB drives). An EXDEV error means "clone elsewhere", not "no cloning":
+Fallbacks, only when the volume can't clone at all and isn't removable
+(network shares, and internal volumes that aren't APFS). Removable drives
+that can't clone, such as exFAT USB sticks, follow the removable-drives path
+below instead. An EXDEV error means "clone elsewhere", not "no cloning":
 - up to 512 MB: read the file into memory, and show a small status bar note;
 - above that: copy to the temporary directory, then map the copy.
 

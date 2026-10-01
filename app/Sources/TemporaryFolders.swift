@@ -42,9 +42,25 @@ enum TemporaryFolders {
         return folder?.path(percentEncoded: false)
     }
 
+    /// What Foundation knows about the volume `url` is on: a new folder there
+    /// for the clone (`volumeFolder(for:)`), and whether the volume is
+    /// internal and ejectable. The core treats a volume that isn't known to
+    /// be internal, or is ejectable, as a removable drive: it reads the file
+    /// without mapping it until it has copied it to the internal disk
+    /// (ADR-0006). Either value is `nil` if Foundation doesn't know it; a
+    /// disk image, for example, has no "is internal" value.
+    static func volume(for url: URL) -> VolumeInfo {
+        let values = try? url.resourceValues(forKeys: [.volumeIsInternalKey, .volumeIsEjectableKey])
+        return VolumeInfo(
+            folder: volumeFolder(for: url),
+            isInternal: values?.volumeIsInternal,
+            isEjectable: values?.volumeIsEjectable
+        )
+    }
+
     /// Opens `url` with the core: a clone on the file's own volume where it
     /// can, otherwise a fallback (`Source.storage()`).
     static func open(_ url: URL, temp: TempLocations) throws -> Source {
-        try openSource(path: url.path(percentEncoded: false), volumeFolder: volumeFolder(for: url), temp: temp)
+        try openSource(path: url.path(percentEncoded: false), volume: volume(for: url), temp: temp)
     }
 }

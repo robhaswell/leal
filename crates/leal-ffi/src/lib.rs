@@ -173,8 +173,16 @@ pub enum SourceStorage {
     /// status bar note.
     Memory,
     /// A memory-mapped copy, because the volume can't clone and the file is
-    /// large.
+    /// large, or because the file is on a removable drive and has been
+    /// copied to the internal disk.
     Copy,
+    /// The file is on a removable drive: read with ordinary reads, never
+    /// mapped, until it has been copied to the internal disk (ADR-0006).
+    Reading,
+    /// The file's removable drive was disconnected before the copy was
+    /// complete. What was copied can still be read; Save is refused and
+    /// Save As is allowed. The app shows the "drive disconnected" banner.
+    Disconnected,
 }
 
 impl From<source::Storage> for SourceStorage {
@@ -183,6 +191,36 @@ impl From<source::Storage> for SourceStorage {
             source::Storage::Clone => Self::Clone,
             source::Storage::Memory => Self::Memory,
             source::Storage::Copy => Self::Copy,
+            source::Storage::Reading => Self::Reading,
+            source::Storage::Disconnected => Self::Disconnected,
+        }
+    }
+}
+
+/// What the app knows about the volume a file is on. See
+/// [`leal_core::source::VolumeInfo`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct VolumeInfo {
+    /// A new, empty folder on the file's own volume, from
+    /// `FileManager.url(for: .itemReplacementDirectory, in: .userDomainMask,
+    /// appropriateFor:, create: true)`, or `nil` if there is none. The core
+    /// takes it over and deletes it.
+    #[uniffi(default = None)]
+    pub folder: Option<String>,
+    /// The file's `URLResourceValues.volumeIsInternal`, if known.
+    #[uniffi(default = None)]
+    pub is_internal: Option<bool>,
+    /// The file's `URLResourceValues.volumeIsEjectable`, if known.
+    #[uniffi(default = None)]
+    pub is_ejectable: Option<bool>,
+}
+
+impl From<VolumeInfo> for source::VolumeInfo {
+    fn from(volume: VolumeInfo) -> Self {
+        Self {
+            folder: volume.folder.map(PathBuf::from),
+            is_internal: volume.is_internal,
+            is_ejectable: volume.is_ejectable,
         }
     }
 }
@@ -211,12 +249,11 @@ impl Source {
 }
 
 /// Opens the file at `path` and takes a snapshot of it. See
-/// [`leal_core::source::Source::open`].
+/// [`leal_core::source::Source::open_on`].
 ///
-/// `volume_folder` is a new, empty folder on the file's own volume, from
-/// `FileManager.url(for: .itemReplacementDirectory, in: .userDomainMask,
-/// appropriateFor:, create: true)`, or `nil` if there is none. The core takes
-/// it over and deletes it.
+/// `volume` is what Foundation says about the file's volume: a folder on it
+/// for the clone, and whether it is internal and ejectable, which decides
+/// whether the file is treated as being on a removable drive (ADR-0006).
 ///
 /// # Errors
 ///
@@ -225,11 +262,11 @@ impl Source {
 #[uniffi::export]
 pub fn open_source(
     path: &str,
-    volume_folder: Option<String>,
+    volume: VolumeInfo,
     temp: TempLocations,
 ) -> Result<Arc<Source>, LealError> {
     let temp = TempFolders::from(temp);
-    source::Source::open(Path::new(path), &temp, volume_folder.map(PathBuf::from))
+    source::Source::open_on(Path::new(path), &temp, volume.into())
         .map(|source| Arc::new(Source { source }))
         .map_err(|err| LealError::from_open(path, &err))
 }
@@ -351,7 +388,7 @@ mod tests {
             })
         );
         assert!(matches!(
-            open_source(&path, None, dir.locations()),
+            open_source(&path, VolumeInfo::default(), dir.locations()),
             Err(LealError::NotAFile {
                 is_directory: true,
                 ..
@@ -372,7 +409,7 @@ mod tests {
         };
         assert_eq!(inspect_file(&path), Err(expected.clone()));
         assert_eq!(
-            open_source(&path, None, dir.locations()).map(|_| ()),
+            open_source(&path, VolumeInfo::default(), dir.locations()).map(|_| ()),
             Err(expected)
         );
     }
@@ -388,7 +425,7 @@ mod tests {
             path: error_path,
             code,
             message,
-        }) = open_source(&path, None, dir.locations())
+        }) = open_source(&path, VolumeInfo::default(), dir.locations())
         else {
             panic!("expected LealError::Io");
         };
@@ -404,7 +441,13 @@ mod tests {
         std::fs::write(&path, b"a,b\n1,2\n").unwrap();
         let folder = dir.path("volume-folder");
         std::fs::create_dir(&folder).unwrap();
-        let source = open_source(&path, Some(folder.clone()), dir.locations()).unwrap();
+        let volume = VolumeInfo {
+            folder: Some(folder.clone()),
+            // On the scratch directory's volume, so still mapped.
+            is_internal: Some(false),
+            is_ejectable: Some(true),
+        };
+        let source = open_source(&path, volume, dir.locations()).unwrap();
         assert_eq!(source.byte_count(), 8);
         assert_eq!(source.storage(), SourceStorage::Clone);
         drop(source);
@@ -413,6 +456,32 @@ mod tests {
             "the clone's folder is deleted"
         );
         assert_eq!(remove_leftover_temp_folders(dir.locations()), Ok(0));
+    }
+
+    #[test]
+    fn volume_info_and_storage_convert() {
+        let volume = source::VolumeInfo::from(VolumeInfo {
+            folder: Some("/Volumes/USB/.TemporaryItems/x".to_owned()),
+            is_internal: None,
+            is_ejectable: Some(true),
+        });
+        assert_eq!(
+            volume,
+            source::VolumeInfo {
+                folder: Some(PathBuf::from("/Volumes/USB/.TemporaryItems/x")),
+                is_internal: None,
+                is_ejectable: Some(true),
+            }
+        );
+        for (core, ffi) in [
+            (source::Storage::Clone, SourceStorage::Clone),
+            (source::Storage::Memory, SourceStorage::Memory),
+            (source::Storage::Copy, SourceStorage::Copy),
+            (source::Storage::Reading, SourceStorage::Reading),
+            (source::Storage::Disconnected, SourceStorage::Disconnected),
+        ] {
+            assert_eq!(SourceStorage::from(core), ffi);
+        }
     }
 
     #[cfg(feature = "test-exports")]

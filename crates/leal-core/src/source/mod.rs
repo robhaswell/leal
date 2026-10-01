@@ -1,7 +1,7 @@
 //! Getting a file's bytes without copying them (DESIGN §3.1).
 //!
-//! [`Source::open`] makes a private snapshot of the user's file and gives
-//! its bytes as one `&[u8]`:
+//! [`Source::open`] makes a private snapshot of the user's file. On an
+//! internal volume its bytes are one `&[u8]` ([`Source::as_slice`]):
 //!
 //! 1. **Clone** the file with `fclonefileat(2)` into a temporary folder. On
 //!    APFS this is nearly instant and takes no extra disk space
@@ -17,11 +17,42 @@
 //!    opened.
 //!
 //! Only when the file's volume can't clone at all (`ENOTSUP`: HFS+, exFAT,
-//! network shares, some USB drives) does it fall back: a file of up to
-//! [`MEMORY_FALLBACK_MAX_BYTES`] is read into memory, a larger one is
-//! copied to Leal's temporary directory and the copy is mapped.
-//! [`Source::storage`] says which happened, so the app can show its status
-//! bar note.
+//! network shares) and isn't a removable drive (an internal partition, or a
+//! network share, which ADR-0006 leaves here) does it fall back: a file of
+//! up to [`MEMORY_FALLBACK_MAX_BYTES`] is read into memory, a larger one is
+//! copied to Leal's temporary directory and the copy is mapped. Both read
+//! the file in full, with ordinary reads, inside `open`, so a vanishing
+//! share gives an error, not a crash. [`Source::storage`] says which
+//! happened, so the app can show its status bar note.
+//!
+//! **Removable drives (ADR-0006).** A file on a removable drive (an
+//! external drive, a disk image) is never mapped from that volume, because touching a mapped page of a file whose drive was
+//! unplugged kills the process (SIGBUS). Instead it is read with ordinary
+//! reads ([`Source::read_range`], which returns an error instead): from a
+//! clone on the drive if its volume can clone, or from the user's file
+//! itself if it can't. [`Source::stream`] copies it to Leal's temporary
+//! directory on the internal disk in chunks, which the index can be built
+//! from in the same pass. When the copy is complete, it is mapped and the
+//! clone on the drive is deleted. If the drive vanishes first, the source
+//! is [`Storage::Disconnected`]: what was copied stays readable, and Save
+//! is refused ([`Source::can_save`]). Without a clone, a change to the
+//! user's file during the copy is reported ([`Source::changed_on_disk`]).
+//! Which volumes can vanish comes from Foundation's "is internal" and "is
+//! ejectable" properties, which the app passes in [`VolumeInfo`], and from
+//! the volume's own mount flags.
+//!
+//! # Reading the bytes
+//!
+//! - [`Source::as_slice`]: the whole file as one `&[u8]`, for a mapped or
+//!   in-memory source. `None` for a file on a removable drive until its
+//!   copy is complete.
+//! - [`Source::read_range`]: any range, always: borrowed from the slice
+//!   when there is one, read with `pread` otherwise. First paint reads its
+//!   first 64 KB this way, and rows are read by their extent.
+//! - [`Source::stream`]: the whole file once, in order, in chunks of
+//!   [`STREAM_CHUNK_BYTES`], cancellable between chunks (ADR-0005 decision
+//!   6). This is the pass the index runs on, and for a removable drive it
+//!   is also the copy.
 //!
 //! The clone or copy is deleted when the [`Source`] is dropped. Each
 //! temporary folder is recorded first, so [`TempFolders::remove_leftovers`]
@@ -32,6 +63,7 @@
 //! does that.
 
 mod error;
+mod removable;
 // The one place in leal-core that may use `unsafe` (CLAUDE.md): the system
 // calls the standard library doesn't wrap, and the memory map.
 #[allow(unsafe_code)]
@@ -39,21 +71,29 @@ mod sys;
 mod temp;
 #[cfg(test)]
 mod tests;
+mod volume;
 
+use std::borrow::Cow;
 use std::ffi::CStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, BufWriter, Read, Write};
+use std::ops::Range;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use memmap2::Mmap;
 
 use error::Step;
-pub use error::{OpenError, OpenErrorKind};
+pub use error::{OpenError, OpenErrorKind, ReadError, ReadErrorKind};
+use removable::{Origin, Removable};
 use temp::TempFolder;
 pub use temp::TempFolders;
+#[cfg(test)]
+use volume::VolumeFlags;
+use volume::VolumeKind;
 
 /// The largest file the fallback reads into memory, when its volume can't
 /// clone: 512 MiB (DESIGN §3.1). A larger file is copied to Leal's
@@ -68,6 +108,12 @@ pub const TEXT_ENCODING_ATTRIBUTE: &str = "com.apple.TextEncoding";
 /// choice (ADR-0005 decision 1).
 pub const INTERPRETATION_ATTRIBUTE: &str = "io.github.robhaswell.leal.interpretation";
 
+/// The size of the chunks [`Source::stream`] delivers: 1 MiB, the same as
+/// the index's chunks ([`crate::index::CHUNK_BYTES`]). Each chunk is a few
+/// milliseconds of reading even from a slow USB drive, so a cancel takes
+/// effect quickly.
+pub const STREAM_CHUNK_BYTES: usize = 1 << 20;
+
 /// The longest attribute value [`Source::open`] reads. Both attributes are a
 /// few dozen bytes; a longer value is treated as absent.
 pub const ATTRIBUTE_MAX_BYTES: usize = 64 * 1024;
@@ -79,19 +125,27 @@ const INTERPRETATION_ATTRIBUTE_C: &CStr = c"io.github.robhaswell.leal.interpreta
 /// An opened file's bytes: a private, read-only snapshot of the file as it
 /// was when it was opened.
 ///
-/// It is `Send` and `Sync`, so a document can share it between threads.
+/// It is `Send` and `Sync`, so a document can share it between threads:
+/// every method takes `&self`, including [`stream`](Self::stream), which
+/// changes how a file on a removable drive is held.
 pub struct Source {
     // Fields are dropped in order: the map goes before the temporary
     // folder that holds the mapped file.
     bytes: Bytes,
-    /// Held only so that dropping the source deletes the clone or copy
-    /// (`TempFolder`'s `Drop`); tests also look inside it.
+    /// Held so that dropping the source deletes the clone or copy
+    /// (`TempFolder`'s `Drop`); tests also look inside it. For a file on a
+    /// removable drive, this is the internal copy's folder.
     #[cfg_attr(not(test), expect(dead_code, reason = "held for its Drop"))]
     temp: Option<TempFolder>,
     path: PathBuf,
+    /// Where the bytes are held, except for a file on a removable drive,
+    /// whose storage changes (`Removable::storage`).
     storage: Storage,
     attributes: RawAttributes,
     identity: FileIdentity,
+    /// The size of [`stream`](Self::stream)'s chunks:
+    /// [`STREAM_CHUNK_BYTES`], except in tests.
+    chunk_len: usize,
 }
 
 /// Where a [`Source`]'s bytes are held.
@@ -102,10 +156,51 @@ pub enum Storage {
     /// Read into memory, because the file's volume can't clone. The app
     /// shows a status bar note (DESIGN §3.1).
     Memory,
-    /// A copy in Leal's temporary directory, memory-mapped, because the
+    /// A copy in Leal's temporary directory, memory-mapped: because the
     /// file's volume can't clone and the file is larger than
-    /// [`MEMORY_FALLBACK_MAX_BYTES`].
+    /// [`MEMORY_FALLBACK_MAX_BYTES`], or because the file is on a removable
+    /// drive and [`Source::stream`] has finished copying it (ADR-0006).
     Copy,
+    /// The file is on a removable drive (ADR-0006). It is read with
+    /// ordinary reads, never mapped, from a clone on the drive (or the
+    /// user's file, if the drive can't clone), until [`Source::stream`] has
+    /// copied it to the internal disk; then it becomes
+    /// [`Copy`](Self::Copy).
+    Reading,
+    /// The file's removable drive was disconnected before its copy was
+    /// complete. The first [`Source::available_len`] bytes (what was
+    /// copied) can still be read; reads past them fail with
+    /// [`ReadErrorKind::Disconnected`]. Save is refused, because it needs
+    /// the bytes that were never read; Save As is allowed (ADR-0006). The
+    /// app shows the "drive disconnected" banner (PLAN 1.7).
+    Disconnected,
+}
+
+/// What the app knows about the volume a file is on, for
+/// [`Source::open_on`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// An empty folder on the file's volume, for its clone: see
+    /// [`Source::open`].
+    pub folder: Option<PathBuf>,
+    /// Foundation's `volumeIsInternal` for the file (`URLResourceValues`):
+    /// whether the volume is on an internal device. `None` if Foundation
+    /// doesn't know (a disk image, for example) or wasn't asked.
+    pub is_internal: Option<bool>,
+    /// Foundation's `volumeIsEjectable` for the file: whether the volume
+    /// can be ejected. `None` if unknown.
+    pub is_ejectable: Option<bool>,
+}
+
+/// One chunk of [`Source::stream`]: `bytes` are the file's bytes from
+/// `offset` on. Chunks arrive in order, with no gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk<'a> {
+    /// Where the chunk starts in the file.
+    pub offset: usize,
+    /// The chunk's bytes: [`STREAM_CHUNK_BYTES`] of them, except for the
+    /// last chunk.
+    pub bytes: &'a [u8],
 }
 
 /// The file's extended attributes that later steps need, exactly as stored.
@@ -143,6 +238,44 @@ pub struct FileIdentity {
 enum Bytes {
     Mapped(Mmap),
     Owned(Vec<u8>),
+    /// A file on a removable drive (ADR-0006).
+    Removable(Box<Removable>),
+}
+
+/// How `open` works, so tests can reach paths that normally need large
+/// files or a real removable drive.
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    /// The largest file the fallback reads into memory.
+    memory_limit: u64,
+    volume: VolumeCheck,
+    /// The size of [`Source::stream`]'s chunks.
+    chunk_len: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            memory_limit: MEMORY_FALLBACK_MAX_BYTES,
+            volume: VolumeCheck::Detect,
+            chunk_len: STREAM_CHUNK_BYTES,
+        }
+    }
+}
+
+/// Whether to find out if the file's volume can vanish, or (in tests) to
+/// assume an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeCheck {
+    Detect,
+    /// Treat the volume as internal: a disk image standing in for a second
+    /// internal disk.
+    #[cfg(test)]
+    Internal,
+    /// Treat the volume as removable: a file in an ordinary temporary
+    /// directory standing in for one on a USB drive.
+    #[cfg(test)]
+    Removable,
 }
 
 impl Source {
@@ -176,12 +309,13 @@ impl Source {
     ///
     /// let temp = TempFolders::new(dir.join("scratch"), dir.join("records"));
     /// let source = Source::open(&path, &temp, None).unwrap();
-    /// assert_eq!(source.bytes(), b"name,age\nAda,36\n");
+    /// assert_eq!(source.as_slice(), Some(&b"name,age\nAda,36\n"[..]));
     /// assert_eq!(source.storage(), Storage::Clone);
+    /// assert_eq!(&*source.read_range(0..8).unwrap(), b"name,age");
     ///
     /// // The snapshot doesn't change when the file does.
     /// std::fs::write(&path, "").unwrap();
-    /// assert_eq!(source.bytes(), b"name,age\nAda,36\n");
+    /// assert_eq!(source.as_slice(), Some(&b"name,age\nAda,36\n"[..]));
     /// # drop(source);
     /// # std::fs::remove_dir_all(&dir).unwrap();
     /// ```
@@ -190,29 +324,74 @@ impl Source {
         temp: &TempFolders,
         volume_folder: Option<PathBuf>,
     ) -> Result<Self, OpenError> {
-        Self::open_with_memory_limit(path, temp, volume_folder, MEMORY_FALLBACK_MAX_BYTES)
+        Self::open_on(
+            path,
+            temp,
+            VolumeInfo {
+                folder: volume_folder,
+                ..VolumeInfo::default()
+            },
+        )
     }
 
-    /// [`open`](Self::open), with the fallback's memory limit as a
-    /// parameter so tests can reach the copy fallback with small files.
-    fn open_with_memory_limit(
+    /// [`open`](Self::open), with what the app knows about the file's
+    /// volume: the folder for the clone, and Foundation's "is internal" and
+    /// "is ejectable" values, which decide (with the volume's mount flags)
+    /// whether it is a removable drive (ADR-0006).
+    ///
+    /// A file on a removable drive opens as [`Storage::Reading`]: nothing
+    /// is mapped until [`stream`](Self::stream) has copied it to the
+    /// internal disk. A file on the same volume as `temp`'s scratch
+    /// directory (the boot volume) is never treated as removable.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open).
+    pub fn open_on(path: &Path, temp: &TempFolders, volume: VolumeInfo) -> Result<Self, OpenError> {
+        Self::open_with_options(path, temp, volume, Options::default())
+    }
+
+    /// [`open_on`](Self::open_on), with options so tests can reach the copy
+    /// fallback with small files, choose the stream's chunk size, and
+    /// pretend a volume is internal or removable.
+    fn open_with_options(
         path: &Path,
         temp: &TempFolders,
-        volume_folder: Option<PathBuf>,
-        memory_limit: u64,
+        mut volume: VolumeInfo,
+        options: Options,
     ) -> Result<Self, OpenError> {
         // Take over the given folder first, so it is removed on every early
         // return below.
-        let volume_folder = volume_folder.map(GivenFolder);
+        let volume_folder = volume.folder.take().map(GivenFolder);
         let (file, identity) = open_regular(path)?;
         let attributes = RawAttributes::read(&file);
 
+        let removable = can_vanish(&file, &identity, temp, &volume, options.volume);
+        let removable_source = |origin| -> Result<_, OpenError> {
+            let copy_error = |error| OpenError::new(path, Step::Copy, error);
+            let copy = temp.create().map_err(copy_error)?;
+            let removable = Removable::new(path, origin, &copy, options.chunk_len)?;
+            Ok((
+                Bytes::Removable(Box::new(removable)),
+                Some(copy),
+                Storage::Reading,
+            ))
+        };
         let (bytes, temp_folder, storage) = match clone(&file, path, temp, volume_folder)? {
+            Some(clone) if removable => removable_source(Origin::Clone(clone))?,
             Some(clone) => {
                 let map = map_file(path, &clone.file_path())?;
                 (Bytes::Mapped(map), Some(clone), Storage::Clone)
             }
-            None if identity.len <= memory_limit => {
+            // A removable drive that can't clone (exFAT, FAT, HFS+): read the
+            // user's file itself, never mapped, and stream it to the internal
+            // disk, rather than reading it all before first paint.
+            None if removable => removable_source(Origin::Original {
+                file,
+                path: path.to_owned(),
+                identity,
+            })?,
+            None if identity.len <= options.memory_limit => {
                 let bytes = read_into_memory(&file, path, identity.len)?;
                 (Bytes::Owned(bytes), None, Storage::Memory)
             }
@@ -230,35 +409,178 @@ impl Source {
             storage,
             attributes,
             identity,
+            chunk_len: options.chunk_len.max(1),
         })
     }
 
-    /// The file's bytes, exactly as they were on disk when it was opened.
-    ///
-    /// This may change (ADR-0006, proposed): a file on a removable drive
-    /// might be served by ordinary reads until an internal copy is mapped,
-    /// and then there is no single slice to hand out at first. Code that
-    /// only needs the size should use [`len`](Self::len), and code that
-    /// holds on to the slice should be able to take it per read instead.
+    /// The whole file as one slice, exactly as it was on disk when it was
+    /// opened, if there is one: always for a file on an internal volume
+    /// (mapped, or in memory), and for a file on a removable drive once
+    /// [`stream`](Self::stream) has copied it to the internal disk and
+    /// mapped the copy. `None` until then ([`Storage::Reading`] and
+    /// [`Storage::Disconnected`]); use [`read_range`](Self::read_range),
+    /// which works in every case.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
+    pub fn as_slice(&self) -> Option<&[u8]> {
         match &self.bytes {
-            Bytes::Mapped(map) => map,
-            Bytes::Owned(bytes) => bytes,
+            Bytes::Mapped(map) => Some(map),
+            Bytes::Owned(bytes) => Some(bytes),
+            Bytes::Removable(removable) => removable.as_slice(),
+        }
+    }
+
+    /// The bytes in `range`, as they were on disk when the file was opened.
+    /// Like `pread`, a range that runs past the end of the file is cut
+    /// short there (and one that starts past it gives no bytes).
+    ///
+    /// The bytes are borrowed when there is a slice to borrow from
+    /// ([`as_slice`](Self::as_slice)), which costs nothing. For a file on a
+    /// removable drive whose copy isn't complete, they are read with
+    /// `pread` into a new buffer: from the internal copy if it has them,
+    /// otherwise from the drive (the clone there, or the user's file itself
+    /// if the drive can't clone). Without a clone there is no snapshot, so
+    /// each such read checks the file's size and modification time
+    /// afterwards; bytes read after a detected change are never returned.
+    /// This never waits: it may be called on the main thread (DESIGN §3.9).
+    ///
+    /// # Errors
+    ///
+    /// Only for a file on a removable drive before its copy is complete:
+    /// [`ReadErrorKind::Disconnected`] if the drive has vanished and the
+    /// range wasn't copied before it did (the source is then
+    /// [`Storage::Disconnected`]), [`ReadErrorKind::ChangedOnDisk`] if the
+    /// user's file (read without a clone) has changed since it was opened,
+    /// or [`ReadErrorKind::Other`] for any
+    /// other read error, which leaves the source as it was.
+    pub fn read_range(&self, range: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
+        let range = clamp(range, self.len_usize());
+        match &self.bytes {
+            Bytes::Mapped(map) => Ok(Cow::Borrowed(&map[range])),
+            Bytes::Owned(bytes) => Ok(Cow::Borrowed(&bytes[range])),
+            Bytes::Removable(removable) => removable.read_range(range),
+        }
+    }
+
+    /// Reads the whole file once, from the start, calling `on_chunk` with
+    /// each [`Chunk`] in order. This is the pass the row index is built from
+    /// (task 1.3a joins the two).
+    ///
+    /// `cancel` is checked before each chunk, so the pass stops within one
+    /// chunk of it being set (ADR-0005 decision 6).
+    ///
+    /// For a file on an internal volume the chunks are borrowed from the
+    /// map or memory, and nothing else happens. For a file on a removable
+    /// drive (ADR-0006), each chunk is also written to Leal's copy on the
+    /// internal disk before it is handed over; after the last one, the copy
+    /// is mapped (the source becomes [`Storage::Copy`]) and the clone on
+    /// the drive, if there is one, is deleted. Without a clone (a drive that
+    /// can't clone), the user's file is checked for changes after every
+    /// chunk is read, and a chunk read after a change is never delivered. A
+    /// pass that is cancelled or fails can be run again: it starts from the
+    /// beginning, reading what was already copied from the internal copy.
+    /// Only one pass runs at a time; a second call waits for the first to
+    /// finish (so `on_chunk` must not call `stream` itself). `on_chunk` may
+    /// call [`read_range`](Self::read_range). Run it on a background thread:
+    /// it reads the whole file, and after an `EIO` it waits briefly to tell
+    /// a pulled drive from a bad block.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadErrorKind::Cancelled`] if `cancel` was set. For a file on a
+    /// removable drive, also:
+    /// - [`ReadErrorKind::Disconnected`] when the pass reaches bytes that
+    ///   weren't copied before the drive vanished (the chunks before them
+    ///   have been delivered);
+    /// - [`ReadErrorKind::ChangedOnDisk`] when the user's file (read
+    ///   without a clone) has changed since it was opened, including being
+    ///   truncated or appended to. The pass stops, the copy is never mapped,
+    ///   and every later pass returns this straight away
+    ///   ([`changed_on_disk`](Self::changed_on_disk));
+    /// - [`ReadErrorKind::Other`] for another read error or a failed write
+    ///   to the internal disk (for example, because it is full).
+    pub fn stream(
+        &self,
+        cancel: &AtomicBool,
+        on_chunk: impl FnMut(Chunk<'_>),
+    ) -> Result<(), ReadError> {
+        match &self.bytes {
+            Bytes::Mapped(map) => stream_slice(map, self.chunk_len, cancel, on_chunk),
+            Bytes::Owned(bytes) => stream_slice(bytes, self.chunk_len, cancel, on_chunk),
+            Bytes::Removable(removable) => removable.stream(cancel, on_chunk),
         }
     }
 
     /// The snapshot's size in bytes.
     #[must_use]
     pub fn len(&self) -> u64 {
-        // A slice's length always fits in u64 on Apple's 64-bit platforms.
-        u64::try_from(self.bytes().len()).unwrap_or(u64::MAX)
+        // A length always fits in u64 on Apple's 64-bit platforms.
+        u64::try_from(self.len_usize()).unwrap_or(u64::MAX)
     }
 
     /// Whether the file was empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bytes().is_empty()
+        self.len_usize() == 0
+    }
+
+    /// How many bytes, from the start of the file, can be read: all of
+    /// them, except after the file's removable drive was disconnected
+    /// ([`Storage::Disconnected`]), when it is what had been copied.
+    #[must_use]
+    pub fn available_len(&self) -> u64 {
+        let available = match &self.bytes {
+            Bytes::Removable(removable) => removable.available_len(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => self.len_usize(),
+        };
+        u64::try_from(available).unwrap_or(u64::MAX)
+    }
+
+    /// Whether Save (writing over the original) is possible. `false`:
+    /// - once the file's removable drive was disconnected before its copy
+    ///   was complete ([`Storage::Disconnected`]), because Save needs the
+    ///   bytes that were never read (ADR-0006). Save As is allowed; it
+    ///   writes the [`available_len`](Self::available_len) bytes, and the
+    ///   app explains that the rest is missing;
+    /// - once the user's file changed while it was being read
+    ///   ([`changed_on_disk`](Self::changed_on_disk)), because the bytes
+    ///   Leal holds may mix old and new contents, and Save would write that
+    ///   mix over the file. The app offers Reload (task 1.9).
+    #[must_use]
+    pub fn can_save(&self) -> bool {
+        self.storage() != Storage::Disconnected && !self.changed_on_disk()
+    }
+
+    /// Whether the user's file changed on disk while Leal was reading it.
+    /// Only a file on a removable drive that can't clone is read without a
+    /// snapshot, so only then can this be `true`. It is checked after every
+    /// read of the file: each chunk [`stream`](Self::stream) reads, and
+    /// each [`read_range`](Self::read_range) that isn't served from the
+    /// copy. Once it is `true`, it stays `true`; the copy is never mapped,
+    /// reads that would need the file give
+    /// [`ReadErrorKind::ChangedOnDisk`], and [`can_save`](Self::can_save)
+    /// is `false`.
+    ///
+    /// **Rows read before the change was detected must be discarded**, not
+    /// only the ones after it: first paint may have read the old bytes, and
+    /// a change between two checks can't be placed exactly, so the rows the
+    /// app holds may come from two versions of the file. The app drops its
+    /// row cache and offers Reload (task 1.9). A change after the copy is
+    /// complete doesn't affect the copy, and is the file watcher's to
+    /// notice.
+    #[must_use]
+    pub fn changed_on_disk(&self) -> bool {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.changed_on_disk(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    fn len_usize(&self) -> usize {
+        match &self.bytes {
+            Bytes::Mapped(map) => map.len(),
+            Bytes::Owned(bytes) => bytes.len(),
+            Bytes::Removable(removable) => removable.len(),
+        }
     }
 
     /// The path the file was opened from.
@@ -267,10 +589,16 @@ impl Source {
         &self.path
     }
 
-    /// Where the bytes are held: a clone, memory or a copy.
+    /// Where the bytes are held: a clone, memory or a copy, or, for a file
+    /// on a removable drive, read from the drive or disconnected from it.
+    /// That last one changes as [`stream`](Self::stream) runs, or when the
+    /// drive vanishes.
     #[must_use]
     pub fn storage(&self) -> Storage {
-        self.storage
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.storage(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => self.storage,
+        }
     }
 
     /// The file's raw extended attributes, for detection.
@@ -284,6 +612,90 @@ impl Source {
     pub fn identity(&self) -> &FileIdentity {
         &self.identity
     }
+
+    /// The clone on the removable drive, while there is one.
+    #[cfg(test)]
+    fn external_clone(&self) -> Option<PathBuf> {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.external_clone(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => None,
+        }
+    }
+
+    /// Lets go of the clone on the removable drive, if any, as a crash
+    /// would.
+    #[cfg(test)]
+    fn abandon_external_clone(&mut self) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.abandon_external_clone();
+        }
+    }
+}
+
+/// `range`, cut short at `len`.
+fn clamp(range: Range<usize>, len: usize) -> Range<usize> {
+    let end = range.end.min(len);
+    range.start.min(end)..end
+}
+
+/// [`Source::stream`] over bytes that are all in hand.
+fn stream_slice(
+    bytes: &[u8],
+    chunk_len: usize,
+    cancel: &AtomicBool,
+    mut on_chunk: impl FnMut(Chunk<'_>),
+) -> Result<(), ReadError> {
+    let mut offset = 0;
+    for chunk in bytes.chunks(chunk_len.max(1)) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ReadError::cancelled());
+        }
+        on_chunk(Chunk {
+            offset,
+            bytes: chunk,
+        });
+        offset += chunk.len();
+    }
+    Ok(())
+}
+
+/// Whether the file's clone must be treated as being on a removable drive
+/// (ADR-0006).
+fn can_vanish(
+    file: &File,
+    identity: &FileIdentity,
+    temp: &TempFolders,
+    volume: &VolumeInfo,
+    check: VolumeCheck,
+) -> bool {
+    match check {
+        VolumeCheck::Detect => {}
+        #[cfg(test)]
+        VolumeCheck::Internal => return false,
+        #[cfg(test)]
+        VolumeCheck::Removable => return true,
+    }
+    // The scratch directory is on the boot volume, which can't vanish
+    // without the Mac going with it, and copying a file to its own volume
+    // would gain nothing. This also keeps opening a file there as fast as
+    // before: one `stat`, and no detection. The scratch directory may not
+    // exist yet, so this asks its nearest folder that does.
+    let on_scratch_volume = temp
+        .scratch()
+        .ancestors()
+        .find_map(|folder| fs::metadata(folder).ok())
+        .is_some_and(|scratch| scratch.dev() == identity.device);
+    if on_scratch_volume {
+        return false;
+    }
+    // The one routing decision for ADR-0006 option C. Network shares stay
+    // on the 1.1 fallbacks until Rob decides otherwise (the proposal is in
+    // docs/tasks/1.1a.md); streaming them too means adding
+    // `VolumeKind::Network` here.
+    matches!(
+        volume::kind(volume, volume::flags(file).ok()),
+        VolumeKind::Removable
+    )
 }
 
 impl fmt::Debug for Source {
@@ -291,8 +703,8 @@ impl fmt::Debug for Source {
         // Not the bytes themselves, which may be gigabytes.
         f.debug_struct("Source")
             .field("path", &self.path)
-            .field("len", &self.bytes().len())
-            .field("storage", &self.storage)
+            .field("len", &self.len())
+            .field("storage", &self.storage())
             .field("attributes", &self.attributes)
             .field("identity", &self.identity)
             .finish_non_exhaustive()

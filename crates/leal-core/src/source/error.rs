@@ -1,4 +1,5 @@
-//! Why a file couldn't be opened, in a form the app can word for users.
+//! Why a file couldn't be opened or read, in a form the app can word for
+//! users.
 
 use std::fmt;
 use std::io;
@@ -143,6 +144,119 @@ impl fmt::Display for OpenError {
 }
 
 impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Why [`Source::read_range`](super::Source::read_range) or
+/// [`Source::stream`](super::Source::stream) failed.
+///
+/// Reads can only fail for a file on a removable drive, before its copy on
+/// the internal disk is complete (ADR-0006), or when a stream is cancelled
+/// or finds the file changed on disk.
+/// The [`Display`](fmt::Display) text is English and meant for logs.
+#[derive(Debug)]
+pub struct ReadError {
+    kind: ReadErrorKind,
+    error: io::Error,
+}
+
+/// The kinds of [`ReadError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadErrorKind {
+    /// The drive holding the file was disconnected (unplugged or
+    /// force-ejected) before the bytes asked for were copied. The source
+    /// is now [`Storage::Disconnected`](super::Storage::Disconnected): the
+    /// bytes copied before it vanished can still be read, nothing after
+    /// them can, and Save is refused.
+    Disconnected,
+    /// The stream's cancel flag was set.
+    Cancelled,
+    /// The pass is complete and the internal copy is mapped, but the
+    /// user's file changed while it was being read: its size or
+    /// modification time differ from when it was opened. This can only
+    /// happen on a removable drive that can't clone, where Leal reads the
+    /// user's file itself, so the bytes may mix old and new contents.
+    /// [`Source::changed_on_disk`](super::Source::changed_on_disk) stays
+    /// `true`, for the "changed elsewhere" banner (task 1.9).
+    ChangedOnDisk,
+    /// Anything else, such as a read error on a drive that is still there,
+    /// or the internal disk being full while copying. The source is
+    /// unchanged, so the read or stream can be tried again.
+    Other,
+}
+
+impl ReadError {
+    pub(crate) fn new(kind: ReadErrorKind, error: io::Error) -> Self {
+        Self { kind, error }
+    }
+
+    /// The drive vanished; `error` is what the read reported.
+    pub(crate) fn disconnected(error: io::Error) -> Self {
+        Self::new(ReadErrorKind::Disconnected, error)
+    }
+
+    /// The drive vanished earlier, so this read wasn't tried.
+    pub(crate) fn already_disconnected() -> Self {
+        Self::disconnected(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "the drive holding the file was disconnected",
+        ))
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::new(
+            ReadErrorKind::Cancelled,
+            io::Error::new(io::ErrorKind::Interrupted, "cancelled"),
+        )
+    }
+
+    pub(crate) fn changed_on_disk() -> Self {
+        Self::new(
+            ReadErrorKind::ChangedOnDisk,
+            io::Error::other("the file changed on disk while it was being read"),
+        )
+    }
+
+    pub(crate) fn other(error: io::Error) -> Self {
+        Self::new(ReadErrorKind::Other, error)
+    }
+
+    /// What kind of failure this is.
+    #[must_use]
+    pub fn kind(&self) -> ReadErrorKind {
+        self.kind
+    }
+
+    /// The OS error code (an errno such as `libc::EIO`), if the error came
+    /// from the operating system.
+    #[must_use]
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.error.raw_os_error()
+    }
+
+    /// The underlying I/O error.
+    #[must_use]
+    pub fn io_error(&self) -> &io::Error {
+        &self.error
+    }
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ReadErrorKind::Disconnected => write!(f, "the drive was disconnected: {}", self.error),
+            ReadErrorKind::Cancelled => f.write_str("cancelled"),
+            ReadErrorKind::ChangedOnDisk => f.write_str(
+                "the file changed on disk while it was being read, so the copy may mix old and new bytes",
+            ),
+            ReadErrorKind::Other => write!(f, "couldn't read the file: {}", self.error),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }

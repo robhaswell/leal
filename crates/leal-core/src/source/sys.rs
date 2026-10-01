@@ -1,6 +1,8 @@
 //! The system calls [`super`] needs that the standard library doesn't wrap:
-//! cloning a file, reading an extended attribute, clearing `O_NONBLOCK`, and
-//! the memory map itself.
+//! cloning a file, reading an extended attribute, clearing `O_NONBLOCK`, a
+//! volume's mount flags, and the memory map itself. (Ordinary reads at an
+//! offset, `pread`, need no `unsafe`: the standard library has them as
+//! `FileExt::read_at`.)
 //!
 //! This is the only module in `leal-core` allowed to use `unsafe`
 //! (CLAUDE.md). Each function wraps exactly one unsafe operation in a safe
@@ -140,19 +142,41 @@ pub(super) fn map_read_only(file: &File) -> io::Result<Mmap> {
     //   alone, under a name no other program uses. Its locking flags are
     //   cleared and it is made read-only (mode 0400) before it is mapped;
     //   `open` fails if either step fails.
-    // - Leal never writes it: `file` is opened read-only, and the map is
-    //   read-only (`PROT_READ`).
+    // - Leal never writes it while it is mapped: `file` is opened
+    //   read-only, and the map is read-only (`PROT_READ`). The internal copy
+    //   of a file on a removable drive, which `Source::stream` writes
+    //   (ADR-0006), is mapped only once the stream has written all of it
+    //   and made it read-only, and nothing writes it after that.
+    // - It is never on a volume that can vanish: if a removable drive is
+    //   unplugged or force-ejected, the mapped pages go with it and reading
+    //   an unloaded one kills the process with SIGBUS. So nothing on a
+    //   removable volume is ever mapped (ADR-0006 option C): the clone there
+    //   (or the user's file, if the volume can't clone) is read with
+    //   `pread`, which returns an error instead, and copied to the internal
+    //   disk, and that copy is what gets mapped. The fallback copy
+    //   and the internal copy are in the scratch directory, on the boot
+    //   volume.
     // Another process running as the same user could still deliberately
     // open and change it, as it could any of the user's files; we accept
     // that, as every macOS app that maps files does.
-    //
-    // Known gap (ADR-0006, proposed): a clone on a *removable* volume is
-    // mapped too (ADR-0005 decision 7). If that drive is unplugged or
-    // force-ejected while the file is open, the pages vanish and the next
-    // read of an unloaded page kills Leal with SIGBUS. A normal eject is
-    // refused while the clone is open. ADR-0006 decides the fix; until then
-    // this is the accepted behaviour.
     unsafe { Mmap::map(file) }
+}
+
+/// The mount flags (`f_flags`, the `MNT_*` constants) of the volume the
+/// open file `file` is on, from `fstatfs(2)`.
+pub(super) fn volume_flags(file: &File) -> io::Result<u32> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fstatfs` writes one `struct statfs` to the pointer, which
+    // points at uninitialised memory of exactly that type and size, owned by
+    // this function. The descriptor is open and borrowed from `file` for
+    // the length of the call.
+    let result = unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatfs` returned 0, so it filled in the whole struct.
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_flags)
 }
 
 /// `path` as a NUL-terminated C string.

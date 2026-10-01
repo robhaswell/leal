@@ -33,7 +33,7 @@ final class LealFFITests: XCTestCase {
         XCTAssertThrowsError(try inspectFile(path: path)) { error in
             XCTAssertEqual(error as? LealError, LealError.NotFound(path: path, code: ENOENT))
         }
-        XCTAssertThrowsError(try openSource(path: path, volumeFolder: nil, temp: temporaryLocations())) { error in
+        XCTAssertThrowsError(try openSource(path: path, volume: VolumeInfo(), temp: temporaryLocations())) { error in
             XCTAssertEqual(error as? LealError, LealError.NotFound(path: path, code: ENOENT))
             XCTAssertEqual(OpenErrorText.describe(error), "The file doesn’t exist.")
         }
@@ -49,7 +49,7 @@ final class LealFFITests: XCTestCase {
             XCTAssertEqual(error as? LealError, expected)
         }
         let volumeFolder = try XCTUnwrap(TemporaryFolders.volumeFolder(for: url))
-        XCTAssertThrowsError(try openSource(path: path, volumeFolder: volumeFolder, temp: temporaryLocations())) {
+        XCTAssertThrowsError(try openSource(path: path, volume: VolumeInfo(folder: volumeFolder), temp: temporaryLocations())) {
             error in
             XCTAssertEqual(error as? LealError, expected)
             XCTAssertEqual(OpenErrorText.describe(error), "It’s a folder, not a file.")
@@ -85,15 +85,16 @@ final class LealFFITests: XCTestCase {
 
     /// The production path: `FileManager` makes a folder on the file's
     /// volume, the core clones into it, and releasing the source deletes it.
+    /// Foundation says the boot volume is internal and not ejectable, so the
+    /// clone is mapped.
     func testOpenSourceClonesIntoTheFoldersFileManagerGives() throws {
         let url = try temporaryFile(named: "people.csv", contents: "name,city\nAda,London\n")
-        let volumeFolder = try XCTUnwrap(TemporaryFolders.volumeFolder(for: url))
+        let volume = TemporaryFolders.volume(for: url)
+        let volumeFolder = try XCTUnwrap(volume.folder)
+        XCTAssertEqual(volume.isInternal, true)
+        XCTAssertEqual(volume.isEjectable, false)
         let temp = try temporaryLocations()
-        var source: Source? = try openSource(
-            path: url.path(percentEncoded: false),
-            volumeFolder: volumeFolder,
-            temp: temp
-        )
+        var source: Source? = try openSource(path: url.path(percentEncoded: false), volume: volume, temp: temp)
         XCTAssertEqual(source?.byteCount(), 21)
         XCTAssertEqual(source?.storage(), .clone)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: volumeFolder).count, 1)
@@ -102,16 +103,21 @@ final class LealFFITests: XCTestCase {
         XCTAssertEqual(try removeLeftoverTempFolders(temp: temp), 0)
     }
 
-    /// ADR-0005 decision 7, end to end: a file on a second APFS volume (a
-    /// disk image) is cloned into the folder `FileManager` makes on that
-    /// volume, not read into memory or copied.
-    func testFileOnASecondAPFSVolumeIsCloned() throws {
+    /// ADR-0005 decision 7 and ADR-0006, end to end: a file on a second APFS
+    /// volume (a disk image) is cloned into the folder `FileManager` makes on
+    /// that volume, not read into memory. Foundation says a disk image is
+    /// ejectable, so the core treats it as a removable drive: the clone is
+    /// read, not mapped, until it has been copied to the internal disk.
+    func testFileOnADiskImageIsClonedThereAndReadNotMapped() throws {
         let image = try DiskImage(temporaryDirectory: temporaryDirectory())
         addTeardownBlock { image.detach() }
         let url = image.root.appending(path: "on-image.csv")
         try Data("a,b\n1,2\n".utf8).write(to: url)
 
-        let volumeFolder = try XCTUnwrap(TemporaryFolders.volumeFolder(for: url))
+        let volume = TemporaryFolders.volume(for: url)
+        let volumeFolder = try XCTUnwrap(volume.folder)
+        XCTAssertNotEqual(volume.isInternal, true)
+        XCTAssertEqual(volume.isEjectable, true)
         let device = { (path: String) in
             try FileManager.default.attributesOfItem(atPath: path)[.systemNumber] as? Int
         }
@@ -121,15 +127,15 @@ final class LealFFITests: XCTestCase {
             try device(url.path(percentEncoded: false)),
             "FileManager's folder should be on the image, got \(volumeFolder)"
         )
-        var source: Source? = try openSource(
-            path: url.path(percentEncoded: false),
-            volumeFolder: volumeFolder,
-            temp: temporaryLocations()
-        )
-        XCTAssertEqual(source?.storage(), .clone)
+        let temp = try temporaryLocations()
+        var source: Source? = try openSource(path: url.path(percentEncoded: false), volume: volume, temp: temp)
+        XCTAssertEqual(source?.storage(), .reading)
         XCTAssertEqual(source?.byteCount(), 8)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: volumeFolder).count, 1)
         source = nil
         XCTAssertFalse(FileManager.default.fileExists(atPath: volumeFolder))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temp.scratchDir), [])
+        XCTAssertEqual(try removeLeftoverTempFolders(temp: temp), 0)
     }
 
     /// A Rust panic in an export that returns `Result` arrives in Swift as a
@@ -184,7 +190,7 @@ final class LealFFITests: XCTestCase {
 
 /// A small APFS disk image, attached inside a temporary directory (not in
 /// `/Volumes`) and hidden from Finder. The same approach as `DiskImage` in
-/// crates/leal-core/src/source/tests.rs: a unique path and volume name,
+/// crates/leal-core/src/source/tests/mod.rs: a unique path and volume name,
 /// retries on `hdiutil`'s transient errors, and a failure that reports
 /// `hdiutil`'s exit status, stdout and stderr.
 private struct DiskImage {

@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
+mod removable;
+
 /// A temporary directory that is deleted when the test ends.
 struct TempDir(PathBuf);
 
@@ -95,7 +97,7 @@ const TRANSIENT_HDIUTIL_ERRORS: [&str; 4] = [
 ];
 
 impl DiskImage {
-    /// Creates and attaches a 16 MB image formatted as `fs` (`"APFS"` or
+    /// Creates and attaches a 16 MB image formatted as `fs` (`"APFS"`, `"ExFAT"` or
     /// `"HFS+"`), mounted inside a temporary directory, not in `/Volumes`,
     /// and hidden from Finder (`-nobrowse`).
     fn new(fs_type: &str) -> Self {
@@ -115,8 +117,10 @@ impl DiskImage {
         let image = dir.path().join("volume.dmg");
         let mount = dir.folder("mnt");
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // At most 11 characters, the limit for an exFAT label: a process ID
+        // is at most 5 hex digits.
         let volume_name = format!(
-            "LealTest-{}-{}",
+            "L{:x}-{:x}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -176,6 +180,38 @@ impl DiskImage {
             std::thread::sleep(HDIUTIL_FIRST_BACKOFF);
         }
         attached_devices(&self.image)
+    }
+
+    /// Detaches the image with `-force` straight away, as if the drive were
+    /// unplugged with files on it still open (a normal detach is refused
+    /// then). Panics if the image is still attached afterwards.
+    fn force_detach(&self) {
+        let mut backoff = HDIUTIL_FIRST_BACKOFF;
+        for _ in 0..HDIUTIL_ATTEMPTS {
+            let devices = attached_devices(&self.image);
+            if devices.is_empty() {
+                return;
+            }
+            for device in &devices {
+                // A failure here shows up as a device still attached.
+                let _ = Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force"])
+                    .arg(device)
+                    .output();
+            }
+            if attached_devices(&self.image).is_empty() {
+                return;
+            }
+            std::thread::sleep(backoff);
+            backoff *= 2;
+        }
+        let left = attached_devices(&self.image);
+        assert!(
+            left.is_empty(),
+            "couldn't force-detach {} ({})",
+            self.image.display(),
+            left.join(", ")
+        );
     }
 }
 
@@ -307,6 +343,43 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Opens `path` as if its volume were internal (a disk image standing in
+/// for a second internal disk or partition), with the given folder and
+/// memory limit.
+fn open_as_internal(
+    path: &Path,
+    temp: &TempFolders,
+    folder: Option<PathBuf>,
+    memory_limit: u64,
+) -> Source {
+    Source::open_with_options(
+        path,
+        temp,
+        VolumeInfo {
+            folder,
+            ..VolumeInfo::default()
+        },
+        Options {
+            memory_limit,
+            volume: VolumeCheck::Internal,
+            ..Options::default()
+        },
+    )
+    .unwrap()
+}
+
+/// A mapped or in-memory source's bytes, which `read_range` must also
+/// give, borrowed.
+fn bytes_of(source: &Source) -> &[u8] {
+    let slice = source
+        .as_slice()
+        .expect("a source on an internal volume has one slice");
+    let read = source.read_range(0..slice.len()).unwrap();
+    assert!(matches!(read, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(&*read, slice);
+    slice
+}
+
 // ---------------------------------------------------------------------------
 // Opening and reading
 
@@ -321,7 +394,7 @@ fn opens_a_clone_with_the_files_bytes() {
     let dir = TempDir::new("basic");
     let path = dir.file("a.csv", b"name,age\r\nAda,36\r\n");
     let source = Source::open(&path, &dir.temp_folders(), None).unwrap();
-    assert_eq!(source.bytes(), b"name,age\r\nAda,36\r\n");
+    assert_eq!(bytes_of(&source), b"name,age\r\nAda,36\r\n");
     assert_eq!(source.storage(), Storage::Clone);
     assert_eq!(source.path(), path);
     assert_eq!(source.identity().len, 18);
@@ -334,7 +407,7 @@ fn empty_file() {
     let dir = TempDir::new("empty");
     let path = dir.file("empty.csv", b"");
     let source = Source::open(&path, &dir.temp_folders(), None).unwrap();
-    assert_eq!(source.bytes(), b"");
+    assert_eq!(bytes_of(&source), b"");
     assert_eq!(source.storage(), Storage::Clone);
 }
 
@@ -348,16 +421,16 @@ fn snapshot_survives_changes_to_the_original() {
     let source = Source::open(&path, &dir.temp_folders(), None).unwrap();
 
     fs::write(&path, b"short").unwrap();
-    assert_eq!(source.bytes(), original.as_slice());
+    assert_eq!(bytes_of(&source), original.as_slice());
     File::options()
         .write(true)
         .open(&path)
         .unwrap()
         .set_len(0)
         .unwrap();
-    assert_eq!(source.bytes(), original.as_slice());
+    assert_eq!(bytes_of(&source), original.as_slice());
     fs::remove_file(&path).unwrap();
-    assert_eq!(source.bytes(), original.as_slice());
+    assert_eq!(bytes_of(&source), original.as_slice());
 }
 
 /// Every corpus file reads back byte for byte.
@@ -369,7 +442,7 @@ fn corpus_files_read_back_identically() {
     assert!(!cases.is_empty());
     for case in cases {
         let source = Source::open(&case.path, &temp, None).unwrap();
-        assert_eq!(source.bytes(), case.bytes.as_slice(), "{}", case.name);
+        assert_eq!(bytes_of(&source), case.bytes.as_slice(), "{}", case.name);
         assert_eq!(source.storage(), Storage::Clone, "{}", case.name);
     }
 }
@@ -381,7 +454,7 @@ proptest! {
         let dir = TempDir::new("prop");
         let path = dir.file("a.csv", &bytes);
         let source = Source::open(&path, &dir.temp_folders(), None).unwrap();
-        prop_assert_eq!(source.bytes(), bytes.as_slice());
+        prop_assert_eq!(bytes_of(&source), bytes.as_slice());
     }
 }
 
@@ -542,7 +615,10 @@ fn an_attribute_over_the_limit_is_none() {
 // Where the clone goes, and the fallbacks
 
 /// The case ADR-0005 decision 7 is about: a file on a second APFS volume is
-/// cloned into the folder on its own volume, not copied.
+/// cloned into the folder on its own volume, not copied. A disk image is
+/// removable, so the test treats it as internal (a second internal disk)
+/// to reach the mapped clone; `removable::a_disk_image_is_detected_as_removable`
+/// covers the image as it is.
 #[test]
 fn file_on_a_second_apfs_volume_is_cloned_on_that_volume() {
     let image = DiskImage::new("APFS");
@@ -557,9 +633,21 @@ fn file_on_a_second_apfs_volume_is_cloned_on_that_volume() {
         "the image is a different volume"
     );
 
-    let source = Source::open(&path, &dir.temp_folders(), Some(given.clone())).unwrap();
+    let source = Source::open_with_options(
+        &path,
+        &dir.temp_folders(),
+        VolumeInfo {
+            folder: Some(given.clone()),
+            ..VolumeInfo::default()
+        },
+        Options {
+            volume: VolumeCheck::Internal,
+            ..Options::default()
+        },
+    )
+    .unwrap();
     assert_eq!(source.storage(), Storage::Clone);
-    assert_eq!(source.bytes(), b"x,y\n1,2\n");
+    assert_eq!(bytes_of(&source), b"x,y\n1,2\n");
     let clone = source.temp.as_ref().unwrap().file_path();
     assert!(clone.starts_with(&given));
     assert_eq!(device(&clone), device(&path));
@@ -573,16 +661,25 @@ fn file_on_a_second_apfs_volume_is_cloned_on_that_volume() {
 }
 
 /// Without a folder on its volume, a file on another APFS volume gets
-/// `EXDEV` from the scratch directory and falls back to memory.
+/// `EXDEV` from the scratch directory and falls back: to memory on an
+/// internal volume, and to reading the file itself on a removable one.
 #[test]
 fn file_on_another_volume_without_a_folder_there_falls_back() {
     let image = DiskImage::new("APFS");
     let dir = TempDir::new("exdev");
     let path = image.root().join("a.csv");
     fs::write(&path, b"x\n").unwrap();
-    let source = Source::open(&path, &dir.temp_folders(), None).unwrap();
+    let source = open_as_internal(&path, &dir.temp_folders(), None, MEMORY_FALLBACK_MAX_BYTES);
     assert_eq!(source.storage(), Storage::Memory);
-    assert_eq!(source.bytes(), b"x\n");
+    assert_eq!(bytes_of(&source), b"x\n");
+
+    let removable = Source::open(&path, &dir.temp_folders(), None).unwrap();
+    assert_eq!(removable.storage(), Storage::Reading);
+    assert_eq!(
+        removable.external_clone(),
+        Some(path.clone()),
+        "reads the file itself"
+    );
 }
 
 /// EXDEV means "clone elsewhere": a given folder that turns out to be on
@@ -603,8 +700,8 @@ fn given_folder_on_the_wrong_volume_clones_elsewhere() {
     assert!(clone.starts_with(dir.path().join("scratch")));
 }
 
-/// A volume that can't clone at all (HFS+) gets `ENOTSUP`: the file is read
-/// into memory.
+/// An internal volume that can't clone at all (HFS+; the image stands in
+/// for an internal partition) gets `ENOTSUP`: the file is read into memory.
 #[test]
 fn volume_that_cant_clone_reads_into_memory() {
     let image = DiskImage::new("HFS+");
@@ -614,19 +711,24 @@ fn volume_that_cant_clone_reads_into_memory() {
     let given = image.root().join("NSIRD_Leal_test");
     fs::create_dir(&given).unwrap();
 
-    let source = Source::open(&path, &dir.temp_folders(), Some(given.clone())).unwrap();
+    let source = open_as_internal(
+        &path,
+        &dir.temp_folders(),
+        Some(given.clone()),
+        MEMORY_FALLBACK_MAX_BYTES,
+    );
     assert_eq!(source.storage(), Storage::Memory);
-    assert_eq!(source.bytes(), b"a,b\n1,2\n");
+    assert_eq!(bytes_of(&source), b"a,b\n1,2\n");
     assert!(!given.exists());
     assert!(entries(&dir.path().join("records")).is_empty());
 
     // Also a snapshot.
     fs::write(&path, b"").unwrap();
-    assert_eq!(source.bytes(), b"a,b\n1,2\n");
+    assert_eq!(bytes_of(&source), b"a,b\n1,2\n");
 }
 
-/// Above the memory limit, a file on a volume that can't clone is copied to
-/// the scratch directory and the copy is mapped.
+/// Above the memory limit, a file on an internal volume that can't clone is
+/// copied to the scratch directory and the copy is mapped.
 #[test]
 fn large_file_on_a_volume_that_cant_clone_is_copied() {
     let image = DiskImage::new("HFS+");
@@ -638,9 +740,9 @@ fn large_file_on_a_volume_that_cant_clone_is_copied() {
     fs::write(&path, &contents).unwrap();
     let temp = dir.temp_folders();
 
-    let source = Source::open_with_memory_limit(&path, &temp, None, 1_000_000).unwrap();
+    let source = open_as_internal(&path, &temp, None, 1_000_000);
     assert_eq!(source.storage(), Storage::Copy);
-    assert_eq!(source.bytes(), contents.as_slice());
+    assert_eq!(bytes_of(&source), contents.as_slice());
     let copy = source.temp.as_ref().unwrap().file_path();
     assert!(copy.starts_with(temp.scratch()));
     assert_eq!(
@@ -649,7 +751,7 @@ fn large_file_on_a_volume_that_cant_clone_is_copied() {
     );
 
     fs::write(&path, b"").unwrap();
-    assert_eq!(source.bytes(), contents.as_slice());
+    assert_eq!(bytes_of(&source), contents.as_slice());
     drop(source);
     assert!(entries(temp.scratch()).is_empty());
     assert!(entries(temp.records()).is_empty());
@@ -662,11 +764,11 @@ fn file_exactly_at_the_memory_limit_is_read_into_memory() {
     let path = image.root().join("a.csv");
     fs::write(&path, b"12345").unwrap();
     let temp = dir.temp_folders();
-    let at_limit = Source::open_with_memory_limit(&path, &temp, None, 5).unwrap();
+    let at_limit = open_as_internal(&path, &temp, None, 5);
     assert_eq!(at_limit.storage(), Storage::Memory);
-    let over_limit = Source::open_with_memory_limit(&path, &temp, None, 4).unwrap();
+    let over_limit = open_as_internal(&path, &temp, None, 4);
     assert_eq!(over_limit.storage(), Storage::Copy);
-    assert_eq!(over_limit.bytes(), b"12345");
+    assert_eq!(bytes_of(&over_limit), b"12345");
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +820,7 @@ fn memory_fallback_leaves_no_temporary_folder() {
     let path = image.root().join("a.csv");
     fs::write(&path, b"a\n").unwrap();
     let temp = dir.temp_folders();
-    let source = Source::open(&path, &temp, None).unwrap();
+    let source = open_as_internal(&path, &temp, None, MEMORY_FALLBACK_MAX_BYTES);
     assert_eq!(source.storage(), Storage::Memory);
     assert!(entries(temp.scratch()).is_empty());
     assert!(entries(temp.records()).is_empty());
@@ -753,11 +855,17 @@ fn cleanup_removes_a_crashed_clone_on_another_volume() {
     let given = image.root().join("NSIRD_Leal_test");
     fs::create_dir(&given).unwrap();
     let temp = dir.temp_folders();
-    crash(Source::open(&path, &temp, Some(given.clone())).unwrap());
+    // The image is removable, so there are two folders: the clone on the
+    // image and the internal copy in the scratch directory.
+    let source = Source::open(&path, &temp, Some(given.clone())).unwrap();
+    assert_eq!(source.storage(), Storage::Reading);
+    crash(source);
     assert!(given.exists());
+    assert_eq!(entries(temp.scratch()).len(), 1);
 
-    assert_eq!(temp.remove_leftovers().unwrap(), 1);
+    assert_eq!(temp.remove_leftovers().unwrap(), 2);
     assert!(!given.exists());
+    assert!(entries(temp.scratch()).is_empty());
     assert!(entries(temp.records()).is_empty());
 }
 
@@ -770,7 +878,7 @@ fn cleanup_leaves_folders_in_use() {
     let temp = dir.temp_folders();
     let source = Source::open(&path, &temp, None).unwrap();
     assert_eq!(temp.remove_leftovers().unwrap(), 0);
-    assert_eq!(source.bytes(), b"a\n");
+    assert_eq!(bytes_of(&source), b"a\n");
     assert!(source.temp.as_ref().unwrap().file_path().exists());
     assert_eq!(entries(temp.records()).len(), 1);
 }
@@ -821,10 +929,11 @@ fn cleanup_keeps_records_of_unmounted_volumes() {
     assert_eq!(entries(&records), vec![records.join("1-1-1.record")]);
 }
 
-/// Hands a source's temporary folder over as a crash would: its record's
-/// lock is released, and nothing is deleted.
+/// Hands a source's temporary folders over as a crash would: their
+/// records' locks are released, and nothing is deleted.
 fn crash(mut source: Source) {
     source.temp.take().unwrap().abandon();
+    source.abandon_external_clone();
 }
 
 // ---------------------------------------------------------------------------
@@ -872,7 +981,7 @@ fn locked_and_append_only_originals_give_a_deletable_read_only_clone() {
 
         let source = Source::open(&path, &temp, None).unwrap();
         assert_eq!(source.storage(), Storage::Clone, "{flag}");
-        assert_eq!(source.bytes(), b"a,b\n1,2\n", "{flag}");
+        assert_eq!(bytes_of(&source), b"a,b\n1,2\n", "{flag}");
         let clone = source.temp.as_ref().unwrap().file_path();
         assert_eq!(
             file_flags(&clone) & (libc::UF_IMMUTABLE | libc::UF_APPEND),

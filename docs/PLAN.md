@@ -94,7 +94,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (Phase 0 review rust-4: today `LealError::Io` carries only
     `io::Error`'s Display text, which the alert shows as is, such as
     "Permission denied (os error 13)".)
-- [ ] **1.1a Removable drives** (ADR-0006, option C).
+- [~] **1.1a Removable drives** (ADR-0006, option C).
   - Detect removable volumes from the volume's "is internal" and "is
     ejectable" properties.
   - Read ranges with ordinary reads (`pread`) for removable volumes, so the
@@ -191,6 +191,16 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     reports completion. A Rust test shows that calling `cancel()` stops a
     running job within one chunk. The Swift side is 1.6. (ADR-0005
     decision 6)
+  - Joins the index pass to the removable-drive copy: the indexer runs on
+    `Source::stream`'s chunks (1.1a), carrying its state and one-unit
+    look-ahead across chunk boundaries; internal volumes can keep
+    `Indexer::run(source.as_slice())`.
+  - Rows before a full slice exists (a file on a removable drive, until
+    its copy is mapped): the index and row parser get window variants,
+    `RowIndex::row_in(window, base)` and `RowParser::parse(window, base,
+    span)`, so rows are served from `Source::read_range` with one range
+    read per screenful. The 1.1a review measured this at about 2 µs per
+    screenful. (1.1a review)
 - [x] **1.4 Rows and fields** — lenient parser, display values, LRU cache (§3.4).
   - Follows ADR-0003 decisions 2, 3, 6 and 7: text after a closing quote
     displays raw (`"a"b` shows as `"a"b`), quotes in it are literal, every
@@ -285,6 +295,22 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Screenshots next to mockups 04a, 05a and 06c.
 - [ ] **1.9 External changes** — watch the original, Reload / Keep editing.
   - Works with the App Sandbox on.
+  - On `ReadErrorKind::ChangedOnDisk` (or `Source::changed_on_disk()`): a
+    file on a removable drive that can't clone changed while Leal was
+    reading it (1.1a). Invalidate the row cache, including rows read
+    before the change was detected, since they may come from the old
+    version; show the "changed elsewhere" banner, and offer Reload. Save
+    is refused meanwhile (`can_save()` is false), because it would write
+    a mix of the two versions over the file. (1.1a re-review)
+  - The drive coming back (ADR-0006: Save is blocked "until the drive
+    returns"). `Storage::Disconnected` is permanent in 1.1a, because the
+    descriptor on the vanished volume is dead. 1.9 detects the volume
+    remounting, re-verifies the file's identity (inode, size, modification
+    time against `Source::identity()`), and then either resumes the copy
+    from `available_len()` or allows Save. If the identity changed, it
+    shows the changed-elsewhere banner instead. Reads from the remounted
+    drive go through `read_range`, which the 1.1a review measured at about
+    2 µs per screenful of rows. (1.1a review)
 - [ ] **1.10 Viewer milestone** — budgets for open, index, scroll and memory
   measured and recorded in `docs/perf.md`, including first paint and scroll
   smoothness while background work runs.

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use leal_core::attributes::{Fingerprint, Interpretation};
-use leal_core::detect::{Choices, DialectSource, EncodingSource, Hints, Note, detect};
+use leal_core::detect::{
+    Choices, DialectSource, EncodingSource, FIRST_PAINT_BYTES, Hints, Note, detect,
+};
 use leal_core::dialect::{Delimiter, Encoding};
 use leal_core::source::{INTERPRETATION_ATTRIBUTE, Source, TEXT_ENCODING_ATTRIBUTE, TempFolders};
 
@@ -63,7 +65,8 @@ fn detection_reads_the_attributes_source_opens() {
 
     let source = Source::open(&path, &dir.temp(), None).unwrap();
     let hints = Hints::from(source.attributes());
-    let d = detect(source.bytes(), source.len(), hints, Choices::default()).unwrap();
+    let head = source.read_range(0..FIRST_PAINT_BYTES).unwrap();
+    let d = detect(&head, source.len(), hints, Choices::default()).unwrap();
     assert_eq!(
         (d.encoding, d.encoding_source),
         (Encoding::Windows1252, EncodingSource::Attribute)
@@ -88,7 +91,7 @@ fn detection_without_attributes_guesses() {
     set_attribute(&path, TEXT_ENCODING_ATTRIBUTE, b"utf-16;256");
     let source = Source::open(&path, &dir.temp(), None).unwrap();
     let d = detect(
-        source.bytes(),
+        &source.read_range(0..FIRST_PAINT_BYTES).unwrap(),
         source.len(),
         source.attributes().into(),
         Choices::default(),

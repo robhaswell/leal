@@ -3,7 +3,7 @@
 [test-groups]
 # Tests that create and attach disk images with `hdiutil`. Run in parallel,
 # `hdiutil create` and `attach` sometimes fail ("Resource busy"), so these
-# run one at a time. `DiskImage::new` in crates/leal-core/src/source/tests.rs
+# run one at a time. `DiskImage::new` in crates/leal-core/src/source/tests/mod.rs
 # fails a test that uses an image but isn't in this group.
 disk-images = { max-threads = 1 }
 
@@ -17,7 +17,14 @@ volume_that_cant_clone_reads_into_memory|\
 large_file_on_a_volume_that_cant_clone_is_copied|\
 file_exactly_at_the_memory_limit_is_read_into_memory|\
 memory_fallback_leaves_no_temporary_folder|\
-cleanup_removes_a_crashed_clone_on_another_volume\
+cleanup_removes_a_crashed_clone_on_another_volume|\
+removable::a_disk_image_is_detected_as_removable|\
+removable::a_drive_disconnected_before_the_copy_fails_reads_without_crashing|\
+removable::a_drive_detached_mid_copy_keeps_what_was_copied|\
+removable::a_completed_copy_survives_the_drive_vanishing|\
+removable::a_drive_that_cant_clone_is_streamed_not_read_at_open|\
+removable::a_drive_that_cant_clone_detached_mid_copy_is_disconnected|\
+removable::changes_to_the_file_without_a_clone_are_reported_and_block_save\
 )$/)
 """
 test-group = "disk-images"
