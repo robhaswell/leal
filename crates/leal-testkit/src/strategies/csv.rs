@@ -932,6 +932,37 @@ mod tests {
             ])
             .is_err()
         );
+        // CR or LF in an unquoted value or in text after a closing quote.
+        assert!(bad(vec![row(vec![unq("a\rb")], None)]).is_err());
+        assert!(bad(vec![row(vec![unq("a\nb")], None)]).is_err());
+        for trailing in [b"x\r", b"x\n"] {
+            assert!(
+                bad(vec![row(
+                    vec![ModelField::Quoted {
+                        value: vec![],
+                        trailing: trailing.to_vec()
+                    }],
+                    None
+                )])
+                .is_err()
+            );
+        }
+        // An unterminated field that isn't the file's last field, or that is
+        // followed by a line ending.
+        assert!(
+            bad(vec![row(
+                vec![ModelField::Unterminated(b"a".to_vec()), unq("b")],
+                None
+            )])
+            .is_err()
+        );
+        assert!(
+            bad(vec![row(
+                vec![ModelField::Unterminated(b"a".to_vec())],
+                Some(LineEnding::Lf)
+            )])
+            .is_err()
+        );
         assert!(bad(vec![row(vec![unq("\u{FEFF}a")], None)]).is_err());
         assert!(
             bad(vec![
@@ -939,6 +970,30 @@ mod tests {
                 row(vec![unq("")], Some(LineEnding::Lf)),
             ])
             .is_err()
+        );
+    }
+
+    /// Proptest prints models with this, so every kind of field must show.
+    #[test]
+    fn model_field_debug_shows_escaped_bytes() {
+        let printed = format!(
+            "{:?}",
+            [
+                unq("a\r"),
+                ModelField::Quoted {
+                    value: b"x\"".to_vec(),
+                    trailing: vec![],
+                },
+                ModelField::Quoted {
+                    value: b"q".to_vec(),
+                    trailing: b"t".to_vec(),
+                },
+                ModelField::Unterminated(b"\xFF".to_vec()),
+            ]
+        );
+        assert_eq!(
+            printed,
+            r#"[Unquoted("a\r"), Quoted("x\""), Quoted("q", trailing: "t"), Unterminated("\xff")]"#
         );
     }
 
