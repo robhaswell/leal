@@ -24,6 +24,8 @@ leal-testkit = { path = "crates/leal-testkit" }
 # Default features off: `fork` and `timeout` pull in `rusty-fork` and
 # `tempfile`, which nextest (one process per test) makes unnecessary.
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+# Single-byte and UTF-16 decoding (WHATWG Encoding Standard), task 1.2.
+encoding_rs = "0.8.42"
 
 # Every crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]
