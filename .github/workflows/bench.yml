@@ -2,9 +2,11 @@ name: Benchmarks
 
 # The criterion benchmarks (crates/leal-bench) on each push to `main` that
 # touches code, compared with the commit before the push on the same runner.
-# The job fails when a benchmark is over its DESIGN §1 budget, or more than
-# 25% slower than before on a run whose noise canaries held still. Why it
-# works this way, and what to do when it fails: docs/tasks/1.2b.md.
+# The job fails when a benchmark is over its DESIGN §1 budget; when it is
+# slower than before with the whole 95% interval of the change above +20%;
+# when the noise canaries moved by more than 10% twice running (the first
+# time, it reruns); or when the base commit's benchmarks fail. Why it works
+# this way, and what to do when it fails: docs/tasks/1.2b.md.
 on:
   push:
     branches: [main]
@@ -61,16 +63,27 @@ jobs:
       - name: Generate and check the reference file
         run: just reference-file
 
-      # The commit before this push (`github.event.before`), the dispatch
-      # input, or else the parent commit.
+      # The dispatch input, which must be a commit; on a push, the commit
+      # before it (`github.event.before`); otherwise the parent commit.
       - name: Choose the base commit
         id: base
         env:
           BEFORE: ${{ github.event.before }}
           REQUESTED: ${{ inputs.base }}
         run: |
-          base="${REQUESTED:-${BEFORE:-}}"
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+          if [ -n "$REQUESTED" ]; then
+            if ! base="$(git rev-parse --verify --quiet "$REQUESTED^{commit}")"; then
+              echo "::error::The base input '$REQUESTED' is not a commit in this repository"
+              exit 1
+            fi
+          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          else
+            # A dispatch with no input, or a push whose previous tip is
+            # unknown (a new branch) or gone (a force push).
+            if [ -n "$BEFORE" ]; then
+              echo "::warning::The commit before this push ($BEFORE) isn't available; comparing with the parent commit instead"
+            fi
             base="$(git rev-parse HEAD~1)"
           fi
           echo "sha=$base" >> "$GITHUB_OUTPUT"

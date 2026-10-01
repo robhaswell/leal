@@ -4,18 +4,25 @@
 //! `<criterion dir>/<benchmark>/new/` (`benchmark.json` for its id and
 //! throughput, `estimates.json` for its statistics). When it compares with
 //! a saved baseline (`--baseline-lenient base`), it also writes
-//! `<benchmark>/change/estimates.json`, the relative change. This module
-//! reads those files; `bench-report` prints the result.
+//! `<benchmark>/change/estimates.json`: the relative change, with a 95%
+//! confidence interval. This module reads those files; `bench-report`
+//! prints the result.
 //!
-//! Two checks fail the report:
+//! The report has one of three verdicts ([`Verdict`]):
 //!
-//! - **Budgets** ([`crate::budgets`]): the median is over the budget, or the
-//!   budgeted benchmark has no result.
-//! - **Regressions**: the median is slower than the baseline's by more than
-//!   the threshold. The `baseline/` benchmarks are the noise canaries: their
-//!   code is the same on both sides of a comparison, so when one of them
-//!   moves by more than the threshold, the machine was too noisy to judge
-//!   and regressions are reported as warnings instead.
+//! - **Fail** if a benchmark is over its budget ([`crate::budgets`]), a
+//!   budgeted benchmark has no result, or, on a quiet run, a benchmark
+//!   regressed: the lower end of the 95% interval for its median's change
+//!   is above [`Thresholds::regression`]. Requiring the whole interval to be
+//!   above the threshold means a single noisy median doesn't fail.
+//! - **Noisy** if a noise canary moved, in either direction, by more than
+//!   [`Thresholds::noise`] (and nothing is over budget). The canaries are
+//!   the `baseline` benchmarks, which run first, and again as
+//!   `baseline-late` after all the others. Their code is the same on both
+//!   sides of a comparison, so when one moves, the machine moved, and the
+//!   run can't judge regressions. `just bench-compare` reruns once, then
+//!   fails.
+//! - **Pass** otherwise.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -26,8 +33,17 @@ use serde_json::Value;
 
 use crate::budgets::Budget;
 
-/// Benchmarks with this id prefix are the noise canaries.
-pub const CANARY_PREFIX: &str = "baseline/";
+/// The criterion groups that are noise canaries: `baseline` runs with the
+/// other benchmarks, and `bench-compare` runs it again as `baseline-late`
+/// after them (`benches/baseline.rs`).
+pub const CANARY_GROUPS: [&str; 2] = ["baseline", "baseline-late"];
+
+/// True if `id` (`group/name`) is a noise canary.
+#[must_use]
+pub fn is_canary(id: &str) -> bool {
+    id.split_once('/')
+        .is_some_and(|(group, _)| CANARY_GROUPS.contains(&group))
+}
 
 /// One benchmark's result.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,9 +54,29 @@ pub struct Measurement {
     pub median_ns: f64,
     /// Bytes processed per iteration, if the benchmark declares it.
     pub throughput_bytes: Option<u64>,
-    /// The median's relative change from the baseline (`0.1` is 10% slower),
-    /// if there was one to compare with.
-    pub change: Option<f64>,
+    /// The change from the baseline, if there was one to compare with.
+    pub change: Option<Change>,
+}
+
+/// The relative change of a benchmark's median from the baseline, as
+/// fractions: `0.1` is 10% slower, `-0.1` 10% faster.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Change {
+    /// Criterion's point estimate.
+    pub median: f64,
+    /// The lower end of criterion's 95% confidence interval.
+    pub lower: f64,
+    /// The upper end of criterion's 95% confidence interval.
+    pub upper: f64,
+}
+
+/// The limits the report checks changes against, as fractions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    /// A benchmark regressed if its change's lower bound is above this.
+    pub regression: f64,
+    /// The run is noisy if a canary's median moved by more than this.
+    pub noise: f64,
 }
 
 /// What the report says about one benchmark.
@@ -48,11 +84,13 @@ pub struct Measurement {
 pub enum Status {
     /// Within its budget and not a regression.
     Ok,
-    /// A noise canary (`baseline/`): reported, never failed.
+    /// A noise canary that held still.
     Canary,
-    /// Slower than the baseline by more than the threshold. Fails.
+    /// A noise canary that moved by more than the noise threshold.
+    NoisyCanary,
+    /// Slower than the baseline past the threshold, on a quiet run. Fails.
     Regression,
-    /// As `Regression`, but on a run whose canaries moved too: a warning.
+    /// As `Regression`, but on a noisy run, so it can't be judged.
     NoisyRegression,
     /// The median is over the benchmark's budget. Fails.
     OverBudget,
@@ -61,20 +99,28 @@ pub enum Status {
 }
 
 impl Status {
-    fn fails(&self) -> bool {
-        matches!(self, Self::Regression | Self::OverBudget | Self::Missing)
-    }
-
     fn label(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Canary => "canary",
+            Self::NoisyCanary => "**canary moved (noisy run)**",
             Self::Regression => "**regression**",
             Self::NoisyRegression => "regression? (noisy run)",
             Self::OverBudget => "**over budget**",
             Self::Missing => "**missing**",
         }
     }
+}
+
+/// The report's overall result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing failed, and the run was quiet enough to judge.
+    Pass,
+    /// A budget failed, or a regression on a quiet run.
+    Fail,
+    /// A canary moved, so regressions can't be judged: rerun.
+    Noisy,
 }
 
 /// One row of the report.
@@ -95,9 +141,9 @@ pub struct Row {
 pub struct Report {
     /// One row per benchmark (and per budget with no result), sorted by id.
     pub rows: Vec<Row>,
-    /// The regression threshold used, as a fraction (`0.25` is 25%).
-    pub threshold: f64,
-    /// True if a noise canary moved by more than the threshold.
+    /// The thresholds used.
+    pub thresholds: Thresholds,
+    /// True if a noise canary moved by more than the noise threshold.
     pub noisy: bool,
 }
 
@@ -131,29 +177,39 @@ fn visit(dir: &Path, found: &mut Vec<Measurement>) -> io::Result<()> {
 }
 
 fn read_measurement(dir: &Path) -> io::Result<Measurement> {
-    let benchmark = read_json(&dir.join("new").join("benchmark.json"))?;
-    let estimates = read_json(&dir.join("new").join("estimates.json"))?;
+    let benchmark_file = dir.join("new").join("benchmark.json");
+    let estimates_file = dir.join("new").join("estimates.json");
     let change_file = dir.join("change").join("estimates.json");
+
+    let benchmark = read_json(&benchmark_file)?;
+    let estimates = read_json(&estimates_file)?;
     let change = if change_file.is_file() {
-        Some(median(&read_json(&change_file)?, &change_file)?)
+        let median = &read_json(&change_file)?["median"];
+        let number = |value: &Value| {
+            value
+                .as_f64()
+                .ok_or_else(|| malformed(&change_file, "no median estimate"))
+        };
+        Some(Change {
+            median: number(&median["point_estimate"])?,
+            lower: number(&median["confidence_interval"]["lower_bound"])?,
+            upper: number(&median["confidence_interval"]["upper_bound"])?,
+        })
     } else {
         None
     };
     let id = benchmark["full_id"]
         .as_str()
-        .ok_or_else(|| malformed(dir, "no `full_id` in benchmark.json"))?;
+        .ok_or_else(|| malformed(&benchmark_file, "no `full_id`"))?;
+    let median_ns = estimates["median"]["point_estimate"]
+        .as_f64()
+        .ok_or_else(|| malformed(&estimates_file, "no median estimate"))?;
     Ok(Measurement {
         id: id.to_owned(),
-        median_ns: median(&estimates, dir)?,
+        median_ns,
         throughput_bytes: benchmark["throughput"]["Bytes"].as_u64(),
         change,
     })
-}
-
-fn median(estimates: &Value, path: &Path) -> io::Result<f64> {
-    estimates["median"]["point_estimate"]
-        .as_f64()
-        .ok_or_else(|| malformed(path, "no median in estimates.json"))
 }
 
 fn read_json(path: &Path) -> io::Result<Value> {
@@ -168,13 +224,20 @@ fn malformed(path: &Path, why: &str) -> io::Error {
     )
 }
 
-/// Checks `measurements` against `budgets` and against their baselines,
-/// failing a slowdown of more than `threshold` (a fraction).
+/// Checks `measurements` against `budgets`, and their changes from the
+/// baseline against `thresholds`.
 #[must_use]
-pub fn evaluate(measurements: &[Measurement], budgets: &[Budget], threshold: f64) -> Report {
-    let noisy = measurements.iter().any(|m| {
-        m.id.starts_with(CANARY_PREFIX) && m.change.is_some_and(|change| change.abs() > threshold)
-    });
+pub fn evaluate(
+    measurements: &[Measurement],
+    budgets: &[Budget],
+    thresholds: Thresholds,
+) -> Report {
+    let canary_moved = |m: &Measurement| {
+        is_canary(&m.id)
+            && m.change
+                .is_some_and(|change| change.median.abs() > thresholds.noise)
+    };
+    let noisy = measurements.iter().any(canary_moved);
 
     let mut rows: Vec<Row> = measurements
         .iter()
@@ -182,9 +245,14 @@ pub fn evaluate(measurements: &[Measurement], budgets: &[Budget], threshold: f64
             let budget = budgets.iter().find(|b| b.id == m.id).copied();
             let status = if budget.is_some_and(|b| m.median_ns > b.max_ms * 1e6) {
                 Status::OverBudget
-            } else if m.id.starts_with(CANARY_PREFIX) {
+            } else if canary_moved(m) {
+                Status::NoisyCanary
+            } else if is_canary(&m.id) {
                 Status::Canary
-            } else if m.change.is_some_and(|change| change > threshold) {
+            } else if m
+                .change
+                .is_some_and(|change| change.lower > thresholds.regression)
+            {
                 if noisy {
                     Status::NoisyRegression
                 } else {
@@ -216,24 +284,32 @@ pub fn evaluate(measurements: &[Measurement], budgets: &[Budget], threshold: f64
 
     Report {
         rows,
-        threshold,
+        thresholds,
         noisy,
     }
 }
 
 impl Report {
-    /// True if any benchmark is over budget, missing, or a regression on a
-    /// quiet run.
+    /// Fail if a budget failed or (on a quiet run) a benchmark regressed;
+    /// otherwise noisy if a canary moved; otherwise pass. A budget failure
+    /// is a failure even on a noisy run: budgets are absolute.
     #[must_use]
-    pub fn failed(&self) -> bool {
-        self.rows.iter().any(|row| row.status.fails())
+    pub fn verdict(&self) -> Verdict {
+        let any = |wanted: &[Status]| self.rows.iter().any(|row| wanted.contains(&row.status));
+        if any(&[Status::OverBudget, Status::Missing, Status::Regression]) {
+            Verdict::Fail
+        } else if self.noisy {
+            Verdict::Noisy
+        } else {
+            Verdict::Pass
+        }
     }
 
-    /// The rows that fail the report or warn about it, for annotations.
+    /// The rows worth an annotation: failures, and what made a run noisy.
     pub fn problems(&self) -> impl Iterator<Item = &Row> {
         self.rows
             .iter()
-            .filter(|row| row.status.fails() || row.status == Status::NoisyRegression)
+            .filter(|row| !matches!(row.status, Status::Ok | Status::Canary))
     }
 
     /// The report as a Markdown table, for the terminal and for GitHub's job
@@ -241,7 +317,9 @@ impl Report {
     #[must_use]
     pub fn markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("| Benchmark | Median | Throughput | Change | Budget | Status |\n");
+        out.push_str(
+            "| Benchmark | Median | Throughput | Change (95% interval) | Budget | Status |\n",
+        );
         out.push_str("|---|---|---|---|---|---|\n");
         for row in &self.rows {
             let (median, throughput, change) = match &row.measurement {
@@ -250,8 +328,17 @@ impl Report {
                     m.throughput_bytes
                         .map(|bytes| gib_per_s(bytes, m.median_ns))
                         .unwrap_or_default(),
-                    m.change
-                        .map_or_else(|| "—".to_owned(), |c| format!("{:+.1}%", c * 100.0)),
+                    m.change.map_or_else(
+                        || "—".to_owned(),
+                        |c| {
+                            format!(
+                                "{} ({} to {})",
+                                percent(c.median),
+                                percent(c.lower),
+                                percent(c.upper)
+                            )
+                        },
+                    ),
                 ),
                 None => ("—".to_owned(), String::new(), "—".to_owned()),
             };
@@ -268,17 +355,22 @@ impl Report {
         }
         let _ = write!(
             out,
-            "\nChange is the median's change from the baseline; a slowdown of more than {:.0}% is a regression.",
-            self.threshold * 100.0
+            "\nA benchmark regressed if its change's whole 95% interval is above {}. \
+             The run is noisy if a `baseline` or `baseline-late` canary moved by more than {}.",
+            percent(self.thresholds.regression),
+            percent(self.thresholds.noise),
         );
         if self.noisy {
-            out.push_str(
-                " A `baseline/` canary moved by more than that, so this run was too noisy to judge regressions; rerun it.",
-            );
+            out.push_str(" **This run was noisy**, so regressions in it can't be judged.");
         }
         out.push('\n');
         out
     }
+}
+
+/// A fraction as a signed percentage: `+1.2%`.
+fn percent(fraction: f64) -> String {
+    format!("{:+.1}%", fraction * 100.0)
 }
 
 /// A duration in nanoseconds, to three significant figures.

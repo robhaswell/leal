@@ -5,6 +5,10 @@
 //!
 //! These are also CI's noise canaries: their code doesn't change between
 //! commits, so if they move, the machine moved (see `src/report.rs`).
+//! `just bench-compare` runs them a second time after all the other
+//! benchmarks, with `LEAL_BENCH_BASELINE_GROUP=baseline-late`, so that noise
+//! late in a run is caught too. That second run is reported under its own
+//! group name, `baseline-late/…`.
 //!
 //! Both run with the file in the page cache (criterion's warm-up reads it),
 //! which is the case for a file the user just opened. A cold read from disk
@@ -45,7 +49,13 @@ fn baseline(c: &mut Criterion) {
     let bytes = std::fs::read(&path).expect("reading the reference file");
     let len = bytes.len() as u64;
 
-    let mut group = c.benchmark_group("baseline");
+    let name = std::env::var("LEAL_BENCH_BASELINE_GROUP").unwrap_or_else(|_| "baseline".into());
+    assert!(
+        leal_bench::report::CANARY_GROUPS.contains(&name.as_str()),
+        "LEAL_BENCH_BASELINE_GROUP must be one of {:?}",
+        leal_bench::report::CANARY_GROUPS
+    );
+    let mut group = c.benchmark_group(name);
     common::whole_file(&mut group, len);
 
     let mut buffer = vec![0; 1 << 20];

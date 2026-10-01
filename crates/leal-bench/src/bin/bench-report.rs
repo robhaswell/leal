@@ -2,13 +2,15 @@
 //! `just bench-compare` runs it, and so does CI.
 //!
 //! ```text
-//! bench-report [--threshold FRACTION] CRITERION_DIR
+//! bench-report [--regression FRACTION] [--noise FRACTION] CRITERION_DIR
 //! ```
 //!
-//! Prints a Markdown table and exits with status 1 if a benchmark is over
-//! budget, missing, or a regression past the threshold (default 0.25, that
-//! is 25% slower). On GitHub Actions it also writes the table to the job
-//! summary and each problem as an annotation.
+//! Prints a Markdown table, then exits with status 0 if the report passed,
+//! 1 if it failed (a budget, or a regression whose 95% interval is wholly
+//! above `--regression`, default 0.20), 3 if the run was too noisy to judge
+//! (a canary moved by more than `--noise`, default 0.10), or 2 on an error.
+//! On GitHub Actions it also writes the table to the job summary and each
+//! problem as an annotation.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -16,12 +18,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use leal_bench::budgets::BUDGETS;
-use leal_bench::report::{self, Status};
+use leal_bench::report::{self, Status, Thresholds, Verdict};
 
 fn main() -> ExitCode {
     match run() {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+        Ok(Verdict::Pass) => ExitCode::SUCCESS,
+        Ok(Verdict::Fail) => ExitCode::from(1),
+        Ok(Verdict::Noisy) => ExitCode::from(3),
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::from(2)
@@ -29,28 +32,32 @@ fn main() -> ExitCode {
     }
 }
 
-/// Returns whether the report passed.
-fn run() -> Result<bool, String> {
-    let mut threshold = 0.25;
+fn run() -> Result<Verdict, String> {
+    let mut thresholds = Thresholds {
+        regression: 0.20,
+        noise: 0.10,
+    };
     let mut dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--threshold" => {
-                let value = args.next().ok_or("--threshold needs a value")?;
-                threshold = value
-                    .parse()
-                    .map_err(|e| format!("--threshold `{value}`: {e}"))?;
+        let target = match arg.as_str() {
+            "--regression" => &mut thresholds.regression,
+            "--noise" => &mut thresholds.noise,
+            _ if dir.is_none() && !arg.starts_with('-') => {
+                dir = Some(PathBuf::from(arg));
+                continue;
             }
-            _ if dir.is_none() && !arg.starts_with('-') => dir = Some(PathBuf::from(arg)),
             _ => return Err(format!("unexpected argument `{arg}`")),
-        }
+        };
+        let value = args.next().ok_or(format!("{arg} needs a value"))?;
+        *target = value.parse().map_err(|e| format!("{arg} `{value}`: {e}"))?;
     }
-    let dir = dir.ok_or("usage: bench-report [--threshold FRACTION] CRITERION_DIR")?;
+    let dir =
+        dir.ok_or("usage: bench-report [--regression FRACTION] [--noise FRACTION] CRITERION_DIR")?;
 
     let measurements =
         report::collect(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
-    let report = report::evaluate(&measurements, BUDGETS, threshold);
+    let report = report::evaluate(&measurements, BUDGETS, thresholds);
     let markdown = report.markdown();
     println!("{markdown}");
 
@@ -68,6 +75,7 @@ fn run() -> Result<bool, String> {
         let (level, what) = match row.status {
             Status::Regression => ("error", "is a regression"),
             Status::NoisyRegression => ("warning", "may be a regression (noisy run)"),
+            Status::NoisyCanary => ("warning", "moved, so the run was noisy"),
             Status::OverBudget => ("error", "is over budget"),
             Status::Missing => ("error", "has a budget but no result"),
             Status::Ok | Status::Canary => continue,
@@ -78,5 +86,5 @@ fn run() -> Result<bool, String> {
             println!("{level}: benchmark {} {what}", row.id);
         }
     }
-    Ok(!report.failed())
+    Ok(report.verdict())
 }

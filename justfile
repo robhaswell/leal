@@ -71,48 +71,88 @@ reference-file:
     fi
     echo "reference-file: $file matches crates/leal-bench/reference.sha256"
 
-# Benchmark this checkout and `base` on this machine, one after the other, and report budgets and regressions. CI runs it on each push to main.
-bench-compare base="main" threshold="0.25":
+# Benchmark `base` and this checkout on this machine, one after the other, and report budgets, regressions and noise. CI runs it on each push to main.
+bench-compare base="main" regression="0.20" noise="0.10":
     #!/usr/bin/env bash
     set -euo pipefail
-    # Both runs share one criterion directory: `base` saves its results as
+    # Annotations on GitHub Actions, plain messages elsewhere.
+    warn() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::$*"; else echo "warning: $*" >&2; fi; }
+    fail() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*"; else echo "error: $*" >&2; fi; exit 1; }
+
+    # Both sides share one criterion directory: `base` saves its results as
     # the `base` baseline, and this checkout's run compares with it. Running
     # both on the same machine within minutes is what makes the comparison
     # meaningful on a shared CI runner (docs/tasks/1.2b.md).
     root="$PWD"
     work="$root/target/bench-compare"
     export CRITERION_HOME="$work/criterion"
-    # One reference file for both runs. Its name carries the generator's
+    # One reference file for both sides. Its name carries the generator's
     # version, so a base with a different generator writes its own file.
     export LEAL_BENCH_DATA="$root/target/bench-data"
-    sha="$(git rev-parse --verify "{{ base }}^{commit}")"
-    rm -rf "$CRITERION_HOME" "$work/base"
-    mkdir -p "$CRITERION_HOME" "$work/base"
+    sha="$(git rev-parse --verify --quiet "{{ base }}^{commit}")" \
+        || fail "bench-compare: \`{{ base }}\` is not a commit"
 
     # The base commit's files, without touching this checkout or git's
     # worktree list. `-m` gives the files the current time, so Cargo
     # rebuilds whatever changed since the last base it built. The base has
     # its own target directory: sharing one with this checkout could let
     # Cargo reuse one side's build for the other.
+    rm -rf "$work/base"
+    mkdir -p "$work/base"
     git archive "$sha" | tar -x -m -C "$work/base"
-    compare=""
+    has_base=yes
     if [ ! -d "$work/base/crates/leal-bench/benches" ]; then
-        echo "bench-compare: ${sha:0:12} has no benchmarks; reporting without a comparison"
-    elif (cd "$work/base" && CARGO_TARGET_DIR="$work/base-target" \
-            cargo bench --package leal-bench -- --save-baseline base); then
-        compare="--baseline-lenient base"
-        # Keep only the saved baseline, so a benchmark that this checkout
-        # removed doesn't show up in the report with the base's numbers.
-        find "$CRITERION_HOME" -type d -name new -prune -exec rm -rf {} +
-    else
-        echo "bench-compare: the benchmarks at ${sha:0:12} failed; reporting without a comparison" >&2
+        has_base=no
+        warn "bench-compare: ${sha:0:12} ({{ base }}) has no benchmarks, so nothing is compared; only budgets are checked"
     fi
 
-    # $compare is unquoted on purpose: it is empty or two words.
-    cargo bench --package leal-bench -- $compare
-    if [ -n "$compare" ]; then echo "bench-compare: compared with ${sha:0:12} ({{ base }})"; fi
-    cargo run --release --quiet --package leal-bench --bin bench-report -- \
-        --threshold "{{ threshold }}" "$CRITERION_HOME"
+    # One side's benchmarks, in the directory $1 with the target directory
+    # $2, passing the rest to criterion: everything (the `baseline` canaries
+    # included), then the canaries again as `baseline-late`, to catch noise
+    # that started part-way through. The steps are chained with `&&`
+    # because `set -e` is off inside a function called with `||`.
+    run_side() {
+        local dir="$1" target="$2"
+        shift 2
+        (
+            cd "$dir" \
+            && CARGO_TARGET_DIR="$target" cargo bench --package leal-bench -- "$@" \
+            && CARGO_TARGET_DIR="$target" LEAL_BENCH_BASELINE_GROUP=baseline-late \
+                cargo bench --package leal-bench --bench baseline -- "$@"
+        )
+    }
+
+    # A noisy run (a canary moved) is rerun once before it fails.
+    for attempt in 1 2; do
+        rm -rf "$CRITERION_HOME"
+        mkdir -p "$CRITERION_HOME"
+        if [ "$has_base" = yes ]; then
+            run_side "$work/base" "$work/base-target" --save-baseline base \
+                || fail "bench-compare: the benchmarks at ${sha:0:12} ({{ base }}) failed, so there is nothing to compare with"
+            # Keep only the saved baseline, so a benchmark that this checkout
+            # removed doesn't show up in the report with the base's numbers.
+            find "$CRITERION_HOME" -type d -name new -prune -exec rm -rf {} +
+            run_side "$root" "${CARGO_TARGET_DIR:-$root/target}" --baseline-lenient base
+            echo "bench-compare: compared with ${sha:0:12} ({{ base }}), attempt $attempt"
+        else
+            run_side "$root" "${CARGO_TARGET_DIR:-$root/target}"
+        fi
+
+        status=0
+        cargo run --release --quiet --package leal-bench --bin bench-report -- \
+            --regression "{{ regression }}" --noise "{{ noise }}" "$CRITERION_HOME" || status=$?
+        case "$status" in
+            0) exit 0 ;;
+            3)
+                if [ "$attempt" = 1 ]; then
+                    warn "bench-compare: a canary moved by more than {{ noise }}, so the run was too noisy to judge; rerunning both sides once"
+                else
+                    fail "bench-compare: the run was noisy twice (a canary moved by more than {{ noise }}); rerun the job, and if it keeps happening see docs/tasks/1.2b.md"
+                fi
+                ;;
+            *) exit "$status" ;;
+        esac
+    done
 
 # Build the universal libleal_ffi.a and generate the Swift bindings (profile: debug or release).
 ffi profile="debug" test_exports="auto":
