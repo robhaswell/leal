@@ -14,23 +14,45 @@ struct CellPosition: Equatable, Hashable, Sendable {
 /// It is the grid's first responder: keys become `GridMove`s and clicks
 /// select cells, both handed to `GridContainerView` through closures.
 @MainActor
-final class GridView: NSView {
+final class GridView: NSView, NSMenuItemValidation {
     weak var dataSource: (any GridDataSource)?
     var geometry = GridLayout()
-    /// The active cell (ADR-0002 question 3).
-    var activeCell: CellPosition? {
+    /// The selection (task 1.8): the active cell (ADR-0002 question 3) and
+    /// the rectangle of selected cells.
+    var selection: GridSelection? {
         didSet {
-            guard activeCell != oldValue else { return }
-            for cell in [oldValue, activeCell].compactMap({ $0 }) where cell.column < geometry.columnCount {
-                setNeedsDisplay(geometry.cellRect(row: cell.row, column: cell.column).insetBy(dx: -2, dy: -2))
+            guard selection != oldValue else { return }
+            let visible = visibleRect.insetBy(dx: -2, dy: -2)
+            for rect in [oldValue, selection].compactMap({ $0.flatMap(selectionRect) }) {
+                setNeedsDisplay(rect.insetBy(dx: -2, dy: -2).intersection(visible))
             }
         }
     }
 
-    /// A key asked to move the active cell.
-    var onMove: ((GridMove) -> Void)?
+    /// The active cell: one cell selected, or the one with the ring.
+    var activeCell: CellPosition? {
+        get { selection?.active }
+        set { selection = newValue.map(GridSelection.init) }
+    }
+
+    /// Find's highlights (task 1.8), while the find bar is showing.
+    weak var highlighter: (any GridHighlighter)? {
+        didSet { needsDisplay = true }
+    }
+
+    /// A key asked to move the active cell (`extend`: with Shift, the
+    /// selection's moving corner).
+    var onMove: ((_ move: GridMove, _ extend: Bool) -> Void)?
     /// A click on a cell.
     var onClick: ((CellPosition) -> Void)?
+    /// A Shift-click on a cell, or a drag over it from the clicked one.
+    var onExtend: ((CellPosition) -> Void)?
+    /// Edit > Select All (⌘A).
+    var onSelectAll: (() -> Void)?
+    /// Edit > Copy (⌘C).
+    var onCopy: (() -> Void)?
+    /// Whether there is something to copy, for the menu item.
+    var canCopy: () -> Bool = { false }
     /// Any key or click: the user is interacting (DESIGN §3.10 rule 3).
     var onUserInput: (() -> Void)?
 
@@ -98,6 +120,7 @@ final class GridView: NSView {
         let columns = geometry.columnRange(minX: dirtyRect.minX, maxX: dirtyRect.maxX)
         if !rows.isEmpty, !columns.isEmpty {
             source.prepare(rows: rows, columns: columns)
+            highlighter?.prepareHighlights(rows: rows, columns: columns)
             drawCells(rows: rows, columns: columns, loaded: loaded, source: source, palette: palette, context: context)
             if firstDrawTime == nil, loaded > 0 {
                 firstDrawTime = CACurrentMediaTime()
@@ -112,12 +135,32 @@ final class GridView: NSView {
                 context: context
             )
         }
-        if let active = activeCell, active.row < rowCount, active.column < geometry.columnCount {
+        if let active = activeCell, active.row < rowCount, active.column < geometry.columnCount,
+           !isCurrentMatchShown(active)
+        {
             let rect = geometry.cellRect(row: active.row, column: active.column)
             if rect.intersects(dirtyRect) {
                 CellPainter.drawActiveCellRing(in: rect, palette: palette, context: context)
             }
         }
+    }
+
+    /// The selection's cells, as one rectangle, if the grid has them.
+    private func selectionRect(_ selection: GridSelection) -> CGRect? {
+        let columns = geometry.columnCount
+        guard columns > 0 else { return nil }
+        let first = min(selection.columns.lowerBound, columns - 1)
+        let last = min(selection.columns.upperBound, columns - 1)
+        let top = geometry.cellRect(row: selection.rows.lowerBound, column: first)
+        let bottom = geometry.cellRect(row: selection.rows.upperBound, column: last)
+        return top.union(bottom)
+    }
+
+    /// The cell is find's current match and its highlight shows: mockup
+    /// 04a draws that in place of the active cell's fill and ring.
+    private func isCurrentMatchShown(_ cell: CellPosition) -> Bool {
+        guard let highlight = highlighter?.highlight(row: cell.row, column: cell.column) else { return false }
+        return highlight.isCurrent && !highlight.ranges.isEmpty
     }
 
     private func drawCells(
@@ -133,7 +176,10 @@ final class GridView: NSView {
             for column in columns {
                 let rect = geometry.cellRect(row: row, column: column)
                 let alignment: CellAlignment = numeric[column - columns.lowerBound] ? .trailing : .leading
-                if activeCell == CellPosition(row: row, column: column) {
+                let highlight = highlighter?.highlight(row: row, column: column)
+                if selection?.contains(row: row, column: column) == true,
+                   !(highlight?.isCurrent == true && highlight?.ranges.isEmpty == false)
+                {
                     CellPainter.drawActiveCellFill(in: rect, palette: palette, context: context)
                 }
                 guard row < loaded else {
@@ -152,6 +198,16 @@ final class GridView: NSView {
                     let key = TextLineCache.Key(text: shown, truncated: truncated || cut, number: number)
                     let line = lines.line(for: key) {
                         CellPainter.makeCellLine(shown, truncated: truncated && !cut, font: font, palette: palette)
+                    }
+                    if let highlight, !highlight.ranges.isEmpty {
+                        CellPainter.drawFindHighlights(
+                            line,
+                            ranges: CellText.displayRanges(highlight.ranges, in: shown),
+                            in: rect,
+                            alignment: alignment,
+                            current: highlight.isCurrent,
+                            context: context
+                        )
                     }
                     CellPainter.drawText(line, in: rect, font: font, alignment: alignment, context: context, ellipsisColor: palette.text)
                     cellsDrawn += 1
@@ -172,12 +228,38 @@ final class GridView: NSView {
     override func mouseDown(with event: NSEvent) {
         onUserInput?()
         window?.makeFirstResponder(self)
-        let point = convert(event.locationInWindow, from: nil)
+        guard let cell = cell(at: convert(event.locationInWindow, from: nil)) else { return }
+        if event.modifierFlags.contains(.shift) {
+            onExtend?(cell)
+        } else {
+            onClick?(cell)
+        }
+    }
+
+    /// Dragging from the clicked cell selects the cells between (task
+    /// 1.8), scrolling when the pointer leaves the visible area.
+    override func mouseDragged(with event: NSEvent) {
+        onUserInput?()
+        autoscroll(with: event)
+        guard let cell = cell(at: convert(event.locationInWindow, from: nil), clamped: true) else { return }
+        onExtend?(cell)
+    }
+
+    /// The cell at `point`; with `clamped`, the nearest one when the point
+    /// is outside the cells (a drag past the edge).
+    func cell(at point: NSPoint, clamped: Bool = false) -> CellPosition? {
+        let rows = dataSource?.rowCount ?? 0
+        var point = point
+        if clamped {
+            guard rows > 0, geometry.columnCount > 0 else { return nil }
+            point.y = min(max(0, point.y), geometry.height(rows: rows) - 1)
+            point.x = min(max(0, point.x), geometry.totalWidth - 1)
+        }
         guard
-            let row = geometry.row(atY: point.y, rows: dataSource?.rowCount ?? 0),
+            let row = geometry.row(atY: point.y, rows: rows),
             let column = geometry.column(atX: point.x)
-        else { return }
-        onClick?(CellPosition(row: row, column: column))
+        else { return nil }
+        return CellPosition(row: row, column: column)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -187,9 +269,33 @@ final class GridView: NSView {
 
     override func doCommand(by selector: Selector) {
         if let move = GridMove(selector: selector) {
-            onMove?(move)
+            onMove?(move, false)
+        } else if let move = GridMove(extendingSelector: selector) {
+            onMove?(move, true)
         } else {
             super.doCommand(by: selector)
+        }
+    }
+
+    // MARK: The Edit menu (task 1.8)
+
+    // Neither Copy nor Select All is noted as user input: that would pause
+    // P2 work for 250 ms (DESIGN §3.10 rule 3), and Copy's own job is P2.
+    // Neither scrolls, so neither needs background work out of the way.
+
+    @objc func copy(_ sender: Any?) {
+        onCopy?()
+    }
+
+    override func selectAll(_ sender: Any?) {
+        onSelectAll?()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(copy(_:)): canCopy()
+        case #selector(selectAll(_:)): (dataSource?.rowCount ?? 0) > 0 && geometry.columnCount > 0
+        default: true
         }
     }
 
@@ -197,8 +303,8 @@ final class GridView: NSView {
     override func insertText(_ insertString: Any) {}
 }
 
-/// A keyboard move of the active cell (DESIGN §4.2). Selection by range
-/// (Shift) and the rest of ADR-0001's navigation list are task 1.8.
+/// A keyboard move of the active cell (DESIGN §4.2), or with Shift of the
+/// selection's moving corner (task 1.8).
 enum GridMove: Equatable, Sendable {
     case up, down, left, right
     case pageUp, pageDown
@@ -232,6 +338,28 @@ enum GridMove: Equatable, Sendable {
             self = .lastColumn
         case #selector(NSResponder.insertTab(_:)): self = .next
         case #selector(NSResponder.insertBacktab(_:)): self = .previous
+        default: return nil
+        }
+    }
+
+    /// The move for one of AppKit's Shift key-binding commands, which
+    /// extend the selection.
+    init?(extendingSelector selector: Selector) {
+        switch selector {
+        case #selector(NSResponder.moveUpAndModifySelection(_:)): self = .up
+        case #selector(NSResponder.moveDownAndModifySelection(_:)): self = .down
+        case #selector(NSResponder.moveLeftAndModifySelection(_:)): self = .left
+        case #selector(NSResponder.moveRightAndModifySelection(_:)): self = .right
+        case #selector(NSResponder.pageUpAndModifySelection(_:)): self = .pageUp
+        case #selector(NSResponder.pageDownAndModifySelection(_:)): self = .pageDown
+        case #selector(NSResponder.moveToBeginningOfDocumentAndModifySelection(_:)): self = .firstRow
+        case #selector(NSResponder.moveToEndOfDocumentAndModifySelection(_:)): self = .lastRow
+        case #selector(NSResponder.moveToLeftEndOfLineAndModifySelection(_:)),
+             #selector(NSResponder.moveToBeginningOfLineAndModifySelection(_:)):
+            self = .firstColumn
+        case #selector(NSResponder.moveToRightEndOfLineAndModifySelection(_:)),
+             #selector(NSResponder.moveToEndOfLineAndModifySelection(_:)):
+            self = .lastColumn
         default: return nil
         }
     }

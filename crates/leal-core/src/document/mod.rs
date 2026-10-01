@@ -47,8 +47,15 @@
 //! [`Indexer::chunked`]: crate::index::Indexer::chunked
 //! [`Priority::P3`]: crate::schedule::Priority::P3
 
+mod search;
 #[cfg(test)]
 mod tests;
+mod values;
+
+pub use search::{
+    CellMatch, SEARCH_CHUNK_BYTES, Search, SearchProgress, SearchStep, SearchSummary,
+};
+pub use values::{CellValue, CopiedText, push_tsv_cell};
 
 use std::borrow::Cow;
 use std::fmt;

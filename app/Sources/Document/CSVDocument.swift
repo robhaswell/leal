@@ -135,6 +135,11 @@ final class CSVDocument: NSDocument {
     }
 
     override func close() {
+        // The window's find search and copy go first (task 1.8): they hold
+        // the core's document, and so its file, until they stop.
+        for case let controller as DocumentWindowController in windowControllers {
+            controller.content.documentWillClose()
+        }
         model?.close()
         super.close()
     }

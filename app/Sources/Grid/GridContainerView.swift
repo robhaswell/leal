@@ -41,17 +41,56 @@ final class GridContainerView: NSView {
     /// estimate, and ⌘↓ waits for the real one (DESIGN §3.10 rule 5).
     var isIndexComplete: () -> Bool = { true }
 
+    /// The selection changed (the active cell or the selected cells).
+    var onSelectionChanged: (() -> Void)?
+    /// Edit > Copy (⌘C) in the grid.
+    var onCopy: (() -> Void)? {
+        get { gridView.onCopy }
+        set { gridView.onCopy = newValue }
+    }
+
     private(set) var geometry = GridLayout()
+
+    /// A move past the indexed rows that is waiting for the index to reach
+    /// its target (DESIGN §3.10 rule 5): the grid shows the skeleton rows
+    /// and the pill until then.
+    enum PendingJump: Equatable {
+        /// ⌘↓: the real last row, once indexing is complete.
+        case end
+        /// Go to Row (⌘L): this row, once it is indexed.
+        case row(Int)
+    }
+
+    private(set) var pendingJump: PendingJump?
+    /// The column a pending Go to Row selects in: the active cell's when
+    /// it was asked for (no cell is selected while it waits).
+    private var pendingColumn = 0
+
     /// ⌘↓ went past the indexed rows: when the index is complete, the
     /// active cell moves to the real last row.
-    private(set) var isJumpingToEnd = false
+    var isJumpingToEnd: Bool { pendingJump == .end }
+
+    /// The selection (task 1.8): the active cell and the selected cells.
+    var selection: GridSelection? {
+        get { gridView.selection }
+        set {
+            guard newValue != gridView.selection else { return }
+            gridView.selection = newValue
+            gutterView.activeRow = newValue?.active.row
+            gutterView.selectedRows = newValue.flatMap { $0.rows.count > 1 ? $0.rows : nil }
+            onSelectionChanged?()
+        }
+    }
 
     var activeCell: CellPosition? {
-        get { gridView.activeCell }
-        set {
-            gridView.activeCell = newValue
-            gutterView.activeRow = newValue?.row
-        }
+        get { selection?.active }
+        set { selection = newValue.map(GridSelection.init) }
+    }
+
+    /// Find's highlights (task 1.8), while the find bar is showing.
+    var highlighter: (any GridHighlighter)? {
+        get { gridView.highlighter }
+        set { gridView.highlighter = newValue }
     }
 
     override init(frame: NSRect) {
@@ -78,14 +117,23 @@ final class GridContainerView: NSView {
             setWidth(width, ofColumn: column)
             onColumnResized?(column, width)
         }
-        gridView.onMove = { [weak self] move in self?.move(move) }
+        gridView.onMove = { [weak self] move, extend in self?.move(move, extend: extend) }
         gridView.onClick = { [weak self] cell in self?.select(cell) }
+        gridView.onExtend = { [weak self] cell in self?.extend(to: cell) }
+        gridView.onSelectAll = { [weak self] in self?.selectAll() }
+        gridView.canCopy = { [weak self] in self?.selection != nil }
         gridView.onUserInput = { [weak self] in self?.onUserInput?() }
         gutterView.onClick = { [weak self] row in
             guard let self else { return }
             onUserInput?()
             window?.makeFirstResponder(gridView)
-            select(CellPosition(row: row, column: activeCell?.column ?? 0))
+            selectRow(row)
+        }
+        gutterView.onExtend = { [weak self] row in
+            guard let self else { return }
+            onUserInput?()
+            window?.makeFirstResponder(gridView)
+            extendRows(to: row)
         }
         for view in [scrollView, headerView, gutterClip, cornerView, pill] as [NSView] {
             addSubview(view)
@@ -169,12 +217,26 @@ final class GridContainerView: NSView {
             needsLayout = true
         }
         updateDocumentSize()
-        if isJumpingToEnd, isIndexComplete() {
-            if rows > 0 { select(CellPosition(row: rows - 1, column: activeCell?.column ?? 0)) }
-            isJumpingToEnd = false
+        let column = activeCell?.column ?? pendingColumn
+        switch pendingJump {
+        case .end? where isIndexComplete():
+            if rows > 0 { select(CellPosition(row: rows - 1, column: column)) }
+            pendingJump = nil
+        case let .row(target)? where target < (dataSource?.loadedRowCount ?? 0):
+            // The target is indexed now (DESIGN §3.10 rule 5).
+            select(CellPosition(row: target, column: column))
+        case .row? where isIndexComplete():
+            // The file is shorter than the row asked for: its last row.
+            if rows > 0 { select(CellPosition(row: rows - 1, column: column)) }
+            pendingJump = nil
+        default:
+            break
         }
-        if let cell = activeCell, cell.row >= rows {
-            activeCell = rows > 0 ? CellPosition(row: rows - 1, column: cell.column) : nil
+        if let current = selection {
+            let kept = current.throughLastRow || current.rows.upperBound >= rows
+                ? current.clamped(rows: rows, columns: geometry.columnCount)
+                : current
+            if kept != current { selection = kept }
         }
         gridView.needsDisplay = true
         gutterView.needsDisplay = true
@@ -197,9 +259,9 @@ final class GridContainerView: NSView {
         return geometry.rowRange(minY: visible.minY, maxY: visible.maxY, rows: dataSource?.rowCount ?? 0)
     }
 
-    /// The user scrolled: a pending ⌘↓ no longer applies.
+    /// The user scrolled: a pending ⌘↓ or Go to Row no longer applies.
     func scrollInputArrived() {
-        isJumpingToEnd = false
+        pendingJump = nil
         onUserInput?()
     }
 
@@ -216,32 +278,118 @@ final class GridContainerView: NSView {
 
     // MARK: The active cell and keys
 
-    /// Makes `cell` the active cell and scrolls it into view. A pending ⌘↓
-    /// (`isJumpingToEnd`) is dropped: the user chose another cell.
+    /// Makes `cell` the active cell, the only one selected, and scrolls it
+    /// into view. A pending ⌘↓ or Go to Row is dropped: the user chose
+    /// another cell.
     func select(_ cell: CellPosition) {
-        isJumpingToEnd = false
+        pendingJump = nil
+        guard let clamped = clamp(cell) else { return }
+        selection = GridSelection(clamped)
+        scrollToVisible(clamped)
+    }
+
+    /// Selects the cells from the active cell to `cell` (Shift-click, a
+    /// drag), keeping the active cell, and scrolls `cell` into view.
+    func extend(to cell: CellPosition, throughLastRow: Bool = false) {
+        guard let current = selection else {
+            select(cell)
+            return
+        }
+        pendingJump = nil
+        guard let clamped = clamp(cell) else { return }
+        selection = current.extended(to: clamped, throughLastRow: throughLastRow)
+        scrollToVisible(clamped)
+    }
+
+    /// ⌘A: every cell, to the last row however many there turn out to be.
+    /// The active cell stays, and nothing scrolls.
+    func selectAll() {
         guard let source = dataSource, source.rowCount > 0, geometry.columnCount > 0 else { return }
-        let clamped = CellPosition(
+        let active = activeCell ?? CellPosition(row: 0, column: 0)
+        selection = .all(rows: source.rowCount, columns: geometry.columnCount, active: active)
+    }
+
+    /// A click on a row number: the row's every cell, with the active cell
+    /// in the column it was in.
+    func selectRow(_ row: Int) {
+        pendingJump = nil
+        guard let clamped = clamp(CellPosition(row: row, column: activeCell?.column ?? 0)) else { return }
+        selection = .row(clamped.row, columns: geometry.columnCount, column: clamped.column)
+        scrollToVisible(clamped)
+    }
+
+    /// A Shift-click on a row number: every cell of the rows from the
+    /// active cell's to `row`.
+    func extendRows(to row: Int) {
+        guard let current = selection, let clamped = clamp(CellPosition(row: row, column: 0)) else {
+            selectRow(row)
+            return
+        }
+        pendingJump = nil
+        selection = GridSelection(
+            active: current.active,
+            anchor: CellPosition(row: current.anchor.row, column: 0),
+            extent: CellPosition(row: clamped.row, column: geometry.columnCount - 1)
+        )
+        scrollToVisible(CellPosition(row: clamped.row, column: current.active.column))
+    }
+
+    /// `cell`, kept inside the grid; `nil` if the grid has no cells.
+    private func clamp(_ cell: CellPosition) -> CellPosition? {
+        guard let source = dataSource, source.rowCount > 0, geometry.columnCount > 0 else { return nil }
+        return CellPosition(
             row: min(max(0, cell.row), source.rowCount - 1),
             column: min(max(0, cell.column), geometry.columnCount - 1)
         )
-        activeCell = clamped
-        gridView.scrollToVisible(geometry.cellRect(row: clamped.row, column: clamped.column))
     }
 
-    func move(_ move: GridMove) {
+    private func scrollToVisible(_ cell: CellPosition) {
+        gridView.scrollToVisible(geometry.cellRect(row: cell.row, column: cell.column))
+    }
+
+    /// A key's move (DESIGN §4.2). With Shift (`extend`), the selection's
+    /// moving corner moves instead, and the active cell stays.
+    func move(_ move: GridMove, extend: Bool = false) {
         guard let source = dataSource else { return }
         let rows = source.rowCount
         let columns = geometry.columnCount
         guard rows > 0, columns > 0 else { return }
-        let from = activeCell ?? CellPosition(row: 0, column: 0)
         let pageRows = Int((scrollView.contentView.bounds.height / geometry.rowHeight).rounded(.down))
+        if extend, let current = selection, move != .next, move != .previous {
+            let target = move.apply(to: current.extent, rows: rows, columns: columns, pageRows: pageRows)
+            // ⇧⌘↓ while indexing selects to the end, however far that is.
+            self.extend(to: target, throughLastRow: move == .lastRow && !isIndexComplete())
+            return
+        }
+        let from = activeCell ?? CellPosition(row: 0, column: 0)
         let target = activeCell == nil ? from : move.apply(to: from, rows: rows, columns: columns, pageRows: pageRows)
         select(target)
         // ⌘↓ before the index is complete aims at the estimated last row,
         // which shows skeleton rows and the pill until the real last row
         // is known (mockup 02b). Any other move, click or scroll drops it.
-        isJumpingToEnd = move == .lastRow && !isIndexComplete()
+        pendingJump = move == .lastRow && !isIndexComplete() ? .end : nil
+        updatePill()
+    }
+
+    /// Go to Row (⌘L): selects grid row `row` in the active cell's column.
+    /// A row past the indexed ones is shown as soon as the index reaches it
+    /// (DESIGN §3.10 rule 5): until then the grid scrolls to where the
+    /// estimate puts it, with skeleton rows and the pill. The index is
+    /// always running ahead of everything else, on its own thread, so it
+    /// is already at the front of the queue.
+    func goTo(row: Int) {
+        guard let source = dataSource, source.rowCount > 0, geometry.columnCount > 0 else { return }
+        let target = max(0, row)
+        if target < source.loadedRowCount || isIndexComplete() {
+            select(CellPosition(row: target, column: activeCell?.column ?? 0))
+            return
+        }
+        // Scroll to where the row is expected, and wait for it there.
+        let estimated = min(target, source.rowCount - 1)
+        pendingColumn = activeCell?.column ?? pendingColumn
+        selection = nil
+        scrollToVisible(CellPosition(row: estimated, column: 0))
+        pendingJump = .row(target)
         updatePill()
     }
 
@@ -256,7 +404,7 @@ final class GridContainerView: NSView {
         let visible = visibleRows
         let showing = !isIndexComplete() && !visible.isEmpty && visible.lowerBound >= loaded
         if showing {
-            pill.setMessage(GridStrings.pill(jumpingToEnd: isJumpingToEnd, row: loaded, of: source.rowCount))
+            pill.setMessage(GridStrings.pill(jump: pendingJump, row: loaded, of: source.rowCount))
             positionPill()
         }
         if pill.isHidden == showing {
@@ -335,18 +483,27 @@ final class IndexingPillView: NSView {
 
 /// The grid's own words (DESIGN §4.4: from the String Catalog).
 enum GridStrings {
-    static func pill(jumpingToEnd: Bool, row: Int, of rows: Int) -> String {
+    static func pill(jump: GridContainerView.PendingJump?, row: Int, of rows: Int) -> String {
         let row = row.formatted()
         let rows = rows.formatted()
-        return jumpingToEnd
-            ? String(
+        switch jump {
+        case .end?:
+            return String(
                 localized: "Reaching the end of the file… row \(row) of about \(rows)",
                 comment: "Pill over skeleton rows after ⌘↓ before indexing is complete; the indexed row count, then the estimate"
             )
-            : String(
+        case let .row(target)?:
+            let target = (target + 1).formatted()
+            return String(
+                localized: "Reaching row \(target)… row \(row) of about \(rows)",
+                comment: "Pill over skeleton rows after Go to Row past the indexed rows (⌘L); the row asked for, the indexed row count, then the estimate"
+            )
+        case nil:
+            return String(
                 localized: "Indexing… row \(row) of about \(rows)",
                 comment: "Pill over skeleton rows scrolled to before they are indexed; the indexed row count, then the estimate"
             )
+        }
     }
 
     /// The title of a column past the header row's last field.

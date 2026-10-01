@@ -1479,3 +1479,5 @@ fn a_newer_search_stops_an_older_one() {
     );
     assert_eq!(current.unwrap(), Some(Place { row: 1, column: 1 }));
 }
+
+mod find;

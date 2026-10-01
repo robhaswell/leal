@@ -82,4 +82,11 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 1.0,
         source: "DESIGN §3.9",
     },
+    // A screenful as the grid reads it while a search for the find bar
+    // runs on the background pool (PLAN 1.8): find never slows the grid.
+    Budget {
+        id: "find/screen_during_find",
+        max_ms: 1.0,
+        source: "DESIGN §3.9",
+    },
 ];

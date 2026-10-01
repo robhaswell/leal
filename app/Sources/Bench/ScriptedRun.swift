@@ -20,7 +20,10 @@ import os
 ///   1×, then the app quits. `-LealSelect row,column` picks the active
 ///   cell; `-LealJumpEnd YES` presses ⌘↓ first; `-LealDetails YES` opens
 ///   the diagnostics popover on its first kind's first occurrence (mockup
-///   03b).
+///   03b); `-LealFind text` searches for `text` from the selected cell in
+///   the find bar (04a); `-LealInspector YES` shows the cell inspector
+///   (05a); `-LealShortcuts YES` draws the shortcut sheet (06c) instead
+///   of the window.
 /// - `-LealAppearance light|dark` and `-LealWindowSize 1000x640` (the
 ///   content size, in points) for either.
 ///
@@ -108,6 +111,21 @@ final class ScriptedRun {
         if has("LealJumpEnd") {
             content.grid.move(.lastRow)
         }
+        if let query = value(of: "LealFind") {
+            // The find bar (mockup 04a), searching from the selected cell.
+            content.showFind(nil)
+            content.findBar.field.stringValue = query
+            content.search(for: query)
+            let deadline = Date().addingTimeInterval(30)
+            while content.find.isSearching || content.find.pendingStep != nil, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        if has("LealInspector") {
+            // The cell inspector (mockup 05a), on the selected cell.
+            content.setInspectorShown(true)
+            await content.inspectorTask?.value
+        }
         // Let sizing, the review and drawing settle.
         try? await Task.sleep(for: .milliseconds(has("LealSnapshotEarly") ? 30 : 600))
         if has("LealDetails") {
@@ -118,6 +136,11 @@ final class ScriptedRun {
                 await content.navigate(kind, forward: true).value
             }
             try? await Task.sleep(for: .milliseconds(300))
+        }
+        if has("LealShortcuts"), let menu = NSApp.mainMenu {
+            // The shortcut sheet (mockup 06c) in place of the window.
+            ShortcutSheet.writePNG(menu: menu, to: url)
+            return
         }
         guard let window = content.view.window else { return }
         // The popover is a window of its own, placed by the system, whose

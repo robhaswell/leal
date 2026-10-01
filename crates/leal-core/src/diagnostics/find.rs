@@ -161,7 +161,7 @@ fn has_nul(raw: &[u8], encoding: Encoding) -> bool {
 /// Whether `raw` holds text that doesn't decode in `encoding`, and so
 /// displays as U+FFFD: invalid UTF-8, an unpaired surrogate or a final odd
 /// byte in UTF-16, or a byte a single-byte encoding doesn't map.
-fn has_invalid(raw: &[u8], encoding: Encoding) -> bool {
+pub(crate) fn has_invalid(raw: &[u8], encoding: Encoding) -> bool {
     match encoding {
         Encoding::Utf8 => simdutf8::basic::from_utf8(raw).is_err(),
         Encoding::Utf16Le => invalid_utf16(raw, u16::from_le_bytes),

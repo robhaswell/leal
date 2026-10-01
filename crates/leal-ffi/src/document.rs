@@ -761,26 +761,7 @@ impl Document {
     /// Runs `call` unless the document has failed, and marks it failed if
     /// `call` panics. Every export of `Document` goes through this.
     fn call<T>(&self, call: impl FnOnce() -> Result<T, LealError>) -> Result<T, LealError> {
-        if let Some(message) = self.failure.get() {
-            return Err(self.failed(message));
-        }
-        // `AssertUnwindSafe`: after a panic nothing in the document is
-        // looked at again, because it is marked failed first.
-        match panic::catch_unwind(AssertUnwindSafe(call)) {
-            Ok(result) => result,
-            Err(payload) => {
-                let message = panic_message(payload.as_ref());
-                self.failure.set(message.clone());
-                Err(self.failed(message))
-            }
-        }
-    }
-
-    fn failed(&self, message: String) -> LealError {
-        LealError::DocumentFailed {
-            path: self.path.clone(),
-            message,
-        }
+        guarded(&self.failure, &self.path, call)
     }
 
     /// A kind search's answer for Swift. A search stopped because a newer
@@ -800,6 +781,33 @@ impl Document {
     fn watch_jobs(&self) {
         self.failure.watch(self.document.index_job().control());
         self.failure.watch(self.document.review_job().control());
+    }
+}
+
+/// Runs `call` unless the document (whose failure is `failure`, and whose
+/// file is `path`) has failed, and marks it failed if `call` panics. Every
+/// export of `Document`, `Search` and `CopyJob` goes through this.
+fn guarded<T>(
+    failure: &Failure,
+    path: &str,
+    call: impl FnOnce() -> Result<T, LealError>,
+) -> Result<T, LealError> {
+    let failed = |message| LealError::DocumentFailed {
+        path: path.to_owned(),
+        message,
+    };
+    if let Some(message) = failure.get() {
+        return Err(failed(message));
+    }
+    // `AssertUnwindSafe`: after a panic nothing in the document is looked
+    // at again, because it is marked failed first.
+    match panic::catch_unwind(AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            failure.set(message.clone());
+            Err(failed(message))
+        }
     }
 }
 
@@ -1486,5 +1494,8 @@ both_ways!(
     ]
 );
 
+mod find;
 #[cfg(test)]
 mod tests;
+
+pub use find::{CellMatch, CellValue, CopyJob, Search, SearchProgress, SearchStep, TextRange};

@@ -240,6 +240,16 @@ final class DocumentModel: GridDataSource {
         }
     }
 
+    /// The core's document, for a call off the main actor (task 1.8's cell
+    /// inspector, like `find(_:forward:from:)` here): `nil` once the
+    /// document has failed or closed. It counts as a core call; hand any
+    /// error it throws back through `call`.
+    func backgroundHandle() -> LealFFI.Document? {
+        guard failure == nil, let handle else { return nil }
+        coreCalls += 1
+        return handle
+    }
+
     /// DESIGN §3.9: no more calls on the handle, no rows, and the window
     /// offers to reopen the file.
     func fail(_ error: any Error) {

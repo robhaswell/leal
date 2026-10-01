@@ -80,6 +80,8 @@ log_strings! {
     REVIEW = b"Review\0";
     DIAGNOSTICS = b"Diagnostics\0";
     ACCELERATION = b"Acceleration\0";
+    FIND = b"Find\0";
+    COPY = b"Copy\0";
     PAUSED = b"Paused\0";
     EMPTY_FORMAT = b"\0";
 }
@@ -92,6 +94,8 @@ fn name(interval: Interval) -> &'static [u8] {
         Interval::Review => &REVIEW,
         Interval::Diagnostics => &DIAGNOSTICS,
         Interval::Acceleration => &ACCELERATION,
+        Interval::Find => &FIND,
+        Interval::Copy => &COPY,
         Interval::Paused => &PAUSED,
     }
 }
@@ -215,6 +219,8 @@ mod tests {
             Interval::Review,
             Interval::Diagnostics,
             Interval::Acceleration,
+            Interval::Find,
+            Interval::Copy,
             Interval::Paused,
         ] {
             let name = CStr::from_bytes_with_nul(super::name(interval)).unwrap();

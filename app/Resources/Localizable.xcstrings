@@ -35,6 +35,9 @@
         }
       }
     },
+    "%@ characters" : {
+      "comment" : "Cell inspector: how long the value is"
+    },
     "%@ columns" : {
       "comment" : "Status bar: the number of columns"
     },
@@ -49,8 +52,14 @@
         }
       }
     },
+    "%@ lines" : {
+      "comment" : "Cell inspector: how many lines the value has"
+    },
+    "%@ matches" : {
+      "comment" : "Find bar count: how many matches, none selected; a total ending in + is still growing"
+    },
     "%@ of %@" : {
-      "comment" : "Details popover: which occurrence is shown, as in 1 of 3 (mockup 03b)",
+      "comment" : "Details popover: which occurrence is shown, as in 1 of 3 (mockup 03b)\nFind bar count: the selected match's number, then how many there are (mockup 04a); a total ending in + is still growing",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -116,11 +125,20 @@
     "1 cell, at %@ — shown as �" : {
       "comment" : "Details popover: one cell with bytes that don't decode (mockup 03b); where, such as row 11"
     },
+    "1 character" : {
+      "comment" : "Cell inspector: the value is one character long"
+    },
     "1 column" : {
       "comment" : "Status bar: one column"
     },
     "1 empty row, at %@" : {
       "comment" : "Details popover: one blank line; where"
+    },
+    "1 line" : {
+      "comment" : "Cell inspector: the value has one line"
+    },
+    "1 match" : {
+      "comment" : "Find bar count: one match, none selected"
     },
     "1 row" : {
       "comment" : "Status bar: one data row"
@@ -158,6 +176,15 @@
     "Byte order mark" : {
       "comment" : "Diagnostic kind: the file starts with a BOM (DESIGN §3.5)"
     },
+    "Cancel" : {
+      "comment" : "Go to Row sheet's cancel button"
+    },
+    "Cell inspector" : {
+      "comment" : "VoiceOver name of the cell inspector pane (mockup 05a)"
+    },
+    "Cell value" : {
+      "comment" : "VoiceOver name of the cell inspector's text"
+    },
     "Changed while reading" : {
       "comment" : "Status bar: the file changed on its drive while Leal read it (1.1a)"
     },
@@ -174,7 +201,10 @@
       "comment" : "Status bar: the delimiter"
     },
     "Copy" : {
-      "comment" : "Edit menu"
+      "comment" : "Button of the sheet before a very large Copy\nEdit menu"
+    },
+    "Copy about %@?" : {
+      "comment" : "Sheet before a very large Copy; the size, like “1.2 GB”"
     },
     "Cut" : {
       "comment" : "Edit menu"
@@ -191,6 +221,9 @@
     "Dismiss" : {
       "comment" : "Banner's close button, for VoiceOver"
     },
+    "Done" : {
+      "comment" : "Button that closes the find bar (mockup 04a)"
+    },
     "Drive disconnected" : {
       "comment" : "Status bar: the file's removable drive was disconnected (ADR-0006)"
     },
@@ -203,17 +236,59 @@
     "Encoding: %@, menu" : {
       "comment" : "VoiceOver: the status bar's Reopen with Encoding button; the encoding as the bar shows it"
     },
+    "Enter a row number from 1 to %@." : {
+      "comment" : "Go to Row sheet; the file's row count"
+    },
+    "Enter a row number. The file has about %@ rows; it is still being read." : {
+      "comment" : "Go to Row sheet while indexing; the estimated row count"
+    },
     "File" : {
       "comment" : "Menu title"
     },
+    "Find" : {
+      "comment" : "Edit menu: the Find submenu\nPlaceholder of the find bar's search field (mockup 04a)"
+    },
+    "Find Next" : {
+      "comment" : "Edit > Find: the next match (⌘G)"
+    },
+    "Find Previous" : {
+      "comment" : "Edit > Find: the previous match (⇧⌘G)"
+    },
+    "Find bar" : {
+      "comment" : "VoiceOver name of the find bar"
+    },
+    "Find in file" : {
+      "comment" : "VoiceOver name of the find bar's search field"
+    },
+    "Find options" : {
+      "comment" : "The find bar's search field menu"
+    },
+    "Find…" : {
+      "comment" : "Edit > Find: show the find bar (⌘F, mockup 04a)"
+    },
+    "Go" : {
+      "comment" : "Go to Row sheet's button"
+    },
+    "Go to Row" : {
+      "comment" : "Title of the Go to Row sheet (⌘L)"
+    },
+    "Go to Row…" : {
+      "comment" : "Edit menu: go to a row by its number (⌘L)"
+    },
     "Header row: off" : {
       "comment" : "Status bar button: no header row; click to use the first row as the header (mockup 06b)"
+    },
+    "Hide Cell Inspector" : {
+      "comment" : "View menu: hide the cell inspector pane (⌘I)"
     },
     "Hide Leal" : {
       "comment" : "App menu"
     },
     "Hide Others" : {
       "comment" : "App menu"
+    },
+    "Ignore Case" : {
+      "comment" : "Find bar option, on by default (DESIGN §4.2)"
     },
     "Indexing… about %@ × %@" : {
       "comment" : "Status bar while indexing: the estimated rows, then the columns",
@@ -285,11 +360,23 @@
     "NUL bytes" : {
       "comment" : "Diagnostic kind (DESIGN §3.5)"
     },
+    "Next" : {
+      "comment" : "The find bar's next-match arrow, for VoiceOver"
+    },
+    "Next match (⌘G)" : {
+      "comment" : "Tooltip of the find bar's next arrow"
+    },
     "Next: %@" : {
       "comment" : "Details popover: go to the next occurrence of a kind (VoiceOver and tooltip); the kind's name"
     },
+    "No cell selected." : {
+      "comment" : "Cell inspector with no active cell"
+    },
     "No header row detected" : {
       "comment" : "Status bar: detection found no header row (mockup 06b)"
+    },
+    "No matches" : {
+      "comment" : "Find bar count when nothing matches"
     },
     "Open Recent" : {
       "comment" : "File menu"
@@ -303,6 +390,12 @@
     "Pipe" : {
       "comment" : "Status bar: the delimiter"
     },
+    "Previous" : {
+      "comment" : "The find bar's previous-match arrow, for VoiceOver"
+    },
+    "Previous match (⇧⌘G)" : {
+      "comment" : "Tooltip of the find bar's previous arrow"
+    },
     "Previous: %@" : {
       "comment" : "Details popover: go to the previous occurrence of a kind (VoiceOver and tooltip); the kind's name"
     },
@@ -311,6 +404,17 @@
     },
     "Ragged rows" : {
       "comment" : "Diagnostic kind: rows with a different number of fields (DESIGN §3.5)"
+    },
+    "Reaching row %@… row %@ of about %@" : {
+      "comment" : "Pill over skeleton rows after Go to Row past the indexed rows (⌘L); the row asked for, the indexed row count, then the estimate",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Reaching row %1$@… row %2$@ of about %3$@"
+          }
+        }
+      }
     },
     "Reaching the end of the file… row %@ of about %@" : {
       "comment" : "Pill over skeleton rows after ⌘↓ before indexing is complete; the indexed row count, then the estimate",
@@ -350,6 +454,12 @@
     "Reopen with Encoding" : {
       "comment" : "Menu: read the file in another encoding (ADR-0005 decision 8)"
     },
+    "Row %@" : {
+      "comment" : "Cell inspector: the active cell's row number, as the gutter shows it (mockup 05a)"
+    },
+    "Row number" : {
+      "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
+    },
     "Save As UTF-8 isn’t available yet." : {
       "comment" : "Alert: the UTF-16 banner's button before task 2.3"
     },
@@ -362,6 +472,9 @@
     "Save As…" : {
       "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)"
     },
+    "Searching…" : {
+      "comment" : "Find bar count while a search has found nothing yet"
+    },
     "Select All" : {
       "comment" : "Edit menu"
     },
@@ -370,6 +483,9 @@
     },
     "Show All" : {
       "comment" : "App menu"
+    },
+    "Show Cell Inspector" : {
+      "comment" : "View menu: show the cell inspector pane (⌘I, mockup 05a)"
     },
     "Show Irregularities" : {
       "comment" : "View menu: the diagnostics details popover (mockup 03b)"
@@ -439,6 +555,9 @@
     "The file’s encoding attribute says UTF-16, but the file has no UTF-16 byte order mark, so Leal ignored it." : {
       "comment" : "Status bar tooltip: an ignored attribute"
     },
+    "The selected cells make a lot of text. Copying them takes a while and puts all of it on the clipboard." : {
+      "comment" : "Sheet before a very large Copy"
+    },
     "This file changed on its drive while Leal was reading it, so what’s shown may mix two versions. Save is off; Save As keeps a copy." : {
       "comment" : "Banner: the file changed while Leal read it from a drive that can't make a snapshot (1.1a)"
     },
@@ -465,6 +584,12 @@
     },
     "This file looks tab-separated." : {
       "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This row has no field here: it is shorter than the others." : {
+      "comment" : "Cell inspector on a short (ragged) row's missing cell"
+    },
+    "This row isn’t read yet." : {
+      "comment" : "Cell inspector on a row past the indexed region"
     },
     "This volume can’t make a snapshot of the file, so Leal read the whole file into memory." : {
       "comment" : "Status bar tooltip: why the file was read into memory (DESIGN §3.1)"
@@ -499,6 +624,12 @@
     "Working from a copy" : {
       "comment" : "Status bar: Leal reads its own copy of the file on this Mac (DESIGN §3.1, ADR-0006)"
     },
+    "Wrapped to the first match. %@" : {
+      "comment" : "VoiceOver: Next went past the last match to the first; then the find bar's count"
+    },
+    "Wrapped to the last match. %@" : {
+      "comment" : "VoiceOver: Previous went before the first match to the last; then the find bar's count"
+    },
     "You chose this encoding." : {
       "comment" : "Status bar tooltip: encoding source"
     },
@@ -508,11 +639,17 @@
     "Zoom" : {
       "comment" : "Window menu"
     },
+    "invalid bytes shown as �" : {
+      "comment" : "Cell inspector: the value has bytes that aren't valid text (DESIGN §3.5)"
+    },
     "row %@" : {
       "comment" : "Where a diagnostic is: a row number as the gutter shows it"
     },
     "the header row" : {
       "comment" : "Where a diagnostic is: in the file's header row"
+    },
+    "value truncated: the first %@ shown" : {
+      "comment" : "Cell inspector: a very long value is shown only in part; how many characters are shown"
     }
   },
   "version" : "1.0"

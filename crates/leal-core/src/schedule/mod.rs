@@ -125,6 +125,10 @@ pub enum Interval {
     Diagnostics,
     /// Filter and sort acceleration (P3).
     Acceleration,
+    /// A search for the find bar (P2, task 1.8).
+    Find,
+    /// Copying cells to the clipboard (P2, task 1.8).
+    Copy,
     /// A P2 or P3 job waiting for the user to stop interacting.
     Paused,
 }
@@ -139,6 +143,8 @@ impl Interval {
             Interval::Review => "Review",
             Interval::Diagnostics => "Diagnostics",
             Interval::Acceleration => "Acceleration",
+            Interval::Find => "Find",
+            Interval::Copy => "Copy",
             Interval::Paused => "Paused",
         }
     }

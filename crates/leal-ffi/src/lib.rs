@@ -20,9 +20,10 @@ mod platform;
 mod document;
 
 pub use document::{
-    Cell, Delimiter, DialectSource, Document, EncodingSource, FirstScreen, IndexProgress,
-    Interpretation, Job, JobFailure, LineEnding, OpenOptions, ProgressObserver, ReviewResult,
-    RowCells, Scheduler, TextEncoding, open_document,
+    Cell, CellMatch, CellValue, CopyJob, Delimiter, DialectSource, Document, EncodingSource,
+    FirstScreen, IndexProgress, Interpretation, Job, JobFailure, LineEnding, OpenOptions,
+    ProgressObserver, ReviewResult, RowCells, Scheduler, Search, SearchProgress, SearchStep,
+    TextEncoding, TextRange, open_document,
 };
 
 use std::path::{Path, PathBuf};

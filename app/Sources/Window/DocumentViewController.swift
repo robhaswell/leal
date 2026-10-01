@@ -40,9 +40,38 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// Navigations started, so a late answer is dropped.
     private var navigationCount = 0
 
+    /// The find bar (mockup 04a), under the title bar, and its state.
+    let findBar = FindBarView()
+    let find: FindModel
+    private var findBarHeight: NSLayoutConstraint!
+    var isFindBarShown: Bool { !findBar.isHidden }
+
+    /// The cell inspector (mockup 05a), under the grid.
+    let inspector = CellInspectorView()
+    private var inspectorHeight: NSLayoutConstraint!
+    var isInspectorShown: Bool { !inspector.isHidden }
+    /// The inspector's latest read of a value, so tests can wait for it.
+    private(set) var inspectorTask: Task<Void, Never>?
+    /// What the inspector shows now.
+    private(set) var inspectorContent: InspectorContent?
+
+    /// Where Copy puts the cells: the general pasteboard, or a private one
+    /// in tests (which must not touch the user's clipboard).
+    var pasteboard = NSPasteboard.general
+    /// The latest Copy's job, while it runs, and its promise to the
+    /// pasteboard.
+    private(set) var copyTask: Task<Void, Never>?
+    private(set) var copyPromise: CopyPromise?
+    /// The brief "wrapped" sign over the grid (Safari's), when Next or
+    /// Previous goes round the end of the file.
+    let wrapIndicator = WrapIndicatorView()
+    /// The latest VoiceOver announcement, for tests.
+    private(set) var lastAnnouncement: String?
+
     init(model: DocumentModel, scheduler: Scheduler) {
         self.model = model
         self.scheduler = scheduler
+        find = FindModel(model: model)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -56,7 +85,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         banners.orientation = .vertical
         banners.spacing = 0
         banners.alignment = .width
-        for view in [banners, grid, statusBar] as [NSView] {
+        for view in [findBar, banners, grid, inspector, statusBar, wrapIndicator] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(view)
         }
@@ -64,18 +93,35 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // zero rather than letting it take the grid's space.
         let noBanners = banners.heightAnchor.constraint(equalToConstant: 0)
         noBanners.priority = .defaultLow
+        // The find bar and the inspector are hidden until asked for.
+        findBarHeight = findBar.heightAnchor.constraint(equalToConstant: 0)
+        inspectorHeight = inspector.heightAnchor.constraint(equalToConstant: 0)
+        findBar.isHidden = true
+        inspector.isHidden = true
         NSLayoutConstraint.activate([
             noBanners,
-            banners.topAnchor.constraint(equalTo: root.topAnchor),
+            findBarHeight,
+            findBar.topAnchor.constraint(equalTo: root.topAnchor),
+            findBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            findBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            banners.topAnchor.constraint(equalTo: findBar.bottomAnchor),
             banners.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             banners.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             grid.topAnchor.constraint(equalTo: banners.bottomAnchor),
             grid.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             grid.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            grid.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            grid.bottomAnchor.constraint(equalTo: inspector.topAnchor),
+            inspectorHeight,
+            inspector.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            inspector.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            inspector.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            wrapIndicator.centerXAnchor.constraint(equalTo: grid.centerXAnchor),
+            wrapIndicator.centerYAnchor.constraint(equalTo: grid.centerYAnchor),
+            wrapIndicator.widthAnchor.constraint(equalToConstant: WrapIndicatorView.size),
+            wrapIndicator.heightAnchor.constraint(equalToConstant: WrapIndicatorView.size),
         ])
         view = root
     }
@@ -83,7 +129,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     override func viewDidLoad() {
         super.viewDidLoad()
         let scheduler = scheduler
-        grid.onUserInput = { scheduler.noteUserInput() }
+        grid.onUserInput = { [weak self] in
+            scheduler.noteUserInput()
+            // The user went somewhere: find doesn't move the selection now.
+            self?.find.cancelPendingStep()
+        }
         grid.onGesture = { [weak self] in self?.model.setInteracting($0) }
         grid.onColumnResized = { [weak self] column, width in self?.model.columnResized(column, width: width) }
         grid.fittingWidth = { [weak self] column in
@@ -97,6 +147,18 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         statusBar.onTreatAs = { [weak self] in self?.treatAs($0) }
         statusBar.onReopen = { [weak self] in self?.reopen(encoding: $0) }
         statusBar.onBadge = { [weak self] in self?.showDetails(nil) }
+        grid.onSelectionChanged = { [weak self] in self?.selectionChanged() }
+        grid.onCopy = { [weak self] in self?.copySelection() }
+        confirmLargeCopy = { [weak self] bytes, answer in
+            guard let self else { return answer(false) }
+            askBeforeCopying(bytes, answer)
+        }
+        findBar.onQuery = { [weak self] text in self?.search(for: text) }
+        findBar.onStep = { [weak self] forward in self?.step(forward: forward) }
+        findBar.onDone = { [weak self] in self?.hideFindBar() }
+        findBar.onIgnoreCase = { [weak self] _ in self?.search(for: self?.findBar.field.stringValue ?? "") }
+        find.onChange = { [weak self] in self?.findChanged() }
+        find.onSelect = { [weak self] cell in self?.grid.select(cell) }
         model.onChange = { [weak self] change in self?.modelChanged(change) }
         updateBanners()
         statusBar.show(model.status)
@@ -112,6 +174,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 grid.setColumnWidths(model.columnWidths)
             }
             grid.reloadData()
+            // A row the inspector was waiting for may be read now.
+            if inspectorContent == .note(InspectorText.notRead) { updateInspector() }
         case .columns:
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
@@ -120,9 +184,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             grid.invalidateContent()
             grid.activeCell = model.rowCount > 0 ? CellPosition(row: 0, column: 0) : nil
             navigation.reset()
+            // The file was read again: its matches are different. A copy
+            // of the old reading's cells goes on: it was promised to the
+            // pasteboard, and keeps what it reads (`CopyPromise`).
+            if isFindBarShown { find.restart(from: grid.activeCell) }
+            updateInspector()
         case .failed:
             grid.invalidateContent()
             detailsPopover?.close()
+            find.stop()
             onFailure?()
         }
         updateBanners()
@@ -314,9 +384,306 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             return !model.isFailed && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
             return model.diagnostics?.diagnostics.isEmpty == false
+        case #selector(showFind(_:)):
+            return !model.isFailed
+        case #selector(findNext(_:)), #selector(findPrevious(_:)):
+            return !model.isFailed && !findBar.field.stringValue.isEmpty
+        case #selector(goToRow(_:)):
+            return !model.isFailed && model.rowCount > 0
+        case #selector(toggleCellInspector(_:)):
+            menuItem.title = isInspectorShown ? MainMenu.hideInspector : MainMenu.showInspector
+            return !model.isFailed
         default:
             return true
         }
+    }
+
+    // MARK: Find (⌘F, ⌘G, ⇧⌘G; mockup 04a)
+
+    /// Edit > Find > Find… (⌘F): shows the find bar, with its query
+    /// selected, and searches for it again if the bar was closed.
+    @objc func showFind(_ sender: Any?) {
+        showFindBar()
+        view.window?.makeFirstResponder(findBar.field)
+        findBar.field.selectText(nil)
+    }
+
+    /// Edit > Find > Find Next (⌘G). With no query yet, it opens the bar.
+    @objc func findNext(_ sender: Any?) {
+        stepFromMenu(forward: true)
+    }
+
+    /// Edit > Find > Find Previous (⇧⌘G).
+    @objc func findPrevious(_ sender: Any?) {
+        stepFromMenu(forward: false)
+    }
+
+    private func stepFromMenu(forward: Bool) {
+        guard !findBar.field.stringValue.isEmpty else {
+            showFind(nil)
+            return
+        }
+        showFindBar()
+        step(forward: forward)
+    }
+
+    /// Shows the find bar, its highlights, and the search for its query.
+    func showFindBar() {
+        guard findBar.isHidden else { return }
+        findBar.isHidden = false
+        findBarHeight.constant = FindBarView.height
+        grid.highlighter = find
+        if !findBar.field.stringValue.isEmpty {
+            search(for: findBar.field.stringValue)
+        }
+        findChanged()
+    }
+
+    /// Done or Esc: the bar, its highlights and its search go; the query
+    /// stays for the next ⌘F or ⌘G.
+    func hideFindBar() {
+        guard !findBar.isHidden else { return }
+        find.stop()
+        grid.highlighter = nil
+        findBar.isHidden = true
+        findBarHeight.constant = 0
+        view.window?.makeFirstResponder(grid.gridView)
+    }
+
+    /// The query changed: search for it from the active cell, so the
+    /// first match at or after it is selected as soon as it is found.
+    func search(for text: String) {
+        find.find(text, caseSensitive: !findBar.ignoresCase, from: grid.activeCell)
+    }
+
+    /// Next or Previous from the active cell.
+    func step(forward: Bool) {
+        if find.search == nil, !findBar.field.stringValue.isEmpty {
+            // Searching again (the bar was closed, or the file read again).
+            find.find(findBar.field.stringValue, caseSensitive: !findBar.ignoresCase, from: nil)
+        }
+        find.step(forward: forward, from: grid.activeCell)
+    }
+
+    private func findChanged() {
+        let complete = find.progress?.complete ?? false
+        findBar.show(
+            count: find.query.isEmpty
+                ? ""
+                : FindText.count(current: find.current?.ordinal, total: find.matchCount, complete: complete, searching: find.isSearching),
+            canStep: find.matchCount > 0 || find.isSearching
+        )
+        if find.misses > lastMisses {
+            NSSound.beep()
+        }
+        lastMisses = find.misses
+        // VoiceOver hears the count after Next or Previous, and when a
+        // search finishes (DESIGN §4.4).
+        if find.steps > lastSteps, let current = find.current {
+            let count = FindText.count(current: current.ordinal, total: find.matchCount, complete: complete, searching: find.isSearching)
+            if find.lastStepWrapped {
+                wrapIndicator.show(over: grid)
+                announce(FindText.wrapped(forward: find.lastStepForward, count: count))
+            } else {
+                announce(count)
+            }
+        }
+        lastSteps = find.steps
+        if complete, let search = find.search, announcedSearch != ObjectIdentifier(search) {
+            announcedSearch = ObjectIdentifier(search)
+            announce(FindText.count(current: find.current?.ordinal, total: find.matchCount, complete: true, searching: false))
+        }
+        grid.gridView.needsDisplay = true
+    }
+
+    private var lastMisses = 0
+    private var lastSteps = 0
+    /// The search whose end was last announced.
+    private var announcedSearch: ObjectIdentifier?
+
+    private func announce(_ text: String) {
+        lastAnnouncement = text
+        NSAccessibility.post(
+            element: view.window ?? findBar,
+            notification: .announcementRequested,
+            userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue]
+        )
+    }
+
+    // MARK: Go to Row (⌘L)
+
+    /// Edit > Go to Row… (⌘L): asks for a row number, as the gutter shows
+    /// it, and goes there.
+    @objc func goToRow(_ sender: Any?) {
+        guard let window = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = FindText.goToRowTitle
+        alert.informativeText = FindText.goToRowMessage(rows: model.rowCount, exact: model.isIndexComplete)
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = FindText.goToRowField
+        field.setAccessibilityLabel(FindText.goToRowField)
+        alert.accessoryView = field
+        alert.addButton(withTitle: FindText.go)
+        alert.addButton(withTitle: FindText.cancel)
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            guard let number = FindText.rowNumber(from: field.stringValue) else {
+                NSSound.beep()
+                return
+            }
+            self?.goTo(rowNumber: number)
+        }
+    }
+
+    /// Goes to row `number` (from 1, as the gutter numbers rows). Past the
+    /// indexed rows, the grid shows the row as soon as the index reaches it
+    /// (DESIGN §3.10 rule 5).
+    func goTo(rowNumber number: Int) {
+        scheduler.noteUserInput()
+        find.cancelPendingStep()
+        view.window?.makeFirstResponder(grid.gridView)
+        grid.goTo(row: number - 1)
+    }
+
+    // MARK: Copy (⌘C)
+
+    /// A copy of at most this many bytes, of rows the index has, goes on
+    /// the clipboard at once, on the main thread: a few screens of cells
+    /// take well under a millisecond.
+    nonisolated static let immediateCopyBytes: UInt64 = 4 << 20
+    /// A copy of more than this many bytes asks first (1.8 review).
+    var askBeforeCopyBytes: UInt64 = 100_000_000
+
+    /// Asks whether to go on with a copy of about `bytes` bytes. Tests
+    /// answer for themselves.
+    var confirmLargeCopy: (_ bytes: UInt64, _ answer: @escaping @MainActor (Bool) -> Void) -> Void = { _, answer in answer(true) }
+
+    /// Copies the selected cells as tab-separated display values (DESIGN
+    /// §4.2), from the core. A small selection the index has goes on the
+    /// clipboard at once. A larger one, or one past the indexed rows, is a
+    /// P2 job in the core, whose text is promised to the pasteboard
+    /// straight away (`Clipboard.promise`), so a paste never gets the old
+    /// clipboard; the text is built off the main thread and taken from
+    /// the core only when something pastes it. Over about 100 MB, it asks
+    /// first.
+    func copySelection() {
+        guard let selection = grid.selection, !model.isFailed else { return }
+        // A copy still running is stopped by its pasteboard, when this one
+        // replaces its promise (`CopyPromise`).
+        copyTask = nil
+        copyPromise = nil
+        let range = model.copyRange(selection)
+        let bytes = model.estimatedCopyBytes(range)
+        if bytes <= Self.immediateCopyBytes, let text = model.copyCellsNow(range) {
+            Clipboard.write(text, to: pasteboard)
+            return
+        }
+        guard bytes > askBeforeCopyBytes else {
+            startCopy(range)
+            return
+        }
+        confirmLargeCopy(bytes) { [weak self] go in
+            if go { self?.startCopy(range) }
+        }
+    }
+
+    private func startCopy(_ range: CopyRange) {
+        guard let job = model.copyCells(range) else { return }
+        copyPromise = Clipboard.promise(job, to: pasteboard)
+        let waiter = job.job()
+        // Only for tests to await: nothing cancels this task, since the
+        // copy outlives the window (`CopyPromise`).
+        copyTask = Task {
+            try? await waiter.finish()
+        }
+    }
+
+    /// The sheet that asks before a very large copy.
+    func askBeforeCopying(_ bytes: UInt64, _ answer: @escaping @MainActor (Bool) -> Void) {
+        guard let window = view.window else {
+            answer(false)
+            return
+        }
+        let alert = NSAlert()
+        let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
+        alert.messageText = FindText.largeCopyTitle(size)
+        alert.informativeText = FindText.largeCopyMessage
+        alert.addButton(withTitle: FindText.copy)
+        alert.addButton(withTitle: FindText.cancel)
+        alert.beginSheetModal(for: window) { response in
+            answer(response == .alertFirstButtonReturn)
+        }
+    }
+
+    /// The document is closing (`CSVDocument.close`): the find search and
+    /// the inspector's read stop, so neither keeps the core's document, and
+    /// its file, open. A copy promised to the pasteboard goes on: it keeps
+    /// its own reading and the file's clone until the pasteboard has its
+    /// text (`CopyPromise`).
+    func documentWillClose() {
+        find.stop()
+        inspectorTask?.cancel()
+        wrapIndicator.dismiss()
+    }
+
+    // MARK: The cell inspector (⌘I; mockup 05a)
+
+    /// View > Show Cell Inspector (⌘I).
+    @objc func toggleCellInspector(_ sender: Any?) {
+        setInspectorShown(!isInspectorShown)
+    }
+
+    func setInspectorShown(_ shown: Bool) {
+        guard shown != isInspectorShown else { return }
+        inspector.isHidden = !shown
+        inspectorHeight.constant = shown ? CellInspectorView.height : 0
+        if shown {
+            updateInspector()
+            if let cell = grid.activeCell { grid.gridView.scrollToVisible(grid.geometry.cellRect(row: cell.row, column: cell.column)) }
+        } else {
+            inspectorTask?.cancel()
+            if view.window?.firstResponder === inspector.textView {
+                view.window?.makeFirstResponder(grid.gridView)
+            }
+        }
+    }
+
+    private func selectionChanged() {
+        find.activeCellChanged(grid.activeCell)
+        updateInspector()
+    }
+
+    /// Shows the active cell's whole value, read off the main thread.
+    func updateInspector() {
+        guard isInspectorShown else { return }
+        inspectorTask?.cancel()
+        guard let cell = grid.activeCell, cell.column < model.columnCount else {
+            showInInspector(column: "", row: nil, content: .note(InspectorText.noCell))
+            return
+        }
+        let title = model.headerTitle(column: cell.column)
+        let column = title.style == .number ? GridStrings.extraColumn(cell.column + 1) : title.text
+        guard cell.row < model.loadedRowCount else {
+            showInInspector(column: column, row: cell.row + 1, content: .note(InspectorText.notRead))
+            return
+        }
+        inspectorTask = Task { [weak self] in
+            guard let self else { return }
+            let value = await model.cellValue(row: cell.row, column: cell.column)
+            guard !Task.isCancelled, grid.activeCell == cell else { return }
+            let content: InspectorContent = switch value {
+            case let value? where value.exists: .value(value)
+            case .some: .note(InspectorText.missing)
+            case nil: .note(InspectorText.notRead)
+            }
+            showInInspector(column: column, row: cell.row + 1, content: content)
+        }
+    }
+
+    private func showInInspector(column: String, row: Int?, content: InspectorContent) {
+        inspectorContent = content
+        inspector.show(column: column, row: row, content: content)
     }
 
     // MARK: The details popover (mockup 03b)
@@ -493,9 +860,18 @@ final class DocumentWindowController: NSWindowController {
             localized: "UTF-16 files are read-only in this version of Leal.",
             comment: "Tooltip of the lock glyph by a read-only file's title"
         )
-        image.frame = NSRect(x: 0, y: 0, width: 22, height: 22)
+        // The glyph sits in a plain container, which is the accessory's
+        // view. AppKit throws "changing the view's origin is not allowed"
+        // if the layout engine ever moves an accessory's view, and with the
+        // image view itself as the accessory it did, in a layout pass of
+        // the hosted tests on a Mac with a second, 1× display (1.8 review
+        // fixes). The container has no content size of its own to lay out.
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
+        image.frame = container.bounds
+        image.autoresizingMask = [.width, .height]
+        container.addSubview(image)
         let accessory = NSTitlebarAccessoryViewController()
-        accessory.view = image
+        accessory.view = container
         accessory.layoutAttribute = .leading
         return accessory
     }

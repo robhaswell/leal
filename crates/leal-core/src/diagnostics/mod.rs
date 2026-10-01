@@ -102,7 +102,7 @@ use crate::dialect::Encoding;
 use crate::index::{IndexDialect, IndexError};
 
 pub(crate) use collect::Collector;
-pub(crate) use find::{Hit, decided_by_bytes, field_with, next_hit, row_may_have};
+pub(crate) use find::{Hit, decided_by_bytes, field_with, has_invalid, next_hit, row_may_have};
 pub(crate) use marks::Mark;
 use marks::RowMarks;
 

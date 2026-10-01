@@ -56,6 +56,11 @@ harness = false
 name = "navigate"
 harness = false
 
+# Find over the reference file, and a screen of cells while it runs (PLAN 1.8).
+[[bench]]
+name = "find"
+harness = false
+
 [dependencies]
 # Reads criterion's `estimates.json` and `benchmark.json` (bench-report).
 # Criterion already depends on it, so it adds nothing to the build.

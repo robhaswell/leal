@@ -95,8 +95,13 @@ enum MainMenu {
         (item.representedObject as? EncodingBox)?.encoding
     }
 
+    /// View > Show Cell Inspector, and Hide once it shows.
+    static let showInspector = String(localized: "Show Cell Inspector", comment: "View menu: show the cell inspector pane (⌘I, mockup 05a)")
+    static let hideInspector = String(localized: "Hide Cell Inspector", comment: "View menu: hide the cell inspector pane (⌘I)")
+
     /// The standard items, which text fields need for their shortcuts (0.3
-    /// notes). The grid's own Copy and Select All are task 1.8.
+    /// notes); the grid answers Copy and Select All itself (task 1.8). Then
+    /// Find (DESIGN §4.2: ⌘F, ⌘G, ⇧⌘G) and Go to Row (⌘L).
     private static func editMenu() -> NSMenu {
         let menu = NSMenu(title: String(localized: "Edit", comment: "Menu title"))
         menu.addItem(withTitle: String(localized: "Undo", comment: "Edit menu"), action: Selector(("undo:")), keyEquivalent: "z")
@@ -108,6 +113,32 @@ enum MainMenu {
         menu.addItem(withTitle: String(localized: "Paste", comment: "Edit menu"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         menu.addItem(withTitle: String(localized: "Delete", comment: "Edit menu"), action: #selector(NSText.delete(_:)), keyEquivalent: "")
         menu.addItem(withTitle: String(localized: "Select All", comment: "Edit menu"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        menu.addItem(.separator())
+        let find = NSMenuItem(title: String(localized: "Find", comment: "Edit menu: the Find submenu"), action: nil, keyEquivalent: "")
+        let findMenu = NSMenu(title: find.title)
+        findMenu.addItem(
+            withTitle: String(localized: "Find…", comment: "Edit > Find: show the find bar (⌘F, mockup 04a)"),
+            action: #selector(DocumentViewController.showFind(_:)),
+            keyEquivalent: "f"
+        )
+        findMenu.addItem(
+            withTitle: String(localized: "Find Next", comment: "Edit > Find: the next match (⌘G)"),
+            action: #selector(DocumentViewController.findNext(_:)),
+            keyEquivalent: "g"
+        )
+        let previous = findMenu.addItem(
+            withTitle: String(localized: "Find Previous", comment: "Edit > Find: the previous match (⇧⌘G)"),
+            action: #selector(DocumentViewController.findPrevious(_:)),
+            keyEquivalent: "g"
+        )
+        previous.keyEquivalentModifierMask = [.command, .shift]
+        find.submenu = findMenu
+        menu.addItem(find)
+        menu.addItem(
+            withTitle: String(localized: "Go to Row…", comment: "Edit menu: go to a row by its number (⌘L)"),
+            action: #selector(DocumentViewController.goToRow(_:)),
+            keyEquivalent: "l"
+        )
         return menu
     }
 
@@ -136,6 +167,7 @@ enum MainMenu {
             action: #selector(DocumentViewController.showDetails(_:)),
             keyEquivalent: ""
         )
+        menu.addItem(withTitle: showInspector, action: #selector(DocumentViewController.toggleCellInspector(_:)), keyEquivalent: "i")
         return menu
     }
 

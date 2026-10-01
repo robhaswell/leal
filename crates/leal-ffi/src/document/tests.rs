@@ -10,10 +10,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// A temporary directory that is deleted when the test ends.
-struct TempDir(PathBuf);
+pub(super) struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let dir =
             std::env::temp_dir().join(format!("leal-ffi-document-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -21,13 +21,13 @@ impl TempDir {
         Self(dir)
     }
 
-    fn file(&self, name: &str, bytes: &[u8]) -> String {
+    pub(super) fn file(&self, name: &str, bytes: &[u8]) -> String {
         let path = self.0.join(name);
         std::fs::write(&path, bytes).unwrap();
         path.to_string_lossy().into_owned()
     }
 
-    fn locations(&self) -> TempLocations {
+    pub(super) fn locations(&self) -> TempLocations {
         TempLocations {
             scratch_dir: self.0.join("scratch").to_string_lossy().into_owned(),
             records_dir: self.0.join("records").to_string_lossy().into_owned(),
@@ -53,7 +53,7 @@ impl Wake for Unpark {
 /// Runs a future to completion on this thread, the way an executor would:
 /// poll, and park until woken. A future that is never woken would hang,
 /// so this gives up after a while.
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(Unpark(thread::current())));
     let mut context = Context::from_waker(&waker);
@@ -67,7 +67,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn options() -> OpenOptions {
+pub(super) fn options() -> OpenOptions {
     OpenOptions {
         delimiter: None,
         header: None,

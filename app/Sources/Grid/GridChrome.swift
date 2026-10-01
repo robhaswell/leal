@@ -155,13 +155,29 @@ final class GridGutterView: NSView {
             }
         }
     }
+    /// The selected rows, when the selection spans more than one (task
+    /// 1.8): their numbers are in the accent colour too.
+    var selectedRows: ClosedRange<Int>? {
+        didSet {
+            guard selectedRows != oldValue else { return }
+            for rows in [oldValue, selectedRows].compactMap({ $0 }) {
+                let rect = NSRect(x: 0, y: CGFloat(rows.lowerBound) * rowHeight, width: bounds.width, height: CGFloat(rows.count) * rowHeight)
+                setNeedsDisplay(rect.intersection(visibleRect))
+            }
+        }
+    }
     /// The top of the visible part: the grid's vertical offset.
     var offsetY: CGFloat { visibleRect.minY }
 
     weak var scrollTarget: NSView?
+    /// A click on a row number: the row is selected.
     var onClick: ((_ row: Int) -> Void)?
+    /// A Shift-click on a row number: the selected rows run to it.
+    var onExtend: ((_ row: Int) -> Void)?
 
     private var numbers: [Int: TextLine] = [:]
+    /// Selected rows' numbers, in the accent colour.
+    private var selectedNumbers: [Int: TextLine] = [:]
     /// How many times it has drawn, for the scroll benchmark.
     private(set) var draws = 0
     private var activeNumber: (row: Int, line: TextLine)?
@@ -186,6 +202,7 @@ final class GridGutterView: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         numbers.removeAll()
+        selectedNumbers.removeAll()
         activeNumber = nil
         needsDisplay = true
     }
@@ -216,6 +233,13 @@ final class GridGutterView: NSView {
                     line = CellPainter.makeLine(String(row + 1), font: font, color: palette.accent, symbolColor: palette.accent)
                     activeNumber = (row, line)
                 }
+            } else if selectedRows?.contains(row) == true {
+                line = selectedNumbers[row] ?? {
+                    if selectedNumbers.count > 2_000 { selectedNumbers.removeAll() }
+                    let made = CellPainter.makeLine(String(row + 1), font: font, color: palette.accent, symbolColor: palette.accent)
+                    selectedNumbers[row] = made
+                    return made
+                }()
             } else if let cached = numbers[row] {
                 line = cached
             } else {
@@ -233,7 +257,12 @@ final class GridGutterView: NSView {
         let y = convert(event.locationInWindow, from: nil).y
         guard y >= 0, let source = dataSource else { return }
         let row = Int((y / rowHeight).rounded(.down))
-        if row < source.rowCount { onClick?(row) }
+        guard row < source.rowCount else { return }
+        if event.modifierFlags.contains(.shift), let onExtend {
+            onExtend(row)
+        } else {
+            onClick?(row)
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {

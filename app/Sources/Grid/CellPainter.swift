@@ -296,6 +296,51 @@ enum CellPainter {
         context.stroke(rect.insetBy(dx: 1, dy: 1))
     }
 
+    /// Find's highlights in a cell (mockup 04a): a yellow mark behind each
+    /// match of the query in `line` (the cell's text as `drawText` lays it
+    /// out), and for the current match a stronger mark with an orange
+    /// outline. `ranges` are UTF-16 ranges of the line's text. Only the
+    /// find bar's matches are drawn, so the colours are resolved here, not
+    /// in the per-frame palette.
+    static func drawFindHighlights(
+        _ line: TextLine,
+        ranges: [NSRange],
+        in rect: CGRect,
+        alignment: CellAlignment,
+        current: Bool,
+        context: CGContext
+    ) {
+        let available = rect.width - 2 * GridMetrics.cellPadding
+        guard available > 2, line.width > 0, !ranges.isEmpty else { return }
+        let width = min(line.width, available)
+        let x = switch alignment {
+        case .leading: rect.minX + GridMetrics.cellPadding
+        case .trailing: rect.maxX - GridMetrics.cellPadding - width
+        }
+        let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let fill = NSColor.systemYellow.withAlphaComponent(dark ? (current ? 0.55 : 0.32) : (current ? 0.6 : 0.38)).cgColor
+        context.saveGState()
+        // A long value is cut with an ellipsis where the column ends.
+        context.clip(to: CGRect(x: x - 2, y: rect.minY, width: width + 4, height: rect.height))
+        for range in ranges {
+            let start = CTLineGetOffsetForStringIndex(line.line, range.location, nil)
+            let end = CTLineGetOffsetForStringIndex(line.line, range.location + range.length, nil)
+            guard end > start else { continue }
+            let mark = CGRect(x: x + start - 1, y: rect.minY + 3, width: end - start + 2, height: rect.height - 6)
+            let path = CGPath(roundedRect: mark, cornerWidth: 3, cornerHeight: 3, transform: nil)
+            context.setFillColor(fill)
+            context.addPath(path)
+            context.fillPath()
+            if current {
+                context.setStrokeColor(NSColor.systemOrange.cgColor)
+                context.setLineWidth(1.5)
+                context.addPath(CGPath(roundedRect: mark.insetBy(dx: 0.75, dy: 0.75), cornerWidth: 3, cornerHeight: 3, transform: nil))
+                context.strokePath()
+            }
+        }
+        context.restoreGState()
+    }
+
     /// The vertical line at a column's right edge.
     static func drawColumnSeparator(atX x: CGFloat, minY: CGFloat, maxY: CGFloat, palette: GridPalette, context: CGContext) {
         context.setFillColor(palette.gridLine)

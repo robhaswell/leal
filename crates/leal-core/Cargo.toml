@@ -20,6 +20,11 @@ libc = "0.2.189"
 memmap2 = "0.9.11"
 # The row index (PLAN 1.3): finding quote, CR and LF bytes (DESIGN §3.3).
 memchr = "2.8.3"
+# Find (PLAN 1.8): the query as literal text, case-insensitive with Unicode
+# simple case folding, on display values and (for UTF-8) on raw bytes, with
+# SIMD-accelerated literal search. Phase 3's regex filter (DESIGN §3.8) uses
+# it too. Already in the lock file through criterion.
+regex = "1.13.1"
 # The background pool for P2 and P3 work (PLAN 1.3a, DESIGN §3.10 rule 4).
 rayon = "1.12.0"
 # Diagnostics (PLAN 1.5): finding invalid UTF-8 during the index's pass,

@@ -297,7 +297,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - These follow the existing ADR-0002 status-bar and banner styles with
       no separate mockup round, and Rob sees screenshots at the phase 1
       gate. (ADR-0005 decision 8)
-- [ ] **1.8 App: find, go to row, copy, cell inspector.**
+- [x] **1.8 App: find, go to row, copy, cell inspector.**
   - Cell selection, multi-cell selection (click, shift-click, drag, ⌘A)
     and keyboard navigation (arrows, Page Up/Down, ⌘↑/⌘↓, Tab, keeping the
     active cell visible) are custom code, about 3–5 days (ADR-0001).
@@ -433,6 +433,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Estimate: 2–3 weeks more than a standard `NSTableView` would need.
 - [ ] **4.3 CLI** — `leal <file>`, `leal check <file>`.
 - [ ] **4.4 Polish** — icon, About, Settings, README, website page.
+  - Find shares its query with other apps through the system find
+    pasteboard (⌘G in Leal finds what was last searched for anywhere), and
+    Edit ▸ Find ▸ Use Selection for Find (⌘E) puts the active cell's value
+    there. Tests must not write the user's find pasteboard. (1.8 review)
 - [ ] **4.5 Release pipeline** — signing, notarization, DMG, Sparkle,
   GitHub Actions release, Homebrew cask. *Needs the Apple Developer Program.*
   - Hardened runtime on, if 1.6 left it off; the sandbox entitlements are
