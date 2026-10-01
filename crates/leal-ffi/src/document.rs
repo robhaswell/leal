@@ -138,6 +138,17 @@ pub enum TextEncoding {
     MacRoman,
 }
 
+/// A line ending, for the status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LineEnding {
+    /// `\n`
+    Lf,
+    /// `\r\n`
+    Crlf,
+    /// `\r` on its own.
+    Cr,
+}
+
 /// Where the encoding came from, for the status bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum EncodingSource {
@@ -163,7 +174,7 @@ pub enum DialectSource {
 }
 
 /// How the file is read. See [`leal_core::detect::Detection`]; the status
-/// bar notes and line endings come with 1.6 and 1.7.
+/// bar notes come with 1.7.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Interpretation {
     /// The encoding.
@@ -178,6 +189,10 @@ pub struct Interpretation {
     pub header: bool,
     /// Where the header choice came from.
     pub header_source: DialectSource,
+    /// The most common line ending in the first 64 KB, or `None` if no
+    /// row there has one. [`ReviewResult::line_ending`] has the whole
+    /// file's.
+    pub line_ending: Option<LineEnding>,
 }
 
 /// How to open (or re-read) a document.
@@ -209,6 +224,16 @@ pub struct Cell {
     pub truncated: bool,
 }
 
+/// One row's cells in a window of columns. See
+/// [`leal_core::document::RowCells`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RowCells {
+    /// How many fields the whole row has.
+    pub field_count: u32,
+    /// The row's cells in the window.
+    pub cells: Vec<Cell>,
+}
+
 /// First paint's result. See [`leal_core::document::FirstScreen`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FirstScreen {
@@ -222,6 +247,9 @@ pub struct FirstScreen {
     pub row_count: u64,
     /// The row count to size the scrollbar with.
     pub estimated_row_count: u64,
+    /// The most common field count in the first 64 KB: the grid's column
+    /// count until [`Document::column_count`] has the index's.
+    pub column_count: u32,
 }
 
 /// Where indexing has got to. See [`leal_core::document::IndexProgress`].
@@ -250,6 +278,8 @@ pub struct ReviewResult {
     /// A delimiter the whole file fits better: "This file looks
     /// semicolon-separated — Switch".
     pub delimiter_suggestion: Option<Delimiter>,
+    /// The most common line ending in the whole file.
+    pub line_ending: Option<LineEnding>,
 }
 
 /// A kind of irregularity (DESIGN §3.5). See
@@ -709,16 +739,66 @@ impl Document {
         max_chars: u32,
     ) -> Result<Vec<Vec<Cell>>, LealError> {
         self.call(|| {
-            let start = usize::try_from(start).unwrap_or(usize::MAX);
-            let end = start.saturating_add(to_usize(count));
             let rows = self
                 .document
-                .rows(start..end, to_usize(max_chars))
+                .rows(to_range(start, count), to_usize(max_chars))
                 .map_err(|error| read_error(&self.path, &error))?;
             Ok(rows
                 .into_iter()
                 .map(|row| row.into_iter().map(Cell::from).collect())
                 .collect())
+        })
+    }
+
+    /// Rows `row_start` to `row_start + row_count`, as for
+    /// [`rows`](Self::rows), but only their cells in columns `column_start`
+    /// to `column_start + column_count`, with each row's field count. The
+    /// grid reads what it shows this way.
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn cells(
+        &self,
+        row_start: u64,
+        row_count: u32,
+        column_start: u32,
+        column_count: u32,
+        max_chars: u32,
+    ) -> Result<Vec<RowCells>, LealError> {
+        self.call(|| {
+            let rows = to_range(row_start, row_count);
+            let columns = to_range(u64::from(column_start), column_count);
+            let rows = self
+                .document
+                .cells(rows, columns, to_usize(max_chars))
+                .map_err(|error| read_error(&self.path, &error))?;
+            Ok(rows.into_iter().map(RowCells::from).collect())
+        })
+    }
+
+    /// The grid's column count: the most common field count so far. It can
+    /// change while indexing.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn column_count(&self) -> Result<u32, LealError> {
+        self.call(|| Ok(to_u32(self.document.column_count())))
+    }
+
+    /// Which columns hold numbers, from the first `sample` rows after the
+    /// header row, for right-aligning them. The first screen's sample is
+    /// fast; call it with 1,000 rows off the main thread.
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn numeric_columns(&self, sample: u32) -> Result<Vec<bool>, LealError> {
+        self.call(|| {
+            self.document
+                .numeric_columns(to_usize(sample))
+                .map_err(|error| read_error(&self.path, &error))
         })
     }
 
@@ -809,6 +889,7 @@ impl Document {
             Ok(Some(ReviewResult {
                 encoding_suggestion: review.encoding_suggestion.map(TextEncoding::from),
                 delimiter_suggestion: review.delimiter_suggestion.map(Delimiter::from),
+                line_ending: review.line_ending.map(LineEnding::from),
             }))
         })
     }
@@ -945,6 +1026,16 @@ fn to_usize(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
+fn to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// `count` items from `start`, as a range of `usize`, saturating.
+fn to_range(start: u64, count: u32) -> std::ops::Range<usize> {
+    let start = usize::try_from(start).unwrap_or(usize::MAX);
+    start..start.saturating_add(to_usize(count))
+}
+
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -1006,6 +1097,15 @@ impl From<document::Cell> for Cell {
     }
 }
 
+impl From<document::RowCells> for RowCells {
+    fn from(row: document::RowCells) -> Self {
+        RowCells {
+            field_count: to_u32(row.field_count),
+            cells: row.cells.into_iter().map(Cell::from).collect(),
+        }
+    }
+}
+
 impl From<document::FirstScreen> for FirstScreen {
     fn from(screen: document::FirstScreen) -> Self {
         FirstScreen {
@@ -1018,6 +1118,7 @@ impl From<document::FirstScreen> for FirstScreen {
                 .collect(),
             row_count: to_u64(screen.row_count),
             estimated_row_count: to_u64(screen.estimated_row_count),
+            column_count: to_u32(screen.column_count),
         }
     }
 }
@@ -1044,6 +1145,7 @@ impl From<&Detection> for Interpretation {
             delimiter_source: detection.delimiter_source.into(),
             header: detection.header,
             header_source: detection.header_source.into(),
+            line_ending: detection.line_ending.map(LineEnding::from),
         }
     }
 }
@@ -1091,6 +1193,7 @@ macro_rules! both_ways {
 }
 
 both_ways!(Delimiter, dialect::Delimiter, [Comma, Semicolon, Tab, Pipe]);
+both_ways!(LineEnding, dialect::LineEnding, [Lf, Crlf, Cr]);
 both_ways!(
     TextEncoding,
     dialect::Encoding,

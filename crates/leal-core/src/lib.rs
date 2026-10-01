@@ -10,12 +10,9 @@ pub mod diagnostics;
 pub mod dialect;
 pub mod document;
 pub mod index;
-mod inspect;
 pub mod rows;
 pub mod schedule;
 pub mod source;
-
-pub use inspect::{FIRST_LINE_MAX_BYTES, FileSummary, inspect_file};
 
 /// Returns the version of `leal-core`, for example `"0.0.0"`.
 ///

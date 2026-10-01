@@ -13,26 +13,26 @@ final class LealFFITests: XCTestCase {
         XCTAssertEqual(version.split(separator: ".").count, 3, "expected a semver version, got \(version)")
     }
 
-    func testInspectFileReadsSizeAndFirstLine() throws {
-        let url = try temporaryFile(named: "people.csv", contents: "name,city\r\nAda,London\r\n")
-        let summary = try inspectFile(path: url.path(percentEncoded: false))
-        XCTAssertEqual(summary, FileSummary(byteCount: 23, firstLine: "name,city"))
-    }
-
     func testNonASCIIPathAndContentsCrossTheBoundary() throws {
-        let url = try temporaryFile(named: "café – résumé.csv", contents: "prénom,ville\nZoë,Zürich\n")
-        let summary = try inspectFile(path: url.path(percentEncoded: false))
-        XCTAssertEqual(summary.firstLine, "prénom,ville")
-        XCTAssertEqual(summary.byteCount, UInt64("prénom,ville\nZoë,Zürich\n".utf8.count))
+        let contents = "prénom,ville\nZoë,Zürich\n"
+        let url = try temporaryFile(named: "café – résumé.csv", contents: contents)
+        let source = try TemporaryFolders.open(url, temp: temporaryLocations())
+        XCTAssertEqual(source.byteCount(), UInt64(contents.utf8.count))
+        let document = try openDocument(
+            path: url.path(percentEncoded: false),
+            volume: VolumeInfo(),
+            temp: temporaryLocations(),
+            scheduler: Scheduler(),
+            options: OpenOptions(),
+            observer: nil
+        )
+        XCTAssertEqual(try document.firstScreen().rows.map { $0.map(\.text) }, [["prénom", "ville"], ["Zoë", "Zürich"]])
     }
 
     /// A Rust `Err` arrives in Swift as a thrown `LealError`, with the path
     /// and the OS error code.
     func testMissingFileThrowsNotFound() throws {
         let path = try temporaryDirectory().appending(path: "missing.csv").path(percentEncoded: false)
-        XCTAssertThrowsError(try inspectFile(path: path)) { error in
-            XCTAssertEqual(error as? LealError, LealError.NotFound(path: path, code: ENOENT))
-        }
         XCTAssertThrowsError(try openSource(path: path, volume: VolumeInfo(), temp: temporaryLocations())) { error in
             XCTAssertEqual(error as? LealError, LealError.NotFound(path: path, code: ENOENT))
             XCTAssertEqual(OpenErrorText.describe(error), "The file doesn’t exist.")
@@ -45,9 +45,6 @@ final class LealFFITests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         let path = url.path(percentEncoded: false)
         let expected = LealError.NotAFile(path: path, isDirectory: true)
-        XCTAssertThrowsError(try inspectFile(path: path)) { error in
-            XCTAssertEqual(error as? LealError, expected)
-        }
         let volumeFolder = try XCTUnwrap(TemporaryFolders.volumeFolder(for: url))
         XCTAssertThrowsError(try openSource(path: path, volume: VolumeInfo(folder: volumeFolder), temp: temporaryLocations())) {
             error in
@@ -64,9 +61,6 @@ final class LealFFITests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path(percentEncoded: false))
         let path = url.path(percentEncoded: false)
         let expected = LealError.PermissionDenied(path: path, code: EACCES)
-        XCTAssertThrowsError(try inspectFile(path: path)) { error in
-            XCTAssertEqual(error as? LealError, expected)
-        }
         XCTAssertThrowsError(try TemporaryFolders.open(url, temp: temporaryLocations())) { error in
             XCTAssertEqual(error as? LealError, expected)
             XCTAssertEqual(OpenErrorText.describe(error), "You don’t have permission to open it.")
@@ -156,7 +150,7 @@ final class LealFFITests: XCTestCase {
         }
 
         let url = try temporaryFile(named: "after-panic.csv", contents: "a,b\n")
-        XCTAssertEqual(try inspectFile(path: url.path(percentEncoded: false)).firstLine, "a,b")
+        XCTAssertEqual(try TemporaryFolders.open(url, temp: temporaryLocations()).byteCount(), 4)
     }
 
     /// A new directory that is deleted after the test.

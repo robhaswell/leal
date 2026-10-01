@@ -32,7 +32,7 @@ final class DocumentFFITests: XCTestCase {
         try await document.reviewJob().wait()
         XCTAssertEqual(try document.rowCount(), 3)
         XCTAssertTrue(try document.progress().complete)
-        XCTAssertEqual(try document.review(), ReviewResult(encodingSuggestion: nil, delimiterSuggestion: nil))
+        XCTAssertEqual(try document.review(), ReviewResult(encodingSuggestion: nil, delimiterSuggestion: nil, lineEnding: .lf))
         XCTAssertEqual(observer.reports.last?.complete, true)
 
         let rows = try document.rows(start: 1, count: 10, maxChars: 3)

@@ -21,8 +21,8 @@ mod document;
 
 pub use document::{
     Cell, Delimiter, DialectSource, Document, EncodingSource, FirstScreen, IndexProgress,
-    Interpretation, Job, JobFailure, OpenOptions, ProgressObserver, ReviewResult, Scheduler,
-    TextEncoding, open_document,
+    Interpretation, Job, JobFailure, LineEnding, OpenOptions, ProgressObserver, ReviewResult,
+    RowCells, Scheduler, TextEncoding, open_document,
 };
 
 use std::path::{Path, PathBuf};
@@ -35,26 +35,6 @@ use leal_core::source::{self, OpenError, OpenErrorKind, TempFolders};
 #[must_use]
 pub fn core_version() -> String {
     leal_core::version().to_owned()
-}
-
-/// The size and first line of a file. See [`leal_core::FileSummary`].
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct FileSummary {
-    /// The file's size in bytes.
-    pub byte_count: u64,
-    /// The first line, without its line ending (LF, CRLF or a lone CR) or a
-    /// UTF-8 BOM, from the first 200 bytes of the file, decoded as UTF-8 with
-    /// invalid bytes replaced.
-    pub first_line: String,
-}
-
-impl From<leal_core::FileSummary> for FileSummary {
-    fn from(summary: leal_core::FileSummary) -> Self {
-        Self {
-            byte_count: summary.byte_count,
-            first_line: summary.first_line,
-        }
-    }
 }
 
 /// An error returned to Swift, where it is thrown.
@@ -197,20 +177,6 @@ impl std::fmt::Display for LealError {
 }
 
 impl std::error::Error for LealError {}
-
-/// Reads the size and first line of the file at `path`.
-///
-/// # Errors
-///
-/// [`LealError::NotFound`], [`LealError::PermissionDenied`],
-/// [`LealError::NotAFile`] (for example, a folder), or [`LealError::Io`] if
-/// it can't be read.
-#[uniffi::export]
-pub fn inspect_file(path: &str) -> Result<FileSummary, LealError> {
-    leal_core::inspect_file(Path::new(&path))
-        .map(FileSummary::from)
-        .map_err(|err| LealError::from_open(path, &err))
-}
 
 /// Where the core may put temporary files. See
 /// [`leal_core::source::TempFolders`].
@@ -417,24 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn inspect_file_wraps_core() {
-        let dir = TempDir::new("inspect");
-        let path = dir.path("a.csv");
-        std::fs::write(&path, b"a,b\n1,2\n").unwrap();
-        assert_eq!(
-            inspect_file(&path),
-            Ok(FileSummary {
-                byte_count: 8,
-                first_line: "a,b".to_owned(),
-            })
-        );
-    }
-
-    #[test]
     fn missing_file_is_not_found() {
+        let dir = TempDir::new("missing");
         let path = "/nonexistent/leal/missing.csv".to_owned();
         assert_eq!(
-            inspect_file(&path),
+            open_source(&path, VolumeInfo::default(), dir.locations()).map(|_| ()),
             Err(LealError::NotFound {
                 path,
                 // ENOENT
@@ -448,19 +401,12 @@ mod tests {
         let dir = TempDir::new("directory");
         let path = dir.path("");
         assert_eq!(
-            inspect_file(&path),
+            open_source(&path, VolumeInfo::default(), dir.locations()).map(|_| ()),
             Err(LealError::NotAFile {
                 path: path.clone(),
                 is_directory: true
             })
         );
-        assert!(matches!(
-            open_source(&path, VolumeInfo::default(), dir.locations()),
-            Err(LealError::NotAFile {
-                is_directory: true,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -474,7 +420,6 @@ mod tests {
             // EACCES
             code: Some(13),
         };
-        assert_eq!(inspect_file(&path), Err(expected.clone()));
         assert_eq!(
             open_source(&path, VolumeInfo::default(), dir.locations()).map(|_| ()),
             Err(expected)

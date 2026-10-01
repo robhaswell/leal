@@ -1,0 +1,338 @@
+import AppKit
+import LealFFI
+import XCTest
+
+@testable import Leal
+
+/// `CSVDocument` and `DocumentModel` against the real core, hosted in
+/// Leal.app: opening and closing, the first screen before the index, rows
+/// arriving while indexing, failure after a panic (DESIGN §3.9),
+/// cancellation (ADR-0005 decision 6), the Header row toggle and UTF-16.
+@MainActor
+final class DocumentTests: XCTestCase {
+    private var directory: URL!
+    private var environment: DocumentEnvironment!
+    private var savedEnvironment: (() throws -> DocumentEnvironment)?
+
+    override func setUp() async throws {
+        directory = FileManager.default.temporaryDirectory.appending(path: "leal-app-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        environment = DocumentEnvironment(
+            scheduler: try Scheduler(),
+            temp: TempLocations(
+                scratchDir: directory.appending(path: "scratch").path(percentEncoded: false),
+                recordsDir: directory.appending(path: "records").path(percentEncoded: false)
+            )
+        )
+        savedEnvironment = CSVDocument.environment
+        let environment = environment!
+        CSVDocument.environment = { environment }
+    }
+
+    override func tearDown() async throws {
+        if let savedEnvironment { CSVDocument.environment = savedEnvironment }
+        for document in NSDocumentController.shared.documents {
+            document.close()
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func file(_ name: String, _ contents: String) throws -> URL {
+        let url = directory.appending(path: name)
+        try Data(contents.utf8).write(to: url)
+        return url
+    }
+
+    private func open(_ url: URL) throws -> CSVDocument {
+        let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+        document.makeWindowControllers()
+        return document
+    }
+
+    /// Waits (letting the main actor run) until `condition` holds.
+    private func waitUntil(_ what: String, timeout: TimeInterval = 20, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline {
+                XCTFail("timed out waiting until \(what)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    /// A file of about `bytes` bytes: a header and numbered rows, some with
+    /// a quoted field holding a newline.
+    private func bigFile(_ name: String, bytes: Int) throws -> (URL, rows: Int) {
+        var text = "id,name,amount,notes\n"
+        var rows = 0
+        while text.utf8.count < bytes {
+            var chunk = ""
+            for _ in 0..<1_000 {
+                let notes = rows % 9 == 0 ? "\"two\nlines\"" : "n\(rows)"
+                chunk += "\(rows),name \(rows),\(rows % 997).25,\(notes)\n"
+                rows += 1
+            }
+            text += chunk
+        }
+        return (try file(name, text), rows)
+    }
+
+    private func records() -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: environment.temp.recordsDir)) ?? []
+    }
+
+    // MARK: Open and close
+
+    func testOpeningShowsTheFileAndClosingReleasesIt() async throws {
+        let url = try file("orders.csv", "order_id,qty,total,notes\r\nA-1,40,1196.00,Gift wrap\r\nA-2,3,12.30,\r\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        XCTAssertEqual(document.windowControllers.count, 1)
+        XCTAssertEqual(model.headerTitle(column: 0), HeaderTitle(text: "order_id", style: .name))
+        XCTAssertEqual(model.columnCount, 4)
+        XCTAssertEqual(model.cell(row: 0, column: 0), .text("A-1", truncated: false))
+        XCTAssertEqual(model.cell(row: 1, column: 3), .text("", truncated: false))
+        XCTAssertTrue(model.isNumeric(column: 1))
+        XCTAssertTrue(model.isNumeric(column: 2))
+        XCTAssertFalse(model.isNumeric(column: 0))
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertEqual(model.rowCount, 2)
+        XCTAssertEqual(model.loadedRowCount, 2)
+        XCTAssertEqual(
+            StatusText.segments(model.status),
+            ["2 rows × 4 columns", "Comma", "CRLF", "UTF-8"]
+        )
+        // The clone is recorded while the file is open, and gone once it is
+        // closed (DESIGN §3.1).
+        XCTAssertFalse(records().isEmpty)
+        let calls = model.coreCalls
+        document.close()
+        try await waitUntil("the clone is removed") { records().isEmpty }
+        _ = model.cell(row: 0, column: 0)
+        XCTAssertEqual(model.coreCalls, calls, "no calls after closing")
+    }
+
+    func testAFileThatCantBeOpenedIsWorded() throws {
+        let url = directory.appending(path: "missing.csv")
+        XCTAssertThrowsError(try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.localizedDescription, "Leal couldn’t open “missing.csv”.")
+            XCTAssertEqual(error.localizedRecoverySuggestion, "The file doesn’t exist.")
+        }
+    }
+
+    // MARK: First paint and indexing (DESIGN §3.10)
+
+    func testTheFirstScreenIsShownBeforeTheIndexAndRowsArriveAsItGrows() async throws {
+        let (url, rows) = try bigFile("big.csv", bytes: 24 << 20)
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        // Nothing has run on the main actor since the open, so this is what
+        // first paint gave: the rows in the first 64 KB and an estimate.
+        let firstLoaded = model.loadedRowCount
+        XCTAssertGreaterThan(firstLoaded, 100)
+        XCTAssertLessThan(firstLoaded, rows / 10)
+        XCTAssertFalse(model.isIndexComplete)
+        XCTAssertEqual(Double(model.rowCount), Double(rows), accuracy: Double(rows) * 0.35, "the scrollbar's estimate (this file's rows get longer as their numbers grow)")
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let grid = controller.content.grid
+        XCTAssertEqual(grid.gridView.frame.height, CGFloat(model.rowCount) * GridMetrics.rowHeight)
+        // The grid draws the first rows now, from the first screen.
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("name 0", truncated: false))
+        XCTAssertEqual(model.cell(row: firstLoaded + 10, column: 1), .notLoaded)
+        XCTAssertTrue(StatusText.counts(model.status).hasPrefix("Indexing… about "))
+
+        // Rows arrive as the index grows, and the count becomes exact.
+        var seen = [firstLoaded]
+        try await waitUntil("indexed") {
+            if model.loadedRowCount != seen.last { seen.append(model.loadedRowCount) }
+            return model.isIndexComplete
+        }
+        XCTAssertEqual(seen, seen.sorted(), "the loaded rows only grow")
+        XCTAssertEqual(model.loadedRowCount, rows)
+        XCTAssertEqual(model.rowCount, rows)
+        XCTAssertEqual(grid.gridView.frame.height, CGFloat(rows) * GridMetrics.rowHeight)
+        XCTAssertEqual(model.cell(row: rows - 1, column: 0), .text("\(rows - 1)", truncated: false))
+        XCTAssertEqual(model.cell(row: 9, column: 3), .text("two\nlines", truncated: false))
+        XCTAssertEqual(StatusText.counts(model.status), "\(rows.formatted()) rows × 4 columns")
+        document.close()
+    }
+
+    // MARK: Failure (DESIGN §3.9)
+
+    func testAPanicFailsTheDocumentWhichMakesNoMoreCallsAndOffersToReopen() async throws {
+        let url = try file("a.csv", "a,b\n1,2\n3,4\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        XCTAssertFalse(model.isFailed)
+        _ = model.call { try $0.debugPanic() }
+        XCTAssertTrue(model.isFailed)
+        XCTAssertTrue(document.isOfferingReopen)
+        XCTAssertEqual(OpenErrorText.describe(try XCTUnwrap(model.failure)), "Something went wrong inside Leal. Close the file and open it again.")
+        let calls = model.coreCalls
+        XCTAssertEqual(model.rowCount, 0)
+        XCTAssertEqual(model.loadedRowCount, 0)
+        _ = model.cell(row: 0, column: 0)
+        model.prepare(rows: 0..<10, columns: 0..<2)
+        model.setHeaderRow(false)
+        XCTAssertNil(model.call { try $0.rowCount() })
+        XCTAssertEqual(model.coreCalls, calls, "no calls on a failed document's handle")
+
+        // Reopening makes a new, working document for the same file.
+        let reopened = await withCheckedContinuation { continuation in
+            document.reopenAfterFailure(display: false) { continuation.resume(returning: $0) }
+        }
+        let again = try XCTUnwrap((reopened as? CSVDocument)?.model)
+        XCTAssertFalse(again.isFailed)
+        XCTAssertEqual(again.cell(row: 0, column: 1), .text("2", truncated: false))
+        XCTAssertEqual(reopened?.fileURL, url)
+    }
+
+    func testAPanicInABackgroundJobFailsTheDocument() async throws {
+        let url = try file("a.csv", "a,b\n1,2\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        let job = debugPanickingJob(scheduler: environment.scheduler)
+        _ = model.call { $0.debugWatch(job: job) }
+        do {
+            try await job.finish()
+            XCTFail("the job should panic")
+        } catch let failure as JobFailure {
+            XCTAssertEqual(failure, .Panicked(message: "deliberate job panic"))
+        }
+        // The core marks the document as the job ends, on the job's thread.
+        try await waitUntil("the core marks the document failed") {
+            _ = model.call { try $0.rowCount() }
+            return model.isFailed
+        }
+        XCTAssertTrue(document.isOfferingReopen)
+    }
+
+    // MARK: Cancellation (ADR-0005 decision 6)
+
+    /// Cancelling the Swift task that awaits a job stops the Rust job.
+    func testCancellingTheWaitingTaskStopsTheJob() async throws {
+        let (url, _) = try bigFile("big.csv", bytes: 4 << 20)
+        // Hold background work, as while the user scrolls, so the review
+        // is still waiting when its task is cancelled.
+        environment.scheduler.setInteracting(interacting: true)
+        defer { environment.scheduler.setInteracting(interacting: false) }
+        let document = try openDocument(
+            path: url.path(percentEncoded: false),
+            volume: VolumeInfo(),
+            temp: environment.temp,
+            scheduler: environment.scheduler,
+            options: OpenOptions(),
+            observer: nil
+        )
+        let review = try document.reviewJob()
+        let waiting = Task { try await review.finish() }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(review.isFinished(), "held while interacting")
+        waiting.cancel()
+        let result = await waiting.result
+        XCTAssertThrowsError(try result.get()) { error in
+            XCTAssertEqual(error as? JobFailure, .Cancelled)
+        }
+        XCTAssertTrue(review.isFinished())
+
+        // A task cancelled before it waits cancels the job at once.
+        let index = try document.indexJob()
+        let early = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await index.finish()
+        }
+        _ = await early.result
+        XCTAssertTrue(index.isFinished())
+    }
+
+    // MARK: The header row (ADR-0002 question 13)
+
+    func testTheHeaderRowToggleReadsTheFileAgain() async throws {
+        let url = try file("readings.csv", "2025-03-01T00:00:00Z,S-01,18.2\n2025-03-01T00:10:00Z,S-02,18.3\n2025-03-01T00:20:00Z,S-03,18.1\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertFalse(model.interpretation.header)
+        XCTAssertEqual(model.headerTitle(column: 0), HeaderTitle(text: "1", style: .number))
+        XCTAssertEqual(model.rowCount, 3)
+        XCTAssertTrue(model.isNumeric(column: 2))
+        XCTAssertEqual(StatusText.segments(model.status).last, "No header row detected")
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        XCTAssertFalse(controller.content.statusBar.headerToggle.isHidden)
+
+        controller.content.statusBar.headerToggle.performClick(nil)
+        XCTAssertTrue(model.interpretation.header)
+        XCTAssertEqual(model.interpretation.headerSource, .user)
+        XCTAssertEqual(model.headerTitle(column: 1), HeaderTitle(text: "S-01", style: .name))
+        try await waitUntil("indexed again") { model.isIndexComplete }
+        XCTAssertEqual(model.rowCount, 2)
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("S-02", truncated: false))
+        XCTAssertTrue(controller.content.statusBar.headerToggle.isHidden)
+        document.close()
+    }
+
+    func testAColumnOnlyLongRowsHaveIsTitledAndDimmed() async throws {
+        let url = try file("ragged.csv", "a,b\n1,2\n3,4,5\n6,7\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        XCTAssertEqual(model.columnCount, 3)
+        XCTAssertEqual(model.headerTitle(column: 2), HeaderTitle(text: "Column 3", style: .extra))
+        XCTAssertEqual(model.cell(row: 0, column: 2), .missing)
+        XCTAssertEqual(model.cell(row: 1, column: 2), .text("5", truncated: false))
+        XCTAssertEqual(model.status.columns, 2)
+        document.close()
+    }
+
+    // MARK: UTF-16 (mockup 06a)
+
+    func testUTF16FilesOpenReadOnlyWithABanner() async throws {
+        let url = directory.appending(path: "legacy.csv")
+        var data = Data([0xFF, 0xFE])
+        data.append("id\tname\r\n1\tZoë\r\n".data(using: .utf16LittleEndian)!)
+        try data.write(to: url)
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertTrue(model.isReadOnly)
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        _ = controller.window
+        XCTAssertEqual(controller.content.banners.arrangedSubviews.count, 1)
+        XCTAssertEqual(
+            StatusText.segments(model.status),
+            ["1 row × 2 columns", "Tab", "CRLF", "UTF-16 LE (BOM)", "Read-only"]
+        )
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("Zoë", truncated: false))
+        document.close()
+    }
+
+    // MARK: The window
+
+    /// The whole window draws: rows in the grid, titles in the header.
+    func testTheWindowDrawsTheGrid() throws {
+        let url = try file("orders.csv", "order_id,customer\nA-100231,Sable Optics\nA-100232,Loire Provisions\n")
+        let document = try open(url)
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let window = try XCTUnwrap(controller.window)
+        window.appearance = NSAppearance(named: .aqua)
+        let view = try XCTUnwrap(window.contentView)
+        view.layoutSubtreeIfNeeded()
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        // The first data row's first cell, below the header, right of the
+        // gutter.
+        let grid = controller.content.grid
+        let cell = grid.convert(NSRect(x: grid.scrollView.frame.minX, y: GridMetrics.headerHeight, width: 80, height: 22), to: view)
+        let flipped = NSRect(x: cell.minX, y: view.bounds.height - cell.maxY, width: cell.width, height: cell.height)
+        let scale = CGFloat(rep.pixelsWide) / view.bounds.width
+        var dark = 0
+        for y in Int(flipped.minY * scale)..<Int(flipped.maxY * scale) {
+            for x in Int(flipped.minX * scale)..<Int(flipped.maxX * scale) {
+                if let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB), color.brightnessComponent < 0.5 { dark += 1 }
+            }
+        }
+        XCTAssertGreaterThan(dark, 20, "the first cell has text")
+        document.close()
+    }
+}

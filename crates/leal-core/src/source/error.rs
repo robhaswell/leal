@@ -5,8 +5,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Why [`Source::open`](super::Source::open) (or
-/// [`inspect_file`](crate::inspect_file)) failed.
+/// Why [`Source::open`](super::Source::open) failed.
 ///
 /// It carries the path of the file being opened, a [`kind`](Self::kind) the
 /// app words in its alerts, and the underlying [`io::Error`] with its OS
@@ -77,11 +76,6 @@ impl OpenError {
             step,
             error,
         }
-    }
-
-    /// Reading the user's file at `path` failed.
-    pub(crate) fn read(path: &Path, error: io::Error) -> Self {
-        Self::new(path, Step::Read, error)
     }
 
     /// `path` is a folder.

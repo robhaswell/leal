@@ -133,8 +133,11 @@ fn open_document_gives_the_first_screen_then_rows() {
             delimiter_source: DialectSource::Guess,
             header: true,
             header_source: DialectSource::Guess,
+            line_ending: Some(LineEnding::Lf),
         }
     );
+    assert_eq!(screen.column_count, 2);
+    assert_eq!(document.column_count().unwrap(), 2);
     assert_eq!(document.storage().unwrap(), SourceStorage::Clone);
 
     // The jobs finish, and Swift's await is woken.
@@ -145,7 +148,8 @@ fn open_document_gives_the_first_screen_then_rows() {
         document.review().unwrap(),
         Some(ReviewResult {
             encoding_suggestion: None,
-            delimiter_suggestion: None
+            delimiter_suggestion: None,
+            line_ending: Some(LineEnding::Lf),
         })
     );
     assert_eq!(document.row_count().unwrap(), 3);
@@ -168,6 +172,20 @@ fn open_document_gives_the_first_screen_then_rows() {
     assert_eq!(text(&rows), [["Zoë", "Zür"], ["Ada", "Lon"]]);
     assert!(!rows[0][0].truncated && rows[0][1].truncated);
     assert_eq!(document.rows(99, 5, 3).unwrap(), Vec::<Vec<Cell>>::new());
+
+    // The grid reads a window of columns, with each row's field count.
+    let window = document.cells(0, 5, 1, 4, 3).unwrap();
+    assert_eq!(
+        window
+            .iter()
+            .map(|row| (
+                row.field_count,
+                row.cells.iter().map(|c| c.text.as_str()).collect()
+            ))
+            .collect::<Vec<(u32, Vec<&str>)>>(),
+        [(2, vec!["cit"]), (2, vec!["Zür"]), (2, vec!["Lon"])]
+    );
+    assert_eq!(document.numeric_columns(10).unwrap(), [false, false]);
 
     // Treat as comma-separated: read again, without reopening.
     let comma = OpenOptions {

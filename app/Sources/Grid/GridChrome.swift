@@ -1,0 +1,297 @@
+import AppKit
+
+/// The sticky header row. It sits above the scroll view and follows its
+/// horizontal offset, so it never scrolls away. Dragging a column's right
+/// edge resizes the column, and double-clicking the edge fits it to its
+/// contents.
+@MainActor
+final class GridHeaderView: NSView {
+    weak var dataSource: (any GridDataSource)?
+    var geometry = GridLayout()
+    /// The scroll view's horizontal offset.
+    var offsetX: CGFloat = 0 {
+        didSet {
+            guard offsetX != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// The user dragged column `column` to `width`.
+    var onResize: ((_ column: Int, _ width: CGFloat) -> Void)?
+    /// The user double-clicked column `column`'s edge.
+    var onFit: ((_ column: Int) -> Void)?
+    /// Scroll events over the header scroll the grid.
+    weak var scrollTarget: NSView?
+
+    private var titleLines: [Int: TextLine] = [:]
+    /// How many times it has drawn, for the scroll benchmark.
+    private(set) var draws = 0
+
+    override var isFlipped: Bool { true }
+    /// Since the macOS 14 SDK views don't clip to their bounds by default,
+    /// and `draw(_:)`'s rectangle may reach past them; this view's fills
+    /// must not spill onto its neighbours.
+    override var clipsToBounds: Bool {
+        get { true }
+        set {}
+    }
+    override var isOpaque: Bool { true }
+
+    func invalidateContent() {
+        titleLines.removeAll()
+        needsDisplay = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        invalidateContent()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        draws += 1
+        let palette = GridPalette.current()
+        context.setFillColor(palette.headerBackground)
+        context.fill(dirtyRect)
+        if let source = dataSource {
+            let columns = geometry.columnRange(minX: offsetX + dirtyRect.minX, maxX: offsetX + dirtyRect.maxX)
+            for column in columns {
+                let rect = geometry.cellRect(row: 0, column: column).offsetBy(dx: -offsetX, dy: 0)
+                let cellRect = CGRect(x: rect.minX, y: 0, width: rect.width, height: bounds.height)
+                let line = titleLines[column] ?? {
+                    let title = source.headerTitle(column: column)
+                    let (font, color) = style(title.style, palette: palette)
+                    let line = CellPainter.makeLine(title.text, font: font, color: color, symbolColor: palette.secondaryText)
+                    titleLines[column] = line
+                    return line
+                }()
+                let font = style(source.headerTitle(column: column).style, palette: palette).font
+                CellPainter.drawText(line, in: cellRect, font: font, alignment: .leading, context: context, ellipsisColor: palette.text)
+                CellPainter.drawColumnSeparator(atX: cellRect.maxX, minY: 0, maxY: bounds.height, palette: palette, context: context)
+            }
+        }
+        context.setFillColor(palette.gridLine)
+        context.fill(CGRect(x: dirtyRect.minX, y: bounds.height - 1, width: dirtyRect.width, height: 1))
+    }
+
+    private func style(_ style: HeaderStyle, palette: GridPalette) -> (font: NSFont, color: CGColor) {
+        switch style {
+        case .name: (GridFonts.header, palette.text)
+        case .number: (GridFonts.cell, palette.secondaryText)
+        case .extra: (GridFonts.header, palette.tertiaryText)
+        }
+    }
+
+    // MARK: Resizing
+
+    /// The resize cursor over a column's edge. It is set as the pointer
+    /// moves, from one tracking area, rather than with a cursor rectangle
+    /// per edge: those would be rebuilt on every frame of a horizontal
+    /// scroll.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect, .cursorUpdate],
+            owner: self
+        ))
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        updateCursor(event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateCursor(event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    private func updateCursor(_ event: NSEvent) {
+        let x = convert(event.locationInWindow, from: nil).x + offsetX
+        (geometry.columnEdge(nearX: x) == nil ? NSCursor.arrow : NSCursor.resizeLeftRight).set()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let column = geometry.columnEdge(nearX: point.x + offsetX) else { return }
+        if event.clickCount == 2 {
+            onFit?(column)
+            return
+        }
+        let startX = point.x
+        let startWidth = geometry.widths[column]
+        // Track the drag until the button comes up. Each move resizes the
+        // column live.
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let x = convert(next.locationInWindow, from: nil).x
+            onResize?(column, max(GridMetrics.resizeMinimumWidth, startWidth + x - startX))
+            if next.type == .leftMouseUp { break }
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        scrollTarget?.scrollWheel(with: event)
+    }
+}
+
+/// The row-number gutter. It is as tall as the grid and sits in its own
+/// clip view left of the scroll view, which follows the grid's vertical
+/// scrolling; so, like the grid, it draws only the strip a scroll exposes.
+/// The active cell's row number is in the accent colour (ADR-0002
+/// question 3); rows not read yet have no number (question 4).
+@MainActor
+final class GridGutterView: NSView {
+    weak var dataSource: (any GridDataSource)?
+    var rowHeight = GridMetrics.rowHeight
+    var activeRow: Int? {
+        didSet {
+            guard activeRow != oldValue else { return }
+            for row in [oldValue, activeRow].compactMap({ $0 }) {
+                setNeedsDisplay(NSRect(x: 0, y: CGFloat(row) * rowHeight, width: bounds.width, height: rowHeight))
+            }
+        }
+    }
+    /// The top of the visible part: the grid's vertical offset.
+    var offsetY: CGFloat { visibleRect.minY }
+
+    weak var scrollTarget: NSView?
+    var onClick: ((_ row: Int) -> Void)?
+
+    private var numbers: [Int: TextLine] = [:]
+    /// How many times it has drawn, for the scroll benchmark.
+    private(set) var draws = 0
+    private var activeNumber: (row: Int, line: TextLine)?
+
+    override var isFlipped: Bool { true }
+    /// Since the macOS 14 SDK views don't clip to their bounds by default,
+    /// and `draw(_:)`'s rectangle may reach past them; this view's fills
+    /// must not spill onto its neighbours.
+    override var clipsToBounds: Bool {
+        get { true }
+        set {}
+    }
+    override var isOpaque: Bool { true }
+
+    /// The width that fits the numbers of `rows` rows.
+    static func width(rows: Int) -> CGFloat {
+        let digits = String(max(1, rows)).count
+        let digit = TextMeasurer(font: GridFonts.gutter).width(of: "0")
+        return max(GridMetrics.gutterMinimumWidth, (CGFloat(digits) * digit + 2 * GridMetrics.cellPadding + 8).rounded(.up))
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        numbers.removeAll()
+        activeNumber = nil
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        draws += 1
+        let palette = GridPalette.current()
+        context.setFillColor(palette.gutterBackground)
+        context.fill(dirtyRect)
+        context.setFillColor(palette.gridLine)
+        context.fill(CGRect(x: bounds.maxX - 1, y: dirtyRect.minY, width: 1, height: dirtyRect.height))
+        guard let source = dataSource else { return }
+        let loaded = min(source.loadedRowCount, source.rowCount)
+        let first = max(0, Int((dirtyRect.minY / rowHeight).rounded(.down)))
+        let end = min(loaded, Int((dirtyRect.maxY / rowHeight).rounded(.up)))
+        guard first < end else { return }
+        if numbers.count > 2_000 { numbers.removeAll() }
+        for row in first..<end {
+            let rect = CGRect(x: 0, y: CGFloat(row) * rowHeight, width: bounds.width - 4, height: rowHeight)
+            let isActive = row == activeRow
+            let font = isActive ? GridFonts.gutterActive : GridFonts.gutter
+            let line: TextLine
+            if isActive {
+                if let cached = activeNumber, cached.row == row {
+                    line = cached.line
+                } else {
+                    line = CellPainter.makeLine(String(row + 1), font: font, color: palette.accent, symbolColor: palette.accent)
+                    activeNumber = (row, line)
+                }
+            } else if let cached = numbers[row] {
+                line = cached
+            } else {
+                line = CellPainter.makeLine(String(row + 1), font: font, color: palette.secondaryText, symbolColor: palette.secondaryText)
+                numbers[row] = line
+            }
+            CellPainter.drawText(line, in: rect, font: font, alignment: .trailing, context: context, ellipsisColor: palette.secondaryText)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let y = convert(event.locationInWindow, from: nil).y
+        guard y >= 0, let source = dataSource else { return }
+        let row = Int((y / rowHeight).rounded(.down))
+        if row < source.rowCount { onClick?(row) }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        scrollTarget?.scrollWheel(with: event)
+    }
+}
+
+/// The box above the gutter, left of the header.
+final class GridCornerView: NSView {
+    override var isFlipped: Bool { true }
+    /// Since the macOS 14 SDK views don't clip to their bounds by default,
+    /// and `draw(_:)`'s rectangle may reach past them; this view's fills
+    /// must not spill onto its neighbours.
+    override var clipsToBounds: Bool {
+        get { true }
+        set {}
+    }
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let palette = GridPalette.current()
+        context.setFillColor(palette.headerBackground)
+        context.fill(bounds)
+        context.setFillColor(palette.gridLine)
+        context.fill(CGRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1))
+        context.fill(CGRect(x: bounds.width - 1, y: 0, width: 1, height: bounds.height))
+    }
+}
+
+/// The grid's scroll view. Its scroll events tell the core's scheduler the
+/// user is interacting, so background work pauses while they scroll
+/// (DESIGN §3.10 rule 3): every event is input, and a gesture, including
+/// its momentum, is one interaction from start to end.
+@MainActor
+final class GridScrollView: NSScrollView {
+    /// The clip view scrolled: header and gutter follow.
+    var onScroll: (() -> Void)?
+    /// A scroll event arrived.
+    var onScrollInput: (() -> Void)?
+    /// A scroll gesture began (`true`) or ended, momentum included (`false`).
+    var onGesture: ((Bool) -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        onScrollInput?()
+        if event.phase.contains(.began) || event.momentumPhase.contains(.began) {
+            onGesture?(true)
+        }
+        super.scrollWheel(with: event)
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
+            || event.phase.contains(.cancelled)
+            || (event.phase.contains(.ended) && event.momentumPhase.isEmpty)
+        {
+            // A gesture that ends without momentum ends here; one with
+            // momentum gets `.began` again from its momentum phase.
+            onGesture?(false)
+        }
+    }
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        onScroll?()
+    }
+}

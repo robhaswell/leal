@@ -149,13 +149,19 @@ targets:
         # Extract `String(localized:)` keys at build time, so Xcode can keep
         # Resources/Localizable.xcstrings in step with the code.
         SWIFT_EMIT_LOC_STRINGS: YES
+        # The App Sandbox is on from phase 1 (DESIGN §4.3, PLAN 1.6): Leal
+        # reads only files the user opened (user-selected read-write) and
+        # writes temporary files only in its container or the item
+        # replacement folders Foundation gives it. See Leal.entitlements.
+        CODE_SIGN_ENTITLEMENTS: Resources/Leal.entitlements
+        # The hardened runtime goes on with Developer ID signing and
+        # notarization (PLAN 4.5); see docs/tasks/1.6.md.
         ENABLE_HARDENED_RUNTIME: NO
 
   # Unit tests that call Rust through the generated bindings. They link the
   # LealFFI framework, not the app, so they run without launching the app.
-  # Tests that need the app's own types (`@testable import Leal`) go in a
-  # separate test target hosted in the app (TEST_HOST and BUNDLE_LOADER),
-  # which also depends on LealFFI; see docs/tasks/0.3.md.
+  # Tests that need the app's own types (`@testable import Leal`) are in
+  # LealAppTests, below.
   LealTests:
     type: bundle.unit-test
     platform: macOS
@@ -166,12 +172,32 @@ targets:
       # App code with no AppKit state, compiled into this bundle too so the
       # tests can check it against real errors from Rust. This bundle doesn't
       # import the app module, so the two copies never meet.
-      - path: Sources/OpenErrorText.swift
-      - path: Sources/TemporaryFolders.swift
+      - path: Sources/Document/OpenErrorText.swift
+      - path: Sources/Document/TemporaryFolders.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.robhaswell.leal.tests
         GENERATE_INFOPLIST_FILE: YES
+
+  # Tests hosted in Leal.app (task 1.6): the NSDocument, the grid and the
+  # window, with `@testable import Leal`. The bundle is loaded into the
+  # running app, so it shares the app's LealFFI framework (one copy of the
+  # bindings and of the Rust core) and has no bindings or Rust of its own.
+  # The app opens no window when it is a test host (see AppDelegate).
+  LealAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    dependencies:
+      - target: Leal
+      - target: LealFFI
+    sources:
+      - path: AppTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.robhaswell.leal.apptests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Leal.app/Contents/MacOS/Leal
+        BUNDLE_LOADER: $(TEST_HOST)
 
 schemes:
   Leal:
@@ -179,11 +205,16 @@ schemes:
       targets:
         Leal: all
         LealTests: [test]
+        LealAppTests: [test]
     run:
       config: Debug
     test:
       config: Debug
+      # Don't reopen windows from an earlier run of the test host.
+      commandLineArguments:
+        "-ApplePersistenceIgnoreState YES": true
       targets:
         - LealTests
+        - LealAppTests
     archive:
       config: Release

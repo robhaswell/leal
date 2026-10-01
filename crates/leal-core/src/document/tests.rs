@@ -125,7 +125,7 @@ fn expected_rows(bytes: &[u8], parser: RowParser, max_chars: usize) -> Vec<Vec<C
     (0..index.row_count())
         .map(|r| {
             let row = parser.parse_row(&index, r, bytes).unwrap();
-            cells(&parser, bytes, 0, &row, max_chars)
+            cells(&parser, bytes, 0, row.fields(), max_chars)
         })
         .collect()
 }
@@ -931,4 +931,147 @@ fn rows_of_a_removable_file_are_read_while_it_is_copied() {
 fn documents_are_send_and_sync() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Document>();
+}
+
+// ---------------------------------------------------------------------------
+// What the grid reads (task 1.6): a window of columns, the column count and
+// the numeric columns.
+
+/// A file whose rows have different lengths: a header of 4, rows of 4, one
+/// of 2 and one of 6, so the mode is 4.
+const RAGGED: &[u8] = b"a,b,c,d\n1,x,2.5,\n2,y\n3,z,4,w\n4,v,5,u,extra,more\n5,t,6,s\n";
+
+fn open_bytes(dir: &Dir, name: &str, bytes: &[u8]) -> (Document, FirstScreen) {
+    let path = dir.file(name, bytes);
+    Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler(),
+        options(10),
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn cells_reads_a_window_of_columns_with_each_rows_field_count() {
+    let dir = Dir::new("cells");
+    let (document, _) = open_bytes(&dir, "ragged.csv", RAGGED);
+    let all = document.rows(0..10, 100).unwrap();
+    let window = document.cells(1..5, 1..4, 100).unwrap();
+    assert_eq!(
+        window.iter().map(|r| r.field_count).collect::<Vec<_>>(),
+        [4, 2, 4, 6]
+    );
+    // The cells are the rows' own, cut to the window; a short row has
+    // fewer.
+    for (offset, row) in window.iter().enumerate() {
+        let full = &all[1 + offset];
+        let expected: Vec<Cell> = full.iter().skip(1).take(3).cloned().collect();
+        assert_eq!(row.cells, expected, "row {}", 1 + offset);
+    }
+    assert_eq!(
+        window[1].cells,
+        [Cell {
+            text: "y".to_owned(),
+            truncated: false
+        }]
+    );
+    // Past the last field, past the last row, or an empty window.
+    let past = document.cells(4..5, 6..9, 100).unwrap();
+    assert!(past[0].cells.is_empty());
+    assert_eq!(past[0].field_count, 6);
+    assert!(document.cells(9..12, 0..4, 100).unwrap().is_empty());
+    assert!(
+        document
+            .cells(1..3, 2..2, 100)
+            .unwrap()
+            .iter()
+            .all(|r| r.cells.is_empty())
+    );
+    // Cells are cut to `max_chars` as for `rows`.
+    let cut = document.cells(0..1, 0..1, 0).unwrap();
+    assert_eq!(cut[0].cells[0].text, "");
+    assert!(cut[0].cells[0].truncated);
+}
+
+#[test]
+fn the_column_count_is_the_most_common_field_count() {
+    let dir = Dir::new("columns");
+    let (document, screen) = open_bytes(&dir, "ragged.csv", RAGGED);
+    assert_eq!(screen.column_count, 4);
+    assert_eq!(document.column_count(), 4);
+    wait_for_index(&document);
+    assert_eq!(document.column_count(), 4);
+
+    let (document, screen) = open_bytes(&dir, "empty.csv", b"");
+    assert_eq!(screen.column_count, 0);
+    assert_eq!(document.column_count(), 0);
+}
+
+#[test]
+fn the_column_count_comes_from_the_first_64_kb_until_the_index_passes_them() {
+    let dir = Dir::new("columns-head");
+    // The first 64 KB have rows of 2 fields; the rest, enough rows of 3 to
+    // change the mode once the index has them.
+    let mut bytes = b"a,b\n".to_vec();
+    while bytes.len() < 70 * 1024 {
+        bytes.extend_from_slice(b"1,2\n");
+    }
+    while bytes.len() < 400 * 1024 {
+        bytes.extend_from_slice(b"1,2,3\n");
+    }
+    let path = dir.file("a.csv", &bytes);
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (document, screen) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler,
+        options(10),
+        None,
+    )
+    .unwrap();
+    assert_eq!(screen.column_count, 2);
+    assert_eq!(document.column_count(), 2);
+    gate.open();
+    wait_for_index(&document);
+    assert_eq!(document.column_count(), 3);
+}
+
+#[test]
+fn numeric_columns_skip_the_header_and_empty_cells() {
+    let dir = Dir::new("numeric");
+    let bytes = b"id,qty,price,notes,when\n\
+        A-1,40,29.90,,2025-01-03\n\
+        A-2,,\"1,234.50\",gift,2025-01-04\n\
+        A-3,3,4.10,,2025-01-05\n";
+    let (document, _) = open_bytes(&dir, "orders.csv", bytes);
+    assert!(document.detection().header);
+    assert_eq!(
+        document.numeric_columns(100).unwrap(),
+        [false, true, true, false, false]
+    );
+    // Only the sample counts: here the first data row alone, whose notes
+    // are empty.
+    assert_eq!(
+        document.numeric_columns(1).unwrap(),
+        [false, true, true, false, false]
+    );
+    assert_eq!(document.numeric_columns(0).unwrap(), Vec::<bool>::new());
+}
+
+#[test]
+fn numeric_columns_include_the_first_row_without_a_header() {
+    let dir = Dir::new("numeric-no-header");
+    let (document, _) = open_bytes(
+        &dir,
+        "readings.csv",
+        b"1,S-01,18.2\n2,S-02,18.3\n3,S-03,x\n",
+    );
+    assert!(!document.detection().header);
+    assert_eq!(document.numeric_columns(100).unwrap(), [true, false, false]);
+    assert_eq!(document.numeric_columns(2).unwrap(), [true, false, true]);
 }

@@ -66,7 +66,9 @@ use crate::index::{
     DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
     Status,
 };
-use crate::rows::{DEFAULT_CACHE_ROWS, ParsedRow, RowCache, RowParser};
+use crate::rows::{
+    DEFAULT_CACHE_ROWS, FieldSpan, NUMBER_MAX_CHARS, NumericColumns, ParsedRow, RowCache, RowParser,
+};
 use crate::schedule::{Interval, IntervalGuard, Job, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{
     OpenError, ReadError, ReadErrorKind, Source, Storage, TempFolders, VolumeInfo,
@@ -103,6 +105,17 @@ pub struct Cell {
     pub truncated: bool,
 }
 
+/// One row's cells in a window of columns ([`Document::cells`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowCells {
+    /// How many fields the whole row has, inside the window or not. The
+    /// grid uses it to tell a short row's missing cells from empty ones.
+    pub field_count: usize,
+    /// The row's cells in the window: fewer if the row ends inside it, none
+    /// if it ends before it.
+    pub cells: Vec<Cell>,
+}
+
 /// What first paint (P0) found: how to read the file, and its first rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirstScreen {
@@ -119,6 +132,10 @@ pub struct FirstScreen {
     /// file's size over the first 64 KB's average row length, or the exact
     /// count if the file fits in 64 KB.
     pub estimated_row_count: usize,
+    /// The most common field count in the first 64 KB (ADR-0003 decision
+    /// 4): the grid's column count until [`Document::column_count`] has
+    /// the index's. 0 for an empty file.
+    pub column_count: usize,
 }
 
 /// Where indexing has got to.
@@ -414,6 +431,89 @@ impl Document {
     /// rows that weren't copied before the drive vanished
     /// ([`ReadErrorKind::Disconnected`]).
     pub fn rows(&self, rows: Range<usize>, max_chars: usize) -> Result<Vec<Vec<Cell>>, ReadError> {
+        self.read_rows(rows, |parser, bytes, base, row| {
+            cells(parser, bytes, base, row.fields(), max_chars)
+        })
+    }
+
+    /// Rows `rows`, as for [`rows`](Self::rows), but only their cells in
+    /// the columns `columns`, with each row's whole field count. The grid
+    /// reads what it shows this way, so a wide file costs no more to draw
+    /// than the columns on screen (the 1.4 notes' open question): each row
+    /// is still split into fields, but only the window's cells are decoded
+    /// and copied.
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn cells(
+        &self,
+        rows: Range<usize>,
+        columns: Range<usize>,
+        max_chars: usize,
+    ) -> Result<Vec<RowCells>, ReadError> {
+        self.read_rows(rows, |parser, bytes, base, row| {
+            let fields = row.fields();
+            let window = fields
+                .get(
+                    columns.start.min(fields.len())..columns.end.clamp(columns.start, fields.len()),
+                )
+                .unwrap_or_default();
+            RowCells {
+                field_count: fields.len(),
+                cells: cells(parser, bytes, base, window, max_chars),
+            }
+        })
+    }
+
+    /// The grid's column count: the most common field count among the
+    /// rows read so far (ADR-0003 decision 4), from the first 64 KB until
+    /// the index has passed them. It can change while indexing and is
+    /// final once the index is complete. 0 for an empty file.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        let reading = self.current();
+        let index = if reading.index.row_count() >= reading.head_rows {
+            &*reading.index
+        } else {
+            &reading.head_index
+        };
+        index.field_count_mode().unwrap_or(0)
+    }
+
+    /// Which columns hold numbers, from the first `sample` rows after the
+    /// header row (see [`NumericColumns`]): one entry per column of the
+    /// longest row in the sample. The grid right-aligns them (DESIGN §4.1).
+    /// First paint asks about the first screen; the 1,000-row sample is P2
+    /// work (§3.10), so the app asks for it off the main thread.
+    ///
+    /// # Errors
+    ///
+    /// As for [`rows`](Self::rows).
+    pub fn numeric_columns(&self, sample: usize) -> Result<Vec<bool>, ReadError> {
+        let first = usize::from(self.current().detection.header);
+        let mut columns = NumericColumns::new();
+        self.read_rows(
+            first..first.saturating_add(sample),
+            |parser, bytes, base, row| {
+                for (column, field) in row.fields().iter().enumerate() {
+                    let (text, truncated) =
+                        parser.display_prefix_in(bytes, base, field, NUMBER_MAX_CHARS);
+                    columns.add(column, &text, truncated);
+                }
+            },
+        )?;
+        Ok(columns.result())
+    }
+
+    /// Reads rows `rows` (as many as can be read now) and hands each to
+    /// `each`, with the parser, the bytes holding them and the bytes'
+    /// offset in the file. One read of the file per call.
+    fn read_rows<T>(
+        &self,
+        rows: Range<usize>,
+        mut each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
+    ) -> Result<Vec<T>, ReadError> {
         let reading = self.current();
         let indexed = reading.index.row_count();
         // Both indexes cover a prefix of the file's rows; use the longer.
@@ -436,7 +536,7 @@ impl Document {
         Ok(rows
             .filter_map(|r| {
                 let row = cache.row_in(index, r, &bytes, base)?;
-                Some(cells(&reading.parser, &bytes, base, &row, max_chars))
+                Some(each(&reading.parser, &bytes, base, &row))
             })
             .collect())
     }
@@ -659,7 +759,13 @@ fn first_screen(
     let rows = (0..paint.head_rows.min(options.first_screen_rows))
         .filter_map(|r| {
             let row = paint.parser.parse_row(&paint.head_index, r, head)?;
-            Some(cells(&paint.parser, head, 0, &row, options.max_chars))
+            Some(cells(
+                &paint.parser,
+                head,
+                0,
+                row.fields(),
+                options.max_chars,
+            ))
         })
         .collect();
     FirstScreen {
@@ -668,6 +774,7 @@ fn first_screen(
         rows,
         row_count: paint.head_rows,
         estimated_row_count: estimate_from_head(&paint.head_index, paint.head_rows, head, len),
+        column_count: paint.head_index.field_count_mode().unwrap_or(0),
     }
 }
 
@@ -846,16 +953,16 @@ fn unavailable(source: &Source) -> JobError {
     }
 }
 
-/// A parsed row's cells. `bytes` are the file's bytes from `base` on, and
-/// hold the row.
+/// Cells for `fields` of a parsed row. `bytes` are the file's bytes from
+/// `base` on, and hold the row.
 fn cells(
     parser: &RowParser,
     bytes: &[u8],
     base: usize,
-    row: &ParsedRow,
+    fields: &[FieldSpan],
     max_chars: usize,
 ) -> Vec<Cell> {
-    row.fields()
+    fields
         .iter()
         .map(|field| {
             let (text, truncated) = parser.display_prefix_in(bytes, base, field, max_chars);

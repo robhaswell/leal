@@ -1,14 +1,116 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%@ (BOM)" : {
+      "comment" : "Status bar: the encoding, from the file's byte order mark"
+    },
+    "%@ (chosen)" : {
+      "comment" : "Status bar: the encoding the user chose with Reopen with Encoding"
+    },
     "%@ (error %d)." : {
       "comment" : "Open error: the system's description of an error, then its POSIX error code"
+    },
+    "%@ (file attribute)" : {
+      "comment" : "Status bar: the encoding, from the file's com.apple.TextEncoding attribute"
+    },
+    "%@ columns" : {
+      "comment" : "Status bar: the number of columns"
+    },
+    "%@ rows" : {
+      "comment" : "Status bar: the number of data rows"
+    },
+    "%@ × %@" : {
+      "comment" : "Status bar: rows, then columns, as in 1,000 rows × 12 columns",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ × %2$@"
+          }
+        }
+      }
+    },
+    "1 column" : {
+      "comment" : "Status bar: one column"
+    },
+    "1 row" : {
+      "comment" : "Status bar: one data row"
+    },
+    "A later version of Leal saves a UTF-8 copy of the file that you can edit." : {
+      "comment" : "Alert: the UTF-16 banner's button before task 2.3"
+    },
+    "About Leal" : {
+      "comment" : "App menu"
     },
     "An unexpected error occurred." : {
       "comment" : "Open error with no OS error code"
     },
     "Another app changed it while Leal was reading it." : {
       "comment" : "Open error: the file changed while it was being read without a snapshot"
+    },
+    "Bring All to Front" : {
+      "comment" : "Window menu"
+    },
+    "Clear Menu" : {
+      "comment" : "File > Open Recent"
+    },
+    "Close" : {
+      "comment" : "Button: close the document after a failure\nFile menu"
+    },
+    "Column %lld" : {
+      "comment" : "Header of a column only long (ragged) rows have; its 1-based number"
+    },
+    "Comma" : {
+      "comment" : "Status bar: the delimiter"
+    },
+    "Copy" : {
+      "comment" : "Edit menu"
+    },
+    "Cut" : {
+      "comment" : "Edit menu"
+    },
+    "Delete" : {
+      "comment" : "Edit menu"
+    },
+    "Dismiss" : {
+      "comment" : "Banner's close button, for VoiceOver"
+    },
+    "Edit" : {
+      "comment" : "Menu title"
+    },
+    "File" : {
+      "comment" : "Menu title"
+    },
+    "Header row: off" : {
+      "comment" : "Status bar button: no header row; click to use the first row as the header (mockup 06b)"
+    },
+    "Hide Leal" : {
+      "comment" : "App menu"
+    },
+    "Hide Others" : {
+      "comment" : "App menu"
+    },
+    "Indexing… about %@ × %@" : {
+      "comment" : "Status bar while indexing: the estimated rows, then the columns",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Indexing… about %1$@ × %2$@"
+          }
+        }
+      }
+    },
+    "Indexing… row %@ of about %@" : {
+      "comment" : "Pill over skeleton rows scrolled to before they are indexed; the indexed row count, then the estimate",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Indexing… row %1$@ of about %2$@"
+          }
+        }
+      }
     },
     "It isn’t a regular file." : {
       "comment" : "Open error: the path is a named pipe, socket or device"
@@ -22,11 +124,82 @@
     "It’s a folder, not a file." : {
       "comment" : "Open error: the path is a folder"
     },
+    "Leal can’t show “%@” any more." : {
+      "comment" : "Alert title after a panic in the core (DESIGN §3.9); the file's name"
+    },
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
     },
+    "Leal guessed the encoding from the start of the file." : {
+      "comment" : "Status bar tooltip: encoding source"
+    },
+    "Leal read the encoding from the file’s byte order mark." : {
+      "comment" : "Status bar tooltip: encoding source"
+    },
+    "Leal read the encoding from the file’s encoding attribute, which the app that saved it set." : {
+      "comment" : "Status bar tooltip: encoding source"
+    },
+    "Minimize" : {
+      "comment" : "Window menu"
+    },
+    "No header row detected" : {
+      "comment" : "Status bar: detection found no header row (mockup 06b)"
+    },
+    "Open Recent" : {
+      "comment" : "File menu"
+    },
+    "Open…" : {
+      "comment" : "File menu"
+    },
+    "Paste" : {
+      "comment" : "Edit menu"
+    },
+    "Pipe" : {
+      "comment" : "Status bar: the delimiter"
+    },
+    "Quit Leal" : {
+      "comment" : "App menu"
+    },
+    "Reaching the end of the file… row %@ of about %@" : {
+      "comment" : "Pill over skeleton rows after ⌘↓ before indexing is complete; the indexed row count, then the estimate",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Reaching the end of the file… row %1$@ of about %2$@"
+          }
+        }
+      }
+    },
+    "Read-only" : {
+      "comment" : "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)\nThe lock glyph by a read-only file's title, for VoiceOver"
+    },
+    "Redo" : {
+      "comment" : "Edit menu"
+    },
+    "Reopen" : {
+      "comment" : "Button: open the file again after a failure"
+    },
+    "Save As UTF-8 isn’t available yet." : {
+      "comment" : "Alert: the UTF-16 banner's button before task 2.3"
+    },
+    "Save As UTF-8…" : {
+      "comment" : "Banner button on a UTF-16 file"
+    },
+    "Select All" : {
+      "comment" : "Edit menu"
+    },
+    "Semicolon" : {
+      "comment" : "Status bar: the delimiter"
+    },
+    "Show All" : {
+      "comment" : "App menu"
+    },
     "Something went wrong inside Leal. Close the file and open it again." : {
       "comment" : "Error after a panic in the Rust core: the document can't be used any more"
+    },
+    "Tab" : {
+      "comment" : "Status bar: the delimiter"
     },
     "That encoding doesn’t match the file’s byte order mark." : {
       "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
@@ -37,8 +210,35 @@
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"
     },
+    "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it." : {
+      "comment" : "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
+    },
+    "UTF-16 files are read-only in this version of Leal." : {
+      "comment" : "Tooltip of the lock glyph by a read-only file's title"
+    },
+    "Undo" : {
+      "comment" : "Edit menu"
+    },
+    "Use First Row as Header" : {
+      "comment" : "View menu: the Header row toggle (ADR-0002 question 13)"
+    },
+    "Use the first row as the header row" : {
+      "comment" : "Tooltip of the Header row: off button"
+    },
+    "View" : {
+      "comment" : "Menu title"
+    },
+    "Window" : {
+      "comment" : "Menu title"
+    },
+    "You chose this encoding." : {
+      "comment" : "Status bar tooltip: encoding source"
+    },
     "You don’t have permission to open it." : {
       "comment" : "Open error: the file can't be read (EACCES or EPERM)"
+    },
+    "Zoom" : {
+      "comment" : "Window menu"
     }
   },
   "version" : "1.0"

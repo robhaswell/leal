@@ -279,11 +279,15 @@ app-test profile="debug": (ffi profile "on") xcodeproj
     results="build/LealTests.xcresult"
     rm -rf "$results"
     status=0
-    # LEAL_FFI_PREBUILT=1: see `app`.
+    # LEAL_FFI_PREBUILT=1: see `app`. ENABLE_TESTABILITY=YES: the hosted
+    # LealAppTests do `@testable import Leal`, which Release builds don't
+    # allow by default. It applies only to this build, in its own
+    # DerivedData, never to the app `just app release` makes.
     LEAL_FFI_PREBUILT=1 xcodebuild -quiet -project app/Leal.xcodeproj -scheme Leal \
         -configuration "$configuration" -derivedDataPath {{ test_derived_data }} \
         -destination "platform=macOS,arch=$(uname -m)" \
         -resultBundlePath "$results" \
+        ENABLE_TESTABILITY=YES \
         test 2>&1 | tee "$log" || status=$?
 
     # `-quiet` hides test results, so read them from the result bundle.
@@ -323,6 +327,77 @@ ide-build:
     done
     just _no_warnings "$log"
     echo "ide-build: the RustFFI target built the library and bindings, and the app built"
+
+# Sync the String Catalog with the strings the app's code uses (DESIGN §4.4), from a Debug build.
+strings: app
+    xcrun xcstringstool sync app/Resources/Localizable.xcstrings \
+        --stringsdata build/DerivedData/Build/Intermediates.noindex/Leal.build/Debug/Leal.build/Objects-normal/*/*.stringsdata
+
+# Write a wide file for the scroll benchmark: 200 columns × 100,000 rows (about 130 MB) in target/bench-data/.
+wide-file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/bench-data
+    awk 'BEGIN {
+        srand(200);
+        for (c = 1; c <= 200; c++) printf "%scol_%d", (c > 1 ? "," : ""), c; print "";
+        for (r = 1; r <= 100000; r++) {
+            for (c = 1; c <= 200; c++) {
+                if (c % 3 == 0) v = sprintf("%.2f", rand() * 1000);
+                else if (c % 3 == 1) v = "value " int(rand() * 100000);
+                else v = int(rand() * 1000);
+                printf "%s%s", (c > 1 ? "," : ""), v;
+            }
+            print "";
+        }
+    }' > target/bench-data/wide-200.csv
+    ls -l target/bench-data/wide-200.csv
+
+# Open `file` in a new Leal that scrolls itself frame by frame and print the frame times and memory (docs/tasks/1.6.md). Speed: fast or moderate. The app quits when it's done.
+bench-scroll file speed="fast" profile="release" *options: (app profile)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The sandboxed app writes into its container. `open` hands it the file,
+    # so the sandbox lets it read it, and the options become argument
+    # defaults (docs/tasks/1.6.md).
+    container="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
+    out="bench-scroll-$$.json"
+    app="$PWD/{{ derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
+    # A locked Mac turns its display off, and then the display link stops:
+    # wake it and keep it on (the spike did the same, docs/tasks/0.4.md).
+    caffeinate -u -t 2
+    # In front: a display link doesn't fire for a window other windows cover.
+    caffeinate -d just _run-scripted "$app" "{{ file }}" 300 front -LealBenchScroll "$out" -LealBenchSpeed "{{ speed }}" {{ options }}
+    cat "$container/$out"
+    rm -f "$container/$out"
+
+# Draw `file`'s window offscreen to `out` (a PNG at 1×), with any of -LealAppearance dark, -LealSelect row,column, -LealJumpEnd YES, -LealSnapshotEarly YES. The app quits when it's done.
+snapshot file out *options: (app "debug")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    container="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
+    name="snapshot-$$.png"
+    just _run-scripted "$PWD/{{ derived_data }}/Build/Products/Debug/Leal.app" "{{ file }}" 60 back -LealSnapshot "$name" {{ options }}
+    mv "$container/$name" "{{ out }}"
+    echo "snapshot: {{ out }}"
+
+# Open a file in a new Leal with scripted-run options (`place`: front, or back to leave the frontmost app alone), wait for it to quit by itself, and quit it after `limit` seconds.
+[private]
+_run-scripted app file limit place *options:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    background=""
+    if [ "{{ place }}" = back ]; then background="-g"; fi
+    open -n $background -W -a "{{ app }}" "{{ file }}" --args -ApplePersistenceIgnoreState YES {{ options }} &
+    waiting=$!
+    for _ in $(seq {{ limit }}); do
+        sleep 1
+        kill -0 "$waiting" 2>/dev/null || exit 0
+    done
+    echo "error: Leal didn't finish in {{ limit }} s; quitting it" >&2
+    # The newest Leal: the one this started.
+    pkill -n -x Leal
+    exit 1
 
 # The Xcode configuration for a Cargo profile.
 [private]

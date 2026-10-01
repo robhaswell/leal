@@ -89,6 +89,7 @@
 
 mod cache;
 mod display;
+mod numeric;
 mod parse;
 #[cfg(test)]
 mod tests;
@@ -104,6 +105,7 @@ use crate::index::{CodeUnit, IndexDialect, RowIndex};
 /// `rows::Encoding` keeps working.
 pub use crate::dialect::Encoding;
 pub use cache::{DEFAULT_CACHE_FIELDS, DEFAULT_CACHE_ROWS, RowCache};
+pub use numeric::{NUMBER_MAX_CHARS, NumericColumns, looks_numeric};
 
 /// One field of a parsed row: where its raw bytes are, and how it is
 /// quoted.

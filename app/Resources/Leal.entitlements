@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- DESIGN §4.3: sandboxed from the start, so a Mac App Store build stays possible. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Files the user opens (Open panel, Finder, Open Recent, drag and drop). Read-write for saving in phase 2. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>
