@@ -14,6 +14,8 @@ publish.workspace = true
 libc = "0.2.189"
 # The `source` module: the read-only memory map of the clone (DESIGN §3.1).
 memmap2 = "0.9.11"
+# The row index (PLAN 1.3): finding quote, CR and LF bytes (DESIGN §3.3).
+memchr = "2.8.3"
 
 [dev-dependencies]
 leal-testkit.workspace = true

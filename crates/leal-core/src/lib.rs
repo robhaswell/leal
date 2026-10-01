@@ -4,6 +4,7 @@
 // root Cargo.toml.
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod index;
 mod inspect;
 pub mod source;
 

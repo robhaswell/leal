@@ -459,6 +459,7 @@ version = "0.0.0"
 dependencies = [
  "leal-testkit",
  "libc",
+ "memchr",
  "memmap2",
  "proptest",
 ]
