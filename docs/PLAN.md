@@ -109,7 +109,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Tests with a disk image detached mid-copy (`hdiutil detach -force`),
     which must never crash the test process.
 
-- [~] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
+- [x] **1.2 Dialect and encoding detection** (§3.2), tested on the corpus.
   - Follows ADR-0003 decisions 1, 6 and 7, and the attribute rules of
     ADR-0004 decision 11: a UTF-8 or Windows-1252 attribute is always
     honoured, another valid one only if the bytes decode under it, and a
