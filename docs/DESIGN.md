@@ -765,7 +765,9 @@ to run concurrently and asserts first paint is still under 150 ms.
   hatched (missing) cell, bytes appended at the end of that row (ADR-0005
   decision 2). Every other byte is identical and in the same order.
 - **F3** Undoing all edits, or setting a cell back to its original value,
-  restores byte-identical output.
+  restores byte-identical output, measured from the last save: after a
+  save the saved file is the base, and undo restores values, not earlier
+  bytes (ADR-0012 decision 4).
 - **F4** No irregular construct in §3.5 is ever normalized on save.
 - **F5** Saving never loses or substitutes characters. It succeeds exactly, or
   stops with an explanation.

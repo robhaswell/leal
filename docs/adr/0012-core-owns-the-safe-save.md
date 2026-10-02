@@ -1,6 +1,6 @@
 # 0012 — The core does the safe save; four save details
 
-- Status: proposed
+- Status: accepted (approved by Rob, 2026-10-03)
 - Date: 2026-10-03
 - Changes: DESIGN §3.7 ("the core writes to the temporary URL AppKit
   provides, which is then swapped in atomically")
@@ -104,4 +104,3 @@ same values either way.
 - The main thread never waits for a save (DESIGN §3.9): the save holds
   the document's lock only to take a snapshot of the edits and to swap in
   the result, and edits made during the save carry over.
-- Product code from task 2.2 lands once this is accepted.

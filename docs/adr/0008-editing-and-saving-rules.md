@@ -2,6 +2,8 @@
 
 - Status: accepted (approved by Rob, 2026-10-02)
 - Date: 2026-10-02
+- Refined by: ADR-0012 (decision 3: a BOM file keeps `com.apple.TextEncoding`,
+  updated, as ADR-0004 decision 11 says)
 
 ## Context
 
