@@ -94,6 +94,9 @@ fn run_large<S: Strategy>(strategy: &S, test: impl Fn(S::Value) -> Result<(), Te
     let config = ProptestConfig::default(); // reads PROPTEST_CASES
     let mut runner = TestRunner::new(ProptestConfig {
         cases: (config.cases / 8).max(1),
+        // As the macro does, so failures are saved to and replayed from
+        // `tests/detect_properties.proptest-regressions`.
+        source_file: Some(file!()),
         ..config
     });
     if let Err(e) = runner.run(strategy, test) {
