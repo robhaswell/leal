@@ -628,6 +628,148 @@ fn a_panicking_on_finish_callback_is_contained() {
     }
 }
 
+/// Something resumable jobs wait for: a flag, and who to wake when it is
+/// set.
+#[derive(Default)]
+struct Signal {
+    state: Mutex<(bool, Vec<JobWaker>)>,
+}
+
+impl Signal {
+    /// Whether it is set; if not, `job` is woken when it is.
+    fn is_set_or_wake(&self, job: &Job) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.0 {
+            state.1.push(job.waker());
+        }
+        state.0
+    }
+
+    fn set(&self) {
+        let waiting = {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            std::mem::take(&mut state.1)
+        };
+        for waker in waiting {
+            waker.wake();
+        }
+    }
+}
+
+/// A resumable job that waits for `signal`, counting its turns.
+fn waiting_job(
+    scheduler: &Scheduler,
+    signal: &Arc<Signal>,
+    turns: &Arc<AtomicUsize>,
+) -> JobHandle<usize> {
+    let signal = Arc::clone(signal);
+    let turns = Arc::clone(turns);
+    // Kept between turns, in the closure.
+    let mut mine = 0;
+    scheduler.spawn_resumable(Priority::P2, Interval::Find, move |job| {
+        job.checkpoint()?;
+        turns.fetch_add(1, Ordering::SeqCst);
+        mine += 1;
+        if signal.is_set_or_wake(job) {
+            std::task::Poll::Ready(Ok(mine))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+}
+
+/// p1-review conc-1: a resumable job that waits doesn't hold a pool thread,
+/// so more of them than the pool has threads don't keep other work from
+/// running. Each runs again once woken.
+#[test]
+fn waiting_resumable_jobs_leave_the_pool_free() {
+    let (scheduler, recorder) = scheduler(2, IDLE_AFTER_INPUT);
+    let signal = Arc::new(Signal::default());
+    let turns = Arc::new(AtomicUsize::new(0));
+    let waiting: Vec<_> = (0..4)
+        .map(|_| waiting_job(&scheduler, &signal, &turns))
+        .collect();
+    // Other work runs while all four wait.
+    for i in 0..3 {
+        let other = scheduler.spawn(Priority::P2, Interval::Review, move |_| Ok(i));
+        assert_eq!(other.control().wait_timeout(LONG), Some(Ok(())));
+    }
+    let deadline = Instant::now() + LONG;
+    while turns.load(Ordering::SeqCst) < 4 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        turns.load(Ordering::SeqCst),
+        4,
+        "one turn each, then a wait"
+    );
+    assert!(waiting.iter().all(|job| !job.is_finished()));
+    signal.set();
+    for job in &waiting {
+        assert_eq!(job.wait(), Ok(&2), "woken for a second turn");
+    }
+    // One interval each, from the first turn to the end, waits included.
+    for job in &waiting {
+        let id = job.control().id();
+        let events = recorder.events();
+        let begins = events
+            .iter()
+            .filter(|e| **e == Event::Begin(Interval::Find, id))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| **e == Event::End(Interval::Find, id))
+            .count();
+        assert_eq!((begins, ends), (1, 1));
+    }
+}
+
+/// Cancelling a resumable job that waits wakes it: it finishes at once,
+/// without another turn.
+#[test]
+fn cancel_wakes_a_waiting_resumable_job() {
+    let (scheduler, _) = scheduler(2, IDLE_AFTER_INPUT);
+    let signal = Arc::new(Signal::default());
+    let turns = Arc::new(AtomicUsize::new(0));
+    let job = waiting_job(&scheduler, &signal, &turns);
+    let deadline = Instant::now() + LONG;
+    while turns.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    job.cancel();
+    assert_eq!(
+        job.control().wait_timeout(LONG),
+        Some(Err(JobError::Cancelled))
+    );
+    assert_eq!(turns.load(Ordering::SeqCst), 1);
+}
+
+/// A wake that comes during the turn that is about to wait (what it waits
+/// for came just after it looked) isn't lost: the next turn runs.
+#[test]
+fn a_wake_during_a_turn_runs_the_next_one() {
+    let (scheduler, _) = scheduler(2, IDLE_AFTER_INPUT);
+    let turns = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&turns);
+    let job = scheduler.spawn_resumable(Priority::P3, Interval::Acceleration, move |job| {
+        let turn = counted.fetch_add(1, Ordering::SeqCst) + 1;
+        if turn == 3 {
+            return std::task::Poll::Ready(Ok(turn));
+        }
+        job.waker().wake();
+        std::task::Poll::Pending
+    });
+    assert_eq!(job.wait(), Ok(&3));
+    let panics: JobHandle<()> = scheduler.spawn_resumable(Priority::P2, Interval::Find, |_| {
+        panic!("deliberate panic in a turn");
+    });
+    assert_eq!(
+        panics.wait(),
+        Err(JobError::Panicked("deliberate panic in a turn".to_owned()))
+    );
+}
+
 /// A platform whose every method panics.
 struct PanickingPlatform;
 

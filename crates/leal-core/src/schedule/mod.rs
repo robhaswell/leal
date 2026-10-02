@@ -65,8 +65,8 @@ use std::thread;
 use std::time::Duration;
 
 use input::Input;
-pub use job::{Job, JobControl, JobError, JobHandle};
-use job::{JobState, contain, run_job};
+pub use job::{Job, JobControl, JobError, JobHandle, JobWaker};
+use job::{JobState, contain, run_job, run_resumable};
 
 /// The smallest background pool: two threads, so that a P3 job can run
 /// and still leave a thread for P2 work ("P3 never takes the pool's last
@@ -343,6 +343,39 @@ impl Scheduler {
     {
         let (handle, state) = self.new_job(priority, interval);
         self.start(priority, run_job(Arc::clone(&self.shared), state, work));
+        handle
+    }
+
+    /// [`spawn`](Self::spawn), for work that may have to wait for something
+    /// another thread does, such as rows from the index, without holding a
+    /// thread meanwhile (p1-review conc-1: a search waiting for the index on
+    /// a pool thread kept every other document's background work waiting).
+    ///
+    /// `work` runs in **turns**. Each call goes on as far as it can, with
+    /// [`Job::checkpoint`] as usual, and returns `Poll::Ready` with the
+    /// result, or `Poll::Pending` when it must wait, having handed
+    /// [`Job::waker`] to whatever it waits for (for rows,
+    /// [`RowIndex::when_past`](crate::index::RowIndex::when_past)). Its
+    /// thread is then free. Once woken, its next turn is queued as a job of
+    /// its priority would be, so state it keeps between turns lives in the
+    /// closure (it is `FnMut`). Cancelling the job wakes it: its next turn
+    /// doesn't run, and it finishes with [`JobError::Cancelled`]. A panic
+    /// in a turn becomes [`JobError::Panicked`].
+    pub fn spawn_resumable<T, F>(
+        &self,
+        priority: Priority,
+        interval: Interval,
+        work: F,
+    ) -> JobHandle<T>
+    where
+        T: Send + Sync + 'static,
+        F: FnMut(&Job) -> std::task::Poll<Result<T, JobError>> + Send + 'static,
+    {
+        let (handle, state) = self.new_job(priority, interval);
+        self.start(
+            priority,
+            run_resumable(Arc::clone(&self.shared), state, work),
+        );
         handle
     }
 

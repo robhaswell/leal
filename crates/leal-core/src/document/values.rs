@@ -6,15 +6,15 @@
 //! anything: an invalid byte is the U+FFFD the grid shows, and text after a
 //! closing quote is copied as it reads (ADR-0002 question 6).
 
-use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 
-use super::search::{Settled, WAIT_FOR_INDEX, rows_settled};
-use super::{Document, Reading};
+use super::search::{Settled, index_ended, more_rows};
+use super::{Document, Reading, bytes_in, index_file};
 use crate::diagnostics::has_invalid;
-use crate::index::{RowIndex, Status};
-use crate::schedule::{Interval, Job, JobError, JobHandle, Priority};
+use crate::index::RowIndex;
+use crate::schedule::{Interval, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{ReadError, Source};
 
 /// Rows copied between checkpoints: a few milliseconds of work at most for
@@ -120,8 +120,10 @@ impl Document {
 
     /// Copies physical rows `rows` and fields `columns` as tab-separated
     /// text ([`push_tsv_cell`]) at once, on the calling thread, if every
-    /// one of the rows is indexed (or the index is complete: rows past the
-    /// file's end are left out). `None` if some aren't yet: then
+    /// one of the rows can be read now, as [`rows`](Self::rows) reads them
+    /// (from the first 64 KB, or the index), or no more rows will come (the
+    /// index is complete, or stopped by a read error): rows past those are
+    /// left out. `None` if some can't be read yet: then
     /// [`copy_cells`](Self::copy_cells) waits for them. For a selection of
     /// a few screens, this takes well under a millisecond, so Copy puts
     /// the text on the clipboard straight away.
@@ -135,20 +137,21 @@ impl Document {
         columns: Range<usize>,
     ) -> Result<Option<String>, ReadError> {
         let reading = self.current();
-        let indexed = reading.index.row_count();
-        if rows.end > indexed && reading.index.status() != Status::Complete {
+        let (index, available) = self.rows_index(&reading);
+        let settled = matches!(
+            index_ended(&reading.index, reading.index_job.control()),
+            Some(Ok(()))
+        );
+        if rows.end > available && !settled {
             return Ok(None);
         }
         let mut out = String::new();
-        let end = rows.end.min(indexed);
+        let end = rows.end.min(available);
         if rows.start < end {
             append_rows(
                 &reading,
-                &reading.index,
-                FileBytes {
-                    source: &self.source,
-                    head: &self.head,
-                },
+                index,
+                (&self.source, &self.head),
                 rows.start..end,
                 rows.start,
                 &columns,
@@ -195,48 +198,62 @@ impl Document {
 
     /// Copies physical rows `rows` and fields `columns` as tab-separated
     /// text ([`push_tsv_cell`]), a row per line, as a P2 job: it pauses
-    /// while the user scrolls, and a selection past the indexed rows waits
-    /// for the index to reach them. Rows past the file's end, once it is
-    /// known, are left out; a short row's missing cells are empty.
+    /// while the user scrolls, and a selection past the rows that can be
+    /// read waits for the index to reach them, without holding a pool
+    /// thread meanwhile ([`Scheduler::spawn_resumable`], p1-review conc-1).
+    /// It reads the rows [`rows`](Self::rows) reads (p1-review fid-1,
+    /// fid-2). Rows past the file's end, once it is known, are left out, as
+    /// are rows that can't be read because the index stopped with a read
+    /// error (its drive vanished); a short row's missing cells are empty.
     ///
     /// The job keeps what it reads: this reading and the file's bytes (its
     /// clone). So it finishes, with the cells as they were when it
     /// started, even if the document closes or the file is read again
     /// meanwhile: the app has promised its text to the pasteboard. If the
     /// document's index stops before reaching the rows (closing cancels
-    /// it), the job indexes the file itself.
+    /// it), the job has the file indexed again for itself, by an index pass
+    /// of its own, which streams a file on a removable drive in chunks.
     pub fn copy_cells(&self, rows: Range<usize>, columns: Range<usize>) -> JobHandle<CopiedText> {
         let reading = self.current();
         let source = Arc::clone(&self.source);
         let head = Arc::clone(&self.head);
+        let scheduler = self.scheduler.clone();
+        // Kept between the job's turns.
+        let mut out = String::new();
+        let mut next = rows.start;
+        let mut own: Option<OwnIndex> = None;
         self.scheduler
-            .spawn(Priority::P2, Interval::Copy, move |job| {
-                let mut out = String::new();
-                let mut next = rows.start;
-                let mut index = Arc::clone(&reading.index);
+            .spawn_resumable(Priority::P2, Interval::Copy, move |job| {
                 while next < rows.end {
                     job.checkpoint()?;
-                    let available = match wait_for_row(&index, &reading, next, job) {
-                        Ok(available) => available,
-                        // The document's index stopped (it closed, or was
-                        // read again), not this job: index the file here.
-                        Err(JobError::Cancelled) if !job.is_cancelled() => {
-                            index = own_index(&source, &reading, job)?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
+                    let (filled, filler) = match &own {
+                        Some(own) => (&*own.index, own.job.control()),
+                        None => (&*reading.index, reading.index_job.control()),
                     };
+                    let indexed = filled.row_count();
+                    let (index, available) = reading.rows_from(filled, source.changed_on_disk());
                     if next >= available {
-                        break;
+                        match more_rows(filled, filler, indexed, job) {
+                            Ok(Settled::Done) => {
+                                if next >= reading.rows_from(filled, source.changed_on_disk()).1 {
+                                    break;
+                                }
+                            }
+                            Ok(Settled::Waiting) => return Poll::Pending,
+                            // The document's index stopped (it closed, or was
+                            // read again), not this job: index the file again.
+                            Err(JobError::Cancelled) if own.is_none() && !job.is_cancelled() => {
+                                own = Some(OwnIndex::start(&scheduler, &source, &reading)?);
+                            }
+                            Err(error) => return Poll::Ready(Err(error)),
+                        }
+                        continue;
                     }
                     let end = rows.end.min(available).min(next + COPY_CHUNK_ROWS);
                     append_rows(
                         &reading,
-                        &index,
-                        FileBytes {
-                            source: &source,
-                            head: &head,
-                        },
+                        index,
+                        (&source, &head),
                         next..end,
                         rows.start,
                         &columns,
@@ -244,35 +261,57 @@ impl Document {
                     )?;
                     next = end;
                 }
-                Ok(CopiedText::new(out))
+                Poll::Ready(Ok(CopiedText::new(std::mem::take(&mut out))))
             })
     }
 }
 
-/// Where a copy reads the file's bytes: the first 64 KB kept in memory, or
-/// the file itself (a borrow of the map).
-#[derive(Clone, Copy)]
-struct FileBytes<'a> {
-    source: &'a Source,
-    head: &'a [u8],
+/// An index of the whole file for a copy job whose document's index stopped
+/// before reaching its rows (the document closed, or the file was read
+/// again with other choices). It is the document's index pass
+/// ([`index_file`]) again, with the reading's dialect, as a P1 job on an
+/// index thread of its own, and the copy waits for its rows as it would
+/// for the document's, holding no thread. So on a removable drive it
+/// streams the file in chunks, carrying on the copy to the internal disk
+/// from where it got to, and stops within a chunk if cancelled, rather
+/// than reading the whole file into memory in one uncancellable read
+/// (p1-review conc-3). Dropping it (the copy finished, or was cancelled)
+/// cancels it.
+struct OwnIndex {
+    index: Arc<RowIndex>,
+    job: JobHandle<()>,
 }
 
-impl FileBytes<'_> {
-    fn read(&self, extent: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
-        match self.head.get(extent.clone()) {
-            Some(bytes) => Ok(Cow::Borrowed(bytes)),
-            None => self.source.read_range(extent),
-        }
+impl OwnIndex {
+    fn start(
+        scheduler: &Scheduler,
+        source: &Arc<Source>,
+        reading: &Reading,
+    ) -> Result<OwnIndex, JobError> {
+        let (index, indexer) = RowIndex::start(reading.index.dialect())?;
+        let source = Arc::clone(source);
+        let job = scheduler.spawn(Priority::P1, Interval::Index, move |job| {
+            index_file(&source, indexer, job, |_| job.checkpoint())
+        });
+        Ok(OwnIndex { index, job })
     }
 }
 
-/// Appends rows `rows` (all indexed) of a copy that starts at row `first`
-/// to `out`: a line break before each row but the first, a tab between
-/// fields `columns`, and each display value as [`push_tsv_cell`] writes it.
+impl Drop for OwnIndex {
+    fn drop(&mut self) {
+        self.job.cancel();
+    }
+}
+
+/// Appends rows `rows` (all in `index`) of a copy that starts at row
+/// `first` to `out`: a line break before each row but the first, a tab
+/// between fields `columns`, and each display value as [`push_tsv_cell`]
+/// writes it. The bytes come from `file`, the source and the first 64 KB,
+/// as [`bytes_in`] gives them.
 fn append_rows(
     reading: &Reading,
     index: &RowIndex,
-    file: FileBytes<'_>,
+    file: (&Source, &[u8]),
     rows: Range<usize>,
     first: usize,
     columns: &Range<usize>,
@@ -281,7 +320,7 @@ fn append_rows(
     let Some(extent) = index.rows_extent(rows.clone()) else {
         return Ok(());
     };
-    let bytes = file.read(extent.clone())?;
+    let bytes = bytes_in(file.0, file.1, extent.clone())?;
     for row in rows {
         if row > first {
             out.push('\n');
@@ -300,48 +339,6 @@ fn append_rows(
         }
     }
     Ok(())
-}
-
-/// Waits until row `row` is indexed, or the index is complete, and returns
-/// how many rows are indexed then.
-fn wait_for_row(
-    index: &RowIndex,
-    reading: &Reading,
-    row: usize,
-    job: &Job,
-) -> Result<usize, JobError> {
-    loop {
-        let indexed = index.row_count();
-        if row < indexed || index.status() == Status::Complete {
-            return Ok(indexed);
-        }
-        match rows_settled(reading, job)? {
-            Settled::Done => return Ok(reading.index.row_count()),
-            Settled::Waiting => {
-                job.checkpoint()?;
-                std::thread::sleep(WAIT_FOR_INDEX);
-            }
-        }
-    }
-}
-
-/// An index of the whole file, made by a copy job whose document's index
-/// stopped before reaching its rows (the document closed, or the file was
-/// read again). It is the same scan as the document's ([`Indexer::run`]),
-/// over the map, or over the whole file read into memory if it is on a
-/// removable drive that was still being copied. It checks the job's cancel
-/// flag between chunks.
-///
-/// [`Indexer::run`]: crate::index::Indexer::run
-fn own_index(source: &Source, reading: &Reading, job: &Job) -> Result<Arc<RowIndex>, JobError> {
-    let (index, indexer) = RowIndex::start(reading.index.dialect())?;
-    let len = usize::try_from(source.len()).unwrap_or(usize::MAX);
-    let bytes = match source.as_slice() {
-        Some(bytes) => Cow::Borrowed(bytes),
-        None => source.read_range(0..len)?,
-    };
-    indexer.run(&bytes, job.cancel_flag(), |_| {})?;
-    Ok(index)
 }
 
 /// Appends one cell to tab-separated text, the way spreadsheets put cells

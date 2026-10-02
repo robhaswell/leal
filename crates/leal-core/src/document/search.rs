@@ -7,7 +7,14 @@
 //! or types, and stops within a chunk when cancelled. It searches the rows
 //! indexed so far and keeps up as more arrive, so it works while indexing
 //! (rule 6's promise for filters, kept for find too), and ends when it has
-//! searched the last row.
+//! searched the last row. Caught up with the index, it doesn't hold its
+//! pool thread: its turn ends, and the index wakes it when it publishes
+//! more rows ([`Scheduler::spawn_resumable`], p1-review conc-1). It reads
+//! the rows the grid does ([`Reading::rows_from`]): after a removable
+//! drive vanishes, the first 64 KB's rows too, and once the file changed
+//! while it was read, only the checked copy's (p1-review fid-1, fid-2).
+//!
+//! [`Scheduler::spawn_resumable`]: crate::schedule::Scheduler::spawn_resumable
 //!
 //! **A match is a cell** whose display value holds the query
 //! ([`Matcher`]). The count and "k of N" count cells, in file order: row
@@ -29,21 +36,16 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
-use std::time::Duration;
+use std::task::Poll;
 
-use super::{Document, Place, Reading};
+use super::{Document, Place, Reading, bytes_in};
 use crate::find::{FindError, Matcher, Query};
-use crate::index::Status;
-use crate::schedule::{Interval, Job, JobError, JobHandle, Priority};
+use crate::index::{RowIndex, Status};
+use crate::schedule::{Interval, Job, JobControl, JobError, JobHandle, Priority};
 use crate::source::{ReadError, Source};
 
 /// About how many bytes of rows one chunk of a search covers.
 pub const SEARCH_CHUNK_BYTES: usize = 64 << 10;
-
-/// How long a search (or a copy) waits for the index to publish more rows
-/// once it has caught up with it.
-pub(super) const WAIT_FOR_INDEX: Duration = Duration::from_millis(1);
 
 /// What a finished search found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +124,8 @@ struct SearchState {
     source: Arc<Source>,
     head: Arc<[u8]>,
     matcher: Matcher,
-    /// The first row searched: 1 if the file has a header row.
-    first_row: usize,
+    /// The matches, and where the search has got to: it starts at row 1 if
+    /// the file has a header row.
     found: Mutex<Found>,
     /// Run once by the next step, between its look at the matches and its
     /// look at whether the search is complete: a test makes the search
@@ -176,7 +178,6 @@ impl Document {
             source: Arc::clone(&self.source),
             head: Arc::clone(&self.head),
             matcher,
-            first_row,
             found: Mutex::new(Found {
                 searched: first_row,
                 ..Found::default()
@@ -187,7 +188,7 @@ impl Document {
         let worker = Arc::clone(&state);
         let job = self
             .scheduler
-            .spawn(Priority::P2, Interval::Find, move |job| worker.run(job));
+            .spawn_resumable(Priority::P2, Interval::Find, move |job| worker.turn(job));
         Ok(Search { state, job })
     }
 }
@@ -411,10 +412,10 @@ impl Search {
         let mut matches = Vec::new();
         for row in wanted {
             let parser = &state.reading.parser;
-            let Some(RowRead { bytes, base }) = state.row_bytes(row)? else {
+            let Some(RowRead { bytes, base, index }) = state.row_bytes(row)? else {
                 continue;
             };
-            let Some(parsed) = parser.parse_row_in(&state.reading.index, row, &bytes, base) else {
+            let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
                 continue;
             };
             for (column, field) in parsed.fields().iter().enumerate() {
@@ -491,27 +492,32 @@ impl SearchState {
         self.found.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The job: search the rows indexed so far, a chunk at a time, waiting
-    /// for the index whenever the search catches up with it.
-    fn run(&self, job: &Job) -> Result<SearchSummary, JobError> {
-        let index = &self.reading.index;
-        let mut next = self.first_row;
+    /// The rows searches read ([`Reading::rows_from`] the reading's index).
+    fn rows_index(&self) -> (&RowIndex, usize) {
+        self.reading
+            .rows_from(&self.reading.index, self.source.changed_on_disk())
+    }
+
+    /// One turn of the job: search the rows that can be read, a chunk at a
+    /// time, and once caught up with the index, end the turn until it has
+    /// more ([`more_rows`]). The search's place is `found.searched`, so a
+    /// turn starts where the last one stopped.
+    fn turn(&self, job: &Job) -> Poll<Result<SearchSummary, JobError>> {
         loop {
             job.checkpoint()?;
-            let indexed = index.row_count();
-            if next >= indexed {
-                match rows_settled(&self.reading, job)? {
-                    Settled::Done => {
-                        if next >= index.row_count() {
-                            break;
-                        }
-                    }
-                    Settled::Waiting => thread::sleep(WAIT_FOR_INDEX),
+            let next = self.lock().searched;
+            let indexed = self.reading.index.row_count();
+            let (index, available) = self.rows_index();
+            if next >= available {
+                let control = self.reading.index_job.control();
+                match more_rows(&self.reading.index, control, indexed, job)? {
+                    Settled::Done if next >= self.rows_index().1 => break,
+                    Settled::Done => continue,
+                    Settled::Waiting => return Poll::Pending,
                 }
-                continue;
             }
-            let end = self.chunk_end(next, indexed);
-            let hits = self.search_rows(next..end)?;
+            let end = chunk_end(index, next, available);
+            let hits = self.search_rows(index, next..end)?;
             let mut found = self.lock();
             for (row, cells) in hits {
                 let total = found.total() + u64::from(cells);
@@ -519,34 +525,24 @@ impl SearchState {
                 found.ends.push(total);
             }
             found.searched = end;
-            drop(found);
-            next = end;
         }
+        let available = self.rows_index().1;
         let mut found = self.lock();
         found.complete = true;
-        found.searched = found.searched.max(index.row_count());
-        Ok(SearchSummary {
+        found.searched = found.searched.max(available);
+        Poll::Ready(Ok(SearchSummary {
             matches: found.total(),
             rows: found.rows.len(),
-        })
+        }))
     }
 
-    /// The end of the chunk that starts at row `next`: about
-    /// [`SEARCH_CHUNK_BYTES`] of rows, at least one, at most `indexed`.
-    fn chunk_end(&self, next: usize, indexed: usize) -> usize {
-        let index = &self.reading.index;
-        let Some(start) = index.row_extent(next).map(|extent| extent.start) else {
-            return next + 1;
-        };
-        index
-            .row_at_offset(start.saturating_add(SEARCH_CHUNK_BYTES))
-            .map_or(indexed, |row| row.max(next + 1))
-            .min(indexed)
-    }
-
-    /// The rows of `rows` with matches, and how many cells of each match.
-    fn search_rows(&self, rows: Range<usize>) -> Result<Vec<(usize, u32)>, JobError> {
-        let index = &*self.reading.index;
+    /// The rows of `rows` (in `index`) with matches, and how many cells of
+    /// each match.
+    fn search_rows(
+        &self,
+        index: &RowIndex,
+        rows: Range<usize>,
+    ) -> Result<Vec<(usize, u32)>, JobError> {
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok(Vec::new());
         };
@@ -568,7 +564,7 @@ impl SearchState {
             if holder >= rows.end {
                 break;
             }
-            let cells = self.cells_matching(holder, &bytes, base);
+            let cells = self.cells_matching(index, holder, &bytes, base);
             if cells > 0 {
                 hits.push((holder, cells));
             }
@@ -590,9 +586,9 @@ impl SearchState {
     /// the raw search, every field's start is a candidate, so every
     /// non-empty field is checked.) In a row of 12 fields with the query in
     /// one, that is one check, not 12.
-    fn cells_matching(&self, row: usize, bytes: &[u8], base: usize) -> u32 {
+    fn cells_matching(&self, index: &RowIndex, row: usize, bytes: &[u8], base: usize) -> u32 {
         let parser = &self.reading.parser;
-        let Some(parsed) = parser.parse_row_in(&self.reading.index, row, bytes, base) else {
+        let Some(parsed) = parser.parse_row_in(index, row, bytes, base) else {
             return 0;
         };
         let mut count = 0;
@@ -626,11 +622,11 @@ impl SearchState {
 
     /// Which of row `row`'s fields match, in order.
     fn columns_of(&self, row: usize) -> Result<Vec<usize>, ReadError> {
-        let Some(RowRead { bytes, base }) = self.row_bytes(row)? else {
+        let Some(RowRead { bytes, base, index }) = self.row_bytes(row)? else {
             return Ok(Vec::new());
         };
         let parser = &self.reading.parser;
-        let Some(parsed) = parser.parse_row_in(&self.reading.index, row, &bytes, base) else {
+        let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
             return Ok(Vec::new());
         };
         Ok(parsed
@@ -645,61 +641,110 @@ impl SearchState {
             .collect())
     }
 
-    /// Row `row`'s bytes (line ending included) and their offset in the
-    /// file, if the index has the row.
+    /// Row `row`'s bytes (line ending included), their offset in the file
+    /// and the index that has the row, if one does
+    /// ([`rows_index`](Self::rows_index)).
     fn row_bytes(&self, row: usize) -> Result<Option<RowRead<'_>>, ReadError> {
-        let Some(extent) = self.reading.index.row_extent(row) else {
+        let (index, available) = self.rows_index();
+        if row >= available {
+            return Ok(None);
+        }
+        let Some(extent) = index.row_extent(row) else {
             return Ok(None);
         };
         let base = extent.start;
         Ok(Some(RowRead {
             bytes: self.read(extent)?,
             base,
+            index,
         }))
     }
 
-    /// The file's bytes in `extent`: from the first 64 KB kept in memory,
-    /// or one read of the file (a borrow of the map).
+    /// The file's bytes in `extent` ([`bytes_in`]).
     fn read(&self, extent: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
-        match self.head.get(extent.clone()) {
-            Some(bytes) => Ok(Cow::Borrowed(bytes)),
-            None => self.source.read_range(extent),
-        }
+        bytes_in(&self.source, &self.head, extent)
     }
 }
 
-/// One row's bytes, line ending included, and where they start in the file.
+/// The end of the chunk that starts at row `next` of `index`: about
+/// [`SEARCH_CHUNK_BYTES`] of rows, at least one, at most `available`.
+fn chunk_end(index: &RowIndex, next: usize, available: usize) -> usize {
+    let Some(start) = index.row_extent(next).map(|extent| extent.start) else {
+        return next + 1;
+    };
+    index
+        .row_at_offset(start.saturating_add(SEARCH_CHUNK_BYTES))
+        .map_or(available, |row| row.max(next + 1))
+        .min(available)
+}
+
+/// One row's bytes, line ending included, where they start in the file, and
+/// the index the row is in.
 struct RowRead<'a> {
     bytes: Cow<'a, [u8]>,
     base: usize,
+    index: &'a RowIndex,
 }
 
-/// Whether more rows can still come, for a job that has caught up with the
-/// index ([`rows_settled`]).
+/// Whether more rows can still come, for a job that has read every row it
+/// can so far ([`more_rows`]).
 pub(super) enum Settled {
-    /// The index is complete: the rows there are, are all there are.
+    /// No more will come: the rows that can be read now are all there will
+    /// be.
     Done,
-    /// The index is still going: wait a moment and look again.
+    /// More may come: the job is woken when they do, or the index stops.
+    /// End the turn (`Poll::Pending`).
     Waiting,
 }
 
-/// For a job that has read every row indexed so far: whether the index is
-/// complete, or still going. If the index job stopped first (cancelled
-/// with the document, or a removable drive that vanished), so does the
-/// caller, with the index's error.
-pub(super) fn rows_settled(reading: &Reading, job: &Job) -> Result<Settled, JobError> {
-    if reading.index.status() == Status::Complete {
-        return Ok(Settled::Done);
+/// How the index filled by the job `filler` has ended, if it has, for a
+/// reader of its rows: `Ok` if no more rows will come, because it is
+/// complete or stopped by a read error (its removable drive vanished, or
+/// the file changed while it was read: the rows read stay readable,
+/// ADR-0006), or the job's other error (cancelled with the document or by
+/// a reinterpret, or failed). `None` while it is still going.
+pub(super) fn index_ended(index: &RowIndex, filler: &JobControl) -> Option<Result<(), JobError>> {
+    if index.status() == Status::Complete {
+        return Some(Ok(()));
     }
-    if let Some(outcome) = reading.index_job.control().outcome() {
+    match filler.outcome()? {
+        Ok(()) | Err(JobError::Read(_)) => Some(Ok(())),
         // The index may have completed between the two looks.
-        if reading.index.status() == Status::Complete {
-            return Ok(Settled::Done);
-        }
-        return Err(outcome.err().unwrap_or(JobError::Cancelled));
+        Err(_) if index.status() == Status::Complete => Some(Ok(())),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+/// For a resumable job ([`Scheduler::spawn_resumable`]) that has read every
+/// row it can so far, `seen` of them from `index`: whether more can come,
+/// and if so, `job` is woken when they do ([`RowIndex::when_past`]) or the
+/// index stops. `filler` is the job filling `index`; if it stopped other
+/// than with a read error ([`index_ended`]), so does the caller, with its
+/// error. No thread waits meanwhile (p1-review conc-1).
+///
+/// [`Scheduler::spawn_resumable`]: crate::schedule::Scheduler::spawn_resumable
+pub(super) fn more_rows(
+    index: &RowIndex,
+    filler: &JobControl,
+    seen: usize,
+    job: &Job,
+) -> Result<Settled, JobError> {
+    match index_ended(index, filler) {
+        Some(Ok(())) => return Ok(Settled::Done),
+        Some(Err(error)) => return Err(error),
+        None => {}
     }
     if job.is_cancelled() {
         return Err(JobError::Cancelled);
+    }
+    let waker = job.waker();
+    if index.status() == Status::Indexing {
+        // Called at once if rows came, or the index stopped, since `seen`.
+        index.when_past(seen, move || waker.wake());
+    } else {
+        // Stopped (or complete), but its job hasn't said how it ended yet:
+        // it will in a moment.
+        filler.on_finish(move || waker.wake());
     }
     Ok(Settled::Waiting)
 }

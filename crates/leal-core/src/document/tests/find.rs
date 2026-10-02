@@ -335,7 +335,7 @@ fn find_runs_while_indexing_and_keeps_up() {
     let path = dir.file("big.csv", &bytes);
     let gate = Gate::closed();
     let scheduler = scheduler_with(Arc::clone(&gate));
-    let (document, _) = Document::open(
+    let (document, screen) = Document::open(
         &path,
         &dir.temp(),
         VolumeInfo::default(),
@@ -344,23 +344,39 @@ fn find_runs_while_indexing_and_keeps_up() {
         None,
     )
     .unwrap();
-    // The index is held: the search can't get anywhere yet, and says so.
+    let parser = document.current().parser;
     let query = Query::new("n6");
+    let expected = expected_matches(&bytes, parser, true, &query);
+    // The index is held: the search gets through the rows of the first
+    // 64 KB, which the grid shows (p1-review fid-1), and waits there,
+    // holding no thread (conc-1).
+    let head_rows = screen.row_count;
     let search = document.find(&query).unwrap();
+    let deadline = std::time::Instant::now() + LONG;
+    while search.progress().rows_searched < head_rows && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     std::thread::sleep(Duration::from_millis(50));
     let progress = search.progress();
     assert!(!progress.complete);
-    assert_eq!(progress.matches, 0);
-    assert_eq!(progress.rows_searched, 1);
-    assert_eq!(search.step(None, true).unwrap(), SearchStep::Pending);
+    assert_eq!(progress.rows_searched, head_rows);
+    let in_head = expected
+        .iter()
+        .filter(|place| place.row < head_rows)
+        .count();
+    assert!(in_head > 0);
+    assert_eq!(progress.matches, in_head as u64);
+    assert_eq!(
+        search.step(None, true).unwrap(),
+        found(expected[0].row, expected[0].column, 1, false)
+    );
+    // Previous from the start must wrap to the last match, which isn't known.
     assert_eq!(search.step(None, false).unwrap(), SearchStep::Pending);
     assert!(!search.job().is_finished());
     // Once the index runs, the search follows it to the end.
     gate.open();
     let summary = wait_for_search(&search);
     assert!(document.progress().complete);
-    let parser = document.current().parser;
-    let expected = expected_matches(&bytes, parser, true, &query);
     assert_eq!(summary.matches, expected.len() as u64);
     assert_eq!(search.progress().rows_searched, document.row_count());
 }
@@ -616,7 +632,7 @@ fn copying_at_once_gives_the_jobs_text_for_indexed_rows() {
     let path = dir.file("big.csv", &bytes);
     let gate = Gate::closed();
     let scheduler = scheduler_with(Arc::clone(&gate));
-    let (document, _) = Document::open(
+    let (document, screen) = Document::open(
         &path,
         &dir.temp(),
         VolumeInfo::default(),
@@ -625,10 +641,20 @@ fn copying_at_once_gives_the_jobs_text_for_indexed_rows() {
         None,
     )
     .unwrap();
-    // The index is held: nothing can be copied at once yet.
-    assert_eq!(document.copy_cells_now(1..3, 0..3).unwrap(), None);
+    // The index is held: the rows of the first 64 KB, which the grid
+    // shows, can be copied at once (p1-review fid-1), and no others.
+    let head_rows = screen.row_count;
+    let early = document.copy_cells_now(1..head_rows, 0..3).unwrap();
+    assert_eq!(
+        document.copy_cells_now(1..head_rows + 1, 0..3).unwrap(),
+        None
+    );
     gate.open();
     wait_for_index(&document);
+    assert_eq!(
+        early.as_deref(),
+        Some(copied(&document, 1..head_rows, 0..3).as_str())
+    );
     let rows = document.row_count();
     for (selection, columns) in [(1..3, 0..3), (5..900, 1..3), (rows - 2..rows + 50, 0..2)] {
         assert_eq!(
@@ -753,4 +779,138 @@ fn a_copy_outlives_its_document_and_a_new_reading() {
         job.control().wait_timeout(LONG),
         Some(Err(JobError::Cancelled))
     );
+}
+
+/// Every row of `bytes` from row 1 on, copied as a mapped document gives
+/// them.
+fn copied_from_a_mapped_file(dir: &Dir, bytes: &[u8]) -> String {
+    let (document, _) = open_bytes(dir, "plain.csv", bytes);
+    wait_for_index(&document);
+    copied(&document, 1..usize::MAX, 0..3)
+}
+
+/// p1-review conc-1: finds and copies waiting for a document's index hold
+/// no pool thread, so more of them than the pool has threads (2 here)
+/// don't keep another document's background work from running. Each goes
+/// on when the index does.
+#[test]
+fn waiting_finds_and_copies_leave_the_pool_to_other_documents() {
+    let dir = Dir::new("find-starve");
+    let bytes = sample(400 * 1024);
+    let path = dir.file("big.csv", &bytes);
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    assert_eq!(scheduler.background_threads(), 2);
+    let open = |path: &std::path::Path| {
+        Document::open(
+            path,
+            &dir.temp(),
+            VolumeInfo::default(),
+            &scheduler,
+            options(5),
+            None,
+        )
+        .unwrap()
+        .0
+    };
+    let slow = open(&path);
+    let query = Query::new("n6");
+    let searches: Vec<Search> = (0..3).map(|_| slow.find(&query).unwrap()).collect();
+    let copy = slow.copy_cells(1..usize::MAX, 0..3);
+    // Another document's review runs meanwhile (alongside its index, which
+    // the gate holds too).
+    let other = open(&dir.file("other.csv", b"a;b\n1;2\n"));
+    assert_eq!(
+        other
+            .review_job()
+            .control()
+            .wait_timeout(Duration::from_secs(10)),
+        Some(Ok(())),
+        "the review waited for the finds and the copy"
+    );
+    assert!(searches.iter().all(|search| !search.job().is_finished()));
+    assert!(!copy.is_finished());
+    gate.open();
+    let parser = slow.current().parser;
+    let expected = expected_matches(&bytes, parser, true, &query).len() as u64;
+    for search in &searches {
+        assert_eq!(wait_for_search(search).matches, expected);
+    }
+    assert_eq!(copy.control().wait_timeout(LONG), Some(Ok(())));
+    assert_eq!(
+        copy.wait().unwrap().take(),
+        Some(copied_from_a_mapped_file(&dir, &bytes))
+    );
+}
+
+/// A file opened as on a removable drive, its index held by `gate`, and a
+/// copy of every row from row 1 on, waiting for it.
+fn removable_copy(
+    dir: &Dir,
+    path: &std::path::Path,
+    chunk_len: usize,
+    gate: &Arc<Gate>,
+) -> (Document, Arc<Source>, JobHandle<CopiedText>) {
+    let scheduler = scheduler_with(Arc::clone(gate));
+    let source = Source::open_simulating_removable(path, &dir.temp(), chunk_len).unwrap();
+    let (document, _) = Document::from_source(source, &scheduler, options(5), None).unwrap();
+    let source = Arc::clone(&document.source);
+    let job = document.copy_cells(1..usize::MAX, 0..3);
+    assert_eq!(job.control().wait_timeout(Duration::from_millis(50)), None);
+    (document, source, job)
+}
+
+/// p1-review conc-3: a copy whose document closes before its index reached
+/// the rows has the file indexed again. On a removable drive that is the
+/// index pass, streaming the file in chunks and carrying the copy to the
+/// internal disk on, so the file ends up copied and mapped, rather than
+/// read whole into memory in one uncancellable read.
+#[test]
+fn a_copy_after_a_removable_file_closes_streams_it() {
+    let dir = Dir::new("copy-removable");
+    let bytes = sample(400 * 1024);
+    let path = dir.file("usb.csv", &bytes);
+    let expected = copied_from_a_mapped_file(&dir, &bytes);
+    let gate = Gate::closed();
+    let (document, source, job) = removable_copy(&dir, &path, 4096, &gate);
+    assert_eq!(source.storage(), Storage::Reading);
+    drop(document);
+    gate.open();
+    assert_eq!(job.control().wait_timeout(LONG), Some(Ok(())));
+    assert_eq!(
+        job.wait().unwrap().take().as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        source.storage(),
+        Storage::Copy,
+        "the copy's pass streamed it"
+    );
+}
+
+/// The copy's own pass over a removable file stops within a chunk when the
+/// copy is cancelled, and lets go of the file.
+#[test]
+fn a_copy_streaming_a_removable_file_can_be_cancelled() {
+    let dir = Dir::new("copy-removable-cancel");
+    let bytes = sample(16 << 20);
+    let path = dir.file("usb.csv", &bytes);
+    let gate = Gate::closed();
+    // Tiny chunks, so the pass takes seconds.
+    let (document, source, job) = removable_copy(&dir, &path, 8, &gate);
+    drop(document);
+    gate.open();
+    assert_eq!(job.control().wait_timeout(Duration::from_millis(200)), None);
+    job.cancel();
+    assert_eq!(
+        job.control().wait_timeout(LONG),
+        Some(Err(JobError::Cancelled))
+    );
+    // Its pass stops too, and lets go of the file.
+    let deadline = std::time::Instant::now() + LONG;
+    while Arc::strong_count(&source) > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(source.storage(), Storage::Reading, "not copied to the end");
 }

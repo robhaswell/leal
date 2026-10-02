@@ -6,6 +6,7 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use super::input::Input;
@@ -80,6 +81,21 @@ struct ControlInner {
     finished: Condvar,
     /// The longest stretch of work between two checkpoints, in nanoseconds.
     longest_chunk_ns: AtomicU64,
+    /// Whether a resumable job is waiting to be woken.
+    park: Mutex<Park>,
+}
+
+/// Whether a resumable job ([`Scheduler::spawn_resumable`]) is in a turn or
+/// waiting to be woken.
+///
+/// [`Scheduler::spawn_resumable`]: super::Scheduler::spawn_resumable
+enum Park {
+    /// In a turn, queued for one, or not resumable at all. `woken`: woken
+    /// meanwhile, so if the turn ends waiting, the next one is queued at
+    /// once (what it waits for may have come just after it looked).
+    Running { woken: bool },
+    /// Waiting: what queues the job's next turn.
+    Parked(Box<dyn FnOnce() + Send>),
 }
 
 enum Outcome {
@@ -124,6 +140,60 @@ impl JobControl {
     pub fn cancel(&self) {
         self.inner.cancel.store(true, Ordering::Release);
         self.inner.input.wake();
+        // A resumable job waiting to be woken runs a turn, which sees it.
+        self.wake();
+    }
+
+    /// Wakes the job if it is waiting ([`Scheduler::spawn_resumable`]):
+    /// its next turn is queued. If it is in a turn, the next one is queued
+    /// as soon as this one ends. Nothing for a job that isn't resumable or
+    /// has finished. Quick, so it may be called anywhere: on the index's
+    /// thread as it publishes rows, or on the main thread.
+    ///
+    /// [`Scheduler::spawn_resumable`]: super::Scheduler::spawn_resumable
+    fn wake(&self) {
+        let resume = {
+            let mut park = self.lock_park();
+            match std::mem::replace(&mut *park, Park::Running { woken: true }) {
+                Park::Parked(resume) => {
+                    *park = Park::Running { woken: false };
+                    Some(resume)
+                }
+                Park::Running { .. } => None,
+            }
+        };
+        if let Some(resume) = resume {
+            resume();
+        }
+    }
+
+    /// The job's turn ended waiting: keeps `resume` until [`wake`](Self::wake),
+    /// or runs it now if the job was woken during the turn.
+    fn park(&self, resume: Box<dyn FnOnce() + Send>) {
+        let now = {
+            let mut park = self.lock_park();
+            match std::mem::replace(&mut *park, Park::Running { woken: false }) {
+                Park::Running { woken: false } => {
+                    *park = Park::Parked(resume);
+                    None
+                }
+                // Only a turn parks, and a parked job has no turn running,
+                // so it is never `Parked` here.
+                Park::Running { woken: true } | Park::Parked(_) => Some(resume),
+            }
+        };
+        if let Some(resume) = now {
+            resume();
+        }
+    }
+
+    fn lock_park(&self) -> MutexGuard<'_, Park> {
+        // Only plain stores happen under this lock (`resume` runs outside
+        // it), so a poisoned lock still holds a consistent state.
+        self.inner
+            .park
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether [`cancel`](Self::cancel) has been called.
@@ -287,6 +357,7 @@ impl<T> JobState<T> {
                     outcome: Mutex::new(Outcome::Running(Vec::new())),
                     finished: Condvar::new(),
                     longest_chunk_ns: AtomicU64::new(0),
+                    park: Mutex::new(Park::Running { woken: false }),
                 }),
             },
             value: OnceLock::new(),
@@ -434,6 +505,19 @@ impl Job {
         Ok(())
     }
 
+    /// What wakes this job once what it waits for has happened, for a
+    /// resumable job ([`Scheduler::spawn_resumable`]) whose turn is about to
+    /// end waiting. Hand it to whatever will happen, such as
+    /// [`RowIndex::when_past`](crate::index::RowIndex::when_past).
+    ///
+    /// [`Scheduler::spawn_resumable`]: super::Scheduler::spawn_resumable
+    #[must_use]
+    pub fn waker(&self) -> JobWaker {
+        JobWaker {
+            control: self.control.clone(),
+        }
+    }
+
     /// Ends the current stretch of work, recording how long it took.
     fn end_chunk(&self) {
         let now = Instant::now();
@@ -446,6 +530,27 @@ impl Job {
 impl fmt::Debug for Job {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Job").field(&self.control).finish()
+    }
+}
+
+/// Wakes a resumable job that is waiting ([`Job::waker`]). Cloning it gives
+/// another; waking more than once, or a job that isn't waiting, is
+/// harmless.
+#[derive(Clone)]
+pub struct JobWaker {
+    control: JobControl,
+}
+
+impl JobWaker {
+    /// Queues the job's next turn (see [`Job::waker`]).
+    pub fn wake(&self) {
+        self.control.wake();
+    }
+}
+
+impl fmt::Debug for JobWaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("JobWaker").field(&self.control.id()).finish()
     }
 }
 
@@ -505,6 +610,118 @@ where
     Prepared {
         control,
         run: Box::new(run),
+    }
+}
+
+/// Wraps `work`, which runs in turns, as the resumable job `state`
+/// ([`Scheduler::spawn_resumable`]).
+///
+/// [`Scheduler::spawn_resumable`]: super::Scheduler::spawn_resumable
+pub(super) fn run_resumable<T, F>(shared: Arc<Shared>, state: Arc<JobState<T>>, work: F) -> Prepared
+where
+    T: Send + Sync + 'static,
+    F: FnMut(&Job) -> Poll<Result<T, JobError>> + Send + 'static,
+{
+    let control = state.control.clone();
+    let run = move || {
+        let control = state.control.clone();
+        if control.is_cancelled() {
+            control.finish(Err(JobError::Cancelled));
+            return;
+        }
+        let interval = IntervalGuard::begin(
+            Arc::clone(&shared.platform),
+            control.interval(),
+            control.id(),
+        );
+        let job = Job {
+            control,
+            shared,
+            chunk_started: Cell::new(Instant::now()),
+        };
+        Box::new(Turns {
+            state,
+            work,
+            job,
+            interval,
+        })
+        .run();
+    };
+    Prepared {
+        control,
+        run: Box::new(run),
+    }
+}
+
+/// A resumable job between its turns: everything a turn needs. It is boxed
+/// and moved into the closure that queues the next turn, so nothing of it
+/// stays on a thread while the job waits.
+struct Turns<T, F> {
+    state: Arc<JobState<T>>,
+    work: F,
+    job: Job,
+    /// The job's interval, for Instruments: from its first turn to its end,
+    /// waits included.
+    interval: IntervalGuard,
+}
+
+impl<T, F> Turns<T, F>
+where
+    T: Send + Sync + 'static,
+    F: FnMut(&Job) -> Poll<Result<T, JobError>> + Send + 'static,
+{
+    /// Runs one turn, and then finishes the job, or leaves it waiting to be
+    /// woken, this thread free.
+    fn run(mut self: Box<Self>) {
+        // `AssertUnwindSafe`: as in `run_job`.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| (self.work)(&self.job)));
+        self.job.end_chunk();
+        let outcome = match result {
+            Ok(Poll::Pending) => {
+                let control = self.job.control.clone();
+                let shared = Arc::clone(&self.job.shared);
+                let next = control.clone();
+                control.park(Box::new(move || {
+                    let turn = Prepared {
+                        control: next.clone(),
+                        run: Box::new(move || self.resume()),
+                    };
+                    super::Scheduler { shared }.start(next.priority(), turn);
+                }));
+                return;
+            }
+            Ok(Poll::Ready(outcome)) => outcome,
+            Err(payload) => Err(JobError::Panicked(panic_message(payload.as_ref()))),
+        };
+        (*self).finish(outcome);
+    }
+
+    /// The next turn, after a wait. Time spent waiting isn't work.
+    fn resume(self: Box<Self>) {
+        self.job.chunk_started.set(Instant::now());
+        if self.job.is_cancelled() {
+            (*self).finish(Err(JobError::Cancelled));
+        } else {
+            self.run();
+        }
+    }
+
+    fn finish(self, outcome: Result<T, JobError>) {
+        let Turns {
+            state,
+            work,
+            job,
+            interval,
+        } = self;
+        drop(interval);
+        // The work and what it holds go before anyone is told the job has
+        // finished, as for a job that isn't resumable.
+        drop(work);
+        let outcome = outcome.map(|value| {
+            // Set once: this is the only place that sets it.
+            let _ = state.value.set(value);
+        });
+        job.control.finish(outcome);
     }
 }
 

@@ -325,6 +325,20 @@ struct State {
     /// The opening quote of a quoted field that never closes. Set when
     /// indexing completes.
     unterminated_quote: Option<usize>,
+    /// Who is waiting for more rows, or for the index to finish
+    /// ([`RowIndex::when_past`]).
+    waiting: Waiting,
+}
+
+/// Callbacks waiting for the index to move on, each with the row count it
+/// waits to see passed.
+#[derive(Default)]
+struct Waiting(Vec<(usize, Box<dyn FnOnce() + Send + Sync>)>);
+
+impl fmt::Debug for Waiting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} waiting", self.0.len())
+    }
 }
 
 /// The worker half of [`RowIndex::start`]: it fills the index when it
@@ -457,6 +471,7 @@ impl RowIndex {
                 status: Status::Indexing,
                 field_count_mode: None,
                 unterminated_quote: None,
+                waiting: Waiting::default(),
             }),
         })
     }
@@ -662,22 +677,79 @@ impl RowIndex {
     }
 
     /// Publishes one chunk's rows: `new_starts` (then emptied) and how far
-    /// the scan got. `done` marks the index complete.
+    /// the scan got. `done` marks the index complete. Then wakes whoever
+    /// was waiting for that ([`when_past`](Self::when_past)).
     fn publish(&self, new_starts: &mut Vec<u32>, scan: &scan::Summary, done: bool) -> Progress {
-        let mut state = self.write();
-        state.starts.extend_from_slice(new_starts);
-        new_starts.clear();
-        state.scanned = scan.scanned;
-        state.field_count_mode = scan.field_count_mode;
-        if done {
-            state.unterminated_quote = scan.unterminated_quote;
-            state.status = Status::Complete;
-            state.starts.shrink_to_fit();
+        let (progress, waiting) = {
+            let mut state = self.write();
+            let before = state.starts.len();
+            state.starts.extend_from_slice(new_starts);
+            new_starts.clear();
+            state.scanned = scan.scanned;
+            state.field_count_mode = scan.field_count_mode;
+            if done {
+                state.unterminated_quote = scan.unterminated_quote;
+                state.status = Status::Complete;
+                state.starts.shrink_to_fit();
+            }
+            let progress = Progress {
+                rows: state.starts.len() - 1,
+                bytes_scanned: state.scanned,
+                bytes_total: state.len,
+            };
+            // Only rows past what a waiter has seen, or the end, are news
+            // to it.
+            let waiting = if done {
+                std::mem::take(&mut state.waiting)
+            } else if state.starts.len() > before {
+                state.waiting.take_past(progress.rows)
+            } else {
+                Waiting::default()
+            };
+            (progress, waiting)
+        };
+        waiting.wake();
+        progress
+    }
+
+    /// Calls `then` once the index has more than `rows` rows, or has
+    /// stopped or completed: straight away, on this thread, if it already
+    /// has, and otherwise on the indexer's thread as it publishes them.
+    /// Keep it short: it delays the index. It runs with no lock held, so it
+    /// may read the index.
+    ///
+    /// This is how a job that has caught up with the index, such as a
+    /// search or a copy, waits for more rows without holding a thread
+    /// (p1-review conc-1): it ends its turn and is woken here
+    /// ([`Scheduler::spawn_resumable`](crate::schedule::Scheduler::spawn_resumable)).
+    pub fn when_past(&self, rows: usize, then: impl FnOnce() + Send + Sync + 'static) {
+        {
+            let mut state = self.write();
+            let indexed = state.starts.len().saturating_sub(1);
+            if indexed <= rows && state.status == Status::Indexing {
+                state.waiting.0.push((rows, Box::new(then)));
+                return;
+            }
         }
-        Progress {
-            rows: state.starts.len() - 1,
-            bytes_scanned: state.scanned,
-            bytes_total: state.len,
+        then();
+    }
+}
+
+impl Waiting {
+    /// The callbacks waiting for fewer than `rows` rows, taken out.
+    fn take_past(&mut self, rows: usize) -> Waiting {
+        let (past, still): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(seen, _)| *seen < rows);
+        self.0 = still;
+        Waiting(past)
+    }
+
+    /// Runs every callback. Called with no lock held, so they may read the
+    /// index.
+    fn wake(self) {
+        for (_, then) in self.0 {
+            then();
         }
     }
 }
@@ -932,10 +1004,15 @@ impl fmt::Debug for ChunkedIndexer {
 
 impl Drop for Indexer {
     fn drop(&mut self) {
-        let mut state = self.index.write();
-        if state.status == Status::Indexing {
-            state.status = Status::Stopped;
-        }
+        let waiting = {
+            let mut state = self.index.write();
+            if state.status == Status::Indexing {
+                state.status = Status::Stopped;
+            }
+            // No more rows will come: whoever waits for them must hear.
+            std::mem::take(&mut state.waiting)
+        };
+        waiting.wake();
     }
 }
 

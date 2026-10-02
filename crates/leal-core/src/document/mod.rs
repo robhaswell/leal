@@ -484,7 +484,17 @@ impl Document {
     /// # Errors
     ///
     /// [`DocumentError::Choice`] if the chosen encoding doesn't fit the
-    /// file's BOM. The document is then unchanged.
+    /// file's BOM, and [`DocumentError::Read`] with
+    /// [`ReadErrorKind::ChangedOnDisk`] once the file changed while it was
+    /// read ([`changed_on_disk`](Self::changed_on_disk)). The document is
+    /// then unchanged.
+    ///
+    /// After such a change the first 64 KB kept in memory may be the old
+    /// version, so detection and the first screen can't come from them, and
+    /// the file can't be read again either: it is never copied whole
+    /// ([`Source::stream`] refuses), so a new index would have no rows. The
+    /// current reading still serves the rows its index checked, and the
+    /// app offers Reload (p1-review fid-2).
     pub fn reinterpret(
         &self,
         choices: Choices,
@@ -497,6 +507,8 @@ impl Document {
             .unwrap_or_else(PoisonError::into_inner);
         let first_paint = self.scheduler.interval(Interval::FirstPaint);
         let paint = read_first_paint(&self.source, &self.head, choices)?;
+        // Checked after detection, so a change noticed meanwhile counts.
+        self.refuse_once_stale()?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let options = OpenOptions {
             choices,
@@ -529,6 +541,7 @@ impl Document {
             .unwrap_or_else(PoisonError::into_inner);
         let old = self.current();
         let paint = read_first_paint(&self.source, &self.head, old.choices)?;
+        self.refuse_once_stale()?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         old.cancel();
         let context = Context {
@@ -539,6 +552,16 @@ impl Document {
         let reading = start_jobs(&context, generation, paint, old.choices);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reading);
         Ok(generation)
+    }
+
+    /// [`reinterpret`](Self::reinterpret)'s and `restart`'s refusal once
+    /// the first 64 KB kept in memory can't be trusted.
+    fn refuse_once_stale(&self) -> Result<(), DocumentError> {
+        if self.head_is_stale() {
+            Err(DocumentError::Read(ReadError::changed_on_disk()))
+        } else {
+            Ok(())
+        }
     }
 
     /// Rows `rows` (as many of them as can be read now), each as its
@@ -680,26 +703,15 @@ impl Document {
         self.rows_index(&self.current()).1
     }
 
-    /// The index rows are read from, and how many rows it has: whichever
-    /// of the two indexes covers more of the file's first rows (both cover
-    /// a prefix), except that once the file changed while it was read, only
-    /// the real index.
+    /// The index rows are read from, and how many rows it has
+    /// ([`Reading::rows_from`] the reading's index).
     fn rows_index<'r>(&self, reading: &'r Reading) -> (&'r RowIndex, usize) {
-        let indexed = reading.index.row_count();
-        if indexed >= reading.head_rows || self.head_is_stale() {
-            (&*reading.index, indexed)
-        } else {
-            (&reading.head_index, reading.head_rows)
-        }
+        reading.rows_from(&reading.index, self.head_is_stale())
     }
 
-    /// The bytes of `extent`: from the first 64 KB kept in memory if they
-    /// hold it, otherwise one read of the file.
+    /// The bytes of `extent` ([`bytes_in`]).
     fn bytes_of(&self, extent: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
-        match self.head.get(extent.clone()) {
-            Some(bytes) if !self.head_is_stale() => Ok(Cow::Borrowed(bytes)),
-            _ => self.source.read_range(extent),
-        }
+        bytes_in(&self.source, &self.head, extent)
     }
 
     /// Whether the first 64 KB kept in memory may be a different version
@@ -1000,19 +1012,16 @@ impl Document {
     }
 
     /// The bytes of row `row`, line ending included, from whichever index
-    /// holds it, without the row cache.
+    /// holds it ([`rows_index`](Self::rows_index)), without the row cache.
     fn row_bytes<'r>(
         &self,
         reading: &'r Reading,
         row: usize,
     ) -> Result<Option<RowBytes<'_, 'r>>, ReadError> {
-        let index = if row < reading.index.row_count() {
-            &*reading.index
-        } else if row < reading.head_rows && !self.head_is_stale() {
-            &reading.head_index
-        } else {
+        let (index, available) = self.rows_index(reading);
+        if row >= available {
             return Ok(None);
-        };
+        }
         let Some(extent) = index.row_extent(row) else {
             return Ok(None);
         };
@@ -1194,6 +1203,26 @@ impl fmt::Debug for Document {
 }
 
 impl Reading {
+    /// The index rows are read from, and how many rows it has: `index`
+    /// (the reading's own, or a copy job's) or the first 64 KB's, whichever
+    /// covers more of the file's first rows (both cover a prefix), except
+    /// that once the first 64 KB are stale (`head_stale`, the file changed
+    /// while it was read), only `index`.
+    ///
+    /// Every reader of rows goes through this and [`bytes_in`]: the grid
+    /// and the inspector, Copy and Find (p1-review fid-1 and fid-2). So
+    /// after a removable drive vanished early, Copy and Find still have
+    /// the rows of the first 64 KB that the grid shows, and after a change
+    /// none of them reads the stale 64 KB.
+    fn rows_from<'r>(&'r self, index: &'r RowIndex, head_stale: bool) -> (&'r RowIndex, usize) {
+        let indexed = index.row_count();
+        if indexed >= self.head_rows || head_stale {
+            (index, indexed)
+        } else {
+            (&self.head_index, self.head_rows)
+        }
+    }
+
     /// The latest diagnostics report, or an empty one if the index job
     /// hasn't made the diagnostics yet.
     fn report(&self) -> Arc<Report> {
@@ -1207,6 +1236,23 @@ impl Reading {
     fn cancel(&self) {
         self.index_job.cancel();
         self.review_job.cancel();
+    }
+}
+
+/// The bytes of `extent`: from the first 64 KB kept in memory (`head`) if
+/// they hold it and can be trusted, otherwise one read of `source`. Once
+/// the file changed while it was read without a snapshot
+/// ([`Source::changed_on_disk`]), the first 64 KB may be a different
+/// version from the rest, so from then on bytes come only from the
+/// checked copy (task 1.9; for every reader since p1-review fid-2).
+fn bytes_in<'a>(
+    source: &'a Source,
+    head: &'a [u8],
+    extent: Range<usize>,
+) -> Result<Cow<'a, [u8]>, ReadError> {
+    match head.get(extent.clone()) {
+        Some(bytes) if !source.changed_on_disk() => Ok(Cow::Borrowed(bytes)),
+        _ => source.read_range(extent),
     }
 }
 

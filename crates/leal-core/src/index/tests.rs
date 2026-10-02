@@ -987,3 +987,63 @@ fn every_corpus_sidecar_matches() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Waiting for rows (p1-review conc-1)
+
+/// A counter that `when_past` callbacks bump.
+fn counter() -> (Arc<std::sync::atomic::AtomicUsize>, impl Fn() -> usize) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let read = {
+        let count = Arc::clone(&count);
+        move || count.load(Ordering::SeqCst)
+    };
+    (count, read)
+}
+
+fn bump(count: &Arc<std::sync::atomic::AtomicUsize>) -> impl FnOnce() + Send + Sync + 'static {
+    let count = Arc::clone(count);
+    move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// `when_past` calls back as soon as there are more rows than it was
+/// given, or none will come: at once if so already, otherwise as the
+/// indexer publishes a chunk with new rows, completes or stops.
+#[test]
+fn when_past_calls_back_once_rows_come_or_the_index_ends() {
+    let bytes = b"a,b\n1,2\n3,4\n5,6\n".repeat(1000);
+    let (index, indexer) = RowIndex::start(utf8(b',')).unwrap();
+    let indexer = indexer.with_chunk_bytes(4096);
+    let (count, calls) = counter();
+    // Waiting for more than 0 rows, before the indexer runs.
+    index.when_past(0, bump(&count));
+    // Waiting for more rows than the file has: only completion wakes it.
+    index.when_past(10_000, bump(&count));
+    assert_eq!(calls(), 0);
+    let mut published = Vec::new();
+    indexer
+        .run(&bytes, &AtomicBool::new(false), |progress| {
+            published.push((progress.rows, calls()));
+        })
+        .unwrap();
+    // The first callback ran with the first chunk's rows, before the
+    // progress callback was told; the second with completion.
+    assert_eq!(published[0].1, 1, "{published:?}");
+    assert_eq!(published.last().unwrap().1, 2, "{published:?}");
+    assert_eq!(calls(), 2);
+    // Past the rows already there, or once complete: at once.
+    index.when_past(5, bump(&count));
+    index.when_past(10_000, bump(&count));
+    assert_eq!(calls(), 4);
+
+    // An indexer dropped (cancelled, or failed) wakes whoever waits.
+    let (index, indexer) = RowIndex::start(utf8(b',')).unwrap();
+    index.when_past(0, bump(&count));
+    drop(indexer);
+    assert_eq!(index.status(), Status::Stopped);
+    assert_eq!(calls(), 5);
+    index.when_past(0, bump(&count));
+    assert_eq!(calls(), 6, "stopped: at once");
+}

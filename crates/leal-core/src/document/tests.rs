@@ -1699,6 +1699,194 @@ fn after_a_change_while_reading_only_the_copy_is_trusted() {
     assert_eq!(rows, expected_rows(&bytes, parser, 100)[..indexed]);
 }
 
+/// `rows` rows of `id,name,flag`: row `i` (1-based, after the header) is
+/// `i,nm{i}q,x`, except that row 2's name has a NUL in it. Each name is
+/// found by searching for it, and only in its row.
+fn named_rows(rows: usize) -> Vec<u8> {
+    let mut bytes = b"id,name,flag\n".to_vec();
+    for i in 1..=rows {
+        if i == 2 {
+            bytes.extend_from_slice(b"2,n\0m2q,x\n");
+        } else {
+            bytes.extend_from_slice(format!("{i},nm{i}q,x\n").as_bytes());
+        }
+    }
+    bytes
+}
+
+/// What every reader of rows gives for `row`'s name: the grid, the
+/// inspector, Copy at once and as a job, and Find (its count and the cell
+/// it selects). They read the same rows from the same bytes (p1-review
+/// fid-1, fid-2).
+fn readers_agree_on(document: &Document, row: usize, name: &str) {
+    assert_eq!(
+        text(&document.rows(row..row + 1, 100).unwrap()),
+        [[row.to_string().as_str(), name, "x"]],
+        "the grid, row {row}"
+    );
+    assert_eq!(
+        document
+            .cell_value(row, 1, 100)
+            .unwrap()
+            .map(|value| value.text),
+        Some(name.to_owned()),
+        "the inspector, row {row}"
+    );
+    let copied = format!("{row}\t{name}\tx");
+    assert_eq!(
+        document.copy_cells_now(row..row + 1, 0..3).unwrap(),
+        Some(copied.clone()),
+        "Copy at once, row {row}"
+    );
+    let job = document.copy_cells(row..row + 1, 0..3);
+    assert_eq!(job.control().wait_timeout(LONG), Some(Ok(())), "row {row}");
+    assert_eq!(job.wait().unwrap().take(), Some(copied), "Copy, row {row}");
+    let search = document.find(&crate::find::Query::new(name)).unwrap();
+    assert_eq!(
+        search.job().control().wait_timeout(LONG),
+        Some(Ok(())),
+        "Find, row {row}"
+    );
+    assert_eq!(search.job().wait().unwrap().matches, 1, "Find, row {row}");
+    assert_eq!(
+        search.step(None, true).unwrap(),
+        SearchStep::Found {
+            place: Place { row, column: 1 },
+            ordinal: 1,
+            wrapped: false
+        },
+        "Find, row {row}"
+    );
+}
+
+/// p1-review fid-1: a removable drive vanishes before its copy reaches
+/// the end of the first 64 KB. The grid and the inspector still read the
+/// rows of those 64 KB (ADR-0006: the rows already read stay readable), so
+/// Copy and Find read them too: a Copy of a row the grid shows gives its
+/// text, at once and as a job, and Find searches every row the grid has
+/// and completes.
+#[test]
+fn after_a_disconnection_copy_and_find_read_what_the_grid_shows() {
+    let dir = Dir::new("fault-disconnect-readers");
+    let bytes = named_rows(2000);
+    assert!(bytes.len() < FIRST_PAINT_BYTES, "the file fits in 64 KB");
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Disconnect { at: 10_000 });
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    let indexed = document.current().index.row_count();
+    assert!(indexed < 1000, "the copy stopped early: {indexed} rows");
+    assert_eq!(document.row_count(), 2001);
+    for row in [1, 1500, 2000] {
+        readers_agree_on(&document, row, &format!("nm{row}q"));
+    }
+    // A selection past the end: the rows there are.
+    let job = document.copy_cells(1999..usize::MAX, 1..2);
+    assert_eq!(job.control().wait_timeout(LONG), Some(Ok(())));
+    assert_eq!(
+        job.wait().unwrap().take().as_deref(),
+        Some("nm1999q\nnm2000q")
+    );
+    let search = document.find(&crate::find::Query::new("nm")).unwrap();
+    assert_eq!(search.job().control().wait_timeout(LONG), Some(Ok(())));
+    let progress = search.progress();
+    assert!(progress.complete);
+    assert_eq!(progress.rows_searched, 2001);
+    assert_eq!(progress.matches, 1999, "every name but row 2's");
+}
+
+/// p1-review tests-1 and fid-2: a file read without a snapshot changes
+/// while it is read, and the first 64 KB kept in memory are the old
+/// version (a same-size write with the same modification time can land
+/// between first paint and the copy, which only the watcher catches). Here
+/// the kept bytes are made to differ from the file, and the copy then
+/// finds the change. From then on every reader gives the copy's bytes,
+/// never the kept ones, Previous and Next of a kind read the copy's bytes
+/// too, and the file can't be read again with other choices.
+#[test]
+fn after_a_change_while_reading_no_reader_uses_the_stale_first_64_kb() {
+    let dir = Dir::new("fault-change-stale");
+    let bytes = named_rows(8000);
+    assert!(bytes.len() > FIRST_PAINT_BYTES);
+    let path = dir.file("usb.csv", &bytes);
+    let source = Source::open_simulating_fault(
+        &path,
+        &dir.temp(),
+        4096,
+        Some(SimulatedFault::Change { at: 16 * 1024 }),
+    )
+    .unwrap();
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (mut document, screen) =
+        Document::from_source(source, &scheduler, options(30), None).unwrap();
+    // The first 64 KB as an older version of the file had them: the same
+    // size, but row 1's name is different and row 2 has no NUL.
+    let mut old = document.head.to_vec();
+    let replace = |old: &mut Vec<u8>, from: &[u8], to: &[u8]| {
+        let at = old.windows(from.len()).position(|w| w == from).unwrap();
+        old[at..at + from.len()].copy_from_slice(to);
+    };
+    replace(&mut old, b"1,nm1q,x", b"1,OLDO,x");
+    replace(&mut old, b"2,n\0m2q,x", b"2,nXm2q,x");
+    document.head = Arc::from(old);
+    // Until the change is found, the kept bytes are trusted.
+    assert_eq!(
+        text(&document.rows(1..2, 100).unwrap()),
+        [["1", "OLDO", "x"]]
+    );
+
+    gate.open();
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    assert!(document.changed_on_disk());
+    let indexed = document.current().index.row_count();
+    assert!(indexed > 2 && indexed < screen.row_count, "{indexed} rows");
+    assert_eq!(document.row_count(), indexed);
+    readers_agree_on(&document, 1, "nm1q");
+    readers_agree_on(&document, indexed - 1, &format!("nm{}q", indexed - 1));
+    let search = document.find(&crate::find::Query::new("OLDO")).unwrap();
+    assert_eq!(search.job().control().wait_timeout(LONG), Some(Ok(())));
+    assert_eq!(search.job().wait().unwrap().matches, 0);
+    // Rows the index didn't reach aren't served from the kept bytes.
+    assert_eq!(
+        document.rows(0..screen.row_count, 100).unwrap().len(),
+        indexed
+    );
+    assert_eq!(
+        document.copy_cells_now(indexed..indexed + 1, 0..3).unwrap(),
+        Some(String::new())
+    );
+    // Previous and Next of a kind read the copy's bytes: row 2's NUL.
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::NulBytes, 0)
+            .unwrap(),
+        Some(Place { row: 2, column: 1 })
+    );
+    // The file can't be read again with other choices: detection would be
+    // from the kept bytes, and a new index would get no rows.
+    let generation = document.generation();
+    let refused = document.reinterpret(
+        Choices {
+            header: Some(false),
+            ..Choices::default()
+        },
+        30,
+        100,
+    );
+    assert!(
+        matches!(&refused, Err(DocumentError::Read(error)) if error.kind() == ReadErrorKind::ChangedOnDisk),
+        "{refused:?}"
+    );
+    assert_eq!(document.generation(), generation);
+    assert_eq!(document.row_count(), indexed);
+    readers_agree_on(&document, 1, "nm1q");
+}
+
 #[test]
 fn watching_stops_when_the_document_is_dropped() {
     let dir = Dir::new("original-drop");
