@@ -393,7 +393,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     against 2.0a.
   - Done before 2.5, because the in-cell editor must sit above the strips.
 
-- [ ] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
+- [x] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
   - Editing a hatched (missing) cell of a short or blank row is allowed:
     the save appends the delimiters needed to reach that column, then the
     value, at the end of the row before its line ending. Edits past an
@@ -419,6 +419,17 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (ADR-0008 decision 5)
   - Decide whether header-row cells (file row 0, not a grid row) can be
     edited; an ADR if it changes DESIGN. (phase 1 review)
+- [ ] **2.1a Drive reconnect head check** (a 1.9 follow-up; 2.1 notes,
+  "Edits on rows of the first 64 KB that turn out stale").
+  - When a drive reconnects after its clone was lost
+    (`Removable::reconnect` falling back to the user's own file), the copy
+    checks every chunk of the first 64 KB against first paint's bytes, as
+    it does when first paint read the user's file. So first paint's bytes
+    are kept whatever it read, clone included.
+  - A test hook loses the clone before a reconnect.
+  - A test: after a reconnect without the clone, a same-size change to the
+    first 64 KB with its modification time put back stops the copy with
+    `ChangedOnDisk`, rather than being read unnoticed.
 - [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
   - Replays the testkit's `EditCase` edits on the real document with
     `existing_hint` passed through, and requires the same bytes, splices,
@@ -453,6 +464,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     applied: never half a row, half a character or an open quote, and no
     marker in the file. It reports how many rows it wrote, for the dialog.
     Tested on the exFAT disk-image case. (ADR-0008 decision 6)
+  - Decide what undoing a hatched edit (missing → `"x"`) does after the
+    save's rebase: the saved file has the cell as a real field, so making it
+    missing again is refused (`ValueChanged`). Either undo it to `""`
+    (keeping the delimiters) or add a change that truncates the row back.
+    The rebase keeps the lineage (`EditStore::with_lineage`). (2.1 notes)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
   - Covers every single-byte encoding Leal supports. (ADR-0005 decision 5)
@@ -474,6 +490,21 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     has at least one non-empty field and all of them are quoted.
     (ADR-0005 decision 3)
   - 2.2's oracle replay is extended to every edit kind.
+  - What 2.1's code needs (2.1 notes, "What 2.4 needs"):
+    - a logical-to-physical `RowMap` seam in every walk over rows: Find's
+      chunks and matching rows, the edit log, the marks and `row_flags`,
+      each kind's Previous/Next, Copy's row ranges, the number-detection
+      sample and the first screen;
+    - a stable row id for the edit log, so a search can catch up across
+      inserts and deletes;
+    - a base epoch, so a structural undo after a save works by value
+      against the new base;
+    - each column operation records, per row, whether it applied, and its
+      undo touches exactly those rows;
+    - Find remaps its matching rows on an insert or delete, or restarts;
+    - undo and redo name cells by identity (a field, an inserted column or
+      an appended cell), and inserted rows get their own store, keyed by an
+      id from the piece list.
 - [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
   Save / Save As / Revert, safe-save with metadata preserved.
   - In-cell editing uses an `NSTextField` overlaid on the cell; Return
@@ -552,6 +583,19 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     calls the job's `cancel()` (2.2; ADR-0005 decision 6).
   - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
     to `just perf` and recorded in docs/perf.md.
+  - From 2.1 (docs/tasks/2.1.md):
+    - Keep an append-only journal of every command applied (edits, undos
+      and redos, in order) with the reading's choices, for Recover changes;
+      `NSUndoManager` can't be listed. Replay once the fresh document's
+      index has finished (`NotReadYet` before then).
+    - The in-cell editor opens only where `canEdit` allows it.
+    - After an edit, an undo or a redo, call `cellsChanged(rows:)` for the
+      rows touched (2.0a notes, "For editing"), and re-measure column
+      widths and number detection, as after a reinterpret.
+    - While `Search.progress().catchingUp` is true, keep polling (or await
+      `catchUpJob()`), and retry a `Pending` Next or Previous once it
+      clears.
+    - Clear the undo history when the split changes (a new lineage).
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
@@ -563,8 +607,17 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
   - Pasting over short rows follows the hatched-cell rule from 2.1.
     (ADR-0005 decision 2)
+  - A row edited out to a far hatched cell (up to column 2²⁰) makes
+    `Document::rows` and the first screen return that many cells, and a far
+    edit to row 0 widens the grid through the first screen's column count
+    and titles. Handle both before a paste can reach far columns. (2.1
+    notes, "Left for later")
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
+  - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
+    edit. This narrows ADR-0005 decision 2's literal text; explicitly
+    padding a short row would be a future "Fill missing cells" command.
+    (2.1 notes, "Decisions and interpretations")
 
 ## Phase 3 — Filter and sort
 

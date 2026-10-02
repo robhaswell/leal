@@ -413,23 +413,52 @@ field says so before the change is committed.
 
 The original bytes are never modified. Edits live in an overlay:
 
-- **Cell edits:** map of `(physical row, column) → new value`.
+- **Cell edits:** for each edited row, its new cell values, by the cell's
+  place in the row: one of its own fields, or a cell past its end (a
+  hatched cell). Looking a row up is O(log n) in the edited rows, and free
+  when there are none.
 - **Row structure:** a piece list over rows, each piece either a range of
   original rows or a run of inserted rows. Deleting a row splits a piece.
-- **Column structure:** a column map applied when rows are serialized.
+  Inserted rows keep their cells in the overlay too, by an id of their own.
+- **Column structure:** a list of column inserts and deletes, each
+  recording the rows it applied to, since a row too short for a column
+  isn't changed (ADR-0004 §5).
 
-Every change is a command storing both the old and new values, in logical
-coordinates. This gives undo/redo, and lets undo history survive a save: after
-saving, the saved file becomes the new base and the stored values still apply
-(§3.1, ADR-0008 decision 1). The same commands can be replayed into a freshly
-opened document, which reports any command that no longer applies; this is
-how a failed document's edits are recovered (§3.9, ADR-0008 decision 5).
+**Commands.** Every change is a command storing both the old and new
+values, in logical coordinates. A missing cell is distinct from an empty
+one (`None` versus `""`), and a command's new value is what the cell reads
+as afterwards. Each command belongs to a **lineage**: the edits of one way
+of splitting the file into cells. A command applies only in its own
+lineage, and only if its cells still hold what it expects, so a stale
+command never lands on the wrong cell. A command of several cells (a paste)
+is checked whole before anything changes, and applies whole or not at all.
+Undoing a row or column delete restores the original bytes, not just the
+values.
+
+**Undo is the app's.** The app's `NSUndoManager` holds the commands, and
+the core keeps no undo stack: undo applies a command's inverse, and redo
+applies it again. The commands survive a save: after saving, the saved file
+becomes the new base, in the same lineage, and the stored values still
+apply (§3.1, ADR-0008 decision 1), except that a hatched cell, a real field
+once saved, can't be made missing again by an undo (task 2.2 decides what
+that undo does).
+
+**Recovery by replay** (§3.9, ADR-0008 decision 5). An undo manager can't
+be listed, so the app also keeps an append-only journal of every command it
+applies (edits, undos and redos, in order), with the reading's choices
+(delimiter, encoding, header row). To recover a failed document's edits, it
+opens the file afresh with those choices, waits for the index, and replays
+the journal. Replay checks values, not lineage. It skips each command that
+no longer applies and reports it with the reason, and returns the ones that
+applied, in the new document's lineage, as the new undo history.
 
 **Edits are visible everywhere** (ADR-0008 decision 2). Every reader goes
 through the overlay: the grid, find (it matches edited values, and stops
 matching the values they replaced), copy (the copy snapshots the overlay
 when it is made), the inspector, the diagnostics markers (an edited cell is
-checked again on its new value), and column widths and number detection.
+checked again on its new value; only a NUL can be in one, and the
+diagnostics report itself still describes the file as it was read), and
+column widths and number detection.
 
 **Editing starts from the full value** (ADR-0008 decision 3). The in-cell
 editor and the inspector start from the core's full display value, never
@@ -444,20 +473,37 @@ across a new delimiter or encoding:
   goes through the same path as Reload (§4.3).
 - **Treat As** and **Reopen with encoding** are disabled while there are
   unsaved edits, with "Save or revert your changes first" as the reason.
-  The core refuses a new delimiter or encoding meanwhile.
+  The core refuses a new delimiter or encoding meanwhile. Once there are no
+  edits, a new split starts a new lineage, so commands from before it are
+  refused and the app clears its undo history.
 - **The header-row toggle** stays available. It changes only how row 1 is
-  displayed, not where the edits are.
-- **A drive coming back** keeps the edits, because Leal has confirmed the
-  file is unchanged.
+  displayed, not where the edits are, so the lineage stays.
+- **A drive coming back** keeps the edits and their lineage, because Leal
+  has confirmed the file is unchanged.
 
 Setting a cell back to exactly its original display value removes the edit,
-so the original bytes (including their quoting) come back.
+so the original bytes (including their quoting) come back. The document has
+unsaved edits only while some cell reads differently from the file, so an
+edit set back by hand leaves it clean.
 
 A **hatched cell** (a missing field of a short or blank row) can be edited
 (ADR-0005 decision 2). Saving appends the delimiters needed to reach that
 column, then the new value, at the end of the row before its line ending. A
-blank line edited in column *c* becomes a row of *c* + 1 fields. Edits past
-an unterminated quote are still rejected (ADR-0004 §8).
+blank line edited in column *c* becomes a row of *c* + 1 fields. Committing
+`""` to a hatched cell is no edit, and setting an edited one back to `""`
+makes it missing again, so the row's original bytes come back. This
+narrows ADR-0005 decision 2 and is for Rob to confirm at the phase 2 gate;
+padding a short row with empty fields would be a separate command, "Fill
+missing cells". Edits past an unterminated quote are still rejected
+(ADR-0004 §8).
+
+**Edits on rows that turn out stale** (§3.1). Rows of the first 64 KB can
+be edited before the index reaches them. If the file then turns out to have
+changed while it was read, those bytes aren't trusted. Such an edit is
+kept, never dropped: it records a hash of its row's bytes, and the core
+reports as **edit conflicts** the edited cells whose rows the trusted copy
+lacks or has with other bytes, for the app and Save As from an incomplete
+document (ADR-0008 decision 6) to name.
 
 ### 3.7 Saving
 
@@ -564,18 +610,29 @@ of physical row numbers to show, in order.
   `withTaskCancellationHandler`, which calls `cancel()`.
 - The main thread never waits on a long operation. While indexing, the row
   count is "rows indexed so far".
+- **Edits are synchronous** calls, safe on the main thread, and serialized
+  with each other and with re-reading. A search takes only the edits of the
+  rows it is reading, never the whole overlay, so an edit during one stays
+  cheap. A copy snapshots the overlay when it is made (§3.6).
+- **Find catches up with edits** without restarting. A search recounts the
+  rows edited since it last looked. A query from the main thread does this
+  itself only when the work is small; otherwise it starts a catch-up job
+  (which checkpoints like any job, §3.10 rule 3) and, until that finishes,
+  reports `catchingUp`, answers Next and Previous with `Pending`, and gives
+  the counts as they are. The app polls the progress, or awaits the
+  catch-up job, and retries a pending step.
 - A Rust panic that UniFFI catches at the boundary reaches Swift as an
   error, but it can leave a `Mutex` inside the document poisoned. So after
   a caught panic, that document is treated as failed: Leal makes no further
   calls on its handle, and the app shows an error and offers to reopen the
   file.
 - **A failed document's unsaved edits are not lost** (ADR-0008 decision 5).
-  The app keeps its own record of the edit commands (the undo history), and
-  the failure alert offers **Recover changes**: Leal opens the file afresh
-  and replays the commands into it (§3.6). If the file is unchanged, the
-  window carries on with the edits. If it changed, or a command no longer
-  applies, Leal offers Save As of what it could recover, and names any
-  edits it couldn't apply.
+  The app keeps its own journal of the edit commands it applied, with the
+  reading's choices, and the failure alert offers **Recover changes**: Leal
+  opens the file afresh with those choices and replays the journal into it
+  (§3.6). If the file is unchanged, the window carries on with the edits.
+  If it changed, or a command no longer applies, Leal offers Save As of
+  what it could recover, and names any edits it couldn't apply.
 
 ### 3.10 First paint and work priority
 
