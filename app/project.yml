@@ -219,11 +219,15 @@ schemes:
       # Don't reopen windows from an earlier run of the test host.
       commandLineArguments:
         "-ApplePersistenceIgnoreState YES": true
+      # Which checkout's disk-image helper serves RemovableDriveTests: the
+      # helper and the tests both key their folder on this path.
+      environmentVariables:
+        LEAL_DISK_IMAGE_CHECKOUT: $(PROJECT_DIR)
       # The hosted RemovableDriveTests need disk images, which the sandboxed
       # test host can't attach: this helper attaches them from outside the
       # sandbox while the tests run, and detaches them all at the end (see
       # the script, cons-12 in the phase 1 review). Its log is
-      # build/disk-image-helper.log.
+      # build/disk-image-helper/helper.log.
       preActions:
         - name: Start the disk-image helper
           settingsTarget: LealAppTests

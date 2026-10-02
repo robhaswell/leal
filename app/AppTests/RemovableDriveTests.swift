@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import LealFFI
 import XCTest
 
@@ -209,7 +210,14 @@ final class RemovableDriveTests: XCTestCase {
 struct HelperDiskImage {
     /// Where requests go: the container's temporary folder, which the
     /// helper watches.
-    static let work = FileManager.default.temporaryDirectory.appending(path: "leal-disk-images")
+    /// This checkout's folder: the helper of another worktree never sees
+    /// it. Keyed, as the helper keys it, on the first 12 hex digits of the
+    /// SHA-256 of the scheme's `$(PROJECT_DIR)`.
+    static var work: URL? {
+        guard let checkout = ProcessInfo.processInfo.environment["LEAL_DISK_IMAGE_CHECKOUT"], !checkout.isEmpty else { return nil }
+        let key = SHA256.hash(data: Data(checkout.utf8)).map { String(format: "%02x", $0) }.joined().prefix(12)
+        return FileManager.default.temporaryDirectory.appending(path: "leal-disk-images").appending(path: String(key))
+    }
     /// How many times `hdiutil detach` is tried, and the wait before the
     /// first retry (doubled for each one after).
     private static let attempts = 5
@@ -226,11 +234,16 @@ struct HelperDiskImage {
     /// (`UDRW` read-write, `UDBZ` compressed and read-only) holding `files`,
     /// and waits until it is attached.
     static func attach(fs: String, format: String, size: String?, files: [String: Data]) async throws -> HelperDiskImage {
-        guard helperIsRunning() else {
+        guard let work else {
+            throw NSError(domain: "HelperDiskImage", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "LEAL_DISK_IMAGE_CHECKOUT isn't set: run the tests with the Leal scheme, whose test action sets it.",
+            ])
+        }
+        guard helperIsRunning(in: work) else {
             throw NSError(domain: "HelperDiskImage", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: """
                 No disk-image helper is running. The Leal scheme's test pre-action starts it \
-                (app/Scripts/disk-image-helper.sh; its log is build/disk-image-helper.log): the sandboxed \
+                (app/Scripts/disk-image-helper.sh; its log is build/disk-image-helper/helper.log): the sandboxed \
                 test host can't attach disk images itself (hdiutil attach fails with "Device not configured").
                 """,
             ])
@@ -267,7 +280,7 @@ struct HelperDiskImage {
     }
 
     /// Whether a helper has looked for requests in the last few seconds.
-    private static func helperIsRunning() -> Bool {
+    private static func helperIsRunning(in work: URL) -> Bool {
         // The helper may be waiting for this folder to exist.
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         let deadline = Date().addingTimeInterval(10)

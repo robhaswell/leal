@@ -8,37 +8,62 @@
 # disk at all). `hdiutil detach -force` and `hdiutil info` do work there.
 # So the Leal scheme's test pre-action starts this helper (`start`), and the
 # post-action stops it (`stop`). Meanwhile it serves requests the test
-# writes into the app container's temporary folder:
+# writes into the app container's temporary folder, in a folder of this
+# checkout's own (`checkout_key`: the scheme passes the same path to the
+# test as LEAL_DISK_IMAGE_CHECKOUT), so helpers of other worktrees never
+# touch them:
 #
-#   leal-disk-images/<id>/source/   the files to put on the volume
-#   leal-disk-images/<id>/request   "fs=ExFAT format=UDBZ size=64m"
+#   leal-disk-images/<checkout>/<id>/source/   the files to put on the volume
+#   leal-disk-images/<checkout>/<id>/request   "fs=ExFAT format=UDBZ size=64m"
 #
 # It makes the image from the source folder, attaches it (hidden from
-# Finder, not in /Volumes) at leal-disk-images/<id>/volume, inside the
-# container, where the sandboxed host may read and write, and writes
-# `ready` ("ok /dev/diskN", or "failed" and hdiutil's output). When the
-# test writes `detach`, the helper pulls the drive at once (`hdiutil
-# detach -force`, which takes about 10 s inside the sandbox while a file
-# on the volume is open) and writes `detached`. At the end the test writes
-# `done`, and the helper detaches whatever is left and removes the folder.
+# Finder, not in /Volumes) at <id>/volume, inside the container, where the
+# sandboxed host may read and write, and writes `ready` ("ok /dev/diskN",
+# or "failed" and hdiutil's output). When the test writes `detach`, the
+# helper pulls the drive at once (`hdiutil detach -force`, which takes about
+# 10 s inside the sandbox while a file on the volume is open) and writes
+# `detached`. At the end the test writes `done`, and the helper detaches
+# whatever is left and removes the folder.
 #
-# The helper always detaches every image it attached: on `done`, on
-# `stop`, on SIGTERM and SIGINT, and when it gives up after an hour.
-# Several helpers may run at once (several runs of the tests); each request
-# is claimed by one, by renaming it. Never kills anything by name.
+# Each run of the tests has its own helper, pid and stop file, keyed by the
+# xcodebuild process that ran the pre-action (its parent). The helper
+# detaches every image it attached: on `done`, on `stop`, on SIGTERM and
+# SIGINT, as soon as that xcodebuild has gone (an interrupted run), and after
+# 20 minutes at most. `start` also detaches what an earlier helper of this
+# checkout left behind, if that helper is gone. Never kills anything by name.
 
 set -uo pipefail
 
 container_tmp="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
-work="$container_tmp/leal-disk-images"
 script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-lifetime=3600
+lifetime=1200
 attempts=5
 transient='Resource busy|Resource temporarily unavailable|no mountable file systems|Device not configured'
 
-# The run's own files (pid and log), next to the build products.
+# This checkout's key: the first 12 hex digits of the SHA-256 of
+# PROJECT_DIR (the app/ folder). The tests compute the same.
+checkout_key() {
+    printf '%s' "${PROJECT_DIR:?PROJECT_DIR is set by the scheme action}" | /usr/bin/shasum -a 256 | cut -c 1-12
+}
+
+# The xcodebuild (or Xcode) that runs the scheme's actions: the first
+# ancestor by that name. The pre- and post-action find the same one.
+owner_pid() {
+    local pid="$PPID" name
+    for _ in $(seq 12); do
+        [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+        name="$(ps -o comm= -p "$pid" 2> /dev/null)"
+        case "$name" in
+            *xcodebuild | */Xcode) echo "$pid"; return ;;
+        esac
+        pid="$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d ' ')"
+    done
+}
+
+# The run's own files (pids, stop files and the log), next to the build
+# products.
 state_dir() {
-    local dir="${LEAL_DISK_IMAGE_STATE:-${PROJECT_DIR:-$PWD}/../build}"
+    local dir="${PROJECT_DIR:-$PWD}/../build/disk-image-helper"
     mkdir -p "$dir"
     echo "$dir"
 }
@@ -110,6 +135,7 @@ serve() {
         esac
     done
     local image="$folder/volume.dmg" mount="$folder/volume"
+    echo $$ > "$folder/helper"
     mkdir -p "$mount"
     log "request $id: $fs $format ${size:-(fitted)}"
     local create=(create -quiet -srcfolder "$folder/source" -fs "$fs" -format "$format" -volname "$id")
@@ -156,21 +182,57 @@ cleanup() {
     log "stopped"
 }
 
+# Detaches what helpers of this checkout that are gone left attached (a
+# run interrupted before its helper could clean up), and removes their
+# folders. A live helper's requests are left alone.
+sweep() {
+    local folder owner image
+    for folder in "$work"/*/; do
+        [ -d "$folder" ] || continue
+        folder="${folder%/}"
+        owner="$(cat "$folder/helper" 2> /dev/null)"
+        if [ -n "$owner" ] && kill -0 "$owner" 2> /dev/null; then
+            continue
+        fi
+        # Not claimed yet: a test may be about to ask; leave it to the
+        # helper that claims it. Unless it is old (a test that has gone).
+        if [ -z "$owner" ] && [ -z "$(find "$folder" -maxdepth 0 -mmin +20 2> /dev/null)" ]; then
+            continue
+        fi
+        image="$folder/volume.dmg"
+        detach_all "$image"
+        rm -rf "$folder"
+        log "swept $(basename "$folder") (its helper ${owner:-none} is gone)"
+    done
+    for beat in "$work"/.helper-*; do
+        [ -e "$beat" ] || continue
+        kill -0 "${beat##*.helper-}" 2> /dev/null || rm -f "$beat"
+    done
+}
+
 watch() {
+    local owner="$1" stop="$2"
     attached="$(mktemp -t leal-disk-images)"
     trap cleanup EXIT
     trap 'exit 0' TERM INT
-    log "watching $work"
-    local deadline=$((SECONDS + lifetime)) stop="${1:-}"
+    log "watching $work for xcodebuild $owner"
+    local deadline=$((SECONDS + lifetime)) watched=yes
+    [ "$owner" = none ] && watched=no
     while [ "$SECONDS" -lt "$deadline" ]; do
-        [ -n "$stop" ] && [ -e "$stop" ] && break
+        [ -e "$stop" ] && break
+        # The run was interrupted: its post-action will never come.
+        if [ "$watched" = yes ] && ! kill -0 "$owner" 2> /dev/null; then
+            log "xcodebuild $owner has gone"
+            break
+        fi
         # The container exists once the test host has run; never make it.
         if [ -d "$container_tmp" ]; then
             mkdir -p "$work"
             touch "$work/.helper-$$"
             for request in "$work"/*/request; do
                 [ -e "$request" ] || continue
-                # Claim it; another helper may have got there first.
+                # Claim it; another helper of this checkout may have got
+                # there first.
                 mv "$request" "$(dirname "$request")/claimed" 2> /dev/null && serve "$(dirname "$request")"
             done
             for detach in "$work"/*/detach; do
@@ -192,31 +254,41 @@ watch() {
 case "${1:-}" in
     start)
         dir="$(state_dir)"
-        rm -f "$dir/disk-image-helper.stop"
+        work="$container_tmp/leal-disk-images/$(checkout_key)"
+        # The xcodebuild that runs this action (and, later, the post-action),
+        # whose end ends the helper; "none" if there is none, when only the
+        # stop file and the lifetime do.
+        owner="$(owner_pid)"
+        owner="${owner:-none}"
+        sweep >> "$dir/helper.log" 2>&1
+        rm -f "$dir/$owner.stop"
         # A clean environment: hdiutil complains about Xcode's variables.
         env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="${TMPDIR:-/tmp}" \
-            nohup "$script" watch "$dir/disk-image-helper.stop" >> "$dir/disk-image-helper.log" 2>&1 < /dev/null &
-        echo $! > "$dir/disk-image-helper.pid"
+            nohup "$script" watch "$work" "$owner" "$dir/$owner.stop" >> "$dir/helper.log" 2>&1 < /dev/null &
+        echo $! > "$dir/$owner.pid"
         ;;
     stop)
         dir="$(state_dir)"
-        touch "$dir/disk-image-helper.stop"
-        if [ -s "$dir/disk-image-helper.pid" ]; then
-            pid="$(cat "$dir/disk-image-helper.pid")"
+        owner="$(owner_pid)"
+        owner="${owner:-none}"
+        touch "$dir/$owner.stop"
+        if [ -s "$dir/$owner.pid" ]; then
+            pid="$(cat "$dir/$owner.pid")"
             # Only the helper this run started, by its PID.
             for _ in $(seq 50); do
                 kill -0 "$pid" 2> /dev/null || break
                 sleep 0.2
             done
             kill "$pid" 2> /dev/null
-            rm -f "$dir/disk-image-helper.pid"
         fi
+        rm -f "$dir/$owner.pid" "$dir/$owner.stop"
         ;;
     watch)
-        watch "${2:-}"
+        work="$2"
+        watch "$3" "$4"
         ;;
     *)
-        echo "usage: $0 start|stop|watch [stop-file]" >&2
+        echo "usage: $0 start|stop  (from the Leal scheme's test actions)" >&2
         exit 2
         ;;
 esac
