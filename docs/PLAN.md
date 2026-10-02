@@ -376,6 +376,23 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Measured with `just perf`; the results go in docs/perf.md. A change to
     the grid's drawing design needs an ADR (ADR-0001).
 
+- [ ] **2.0b Grid strips** (ADR-0011). Draw the grid and gutter into strips
+  of rows that scrolling moves, on top of 2.0a; grids wider than 4,096 pt
+  keep 2.0a's drawing, with hysteresis around the switch.
+  - Start from `task/2.0a-strips` (`ca904cd`, the prototype), rebased onto
+    2.0a as landed; the prototype lacks 2.0a's review fixes.
+  - Pixel tests: strip rasters match synchronous drawing in light, dark,
+    1× and 2×, including selection, find marks, hatching and spilling ink.
+  - Risks to test (ADR-0011): stale or blank strips during a fling, a
+    column resize or live window resize, a move between 1× and 2× displays,
+    VoiceOver frames lining up with the pixels, and `cacheDisplay` (tests,
+    screenshots) going through the strips.
+  - Memory: footprint at the 4,096 pt switch on Retina, against the 1.10
+    tiles' +180 MB. Report render-server CPU as well as the main thread.
+  - On-screen check before landing, and an unloaded `just perf` A/B
+    against 2.0a.
+  - Done before 2.5, because the in-cell editor must sit above the strips.
+
 - [ ] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
   - Editing a hatched (missing) cell of a short or blank row is allowed:
     the save appends the delimiters needed to reach that column, then the
