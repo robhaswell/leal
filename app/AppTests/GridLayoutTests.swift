@@ -177,6 +177,46 @@ final class GridLayoutTests: XCTestCase {
         XCTAssertEqual(CellText.display("😀\n").symbols, [NSRange(location: 2, length: 1)])
     }
 
+    /// C1 controls (U+0080 to U+009F) are drawn as `⍰`, not at zero width,
+    /// so a cell never looks like text a search for it doesn't find
+    /// (phase 1 review, fid-3). U+2028 and U+2029 are line breaks.
+    func testC1ControlsAndUnicodeLineBreaksShowAsSymbols() {
+        XCTAssertEqual(CellText.display("a\u{81}b").text, "a⍰b")
+        XCTAssertEqual(CellText.display("a\u{81}b").symbols, [NSRange(location: 1, length: 1)])
+        XCTAssertEqual(CellText.display("\u{80}\u{85}\u{9D}\u{9F}").text, "⍰⍰⍰⍰")
+        XCTAssertEqual(CellText.display("one\u{2028}two\u{2029}three").text, "one↵two↵three")
+        // Characters next to them in UTF-8 are left alone: U+00A0 to
+        // U+00BF (C2 A0 to C2 BF) and other E2 80 characters.
+        for plain in ["\u{A0}", "£", "°", "©", "\u{2019}", "\u{2026}", "€", "\u{2027}", "\u{202A}", "Zoë"] {
+            XCTAssertEqual(CellText.display(plain).text, plain)
+            XCTAssertEqual(CellText.display(plain).symbols, [])
+        }
+        // One unit for one: find's ranges need no moving.
+        let value = "x\u{85}marlow"
+        XCTAssertEqual(CellText.displayRanges([NSRange(location: 2, length: 6)], in: value), [NSRange(location: 2, length: 6)])
+        XCTAssertEqual((CellText.display(value).text as NSString).substring(with: NSRange(location: 2, length: 6)), "marlow")
+        // Each is drawn with some width now.
+        let measurer = TextMeasurer(font: GridFonts.cell)
+        XCTAssertGreaterThan(measurer.cellWidth(of: "a\u{81}b", truncated: false), measurer.width(of: "ab") + 4)
+        XCTAssertGreaterThan(measurer.cellWidth(of: "a\u{2028}b", truncated: false), measurer.width(of: "ab") + 4)
+    }
+
+    /// The inspector shows the value itself, with its control characters
+    /// drawn as visible glyphs rather than at zero width (fid-3).
+    func testTheInspectorDrawsControlCharacters() throws {
+        func width(_ text: String) throws -> CGFloat {
+            let inspector = CellInspectorView(frame: NSRect(x: 0, y: 0, width: 600, height: CellInspectorView.height))
+            inspector.textView.string = text
+            let layout = try XCTUnwrap(inspector.textView.layoutManager)
+            let container = try XCTUnwrap(inspector.textView.textContainer)
+            return layout.boundingRect(forGlyphRange: layout.glyphRange(for: container), in: container).width
+        }
+        let plain = try width("ab")
+        for text in ["a\u{81}b", "a\u{9D}b", "a\0b", "a\u{7F}b"] {
+            XCTAssertGreaterThan(try width(text), plain + 4, "\(text.unicodeScalars.map(\.value))")
+        }
+    }
+
     // MARK: Keyboard moves
 
     func testMoves() {

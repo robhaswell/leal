@@ -45,6 +45,11 @@ final class CellInspectorView: NSView {
         textView.textContainer?.widthTracksTextView = true
         // Lay out only what is on screen, so a long value shows at once.
         textView.layoutManager?.allowsNonContiguousLayout = true
+        // Control characters (NUL, DEL, the C1 controls) are drawn as
+        // visible glyphs, not at zero width, as the grid shows them as
+        // symbols (`CellText`). The text itself is the value, unchanged
+        // (phase 1 review, fid-3).
+        textView.layoutManager?.showsControlCharacters = true
         textView.setAccessibilityLabel(InspectorText.valueLabel)
         scroll.documentView = textView
         scroll.hasVerticalScroller = true

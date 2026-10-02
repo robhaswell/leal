@@ -3,22 +3,33 @@ import CoreText
 
 /// How a cell's text is shown on its one grid line. The core gives values
 /// as they are (the 1.4 notes' open question); this is presentation only,
-/// and never changes a value:
+/// and never changes a value. Every character Core Text would draw as
+/// nothing, or would break the line at, is shown as a symbol instead:
 ///
-/// - a line break (CR, LF or CRLF) shows as a small `↵` (ADR-0002
-///   question 11: "multiline values show on one grid line with a small ↵
-///   between lines");
-/// - a tab shows as `⇥`;
-/// - NUL and the other control characters show as their Unicode control
-///   pictures (`␀`, `␁`, …), so they are visible rather than invisible.
+/// | In the value | Shown as |
+/// |---|---|
+/// | a line break: CR, LF or CRLF (one symbol for the pair), U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR | `↵` (ADR-0002 question 11: "multiline values show on one grid line with a small ↵ between lines") |
+/// | a tab, U+0009 | `⇥` |
+/// | NUL and the other C0 controls, U+0000–U+001F | their Unicode control pictures, `␀` to `␟` (U+2400–U+241F) |
+/// | DEL, U+007F | `␡` (U+2421) |
+/// | the C1 controls, U+0080–U+009F (NEL among them) | `⍰` (U+2370), one for each |
 ///
-/// The symbols are drawn in the secondary text colour.
+/// Unicode has no control pictures for C1 controls, so they share one
+/// placeholder (phase 1 review, fid-3). They are common in messy input:
+/// every 0x80–0x9F byte under ISO-8859-1, the five bytes Windows-1252
+/// leaves unmapped (WHATWG maps them to C1), and NEL in UTF-8. Before,
+/// they were drawn at zero width: a cell holding `a`, U+0081 and `b`
+/// looked like `ab`, though a search for "ab" doesn't find it.
+///
+/// Each symbol is one UTF-16 unit standing for one unit of the value,
+/// except the CRLF pair's (`displayRanges`). The symbols are drawn in the
+/// secondary text colour.
 enum CellText {
     /// The text to draw for `value`, and where the symbols are (UTF-16
     /// ranges, for colouring them). Values without control characters
     /// come back unchanged with no symbols, which is almost every value.
     static func display(_ value: String) -> (text: String, symbols: [NSRange]) {
-        guard value.utf8.contains(where: { $0 < 0x20 || $0 == 0x7F }) else {
+        guard needsSymbols(value) else {
             return (value, [])
         }
         var text = ""
@@ -40,6 +51,10 @@ enum CellText {
                 symbol = Character(Unicode.Scalar(0x2400 + scalar.value) ?? "?")
             case 0x7F:
                 symbol = "␡"
+            case 0x80...0x9F:
+                symbol = "⍰"
+            case 0x2028, 0x2029:
+                symbol = "↵"
             default:
                 symbol = nil
             }
@@ -54,6 +69,23 @@ enum CellText {
             }
         }
         return (text, symbols)
+    }
+
+    /// Whether `value` has anything `display` shows as a symbol, from its
+    /// UTF-8 bytes: C0 controls and DEL are single bytes, C1 controls are
+    /// `C2 80` to `C2 9F`, and U+2028 and U+2029 are `E2 80 A8` and
+    /// `E2 80 A9`.
+    private static func needsSymbols(_ value: String) -> Bool {
+        var previous: UInt8 = 0
+        var beforePrevious: UInt8 = 0
+        for byte in value.utf8 {
+            if byte < 0x20 || byte == 0x7F { return true }
+            if previous == 0xC2, (0x80...0x9F).contains(byte) { return true }
+            if beforePrevious == 0xE2, previous == 0x80, byte == 0xA8 || byte == 0xA9 { return true }
+            beforePrevious = previous
+            previous = byte
+        }
+        return false
     }
 }
 
