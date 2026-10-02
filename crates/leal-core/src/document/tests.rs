@@ -1078,6 +1078,40 @@ fn numeric_columns_include_the_first_row_without_a_header() {
     assert_eq!(document.numeric_columns(2).unwrap(), [true, false, true]);
 }
 
+/// The row cache is locked only to find the rows, not while each row's
+/// cells or whole value are worked out (p1-review conc-2): the inspector's
+/// `cell_value` decodes a whole value, megabytes long at worst, off the
+/// main thread, while the main thread's `rows` needs the cache. Before and
+/// after the first 64 KB are passed by the index, and with the row cached.
+#[test]
+fn the_row_cache_is_not_locked_while_rows_are_read() {
+    let dir = Dir::new("cache-lock");
+    let bytes = sample(200 * 1024);
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let path = dir.file("a.csv", &bytes);
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler,
+        options(30),
+        None,
+    )
+    .unwrap();
+    let free = |rows: Range<usize>| {
+        let reading = document.current();
+        document
+            .read_rows(rows, |_, _, _, _| reading.cache.try_lock().is_ok())
+            .unwrap()
+    };
+    assert_eq!(free(0..3), [true; 3], "from the first 64 KB");
+    assert_eq!(free(0..3), [true; 3], "cached");
+    gate.open();
+    let rows = wait_for_index(&document).rows;
+    assert_eq!(free(rows - 3..rows), [true; 3], "from the index");
+}
+
 // ---------------------------------------------------------------------------
 // Task 1.7: each kind's Previous and Next, row flags, Save and faults
 

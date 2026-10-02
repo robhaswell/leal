@@ -651,17 +651,23 @@ impl Document {
         };
         let bytes = self.bytes_of(extent.clone())?;
         let base = extent.start;
-        let mut cache = reading.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.head_is_stale() && !reading.cache_dropped.swap(true, Ordering::AcqRel) {
-            // Rows parsed before the change was noticed may be from either
-            // version of the file.
-            cache.clear();
-        }
-        Ok(rows
-            .filter_map(|r| {
-                let row = cache.row_in(index, r, &bytes, base)?;
-                Some(each(&reading.parser, &bytes, base, &row))
-            })
+        // The cache is locked only to find (or parse) the rows, never while
+        // `each` runs: `each` may decode whole values, megabytes long for
+        // the inspector (`cell_value`), and the main thread's `rows` needs
+        // the lock meanwhile (p1-review conc-2).
+        let parsed: Vec<Arc<ParsedRow>> = {
+            let mut cache = reading.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.head_is_stale() && !reading.cache_dropped.swap(true, Ordering::AcqRel) {
+                // Rows parsed before the change was noticed may be from
+                // either version of the file.
+                cache.clear();
+            }
+            rows.filter_map(|r| cache.row_in(index, r, &bytes, base))
+                .collect()
+        };
+        Ok(parsed
+            .iter()
+            .map(|row| each(&reading.parser, &bytes, base, row))
             .collect())
     }
 
