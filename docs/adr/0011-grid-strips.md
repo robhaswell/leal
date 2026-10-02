@@ -14,10 +14,11 @@ the prototype has tests and has been checked on screen, as a follow-up
 task; task 2.0a lands without it.
 
 - Task 2.0a cut Leal's own work per scroll frame (text layout and core
-  reads moved off the main thread, batched drawing): 5.2–6.0 M instructions
+  reads moved off the main thread, batched drawing): 5.2–6.4 M instructions
   a frame against 13.0–18.5 M. Its `just perf` run gave p99 2.2–2.6 ms on
   a loaded Mac with a fast clock; in Rob's conditions that would be about
-  3.1–3.9 ms, over the 3× rule's 2.8 ms. The rule's p99 is unproven.
+  2.75–3.6 ms after indexing and 3.1–3.9 ms with a search, likely over the
+  3× rule's 2.8 ms. The rule's p99 is unproven until an unloaded run.
 - About half of what is left in each frame is AppKit rebuilding the
   visible grid's and gutter's layers from their recorded drawing. A
   prototype that draws into strips instead (branch `task/2.0a-strips`)
@@ -110,7 +111,9 @@ files. Not re-measured.
 
 Accepted by Rob on 2 October 2026, conditional: **strips for grids up to
 4,096 pt wide, today's drawing for wider ones**, switching when the width
-crosses the line (a column resized, more columns read). The follow-up task
+crosses the line (a column resized, more columns read), with some
+hysteresis (switching back only a little below the line), so a column
+dragged back and forth across it doesn't switch on every step. The follow-up task
 lands it only once the prototype has tests and an on-screen check. Wide
 files keep 2.0a's drawing, where p99 is 2.9 ms at 200 columns on this Mac
 (the 3× rule judges only the reference file, but wide files are already
@@ -138,8 +141,9 @@ From the 2.0a review:
   line may need to be lower, or strips narrower than the grid.
 - **Tests and screenshots draw through `cacheDisplay`**, which bypasses the
   strips: they would no longer see what is on screen. The follow-up needs
-  a test that renders the strips themselves and compares them with
-  `cacheDisplay`.
+  a pixel test that renders the strips' rasters and compares them with the
+  grid's synchronous drawing (`cacheDisplay`), in light and dark, at 1× and
+  2×.
 - **VoiceOver frames** (4.2) come from the grid's geometry, which doesn't
   move; check they still line up with what is drawn.
 - **Render-server CPU**: more layers (about a dozen strips) for
@@ -149,8 +153,11 @@ From the 2.0a review:
 ## Consequences
 
 - PLAN: a follow-up task (the coordinator adds it) to land strips with the
-  tests and the on-screen check above, the 4,096 pt switch, footprint
-  checked in `just perf` against Rob's run, and the in-cell editor's place.
+  tests and the on-screen check above, the 4,096 pt switch with its
+  hysteresis, footprint checked in `just perf` against Rob's run, and the
+  in-cell editor's place. It re-measures the comparison above against the
+  reviewed 2.0a binary (the numbers here are from 2.0a before its review's
+  fixes).
 - Phase 2 (2.5, in-cell editing): the editor and the callout are placed
   above the strips' view, not inside the document view.
 - DESIGN §2's grid description gains a sentence on strips when it lands.

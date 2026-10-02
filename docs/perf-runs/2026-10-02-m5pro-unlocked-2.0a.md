@@ -3,7 +3,9 @@
 > **Provisional** (task 2.0a review): the Mac was loaded (load average
 > 9–16) and its main thread ran at 2.6–3.1 GHz, faster than in Rob's run
 > (2.2–2.4 GHz); `main` measured in the same session was 1.25–1.5× faster
-> than in Rob's run. The 3× rule's p99 is unproven until an unloaded run.
+> than in Rob's run. The 3× rule's p99 is likely over 2.8 ms in Rob's
+> conditions (about 2.75–3.6 ms after indexing, 3.1–3.9 ms with a search),
+> and unproven until an unloaded run.
 
 - Machine: Mac17,8, Apple M5 Pro (6 performance + 12 efficiency cores), 48 GB, macOS 27.0
 - Power: Now drawing from 'AC Power'; powermode 0
