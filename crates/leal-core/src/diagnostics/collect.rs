@@ -720,3 +720,55 @@ impl RowObserver for Collector {
             .publish(report, &mut self.new_codes, &mut self.new_wide, mode);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{IndexDialect, RowIndex};
+
+    /// Collects the diagnostics of `bytes` (comma-separated UTF-8) in one
+    /// pass, and returns the most candidate rows the collector held at the
+    /// end of any chunk, and the report.
+    fn most_candidates(bytes: &[u8]) -> (usize, Arc<Report>) {
+        let dialect = IndexDialect {
+            delimiter: b',',
+            quote: b'"',
+            code_unit: CodeUnit::Byte,
+            bom_len: 0,
+        };
+        let diagnostics = Arc::new(Diagnostics::new(dialect, Encoding::Utf8).unwrap());
+        let mut collector = Collector::new(Arc::clone(&diagnostics));
+        let (_index, indexer) = RowIndex::start(dialect).unwrap();
+        let mut chunked = indexer.chunked(bytes.len()).unwrap();
+        let mut most = 0;
+        for piece in bytes.chunks(64 << 10) {
+            chunked.push_observed(piece, &mut collector).unwrap();
+            most = most.max(collector.candidates.len());
+        }
+        chunked.finish_observed(&mut collector).unwrap();
+        most = most.max(collector.candidates.len());
+        (most, diagnostics.report())
+    }
+
+    /// The memory bound the ragged-row candidates promise (p1-review
+    /// tests-6): at most `KEEP_ALL_ROWS + MAX_LOCATIONS` rows are kept,
+    /// whatever the file, here one with a ragged row in every ten over
+    /// 50 times `KEEP_ALL_ROWS` rows. Without the bound, a file with
+    /// millions of ragged rows would grow the diagnostics without limit
+    /// (DESIGN §1's 40 MB heap). The report is right either way.
+    #[test]
+    fn ragged_row_candidates_stay_bounded() {
+        let rows = 50 * KEEP_ALL_ROWS;
+        let mut bytes = Vec::new();
+        for i in 0..rows {
+            bytes.extend_from_slice(if i % 10 == 9 { b"1,2,3\n" } else { b"1,2\n" });
+        }
+        let (most, report) = most_candidates(&bytes);
+        let bound = usize::try_from(KEEP_ALL_ROWS).unwrap() + MAX_LOCATIONS;
+        assert!(most <= bound, "{most} candidate rows kept, over {bound}");
+        let ragged = report.get(DiagnosticKind::RaggedRows).unwrap();
+        assert_eq!(ragged.count(), usize::try_from(rows / 10).unwrap());
+        assert_eq!(ragged.first().len(), MAX_LOCATIONS);
+        assert_eq!(ragged.first()[0].row, 9);
+    }
+}

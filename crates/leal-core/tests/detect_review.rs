@@ -148,3 +148,34 @@ fn the_review_checks_in_before_every_chunk() {
     assert_eq!(stopped, Err(Cancelled));
     assert_eq!(calls, 2, "no chunk after the one that said stop");
 }
+
+/// Blank lines aren't rows for the header heuristic (p1-review tests-5):
+/// 200 blank lines under `id` don't take the place of the numbers below
+/// them, which make it a header. A blank first line is no header.
+#[test]
+fn blank_lines_dont_count_for_the_header() {
+    let mut file = b"id\n".to_vec();
+    file.extend(std::iter::repeat_n(b'\n', 200));
+    file.extend_from_slice(b"1\n2\n");
+    assert!(plain(&file).header);
+    assert!(!plain(b"\nid\n1\n2\n").header);
+}
+
+/// The review's chunks are 128 KiB (p1-review tests-4): under DESIGN
+/// §3.10 rule 3's ~5 ms of work even on slow rows (the constant's docs),
+/// and not so small that checking in costs anything. A 1 MiB file is
+/// checked in 8 times, give or take the last chunk.
+#[test]
+fn the_reviews_chunks_are_128_kib() {
+    assert_eq!(REVIEW_CHUNK_BYTES, 128 << 10);
+    let file = repeated(b"a,b\n", b"1,2\n", 1 << 20);
+    assert_eq!(file.len(), 1 << 20);
+    let d = plain(&file);
+    let mut calls = 0;
+    leal_core::detect::review_with(&file, &d, || {
+        calls += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert!((8..=9).contains(&calls), "{calls} checkpoints");
+}

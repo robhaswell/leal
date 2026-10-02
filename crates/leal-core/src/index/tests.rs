@@ -1047,3 +1047,42 @@ fn when_past_calls_back_once_rows_come_or_the_index_ends() {
     index.when_past(0, bump(&count));
     assert_eq!(calls(), 6, "stopped: at once");
 }
+
+// ---------------------------------------------------------------------------
+// Chunk sizes (p1-review tests-4)
+
+/// How many times the indexer publishes over about `len` bytes, by the
+/// default path (`RowIndex::start`, no chunk override), with diagnostics
+/// or without.
+fn publishes(len: usize, diagnostics: bool) -> usize {
+    let bytes = b"1,2,3\n".repeat(len / 6);
+    let (_index, indexer) = RowIndex::start(utf8(b',')).unwrap();
+    let indexer = if diagnostics {
+        indexer
+            .with_diagnostics(crate::dialect::Encoding::Utf8)
+            .unwrap()
+            .0
+    } else {
+        indexer
+    };
+    let mut count = 0;
+    indexer
+        .run(&bytes, &AtomicBool::new(false), |_| count += 1)
+        .unwrap();
+    count
+}
+
+/// The index publishes rows, reports progress and checks its cancel flag
+/// every 256 KiB, with diagnostics and without: task 1.10's fix for
+/// DESIGN §3.10 rule 3 (about 1 ms on the worst file, where 1 MiB took
+/// 4 ms). A bigger chunk would make cancelling and the first rows slower,
+/// and nothing else would notice.
+#[test]
+fn the_index_publishes_every_256_kib() {
+    assert_eq!(CHUNK_BYTES, 256 << 10);
+    assert_eq!(DIAGNOSTICS_CHUNK_BYTES, 256 << 10);
+    // A little over 4 MiB: 17 chunks.
+    let len = (4 << 20) + 6 * 100;
+    assert_eq!(publishes(len, false), 17);
+    assert_eq!(publishes(len, true), 17);
+}

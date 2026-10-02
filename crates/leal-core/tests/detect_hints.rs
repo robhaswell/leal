@@ -167,6 +167,25 @@ fn the_review_checks_the_whole_file_decodes_under_the_attribute() {
     assert_eq!(r.encoding_suggestion, Some(Encoding::Windows1252));
 }
 
+/// The other half (p1-review tests-5): a file that decodes under the
+/// attribute's encoding all the way through gets no suggestion, even with
+/// bytes past the first 64 KB that UTF-8 or Windows-1252 would read
+/// differently (ADR-0004 decision 11: the attribute isn't second-guessed).
+#[test]
+fn a_file_that_decodes_under_the_attribute_gets_no_suggestion() {
+    let mut file = ascii_rows(FIRST_PAINT_BYTES + 100);
+    // "ę" and "ł" in Windows-1250.
+    file.extend_from_slice(b"99,\xEAl\xB3\n");
+    for e in [Encoding::Windows1250, Encoding::Windows1253] {
+        let d = with_encoding_attribute(&file, &attr(e));
+        assert_eq!(
+            (d.encoding, d.encoding_source),
+            (e, EncodingSource::Attribute)
+        );
+        assert_eq!(review(&file, &d).encoding_suggestion, None, "{e:?}");
+    }
+}
+
 // ---- first paint and the whole-file rule (ADR-0005 decision 4) ------------
 
 /// Rows of `id,name` ASCII, at least `len` bytes long.

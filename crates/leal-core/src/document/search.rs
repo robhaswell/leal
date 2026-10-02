@@ -756,3 +756,49 @@ fn to_usize(row: u32) -> usize {
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{CodeUnit, IndexDialect};
+
+    fn index(bytes: &[u8]) -> RowIndex {
+        let dialect = IndexDialect {
+            delimiter: b',',
+            quote: b'"',
+            code_unit: CodeUnit::Byte,
+            bom_len: 0,
+        };
+        RowIndex::build(bytes, dialect).unwrap()
+    }
+
+    /// A search's chunks are about 64 KiB of rows (p1-review tests-4):
+    /// task 1.8's review measured 256 KiB at up to 15 ms on rows with many
+    /// candidates, over DESIGN §3.10 rule 3's ~5 ms. At least one row,
+    /// however long, and never past the rows there are.
+    #[test]
+    fn a_search_chunk_is_about_64_kib_of_rows() {
+        assert_eq!(SEARCH_CHUNK_BYTES, 64 << 10);
+        let row = b"12345,abcdefghij,klmnopqrst\n";
+        let bytes = row.repeat(10_000);
+        let index = index(&bytes);
+        let rows = index.row_count();
+        for start in [0, 5_000] {
+            let end = chunk_end(&index, start, rows);
+            let covered = index.rows_extent(start..end).unwrap().len();
+            assert!(
+                (SEARCH_CHUNK_BYTES - row.len()..=SEARCH_CHUNK_BYTES).contains(&covered),
+                "from row {start}: {covered} bytes"
+            );
+        }
+        assert_eq!(chunk_end(&index, rows - 3, rows), rows);
+        assert_eq!(chunk_end(&index, 0, 10), 10, "only the rows available");
+        assert_eq!(chunk_end(&index, rows + 5, rows), rows + 6);
+
+        // A row longer than a chunk is a chunk of its own.
+        let long = [vec![b'x'; 100 << 10], b"\ny\nz\n".to_vec()].concat();
+        let index = super::tests::index(&long);
+        assert_eq!(chunk_end(&index, 0, 3), 1);
+        assert_eq!(chunk_end(&index, 1, 3), 3);
+    }
+}

@@ -177,7 +177,9 @@ fn is_boolean(s: &str) -> bool {
 }
 
 fn shape(s: &str) -> Shape {
-    let mut lower = 0;
+    // Only whether there are lower-case letters matters, but how many
+    // upper-case ones (`A` is title case, `AB` upper case).
+    let mut lower = false;
     let mut upper = 0;
     let mut word_starts_upper = true;
     let mut inner_upper = false;
@@ -193,7 +195,7 @@ fn shape(s: &str) -> Shape {
                     inner_upper = true;
                 }
             } else {
-                lower += 1;
+                lower = true;
                 if !previous_letter {
                     word_starts_upper = false;
                 }
@@ -211,9 +213,9 @@ fn shape(s: &str) -> Shape {
         }
     }
     let case = match (lower, upper) {
-        (0, 0) => Case::None,
-        (_, 0) => Case::Lower,
-        (0, u) if u >= 2 => Case::Upper,
+        (false, 0) => Case::None,
+        (true, 0) => Case::Lower,
+        (false, u) if u >= 2 => Case::Upper,
         _ if word_starts_upper && !inner_upper => Case::Title,
         _ => Case::Mixed,
     };
@@ -328,5 +330,52 @@ mod tests {
     fn too_few_rows_have_no_header() {
         assert!(!header("id,name"));
         assert!(!is_header(None, &rows("1,2")));
+    }
+
+    // The edges of the vote (p1-review tests-5).
+
+    /// A number, date or boolean over a text column votes against a
+    /// header: here it cancels `name`'s vote for one.
+    #[test]
+    fn a_typed_first_cell_over_text_votes_against() {
+        for first in ["2024", "2026-01-03", "TRUE"] {
+            assert!(
+                !header(&format!("{first},name\nNorth,Ada\nSouth,Bob")),
+                "{first}"
+            );
+        }
+        // Without it, `name` decides.
+        assert!(header("x,name\nNorth,Ada\nSouth,Bob"));
+    }
+
+    /// A first cell of a typed column's own kind abstains, rather than
+    /// voting against: `1` over numbers leaves `id` to decide.
+    #[test]
+    fn a_first_cell_of_its_columns_type_abstains() {
+        assert!(header("id,1\nAda,2\nBob,3"));
+    }
+
+    /// A column is typed only if more than half its cells are: exactly
+    /// half isn't, and then `name` over a lower-case word of its shape
+    /// doesn't vote. Two thirds is.
+    #[test]
+    fn a_typed_column_needs_more_than_half() {
+        assert!(!header("name\n12\nabc"));
+        assert!(header("name\n12\n13\nabc"));
+    }
+
+    /// A column with nothing below its first cell abstains.
+    #[test]
+    fn a_column_with_nothing_below_abstains() {
+        assert!(!header("x,name\nabc"));
+    }
+
+    /// A word is lower case with any number of lower-case letters and no
+    /// upper-case ones.
+    #[test]
+    fn lower_case_needs_only_one_lower_case_letter() {
+        assert_eq!(shape("a").case, Case::Lower);
+        assert_eq!(shape("a1").case, Case::Lower);
+        assert_eq!(shape("Ab").case, Case::Title);
     }
 }

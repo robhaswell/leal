@@ -1439,11 +1439,14 @@ fn kind_navigation_agrees_with_the_report_on_the_corpus() {
 /// moments, so a report can be older than the marks. Such a report (here,
 /// an empty, incomplete one, as before the first chunk) must not let a
 /// search take every flagged row as its kind: row 1 has a NUL and row 3
-/// text after a quote, and each search must still find its own row.
+/// text after a quote, and each search must still find its own row. Row 1
+/// also has an ordinary quoted field, so the search for text after a quote
+/// must parse it, not take a quote byte in a flagged row for the kind
+/// (p1-review tests-3).
 #[test]
 fn a_report_older_than_the_marks_is_not_trusted() {
     let dir = Dir::new("kind-race");
-    let (document, _) = open_bytes(&dir, "race.csv", b"a,b\n1,n\0l\n2,3\n\"q\"x,4\n");
+    let (document, _) = open_bytes(&dir, "race.csv", b"a,b\n\"ok\",n\0l\n2,3\n\"q\"x,4\n");
     wait_for_index(&document);
     let reading = document.current();
     let diagnostics = reading.diagnostics.get().unwrap();
