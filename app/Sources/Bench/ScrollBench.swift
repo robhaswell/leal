@@ -346,8 +346,20 @@ final class ScrollBench: NSObject {
         lastDrawn = content.grid.gridView.drawnArea
         ticks += 1
         if ticks % 15 == 0 {
+            // The probe is the bench's own work, not Leal's: walking every
+            // malloc zone takes about half a millisecond, and it would
+            // otherwise count towards the next frame (task 2.0a).
+            let probeWall = CACurrentMediaTime()
+            let probeCPU = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+            let probeCounts = ThreadCounts.current()
             peakFootprint = max(peakFootprint, Memory.footprintMB())
             peakHeap = max(peakHeap, Memory.heapMB())
+            lastWall += CACurrentMediaTime() - probeWall
+            lastCPU += clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - probeCPU
+            if let probeCounts, let after = ThreadCounts.current(), lastCounts.instructions > 0 {
+                lastCounts.instructions += after.instructions - probeCounts.instructions
+                lastCounts.cycles += after.cycles - probeCounts.cycles
+            }
         }
         guard let stage = stages.first else { return }
         if stage.step(dt) {
