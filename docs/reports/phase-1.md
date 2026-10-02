@@ -1,6 +1,6 @@
 # Phase 1 report — Viewer
 
-Date: 2026-10-02 · Status: **awaiting Rob's approval**
+Date: 2026-10-02 · Status: **approved by Rob** (tag `phase-1`)
 
 ## What Rob needs to decide
 

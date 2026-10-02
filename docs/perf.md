@@ -8,8 +8,8 @@ gate (2 October 2026, "Decisions" below).
 **Read the table with the 3× rule in mind.** It was measured on an M5 Pro,
 much faster than the reference machine (a base M1 Air). None is available,
 so the M5 Pro must show about 3× headroom: main-thread work per scroll
-frame of at most about 2.8 ms, checked at p50 and p99 (p50 and p99:
-proposed, awaiting Rob). An Air is checked during the beta.
+frame of at most about 2.8 ms, checked at p50 and p99. An Air is checked
+during the beta.
 
 ## Results
 
@@ -178,8 +178,7 @@ Decided by Rob at the phase 1 gate, 2 October 2026
 - **The 3× rule.** The base M1 Air stays the design target. None is
   available, so the M5 Pro must show about 3× headroom (main-thread work
   per scroll frame ≤ about 2.8 ms), and an Air is checked during the beta.
-  `just perf` checks it at p50 and p99 (p50 and p99: proposed, awaiting
-  Rob). Scrolling fails it today: PLAN 2.0a.
+  `just perf` checks it at p50 and p99. Scrolling fails it today: PLAN 2.0a.
 
 ## Commands
 
@@ -255,8 +254,8 @@ system, and `leal-perf` quits only the processes it started, by PID.
   window floats, moves to the screen with the fastest refresh, and the run
   declares user activity every 5 s so a locked Mac keeps its display on.
   - **The 3× rule** is judged from the main thread's CPU time per frame,
-    p50 and p99 over every frame scrolled (`cpuP50`, `cpuP99`; p50 and
-    p99: proposed, awaiting Rob), against `HEADROOM_FRAME_MS` (2.8 ms), on
+    p50 and p99 over every frame scrolled (`cpuP50`, `cpuP99`), against `HEADROOM_FRAME_MS`
+    (2.8 ms), on
     the reference file's two rows. A run without those figures leaves the
     rule untested, never passed. The stress row is judged on late frames
     only.

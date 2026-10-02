@@ -356,8 +356,7 @@ pub const APPKIT_WINDOW_HEAP_MB: f64 = 21.0;
 /// main thread's work per scroll frame must be at most this. It is about a
 /// third of a 120 Hz frame (8.3 ms), so a base M1 Air, expected to be 2–3
 /// times slower, would still fit in one. It is checked at p50 and p99
-/// (p50 and p99: proposed, awaiting Rob), since no dropped frames makes
-/// p99 the honest reading.
+/// (Rob, 2026-10-02), because a slow 1% of frames is what shows as stutter.
 pub const HEADROOM_FRAME_MS: f64 = 2.8;
 
 /// The reference machine's `hw.model`: the base M1 MacBook Air (DESIGN
@@ -845,7 +844,7 @@ fn scroll_row(runs: &[ScrollRun], budget: &str, how: &str, headroom: Headroom) -
     let (verdict, note) = match headroom {
         Headroom::Judged => {
             how.push_str(&format!(
-                "; 3× rule (DESIGN §1): main-thread work per frame ≤ {HEADROOM_FRAME_MS} ms at p50 and p99 (p50 and p99: proposed, awaiting Rob)"
+                "; 3× rule (DESIGN §1): main-thread work per frame ≤ {HEADROOM_FRAME_MS} ms at p50 and p99"
             ));
             match (late, headroom_verdict(runs, HEADROOM_FRAME_MS)) {
                 (Verdict::Untested, _) => (Verdict::Untested, None),

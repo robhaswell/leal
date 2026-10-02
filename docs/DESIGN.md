@@ -73,8 +73,8 @@ What the budgets mean (decided by Rob at the phase 1 gate, 2026-10-02):
   available, so the faster Mac the budgets are measured on (an M5 Pro)
   must show about 3× headroom: main-thread work per scroll frame of at
   most about 2.8 ms (a third of a 120 Hz frame), as well as no dropped
-  frames. It is checked at p50 and p99 (p50 and p99: proposed, awaiting
-  Rob). An Air is checked during the beta.
+  frames. It is checked at p50 and p99 (Rob, 2026-10-02), because a slow
+  1% of frames is what shows as stutter. An Air is checked during the beta.
 
 These budgets are checked by benchmarks in CI (core) and by `just perf`
 and Instruments runs before each release (app; docs/perf.md). A regression

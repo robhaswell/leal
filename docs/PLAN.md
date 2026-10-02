@@ -361,9 +361,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - It doesn't block 2.1: phase 2 goes ahead alongside it (phase 1
     decision 2). If the headroom can't be reached, the next step is an ADR
     on ADR-0001's fallback (option C).
-  - Main-thread work per frame is at most 2.8 ms at p50 and p99 (p50 and
-    p99: proposed, awaiting Rob) on the M5 Pro, unlocked, with the app
-    launched with `open`, in every reference-file scroll run.
+  - Main-thread work per frame is at most 2.8 ms at p50 and p99 on the M5
+    Pro, unlocked, with the app launched with `open`, in every
+    reference-file scroll run.
   - Regression guard: late frames and GPU memory (footprint) are no worse
     than in Rob's unlocked run.
   - About half of each frame is AppKit rebuilding the whole visible

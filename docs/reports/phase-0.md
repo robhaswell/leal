@@ -1,6 +1,6 @@
 # Phase 0 report — Foundations
 
-Date: 2026-10-01 · Status: **awaiting Rob's approval**
+Date: 2026-10-01 · Status: **approved by Rob** (tag `phase-0`)
 
 ## What Rob needs to decide
 
