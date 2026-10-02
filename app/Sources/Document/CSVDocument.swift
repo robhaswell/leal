@@ -29,14 +29,21 @@ final class CSVDocument: NSDocument {
     /// The "Open to first rows" signpost, which the grid's first draw with
     /// rows ends.
     private var opening: OSSignpostIntervalState?
+    /// The file's modification date when it was opened, read off the main
+    /// thread (`PendingOpens.Facts`), for `DocumentController` to set as
+    /// `fileModificationDate` (task 2.0). `nil` when this document opened
+    /// the file itself (tests).
+    private(set) var openedModificationDate: Date?
 
     /// Leal writes the file only when the user saves (DESIGN §4.3).
     nonisolated override class var autosavesInPlace: Bool { false }
 
     /// Reading happens on the main thread, AppKit's default, so the model
-    /// can be set up there: first paint is a few milliseconds whatever the
-    /// file's size (1.3a notes). On a slow removable drive it includes one
-    /// 64 KB read.
+    /// can be set up there. The file itself is read before that, off the
+    /// main thread, by `DocumentController` (task 2.0): a file on a network
+    /// share must never be read on the main thread (ADR-0009). AppKit's
+    /// concurrent reading would make the `NSDocument` on a background queue,
+    /// which Swift 6 doesn't allow for this main-actor class.
     nonisolated override class func canConcurrentlyReadDocuments(ofType typeName: String) -> Bool {
         false
     }
@@ -63,13 +70,44 @@ final class CSVDocument: NSDocument {
         }
     }
 
+    /// Makes the model for `url`. `DocumentController` has usually opened
+    /// the core's document already, off the main thread (`PendingOpens`);
+    /// otherwise (a test's `CSVDocument(contentsOf:ofType:)`) the core opens
+    /// the file here, which is only safe for a file that isn't on a network
+    /// share (ADR-0009: the core's debug builds check).
     private func open(_ url: URL) throws {
-        openStarted = CACurrentMediaTime()
-        opening = Signposts.opening()
+        let core: Result<DocumentModel.OpenedCore, any Error>
+        if let pending = PendingOpens.take(url) {
+            openStarted = pending.started
+            opening = pending.opening
+            environment = pending.environment
+            openedModificationDate = pending.facts.modified
+            core = pending.core
+        } else {
+            if !AppDelegate.isTestHost, !PendingOpens.wasSkipped(url) {
+                // Every open in the app comes through `DocumentController`;
+                // one that didn't reads the file on the main thread, which a
+                // network share must never be (ADR-0009).
+                Logger.document.fault("Opening \(url.lastPathComponent, privacy: .private) on the main thread: it didn't come through DocumentController")
+            }
+            openStarted = CACurrentMediaTime()
+            opening = Signposts.opening()
+            do {
+                let environment = try Self.environment()
+                self.environment = environment
+                core = Result { try DocumentModel.openCore(url: url, environment: environment) }
+            } catch {
+                try fail(opening: error, url: url)
+            }
+        }
+        try finishOpening(core, url: url)
+    }
+
+    /// The end of an open: the model from what the core opened, or the open
+    /// error.
+    private func finishOpening(_ core: Result<DocumentModel.OpenedCore, any Error>, url: URL) throws {
         do {
-            let environment = try Self.environment()
-            self.environment = environment
-            let opened = try DocumentModel.open(url: url, environment: environment)
+            let opened = try DocumentModel.make(from: core.get())
             // A panic while opening (in a call `init` makes) fails the
             // document before there is a window to show the failure in:
             // report it as an open error instead (DESIGN §3.9).
@@ -85,13 +123,22 @@ final class CSVDocument: NSDocument {
             }
             model = opened
         } catch {
-            // No rows will be drawn: end the signpost here.
-            if let opening {
-                self.opening = nil
-                Signposts.firstRows(opening)
+            if case let .success(core) = core, model == nil {
+                // Opened, but no model came of it: let go of the core's
+                // document (and its snapshot) off the main thread.
+                core.release()
             }
-            throw Self.openError(error, url: url)
+            try fail(opening: error, url: url)
         }
+    }
+
+    /// An open failed: no rows will be drawn, so the signpost ends here.
+    private func fail(opening error: any Error, url: URL) throws -> Never {
+        if let opening {
+            self.opening = nil
+            Signposts.firstRows(opening)
+        }
+        throw Self.openError(error, url: url)
     }
 
     /// An error AppKit can present: the title, then the core's error in
@@ -125,12 +172,38 @@ final class CSVDocument: NSDocument {
             throw failure
         }
         let target = url ?? model.url
-        // Read before the core's snapshot, so a change in between is still
-        // a change by the time Leal saves. From the file system, not the
-        // URL's cached resource values.
-        let attributes = try? FileManager.default.attributesOfItem(atPath: target.path(percentEncoded: false))
-        let modified = attributes?[.modificationDate] as? Date
+        let modified = Self.modificationDate(of: target)
         try model.reload(from: target)
+        followReload(of: model, modified: modified)
+    }
+
+    /// **Reload** of a file on a network share (ADR-0009): as `reload`, with
+    /// everything that touches the file (its modification date, and the
+    /// core's open) off the main thread. The window's Reload comes here for
+    /// such a file.
+    func reloadInBackground() async throws {
+        guard let model else { return }
+        if let failure = model.failure { throw failure }
+        let target = model.url
+        let modified = await FileWork.run { Self.modificationDate(of: target) }
+        // Only if the new snapshot was adopted: one that wasn't (the
+        // document failed or closed meanwhile) mustn't move NSDocument's
+        // idea of the file.
+        if try await model.reloadInBackground(from: target) {
+            followReload(of: model, modified: modified)
+        }
+    }
+
+    /// The file's modification date, read before the core's snapshot, so a
+    /// change in between is still a change by the time Leal saves. From the
+    /// file system, not the URL's cached resource values.
+    nonisolated private static func modificationDate(of url: URL) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))
+        return attributes?[.modificationDate] as? Date
+    }
+
+    /// `NSDocument` is told the file Leal shows after a Reload.
+    private func followReload(of model: DocumentModel, modified: Date?) {
         if fileURL != model.url {
             fileURL = model.url
         }
@@ -141,7 +214,7 @@ final class CSVDocument: NSDocument {
         guard let model, let environment else { return }
         let controller = DocumentWindowController(model: model, scheduler: environment.scheduler)
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
-        controller.content.onReload = { [weak self] in try self?.reload() }
+        controller.content.onReload = { [weak self] in try await self?.reloadInBackground() }
         watchWindow(controller.window)
         if let opening {
             self.opening = nil

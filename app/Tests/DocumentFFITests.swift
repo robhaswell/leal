@@ -202,6 +202,14 @@ final class DocumentFFITests: XCTestCase {
             "The drive it’s on was disconnected."
         )
         XCTAssertEqual(
+            OpenErrorText.describe(LealError.DeletedElsewhere(path: path)),
+            "Another computer deleted it while Leal was reading it."
+        )
+        XCTAssertEqual(
+            OpenErrorText.describe(JobFailure.DeletedElsewhere),
+            "Another computer deleted it while Leal was reading it."
+        )
+        XCTAssertEqual(
             OpenErrorText.describe(LealError.TooLarge(path: path, byteCount: 1 << 33)),
             "It’s 4 GB or larger, more than Leal can open."
         )

@@ -644,6 +644,7 @@ final class DiagnosticsTests: XCTestCase {
             (.reading, "Reading from the drive", "while it copies it to this Mac"),
             (.copy, "Working from a copy", "copied the file to this Mac"),
             (.disconnected, "Drive disconnected", "Save is off"),
+            (.deleted, "Deleted", "deleted on another computer while Leal was reading it"),
             (.memory, "Read into memory", "into memory"),
         ]
         for (storage, segment, help) in notes {
@@ -651,10 +652,26 @@ final class DiagnosticsTests: XCTestCase {
             XCTAssertEqual(StatusText.segments(status), ["3 rows × 2 columns", "Comma", "LF", "UTF-8", segment])
             XCTAssertTrue(StatusText.help(status).contains(help), "\(storage)")
         }
+        // A file on a network share says so while it is read (ADR-0009).
+        status.storage = .reading
+        status.onNetworkShare = true
+        XCTAssertEqual(StatusText.segments(status).last, "Reading from the network")
+        XCTAssertTrue(StatusText.help(status).contains("on a network share"))
+        // Deleted on its share: one "Deleted", not two.
+        status.storage = .deleted
+        status.original = .deleted
+        XCTAssertEqual(StatusText.segments(status).filter { $0 == "Deleted" }.count, 1)
+        status.original = .unchanged
+        status.onNetworkShare = false
         status.storage = .clone
         XCTAssertEqual(StatusText.segments(status).count, 4)
         status.changedOnDisk = true
         XCTAssertEqual(StatusText.segments(status).last, "Changed while reading")
+        // Replaced elsewhere mid-copy (a share's file, task 2.0 review): the
+        // "Changed on disk" note stays beside it.
+        status.original = .changed
+        XCTAssertEqual(StatusText.segments(status).suffix(2), ["Changed while reading", "Changed on disk"])
+        status.original = .unchanged
         status.changedOnDisk = false
         status.notes = [.interpretationNotSensible(delimiter: .pipe)]
         XCTAssertEqual(StatusText.segments(status).last, "Remembered settings ignored")

@@ -3,14 +3,18 @@ import LealFFI
 
 /// The banner about the file itself, first in the window's stack: it
 /// changed while Leal read it from a drive that can't make a snapshot
-/// (1.1a), it changed or was deleted elsewhere (task 1.9, DESIGN §3.1), or
-/// its removable drive was disconnected before Leal had read it all
+/// (1.1a), it was deleted on its network share while Leal read it
+/// (ADR-0009), it changed or was deleted elsewhere (task 1.9, DESIGN §3.1),
+/// or its removable drive was disconnected before Leal had read it all
 /// (ADR-0006). At most one shows: the first that applies and wasn't
 /// dismissed. Pure, so it is tested on its own.
 enum FileBanner: Equatable, Sendable {
     /// Changed while it was read without a snapshot: what Leal holds may
     /// mix two versions, so only what was checked is shown. **Reload**.
     case changedWhileReading
+    /// Deleted on its network share by another computer before Leal had
+    /// read it all (ADR-0009): only the rows read are shown. **Save As…**.
+    case deletedWhileReading
     /// Changed elsewhere (or replaced by another file). Leal shows the
     /// snapshot it took. **Reload** or **Keep Editing**.
     case changed
@@ -32,9 +36,12 @@ enum FileBanner: Equatable, Sendable {
     ) -> [FileBanner] {
         var banners: [FileBanner] = []
         if changedWhileReading { banners.append(.changedWhileReading) }
+        let deletedWhileReading = storage == .deleted
+        if deletedWhileReading { banners.append(.deletedWhileReading) }
         switch original {
         case .changed: banners.append(.changed)
-        case .deleted: banners.append(.deleted)
+        // The same deletion, already said with what it means for the rows.
+        case .deleted: if !deletedWhileReading { banners.append(.deleted) }
         case .unchanged, .unavailable: break
         }
         if storage == .disconnected { banners.append(.disconnected) }
@@ -48,6 +55,7 @@ enum FileBanner: Equatable, Sendable {
     var key: String {
         switch self {
         case .changedWhileReading: "drive-changed"
+        case .deletedWhileReading: "share-deleted"
         case .changed: "file-changed"
         case .deleted: "file-deleted"
         case .disconnected: "drive-disconnected"
@@ -58,6 +66,7 @@ enum FileBanner: Equatable, Sendable {
     var message: String {
         switch self {
         case .changedWhileReading: DiagnosticsText.changedWhileReading
+        case .deletedWhileReading: Self.deletedWhileReadingMessage
         case .changed: Self.changedMessage
         case .deleted: Self.deletedMessage
         case .disconnected: DiagnosticsText.disconnected
@@ -70,7 +79,7 @@ enum FileBanner: Equatable, Sendable {
     var buttonTitle: String {
         switch self {
         case .changedWhileReading, .changed, .readStopped: Self.reload
-        case .deleted, .disconnected: DiagnosticsText.saveAs
+        case .deletedWhileReading, .deleted, .disconnected: DiagnosticsText.saveAs
         }
     }
 
@@ -78,7 +87,7 @@ enum FileBanner: Equatable, Sendable {
     var secondaryTitle: String? {
         switch self {
         case .changed, .deleted: Self.keepEditing
-        case .changedWhileReading, .disconnected, .readStopped: nil
+        case .changedWhileReading, .deletedWhileReading, .disconnected, .readStopped: nil
         }
     }
 
@@ -98,6 +107,13 @@ enum FileBanner: Equatable, Sendable {
         String(
             localized: "This file was deleted or moved to the Trash. Leal still shows it as it was; Save As keeps a copy.",
             comment: "Banner: the open file was deleted or moved to the Trash (task 1.9)"
+        )
+    }
+
+    static var deletedWhileReadingMessage: String {
+        String(
+            localized: "This file was deleted on another computer while Leal was reading it. Leal shows the rows it had read; Save is off, and Save As keeps a copy.",
+            comment: "Banner: another computer deleted the file on its network share before Leal had read it all (ADR-0009)"
         )
     }
 

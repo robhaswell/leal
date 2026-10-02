@@ -170,6 +170,9 @@
     "Another app changed this file after Leal opened it. Leal shows the version it opened; File ▸ Reload from Disk shows the new one." : {
       "comment" : "Status bar tooltip: the file changed on disk (task 1.9)"
     },
+    "Another computer deleted it while Leal was reading it." : {
+      "comment" : "Open error: the file on a network share was deleted elsewhere while it was being read (ADR-0009)"
+    },
     "Blank lines" : {
       "comment" : "Diagnostic kind: empty rows (DESIGN §3.5)\nStatus bar: the file has empty rows"
     },
@@ -405,6 +408,12 @@
     "Open Recent" : {
       "comment" : "File menu"
     },
+    "Opening" : {
+      "comment" : "Title of the small panel shown while a slow file opens (task 2.0)"
+    },
+    "Opening “%@”…" : {
+      "comment" : "Shown while a file takes long to open, such as one on a slow network share (task 2.0); the file's name"
+    },
     "Open…" : {
       "comment" : "File menu"
     },
@@ -462,6 +471,9 @@
     },
     "Reading from the drive" : {
       "comment" : "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)"
+    },
+    "Reading from the network" : {
+      "comment" : "Status bar: the file is on a network share, and Leal is still copying it (ADR-0009)"
     },
     "Redo" : {
       "comment" : "Edit menu"
@@ -568,6 +580,9 @@
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"
     },
+    "The file is on a network share. Leal reads it from the share while it copies it to this Mac." : {
+      "comment" : "Status bar tooltip: the copy off a network share isn't finished (ADR-0009)"
+    },
     "The file is on a removable drive. Leal reads it from the drive while it copies it to this Mac." : {
       "comment" : "Status bar tooltip: the copy off a removable drive isn't finished (ADR-0006)"
     },
@@ -626,6 +641,9 @@
     },
     "This file looks tab-separated." : {
       "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
+    },
+    "This file was deleted on another computer while Leal was reading it. Leal shows the rows it had read; Save is off, and Save As keeps a copy." : {
+      "comment" : "Banner: another computer deleted the file on its network share before Leal had read it all (ADR-0009)\nStatus bar tooltip: the file on a network share was deleted elsewhere while Leal was copying it (ADR-0009)"
     },
     "This file was deleted or moved to the Trash after Leal opened it. Leal shows the version it opened." : {
       "comment" : "Status bar tooltip: the file was deleted (task 1.9)"

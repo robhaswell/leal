@@ -79,6 +79,8 @@ enum OpenErrorText {
                 localized: "Another app changed it while Leal was reading it.",
                 comment: "Open error: the file changed while it was being read without a snapshot"
             )
+        case .DeletedElsewhere:
+            deletedElsewhere
         case .DocumentFailed:
             documentFailed
         }
@@ -100,11 +102,22 @@ enum OpenErrorText {
                 localized: "Another app changed it while Leal was reading it.",
                 comment: "Open error: the file changed while it was being read without a snapshot"
             )
+        case .DeletedElsewhere:
+            deletedElsewhere
         case .Panicked:
             documentFailed
         case .Failed:
             String(localized: "An unexpected error occurred.", comment: "Open error with no OS error code")
         }
+    }
+
+    /// The file on a network share was deleted by another computer while
+    /// Leal read it (ADR-0009).
+    private static var deletedElsewhere: String {
+        String(
+            localized: "Another computer deleted it while Leal was reading it.",
+            comment: "Open error: the file on a network share was deleted elsewhere while it was being read (ADR-0009)"
+        )
     }
 
     /// After a panic in the core the document has failed (DESIGN §3.9): the

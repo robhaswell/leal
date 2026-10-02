@@ -65,8 +65,19 @@ final class DocumentModel: GridDataSource {
     /// Opens the core's document in place of `openDocument`. Only tests set
     /// it, to open a file as if on a removable drive that vanishes, or
     /// whose file changes, part-way through (`debugOpenDocumentWithFault`,
-    /// task 1.7).
-    static var openForTesting: ((_ path: String, _ environment: DocumentEnvironment, _ options: OpenOptions, _ observer: any ProgressObserver) throws -> LealFFI.Document)?
+    /// task 1.7), or on a network share (`debugOpenDocumentSimulatingShare`,
+    /// task 2.0). It is read off the main thread (`openCore`), so it is
+    /// kept behind a lock.
+    nonisolated static var openForTesting: OpenHook? {
+        get { openForTestingLock.withLock { $0 } }
+        set { openForTestingLock.withLock { $0 = newValue } }
+    }
+    typealias OpenHook = @Sendable (_ path: String, _ environment: DocumentEnvironment, _ options: OpenOptions, _ observer: any ProgressObserver) throws -> LealFFI.Document
+    nonisolated private static let openForTestingLock = OSAllocatedUnfairLock<OpenHook?>(initialState: nil)
+    /// How often a disconnected file on a network share is looked at again
+    /// (task 2.0 review): an SMB session that reconnects by itself fires no
+    /// mount notification. Tests shorten it.
+    static var shareRecheckInterval: Duration = .seconds(5)
     /// Rows per block of the row-flags cache (gutter markers and hatching).
     nonisolated static let flagBlockRows = 64
 
@@ -107,6 +118,22 @@ final class DocumentModel: GridDataSource {
     /// The file changed on its drive while it was read (1.1a): the rows
     /// shown may mix two versions.
     private(set) var changedOnDisk = false
+    /// The file is on a network share (ADR-0009). While it is disconnected,
+    /// the model looks at it again every `shareRecheckInterval`.
+    private(set) var isOnNetworkShare = false
+    /// A Reload is under way (`reloadInBackground`): Reload, Treat As,
+    /// Reopen with Encoding and the Header row are off until it is done.
+    private(set) var isReloading = false
+    /// Looks at a disconnected share's file again, now and then.
+    private var shareRecheck: Task<Void, Never>?
+    /// Where the index had got to at the share's last disconnection, and
+    /// how many disconnections in a row stopped there: after
+    /// `shareRecheckLimit`, the periodic check stops, so a bad block doesn't
+    /// reconnect and fail for ever (task 2.0 re-review). A mount, an app
+    /// activation or a Reload starts it again.
+    private var lastDisconnection: (generation: UInt64, offset: UInt64, times: Int)?
+    /// See `lastDisconnection`.
+    nonisolated static let shareRecheckLimit = 3
     /// The index stopped before the end of the file, on a read error (a
     /// drive still there but failing, or the internal disk full while
     /// copying): no more rows will come for this reading, so the window
@@ -175,21 +202,77 @@ final class DocumentModel: GridDataSource {
 
     /// Opens `url` with the core: first paint (P0) happens before this
     /// returns, and the index (P1) and review (P2) start in the background.
+    /// It reads the file on this thread; for a file that may be on a network
+    /// share, open it off the main thread with `openCore` and make the model
+    /// with `make(from:)` (ADR-0009, `CSVDocument.read(from:ofType:)`).
     static func open(url: URL, environment: DocumentEnvironment) throws -> DocumentModel {
+        try make(from: openCore(url: url, environment: environment))
+    }
+
+    /// The core's document for `url`, opened (first paint included) but
+    /// without its model yet: `openCore` makes it on any thread, and
+    /// `make(from:)` turns it into a model on the main actor. It hands its
+    /// document over exactly once (`make(from:)` or `release()`), so
+    /// whoever lets go of it last does so on purpose: never by a stray copy
+    /// going out of scope on the main thread (task 2.0 review).
+    final class OpenedCore: Sendable {
+        let url: URL
+        let environment: DocumentEnvironment
+        let reference: ModelReference
+        private let handle: OSAllocatedUnfairLock<LealFFI.Document?>
+
+        nonisolated init(url: URL, environment: DocumentEnvironment, handle: LealFFI.Document, reference: ModelReference) {
+            self.url = url
+            self.environment = environment
+            self.reference = reference
+            self.handle = OSAllocatedUnfairLock(initialState: handle)
+        }
+
+        /// The core's document, which the caller now owns; `nil` once taken.
+        nonisolated func takeHandle() -> LealFFI.Document? {
+            handle.withLock { held in
+                defer { held = nil }
+                return held
+            }
+        }
+
+        /// Lets go of the document, if it wasn't taken, off the main thread
+        /// (`CoreRelease`).
+        nonisolated func release() {
+            var unused = takeHandle()
+            CoreRelease.later(&unused)
+        }
+    }
+
+    /// Opens `url` in the core: its first paint, which reads the file. Safe
+    /// on any thread, and for a file on a network share it must be off the
+    /// main thread, where a share that stops answering would freeze the app
+    /// (ADR-0009; the core's debug builds check).
+    nonisolated static func openCore(url: URL, environment: DocumentEnvironment) throws -> OpenedCore {
         let reference = ModelReference()
-        // The first screen's rows are read below, through `cells`, with a
+        // The first screen's rows are read later, through `cells`, with a
         // cap on the fields; the core's first screen need only bring the
         // first row, for the header titles.
         let options = OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters)
         let handle = try openHandle(url: url, environment: environment, options: options, reference: reference, number: 0)
-        let model = try DocumentModel(url: url, handle: handle, environment: environment)
-        reference.model = model
+        return OpenedCore(url: url, environment: environment, handle: handle, reference: reference)
+    }
+
+    /// The model for a core document `openCore` opened. It reads only
+    /// what first paint already holds (the first 64 KB), never the file.
+    static func make(from core: OpenedCore) throws -> DocumentModel {
+        guard let handle = core.takeHandle() else {
+            throw LealError.Internal(message: "the opened document was already taken")
+        }
+        let model = try DocumentModel(url: core.url, handle: handle, environment: core.environment)
+        core.reference.model = model
         return model
     }
 
     /// Opens `url` in the core, with progress for handle `number` relayed
-    /// to the model `reference` will point at.
-    private static func openHandle(
+    /// to the model `reference` will point at. Any thread: it reads the
+    /// file and asks Foundation about its volume.
+    nonisolated private static func openHandle(
         url: URL,
         environment: DocumentEnvironment,
         options: OpenOptions,
@@ -230,6 +313,7 @@ final class DocumentModel: GridDataSource {
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
         applyFirstScreen(screen)
         original = call({ try $0.original() }) ?? original
+        isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? false
         refreshDriveState()
         if let hook = Self.afterFirstPaintForTesting {
             _ = call { try hook($0) }
@@ -253,6 +337,8 @@ final class DocumentModel: GridDataSource {
         setInteracting(false)
         for task in tasks { task.cancel() }
         tasks.removeAll()
+        shareRecheck?.cancel()
+        shareRecheck = nil
         tiles.removeAll()
         stopObserving()
         CoreRelease.later(&handle)
@@ -295,9 +381,10 @@ final class DocumentModel: GridDataSource {
             switch error {
             case .DocumentFailed:
                 fail(error)
-            case .DriveDisconnected, .ChangedOnDisk:
-                // A read found the drive gone or the file changed: show it
-                // (task 1.7). Not now, though: this may be inside a draw.
+            case .DriveDisconnected, .ChangedOnDisk, .DeletedElsewhere:
+                // A read found the drive gone, the file changed, or the file
+                // on its share deleted: show it (task 1.7, ADR-0009). Not
+                // now, though: this may be inside a draw.
                 queueDriveCheck()
             default:
                 Logger.document.error("Core call failed for \(self.url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
@@ -379,10 +466,11 @@ final class DocumentModel: GridDataSource {
         case .Cancelled?, nil:
             // Closing, re-reading or a cancelled task.
             break
-        case .DriveDisconnected?, .ChangedOnDisk?:
-            // The drive-disconnected and changed-while-reading banners
-            // (ADR-0006, 1.1a). `refreshDriveState` drops rows read before
-            // a change (task 1.9); the banner offers Reload.
+        case .DriveDisconnected?, .ChangedOnDisk?, .DeletedElsewhere?:
+            // The drive-disconnected, changed-while-reading and
+            // deleted-on-its-share banners (ADR-0006, 1.1a, ADR-0009).
+            // `refreshDriveState` drops rows read before a change (task
+            // 1.9); the banner offers Reload.
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
             if job == .index, current {
                 // No more rows for this reading: no "Indexing…" for good.
@@ -394,10 +482,22 @@ final class DocumentModel: GridDataSource {
                 refreshDriveState()
                 onChange?(.progress)
             }
-            if case .DriveDisconnected? = error as? JobFailure {
+            switch error as? JobFailure {
+            case .DriveDisconnected? where !isShareBackedOff:
                 // The drive may be back already, before the copy noticed it
-                // had gone (a volume that mounts again quickly).
+                // had gone (a volume that mounts again quickly). Not for a
+                // share that keeps failing at the same place: that is a bad
+                // read, which would reconnect and fail for ever.
                 checkOriginal()
+            case .DriveDisconnected?:
+                break
+            case .DeletedElsewhere?:
+                // The share said the file is gone: look at its path, so the
+                // file's own state says so too (a share's watcher doesn't
+                // see another computer's changes).
+                checkOriginal()
+            default:
+                break
             }
         case .Failed?:
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
@@ -433,6 +533,10 @@ final class DocumentModel: GridDataSource {
         storage = call({ try $0.storage() }) ?? storage
         changedOnDisk = call({ try $0.changedOnDisk() }) ?? changedOnDisk
         canSave = call({ try $0.canSave() }) ?? canSave
+        if storage == .disconnected {
+            noteDisconnection()
+        }
+        recheckShareWhileDisconnected()
         if changedOnDisk, !changedBefore {
             // The file changed while it was read (1.1a): rows read before
             // the change was noticed may be from either version, so none
@@ -444,6 +548,64 @@ final class DocumentModel: GridDataSource {
                 progress = current
             }
         }
+    }
+
+    /// While a file on a network share is disconnected, looks at it again
+    /// every `shareRecheckInterval` (task 2.0 review): a share whose SMB
+    /// session comes back by itself fires no mount notification, and the
+    /// app may not be activated meanwhile. The check runs off the main
+    /// thread (`checkOriginal`) and stops once the share is back or the
+    /// document closes.
+    /// The share failed at the same place `shareRecheckLimit` times in a
+    /// row: Leal stops looking for it by itself.
+    private var isShareBackedOff: Bool {
+        (lastDisconnection?.times ?? 0) >= Self.shareRecheckLimit
+    }
+
+    private func recheckShareWhileDisconnected() {
+        guard isOnNetworkShare, storage == .disconnected, shareRecheck == nil, failure == nil, !isShareBackedOff
+        else { return }
+        shareRecheck = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: DocumentModel.shareRecheckInterval)
+                // The model only for this step: not held across the wait.
+                guard let check = self?.shareRecheckStep() else { break }
+                await check?.value
+            }
+            self?.shareRecheck = nil
+        }
+    }
+
+    /// One step of the periodic share check: `nil` to stop (the share is
+    /// back, the document failed, or the checks are backed off), otherwise
+    /// the check started, if one wasn't already under way.
+    private func shareRecheckStep() -> Task<Void, Never>?? {
+        guard !Task.isCancelled, storage == .disconnected, failure == nil, !isShareBackedOff
+        else { return nil }
+        return .some(checkOriginal())
+    }
+
+    /// The share is disconnected: count it once for this reading (a
+    /// reconnection reads the file again, as a new generation, and may fail
+    /// again before the window has seen it reading), and in a row with the
+    /// last if it stopped where that one did (a read that fails each time,
+    /// not a share that comes and goes).
+    private func noteDisconnection() {
+        guard isOnNetworkShare, lastDisconnection?.generation != generation,
+              let offset = call({ try $0.availableBytes() })
+        else { return }
+        if let last = lastDisconnection, last.offset == offset {
+            lastDisconnection = (generation, offset, last.times + 1)
+        } else {
+            lastDisconnection = (generation, offset, 1)
+        }
+    }
+
+    /// A mount, an app activation or a Reload: the periodic share check may
+    /// run again, however often it failed.
+    private func resetShareBackoff() {
+        lastDisconnection = nil
+        recheckShareWhileDisconnected()
     }
 
     /// A read failed because the drive went or the file changed: check the
@@ -876,7 +1038,7 @@ final class DocumentModel: GridDataSource {
     /// read, when the first 64 KB Leal holds may be from the old version.
     /// The core refuses then (`ChangedOnDisk`); the window turns the three
     /// off and says to Reload first.
-    var canReinterpret: Bool { failure == nil && !changedOnDisk }
+    var canReinterpret: Bool { failure == nil && !changedOnDisk && !isReloading }
 
     /// Reads the file again with the given choices, keeping the user's
     /// earlier ones for the rest. Nothing is reopened (PLAN 1.3).
@@ -942,7 +1104,10 @@ final class DocumentModel: GridDataSource {
         ]
         for (center, name) in names {
             let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { _ = self?.checkOriginal() }
+                MainActor.assumeIsolated {
+                    self?.resetShareBackoff()
+                    _ = self?.checkOriginal()
+                }
             }
             observers.append((center, observer))
         }
@@ -994,9 +1159,11 @@ final class DocumentModel: GridDataSource {
         let number = handleNumber
         coreCalls += 1
         let task = Task { [weak self] in
-            let result = await Task.detached(priority: .utility) { () -> Result<OriginalStatus, any Error> in
+            // On `FileWork`'s queue: a look at a share can block. At utility
+            // QoS, as the watching thread it may wait for.
+            let result = await FileWork.run(qos: .utility) { () -> Result<OriginalStatus, any Error> in
                 Result { try handle.checkOriginal() }
-            }.value
+            }
             // After a Reload, `checkingOriginal` is the new handle's.
             guard let self, number == handleNumber else { return }
             checkingOriginal = nil
@@ -1058,24 +1225,90 @@ final class DocumentModel: GridDataSource {
     func reload(from url: URL? = nil) throws {
         guard failure == nil else { return }
         let url = url ?? self.url
+        let number = handleNumber + 1
+        let reference = ModelReference()
+        let new = try Self.openReloaded(url: url, environment: environment, options: reloadOptions, reference: reference, number: number)
+        try adoptReloaded(new, url: url, reference: reference, number: number)
+    }
+
+    /// **Reload** as the window does it (task 2.0): as `reload`, but the
+    /// core opens the file on `FileWork`'s queue, because first paint reads
+    /// the file, which on a network share can block (ADR-0009). The window
+    /// keeps showing the old snapshot until the new one is ready, and the
+    /// re-readings (Reload, Treat As, Reopen with Encoding, the Header row)
+    /// are off meanwhile (`isReloading`). Returns whether the new document
+    /// was adopted: not if the model failed or closed meanwhile.
+    @discardableResult
+    func reloadInBackground(from url: URL? = nil) async throws -> Bool {
+        guard failure == nil else { return false }
+        let url = url ?? self.url
+        let number = handleNumber + 1
+        let reference = ModelReference()
+        let environment = environment
+        let options = reloadOptions
+        willReload()
+        defer { reloadEnded() }
+        var new: LealFFI.Document? = try await FileWork.run {
+            try Self.openReloaded(url: url, environment: environment, options: options, reference: reference, number: number)
+        }
+        guard failure == nil, handle != nil, number == handleNumber + 1, let opened = new else {
+            // Let go of it off the main thread, and hold no other reference.
+            CoreRelease.later(&new)
+            return false
+        }
+        new = nil
+        try adoptReloaded(opened, url: url, reference: reference, number: number)
+        return true
+    }
+
+    /// A Reload was asked for: the re-readings are off from now, before its
+    /// task has even started, until `reloadEnded`.
+    func willReload() {
+        guard !isReloading else { return }
+        isReloading = true
+        onChange?(.progress)
+    }
+
+    /// The Reload is over, adopted or not.
+    func reloadEnded() {
+        guard isReloading else { return }
+        isReloading = false
+        onChange?(.progress)
+    }
+
+    /// The user's own choices, for a Reload: kept where they still fit.
+    private var reloadOptions: OpenOptions {
         let current = interpretation
-        let chosen = OpenOptions(
+        return OpenOptions(
             delimiter: current.delimiterSource == .user ? current.delimiter : nil,
             header: current.headerSource == .user ? current.header : nil,
             encoding: current.encodingSource == .user ? current.encoding : nil,
             firstScreenRows: 1,
             maxChars: GridMetrics.maxCellCharacters
         )
-        let number = handleNumber + 1
-        let reference = ModelReference()
-        let new: LealFFI.Document
+    }
+
+    /// Opens `url` again for a Reload, with the user's choices, or without
+    /// them if the chosen encoding no longer fits the file's BOM. Any
+    /// thread: it reads the file.
+    nonisolated private static func openReloaded(
+        url: URL,
+        environment: DocumentEnvironment,
+        options: OpenOptions,
+        reference: ModelReference,
+        number: Int
+    ) throws -> LealFFI.Document {
         do {
-            new = try Self.openHandle(url: url, environment: environment, options: chosen, reference: reference, number: number)
+            return try openHandle(url: url, environment: environment, options: options, reference: reference, number: number)
         } catch LealError.EncodingDoesNotFit {
             // The chosen encoding no longer fits the file's BOM.
             let plain = OpenOptions(firstScreenRows: 1, maxChars: GridMetrics.maxCellCharacters)
-            new = try Self.openHandle(url: url, environment: environment, options: plain, reference: reference, number: number)
+            return try openHandle(url: url, environment: environment, options: plain, reference: reference, number: number)
         }
+    }
+
+    /// Swaps in the core document a Reload opened, as handle `number`.
+    private func adoptReloaded(_ new: LealFFI.Document, url: URL, reference: ModelReference, number: Int) throws {
         let screen = try new.firstScreen()
 
         // From here on, the new core document.
@@ -1083,6 +1316,10 @@ final class DocumentModel: GridDataSource {
         tasks.removeAll()
         checkingOriginal?.cancel()
         checkingOriginal = nil
+        // A new snapshot: the share's checks start again from nothing.
+        shareRecheck?.cancel()
+        shareRecheck = nil
+        lastDisconnection = nil
         self.url = url
         // The old core document goes off the main thread (app-10).
         CoreRelease.later(&handle)
@@ -1117,6 +1354,7 @@ final class DocumentModel: GridDataSource {
         indexStopped = false
         canSave = true
         original = call({ try $0.original() }) ?? OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
+        isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
         applyFirstScreen(screen)
         for column in resizedColumns where column < columnWidths.count && column < resized.count {
             columnWidths[column] = resized[column]
@@ -1146,6 +1384,7 @@ final class DocumentModel: GridDataSource {
             headerSource: interpretation.headerSource,
             readOnly: isReadOnly,
             storage: storage,
+            onNetworkShare: isOnNetworkShare,
             changedOnDisk: changedOnDisk,
             readStopped: readStopped,
             original: original.state,
@@ -1177,10 +1416,13 @@ private struct RefinedColumns: Sendable {
     let fieldCount: Int
 }
 
-/// The model, for the progress relay, which exists before it.
-@MainActor
-private final class ModelReference {
-    weak var model: DocumentModel?
+/// The model, for the progress relay, which exists before it. Made on any
+/// thread (a file on a network share is opened off the main thread,
+/// ADR-0009); the model is set and read only on the main actor.
+final class ModelReference: Sendable {
+    @MainActor weak var model: DocumentModel?
+
+    nonisolated init() {}
 }
 
 extension Logger {

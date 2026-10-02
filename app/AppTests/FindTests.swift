@@ -227,6 +227,9 @@ final class FindTests: XCTestCase {
 
         // Search, from the top: typing would select the first match.
         content.showFind(nil)
+        // The find bar takes its room now, before the jump, as a window on
+        // screen would lay out at once.
+        content.view.layoutSubtreeIfNeeded()
         content.findBar.field.stringValue = "marlow foods"
         content.find.find("marlow foods", caseSensitive: false, from: nil)
         XCTAssertTrue(content.find.isSearching)
@@ -468,6 +471,7 @@ final class FindTests: XCTestCase {
             let url = try XCTUnwrap(document.fileURL)
             try Data("id,customer,notes\n0,Changed Elsewhere,x\n".utf8).write(to: url, options: .atomic)
             content.reloadFromDisk(nil)
+            await content.reloading?.value
             XCTAssertEqual(content.model.cell(row: 0, column: 1), .text("Changed Elsewhere", truncated: false))
         }
     }
@@ -490,6 +494,7 @@ final class FindTests: XCTestCase {
         try Data(fewer.utf8).write(to: url, options: .atomic)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         try await waitUntil("indexed again") { model.isIndexComplete }
         try await searchSettled(content)
         XCTAssertTrue(content.isFindBarShown)
@@ -513,6 +518,7 @@ final class FindTests: XCTestCase {
         try Data("id,notes\n1,new note\n2,second\n".utf8).write(to: url, options: .atomic)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertTrue(content.isInspectorShown)
         XCTAssertEqual(content.grid.activeCell, CellPosition(row: 0, column: 1))
         await content.inspectorTask?.value

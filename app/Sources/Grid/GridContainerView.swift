@@ -66,6 +66,18 @@ final class GridContainerView: NSView {
     /// it was asked for (no cell is selected while it waits).
     private var pendingColumn = 0
 
+    /// The cell a pending ⌘↓ or Go to Row ended on, until the user moves
+    /// again: if the visible area then shrinks (the find bar or a banner
+    /// appearing just after), it is scrolled back into view, so the row
+    /// jumped to is never left hidden (task 2.0 review).
+    private var jumpedTo: CellPosition?
+    /// When `jumpedTo` was set (`CACurrentMediaTime`): it is re-revealed
+    /// only within `revealWindow` of that, so a shrink long after a jump
+    /// leaves the view alone.
+    private var jumpedAt: CFTimeInterval = 0
+    /// See `jumpedAt`. Tests shorten it.
+    static var revealWindow: CFTimeInterval = 1
+
     /// ⌘↓ went past the indexed rows: when the index is complete, the
     /// active cell moves to the real last row.
     var isJumpingToEnd: Bool { pendingJump == .end }
@@ -105,6 +117,14 @@ final class GridContainerView: NSView {
         gutterClip.drawsBackground = false
         scrollView.onScroll = { [weak self] in self?.followScroll() }
         scrollView.onScrollInput = { [weak self] in self?.scrollInputArrived() }
+        // A live scroll (a trackpad or a scroller drag) is scroll input too:
+        // a jump's row is no longer to be kept in view.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(liveScrollWillStart(_:)),
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
         scrollView.onGesture = { [weak self] began in self?.onGesture?(began) }
         headerView.scrollTarget = scrollView
         gutterView.scrollTarget = scrollView
@@ -178,6 +198,10 @@ final class GridContainerView: NSView {
 
     override func layout() {
         super.layout()
+        // Whether the cell a jump ended on is in view before the visible
+        // area changes size. The clip view's own rectangle: the view's
+        // `visibleRect` is cut by this view's new size already.
+        let jumpedCellWasShown = jumpedTo.map { scrollView.documentVisibleRect.contains(geometry.cellRect(row: $0.row, column: $0.column)) } ?? false
         let gutterWidth = GridGutterView.width(rows: dataSource?.rowCount ?? 0)
         let header = GridMetrics.headerHeight
         let width = bounds.width
@@ -188,6 +212,35 @@ final class GridContainerView: NSView {
         scrollView.frame = NSRect(x: gutterWidth, y: header, width: max(0, width - gutterWidth), height: max(0, height - header))
         updateDocumentSize()
         positionPill()
+        revealJumpedToCell(wasShown: jumpedCellWasShown)
+    }
+
+    /// A pending ⌘↓ or Go to Row ended on the active cell.
+    private func noteJumpEnded() {
+        jumpedTo = activeCell
+        jumpedAt = CACurrentMediaTime()
+    }
+
+    @objc private func liveScrollWillStart(_ notification: Notification) {
+        scrollInputArrived()
+    }
+
+    /// Scrolls the cell a jump ended on back into view if it was in view
+    /// before this layout, is still the active cell, and the jump was less
+    /// than `revealWindow` ago: the visible area shrank under it (the find
+    /// bar or a banner appearing). A cell the user scrolled away from stays
+    /// away.
+    private func revealJumpedToCell(wasShown: Bool) {
+        guard let cell = jumpedTo, cell == activeCell,
+              CACurrentMediaTime() - jumpedAt <= Self.revealWindow
+        else {
+            jumpedTo = nil
+            return
+        }
+        let rect = geometry.cellRect(row: cell.row, column: cell.column)
+        if wasShown, !scrollView.documentVisibleRect.contains(rect) {
+            scrollToVisible(cell)
+        }
     }
 
     /// The document view is as large as the rows and columns, and at least
@@ -222,13 +275,16 @@ final class GridContainerView: NSView {
         case .end? where isIndexComplete():
             if rows > 0 { select(CellPosition(row: rows - 1, column: column)) }
             pendingJump = nil
+            noteJumpEnded()
         case let .row(target)? where target < (dataSource?.loadedRowCount ?? 0):
             // The target is indexed now (DESIGN §3.10 rule 5).
             select(CellPosition(row: target, column: column))
+            noteJumpEnded()
         case .row? where isIndexComplete():
             // The file is shorter than the row asked for: its last row.
             if rows > 0 { select(CellPosition(row: rows - 1, column: column)) }
             pendingJump = nil
+            noteJumpEnded()
         default:
             break
         }
@@ -262,6 +318,7 @@ final class GridContainerView: NSView {
     /// The user scrolled: a pending ⌘↓ or Go to Row no longer applies.
     func scrollInputArrived() {
         pendingJump = nil
+        jumpedTo = nil
         onUserInput?()
     }
 
@@ -283,6 +340,7 @@ final class GridContainerView: NSView {
     /// another cell.
     func select(_ cell: CellPosition) {
         pendingJump = nil
+        jumpedTo = nil
         guard let clamped = clamp(cell) else { return }
         selection = GridSelection(clamped)
         scrollToVisible(clamped)
@@ -296,6 +354,7 @@ final class GridContainerView: NSView {
             return
         }
         pendingJump = nil
+        jumpedTo = nil
         guard let clamped = clamp(cell) else { return }
         selection = current.extended(to: clamped, throughLastRow: throughLastRow)
         scrollToVisible(clamped)
@@ -313,6 +372,7 @@ final class GridContainerView: NSView {
     /// in the column it was in.
     func selectRow(_ row: Int) {
         pendingJump = nil
+        jumpedTo = nil
         guard let clamped = clamp(CellPosition(row: row, column: activeCell?.column ?? 0)) else { return }
         selection = .row(clamped.row, columns: geometry.columnCount, column: clamped.column)
         scrollToVisible(clamped)
@@ -326,6 +386,7 @@ final class GridContainerView: NSView {
             return
         }
         pendingJump = nil
+        jumpedTo = nil
         selection = GridSelection(
             active: current.active,
             anchor: CellPosition(row: current.anchor.row, column: 0),

@@ -23,9 +23,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     let banners = NSStackView()
     /// The document failed (DESIGN §3.9).
     var onFailure: (() -> Void)?
-    /// **Reload**, through the `NSDocument` (`CSVDocument.reload`), so it
-    /// stays in step with the file shown. Without one, the model reloads.
-    var onReload: (() throws -> Void)?
+    /// **Reload**, through the `NSDocument` (`CSVDocument.reloadInBackground`),
+    /// so it stays in step with the file shown. It opens the file off the
+    /// main thread (task 2.0). Without one, the model reloads.
+    var onReload: (() async throws -> Void)?
+    /// A Reload, while it is under way.
+    private(set) var reloading: Task<Void, Never>?
     /// Whether the file is read-only (UTF-16) changed: the window's lock
     /// glyph follows it.
     var onReadOnlyChanged: ((Bool) -> Void)?
@@ -449,14 +452,25 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// can't be opened, the window says why and keeps what it shows.
     @objc func reloadFromDisk(_ sender: Any?) {
         scheduler.noteUserInput()
-        do {
-            if let onReload {
-                try onReload()
-            } else {
-                try model.reload()
+        // Opening the file reads it, which on a network share can block:
+        // always off the main thread (task 2.0, ADR-0009). The window shows
+        // the old snapshot until the new one is ready.
+        guard reloading == nil else { return }
+        let reload = onReload
+        let model = model
+        model.willReload()
+        reloading = Task { [weak self] in
+            do {
+                if let reload {
+                    try await reload()
+                } else {
+                    try await model.reloadInBackground()
+                }
+            } catch {
+                self?.showReloadError(error)
             }
-        } catch {
-            showReloadError(error)
+            model.reloadEnded()
+            self?.reloading = nil
         }
     }
 
@@ -576,8 +590,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             menuItem.title = isInspectorShown ? MainMenu.hideInspector : MainMenu.showInspector
             return !model.isFailed
         case #selector(reloadFromDisk(_:)):
-            // There must be a file to open again.
-            return !model.isFailed && model.original.state != .deleted && model.original.state != .unavailable
+            // There must be a file to open again, and no Reload under way.
+            return !model.isFailed && !model.isReloading && reloading == nil
+                && model.original.state != .deleted && model.original.state != .unavailable
         default:
             return true
         }

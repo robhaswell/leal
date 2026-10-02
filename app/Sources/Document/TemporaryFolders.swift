@@ -49,10 +49,16 @@ enum TemporaryFolders {
     /// without mapping it until it has copied it to the internal disk
     /// (ADR-0006). Either value is `nil` if Foundation doesn't know it; a
     /// disk image, for example, has no "is internal" value.
+    ///
+    /// A network volume gets no folder: asking `FileManager` for one would
+    /// make a `.TemporaryItems` folder on the user's share, and a share is
+    /// never cloned (task 2.0). Call it off the main thread: it asks the
+    /// volume.
     static func volume(for url: URL) -> VolumeInfo {
-        let values = try? url.resourceValues(forKeys: [.volumeIsInternalKey, .volumeIsEjectableKey])
+        let values = try? url.resourceValues(forKeys: [.volumeIsInternalKey, .volumeIsEjectableKey, .volumeIsLocalKey])
+        let onShare = values?.volumeIsLocal == false
         return VolumeInfo(
-            folder: volumeFolder(for: url),
+            folder: onShare ? nil : volumeFolder(for: url),
             isInternal: values?.volumeIsInternal,
             isEjectable: values?.volumeIsEjectable
         )

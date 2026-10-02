@@ -18,9 +18,12 @@ struct StatusSummary: Equatable, Sendable {
     var headerSource: DialectSource
     var readOnly: Bool
     /// Where the bytes are held: in memory, a copy, still being read from a
-    /// removable drive, or disconnected from it, each with a note (DESIGN
-    /// §3.1, ADR-0006).
+    /// removable drive or network share, disconnected from it, or deleted on
+    /// its share, each with a note (DESIGN §3.1, ADR-0006, ADR-0009).
     var storage: SourceStorage = .clone
+    /// The file is on a network share (ADR-0009): the notes say "network
+    /// share" where they would say "drive".
+    var onNetworkShare = false
     /// The file changed on its drive while it was read (1.1a).
     var changedOnDisk = false
     /// The index stopped on a read error: the rows shown are all Leal could
@@ -116,9 +119,13 @@ enum StatusText {
         case .copy:
             String(localized: "Working from a copy", comment: "Status bar: Leal reads its own copy of the file on this Mac (DESIGN §3.1, ADR-0006)")
         case .reading:
-            String(localized: "Reading from the drive", comment: "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)")
+            status.onNetworkShare
+                ? String(localized: "Reading from the network", comment: "Status bar: the file is on a network share, and Leal is still copying it (ADR-0009)")
+                : String(localized: "Reading from the drive", comment: "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)")
         case .disconnected:
             String(localized: "Drive disconnected", comment: "Status bar: the file's removable drive was disconnected (ADR-0006)")
+        case .deleted:
+            String(localized: "Deleted", comment: "Status bar: the open file was deleted or moved to the Trash (task 1.9)")
         }
     }
 
@@ -127,7 +134,13 @@ enum StatusText {
     /// storage note already says it: a change while reading, or a drive
     /// disconnected before the copy was complete.
     static func originalNote(_ status: StatusSummary) -> String? {
-        if status.changedOnDisk { return nil }
+        // A file deleted on its share while it was read: the storage note
+        // already says "Deleted".
+        if status.storage == .deleted { return nil }
+        // Changed while reading says the rest, unless the file is also known
+        // to have changed elsewhere (a share's file replaced mid-copy, task
+        // 2.0 review), which keeps its own note.
+        if status.changedOnDisk, status.original != .changed { return nil }
         return switch status.original {
         case .unchanged: nil
         case .changed:
@@ -332,14 +345,24 @@ enum StatusText {
                     comment: "Status bar tooltip: Leal reads its own copy (DESIGN §3.1, ADR-0006)"
                 ))
             case .reading:
-                lines.append(String(
-                    localized: "The file is on a removable drive. Leal reads it from the drive while it copies it to this Mac.",
-                    comment: "Status bar tooltip: the copy off a removable drive isn't finished (ADR-0006)"
-                ))
+                lines.append(status.onNetworkShare
+                    ? String(
+                        localized: "The file is on a network share. Leal reads it from the share while it copies it to this Mac.",
+                        comment: "Status bar tooltip: the copy off a network share isn't finished (ADR-0009)"
+                    )
+                    : String(
+                        localized: "The file is on a removable drive. Leal reads it from the drive while it copies it to this Mac.",
+                        comment: "Status bar tooltip: the copy off a removable drive isn't finished (ADR-0006)"
+                    ))
             case .disconnected:
                 lines.append(String(
                     localized: "The drive was disconnected before Leal had read the whole file. Save is off until it’s back; Save As keeps a copy.",
                     comment: "Status bar tooltip: the removable drive was disconnected (ADR-0006)"
+                ))
+            case .deleted:
+                lines.append(String(
+                    localized: "This file was deleted on another computer while Leal was reading it. Leal shows the rows it had read; Save is off, and Save As keeps a copy.",
+                    comment: "Status bar tooltip: the file on a network share was deleted elsewhere while Leal was copying it (ADR-0009)"
                 ))
             }
         }

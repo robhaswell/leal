@@ -173,6 +173,84 @@ final class GridRenderingTests: XCTestCase {
         XCTAssertTrue(grid.pill.isHidden)
     }
 
+    /// Go to Row past the indexed rows, then the visible area shrinks just
+    /// after the row arrives (the find bar or a banner appearing): the row
+    /// jumped to is scrolled back into view, not left hidden below (task
+    /// 2.0 review). Once the user scrolls, it no longer is.
+    func testTheRowJumpedToStaysInViewWhenTheGridShrinks() {
+        let source = FakeGridSource(rows: 10_000, columns: 3, loaded: 500)
+        let (window, grid) = makeGrid(source: source)
+        grid.isIndexComplete = { false }
+        grid.goTo(row: 5_000)
+        XCTAssertEqual(grid.pendingJump, .row(5_000))
+        source.loadedRowCount = 6_000
+        grid.reloadData()
+        XCTAssertEqual(grid.activeCell?.row, 5_000)
+        // The row ends up at the bottom edge of the visible area.
+        XCTAssertTrue(grid.visibleRows.contains(5_000))
+        XCTAssertTrue(grid.gridView.visibleRect.contains(grid.geometry.cellRect(row: 5_000, column: 0)), "visible \(grid.gridView.visibleRect) cell \(grid.geometry.cellRect(row: 5_000, column: 0))")
+
+        // The grid loses 10 rows' height at the bottom.
+        var frame = window.contentView!.bounds
+        frame.size.height -= 10 * GridMetrics.rowHeight
+        grid.frame = frame
+        grid.layoutSubtreeIfNeeded()
+        let rect = grid.gridView.visibleRect
+        XCTAssertTrue(rect.contains(grid.geometry.cellRect(row: 5_000, column: 0)), "re-revealed after shrinking")
+
+        // After the user scrolls, shrinking leaves the view alone.
+        grid.scrollView.onScrollInput?()
+        let before = grid.scrollView.contentView.bounds.origin
+        frame.size.height -= 5 * GridMetrics.rowHeight
+        grid.frame = frame
+        grid.layoutSubtreeIfNeeded()
+        XCTAssertEqual(grid.scrollView.contentView.bounds.origin, before)
+    }
+
+    /// The re-reveal leaves the view alone when the user moved it (task 2.0
+    /// re-review): a scroll of the clip view itself, a live scroll (the
+    /// trackpad), or a shrink more than `revealWindow` after the jump.
+    func testTheRowJumpedToIsntForcedBackAfterTheUserScrolls() {
+        let source = FakeGridSource(rows: 10_000, columns: 3, loaded: 500)
+        let (window, grid) = makeGrid(source: source)
+        grid.isIndexComplete = { false }
+        var frame = window.contentView!.bounds
+        func jump(to row: Int) {
+            source.loadedRowCount = 500
+            grid.reloadData()
+            grid.goTo(row: row)
+            source.loadedRowCount = 9_000
+            grid.reloadData()
+            XCTAssertEqual(grid.activeCell?.row, row)
+        }
+        func shrinkLeavesTheViewAlone(_ why: String) {
+            let before = grid.scrollView.contentView.bounds.origin
+            frame.size.height -= 2 * GridMetrics.rowHeight
+            grid.frame = frame
+            grid.layoutSubtreeIfNeeded()
+            XCTAssertEqual(grid.scrollView.contentView.bounds.origin, before, why)
+        }
+
+        // The clip view scrolled directly, as a scroller drag does.
+        jump(to: 5_000)
+        let clip = grid.scrollView.contentView
+        clip.scroll(to: NSPoint(x: 0, y: 1_000 * GridMetrics.rowHeight))
+        grid.scrollView.reflectScrolledClipView(clip)
+        shrinkLeavesTheViewAlone("scrolled away from the row")
+
+        // A live scroll starting.
+        jump(to: 6_000)
+        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: grid.scrollView)
+        shrinkLeavesTheViewAlone("a live scroll")
+
+        // Long after the jump.
+        let window0 = GridContainerView.revealWindow
+        GridContainerView.revealWindow = 0
+        defer { GridContainerView.revealWindow = window0 }
+        jump(to: 7_000)
+        shrinkLeavesTheViewAlone("after the window")
+    }
+
     /// A click or a scroll after ⌘↓ drops the pending jump: finishing the
     /// index then leaves the active cell where the user put it.
     func testAClickOrScrollAfterJumpingDropsTheJump() {

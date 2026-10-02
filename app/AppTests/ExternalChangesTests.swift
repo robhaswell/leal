@@ -115,6 +115,7 @@ final class ExternalChangesTests: XCTestCase {
         try save(text(rows: 300, prefix: "new"), to: url)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         try XCTUnwrap(content.driveBanner?.button).performClick(nil)
+        await content.reloading?.value
 
         XCTAssertNil(content.driveBanner, "the new snapshot is what's on disk")
         XCTAssertEqual(model.original.state, .unchanged)
@@ -153,6 +154,7 @@ final class ExternalChangesTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertNil(content.driveBanner)
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("newer 0", truncated: false))
         document.close()
     }
@@ -175,6 +177,7 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertFalse(document.fileURL?.pathComponents.contains("TemporaryItems") ?? true)
         XCTAssertEqual(content.driveBanner?.message, FileBanner.changedMessage)
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("new 0", truncated: false))
         try? FileManager.default.removeItem(at: staging)
         document.close()
@@ -199,6 +202,7 @@ final class ExternalChangesTests: XCTestCase {
         try await waitUntil("the new file is seen") { model.original.state == .changed }
         XCTAssertEqual(content.driveBanner?.message, FileBanner.changedMessage)
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("back 0", truncated: false))
         document.close()
     }
@@ -216,6 +220,7 @@ final class ExternalChangesTests: XCTestCase {
         try Data(text(rows: 2, prefix: "new").utf8).write(to: moved)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("new 0", truncated: false))
         document.close()
     }
@@ -234,6 +239,7 @@ final class ExternalChangesTests: XCTestCase {
         try FileManager.default.setAttributes([.modificationDate: later], ofItemAtPath: url.path(percentEncoded: false))
         try await waitUntil("the change is seen") { model.original.state == .changed }
         try XCTUnwrap(content.driveBanner?.button).performClick(nil)
+        await content.reloading?.value
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("new 0", truncated: false))
         XCTAssertEqual(try XCTUnwrap(document.fileModificationDate).timeIntervalSince1970, later.timeIntervalSince1970, accuracy: 0.001)
 
@@ -261,6 +267,7 @@ final class ExternalChangesTests: XCTestCase {
         try utf16.write(to: url, options: .atomic)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertTrue(model.isReadOnly)
         let lock = try XCTUnwrap(controller.lock)
         XCTAssertTrue(controller.window?.titlebarAccessoryViewControllers.contains(lock) ?? false)
@@ -269,6 +276,7 @@ final class ExternalChangesTests: XCTestCase {
         try save("id\tname\r\n1\tZoë\r\n", to: url)
         try await waitUntil("the second change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertFalse(model.isReadOnly)
         XCTAssertNil(controller.lock)
         XCTAssertFalse(controller.window?.titlebarAccessoryViewControllers.contains(lock) ?? true)
@@ -332,6 +340,7 @@ final class ExternalChangesTests: XCTestCase {
         // this time).
         DocumentModel.openForTesting = nil
         banner.button?.performClick(nil)
+        await content.reloading?.value
         XCTAssertFalse(model.changedOnDisk)
         XCTAssertNil(content.driveBanner)
         try await waitUntil("indexed") { model.isIndexComplete }
@@ -377,6 +386,7 @@ final class ExternalChangesTests: XCTestCase {
         // Reload: the file can be read another way again.
         DocumentModel.openForTesting = nil
         try XCTUnwrap(content.driveBanner?.button).performClick(nil)
+        await content.reloading?.value
         XCTAssertFalse(model.changedOnDisk)
         XCTAssertEqual(items.map { content.validateMenuItem($0) }, [true, true, true])
         XCTAssertEqual(items.map(\.toolTip), [nil, nil, nil])
@@ -442,6 +452,7 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertFalse(StatusText.counts(model.status).hasPrefix("Indexing"))
 
         banner.button?.performClick(nil)
+        await content.reloading?.value
         XCTAssertFalse(model.readStopped)
         XCTAssertNil(content.driveBanner)
         try await waitUntil("indexed") { model.isIndexComplete }
@@ -468,6 +479,7 @@ final class ExternalChangesTests: XCTestCase {
         try save(text(rows: 3_000, prefix: "new"), to: url)
         try await waitUntil("the change is seen") { model.original.state == .changed }
         content.reloadFromDisk(nil)
+        await content.reloading?.value
         XCTAssertNotEqual(model.readingID, second)
         model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index, reading: second)
         model.jobEnded(JobFailure.DriveDisconnected, job: .index, reading: second)
@@ -514,6 +526,15 @@ final class ExternalChangesTests: XCTestCase {
         // Editing) the disconnection.
         XCTAssertEqual(FileBanner.applicable(changedWhileReading: false, original: .changed, storage: .disconnected), [.changed, .disconnected])
         XCTAssertEqual(FileBanner.applicable(changedWhileReading: true, original: .changed, storage: .reading), [.changedWhileReading, .changed])
+        // A file deleted on its share while Leal read it (ADR-0009): its own
+        // banner, first after a change while reading, and not the plain
+        // "deleted" one too.
+        XCTAssertEqual(FileBanner.applicable(changedWhileReading: false, original: .unchanged, storage: .deleted), [.deletedWhileReading])
+        XCTAssertEqual(FileBanner.applicable(changedWhileReading: false, original: .deleted, storage: .deleted), [.deletedWhileReading])
+        XCTAssertEqual(FileBanner.applicable(changedWhileReading: true, original: .changed, storage: .deleted), [.changedWhileReading, .deletedWhileReading, .changed])
+        XCTAssertFalse(FileBanner.deletedWhileReading.reloads)
+        XCTAssertNil(FileBanner.deletedWhileReading.secondaryTitle)
+        XCTAssertEqual(FileBanner.deletedWhileReading.buttonTitle, DiagnosticsText.saveAs)
         XCTAssertTrue(FileBanner.changed.reloads)
         XCTAssertTrue(FileBanner.changedWhileReading.reloads)
         XCTAssertFalse(FileBanner.deleted.reloads)
@@ -541,8 +562,12 @@ final class ExternalChangesTests: XCTestCase {
         // The storage note already says so.
         status.storage = .disconnected
         XCTAssertNil(StatusText.originalNote(status))
+        // Changed elsewhere too (a share's file replaced mid-copy): its own
+        // note stays beside "Changed while reading" (task 2.0 review).
         status.original = .changed
         status.changedOnDisk = true
+        XCTAssertEqual(StatusText.originalNote(status), "Changed on disk")
+        status.original = .unchanged
         XCTAssertNil(StatusText.originalNote(status))
     }
 }

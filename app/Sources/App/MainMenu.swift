@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import LealFFI
 
 /// The menu bar, built in code because the app has no storyboard.
@@ -205,15 +206,19 @@ final class RecentDocumentsMenu: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let controller = NSDocumentController.shared
+        // Names and icons from the URLs alone: the menu opens on the main
+        // thread, and a recent file may be on a network share that has
+        // stopped answering, so nothing here asks the file system (task 2.0).
         for url in controller.recentDocumentURLs {
             let item = NSMenuItem(
-                title: FileManager.default.displayName(atPath: url.path(percentEncoded: false)),
+                title: url.lastPathComponent,
                 action: #selector(openRecent(_:)),
                 keyEquivalent: ""
             )
             item.target = self
             item.representedObject = url
-            let icon = NSWorkspace.shared.icon(forFile: url.path(percentEncoded: false))
+            let type = UTType(filenameExtension: url.pathExtension) ?? .commaSeparatedText
+            let icon = NSWorkspace.shared.icon(for: type)
             icon.size = NSSize(width: 16, height: 16)
             item.image = icon
             menu.addItem(item)
@@ -230,6 +235,13 @@ final class RecentDocumentsMenu: NSObject, NSMenuDelegate {
 
     @objc private func openRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+        // As File ▸ Open does: say why it couldn't be opened, unless the
+        // user cancelled.
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, error in
+            guard let error else { return }
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain, failure.code == NSUserCancelledError { return }
+            MainActor.assumeIsolated { _ = NSDocumentController.shared.presentError(error) }
+        }
     }
 }
