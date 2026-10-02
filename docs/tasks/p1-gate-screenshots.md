@@ -31,9 +31,10 @@ names, `.example` e-mail addresses, and nothing from a real file.
   window, as in 1.6's 06a shot.
 
 New options for the scripted run (`ScriptedRun`, `LEAL_BENCH` builds only):
-`-LealMenu treatAs|reopen`, `-LealGoToRow YES`, `-LealFindWrap YES`,
-`-LealWaitForReview YES` and, in Debug, `-LealSimulateFault
-disconnect:<byte>|change:<byte>`. `-LealWaitForChange YES` also waits for a
+`-LealMenu treatAs|reopen`, `-LealMainMenu File` (or `View,View/Treat_As`),
+`-LealGoToRow YES`, `-LealFindWrap YES`, `-LealWaitForReview YES` and, in
+Debug, `-LealSimulateFault disconnect:<byte>|change:<byte>|none` and
+`-LealSimulateReadError YES`. `-LealWaitForChange YES` also waits for a
 disconnected drive. For example:
 
 ```sh
@@ -67,9 +68,20 @@ UTF-8.
 | Drive disconnected part-way: **Save As…**, "Drive disconnected" in the status bar | ![](p1-gate-drive-disconnected-light.png) | ![](p1-gate-drive-disconnected-dark.png) |
 | Changed while reading: **Reload**, "Changed while reading" | ![](p1-gate-changed-while-reading-light.png) | ![](p1-gate-changed-while-reading-dark.png) |
 
-While the drive is away, the status bar still says "Indexing… about N
-rows", with its progress bar stopped. That is as built in 1.7: the drive
-may come back and the index carry on.
+Since the review's follow-up, neither shows "Indexing…" with a stopped
+progress bar any more. The counts are the rows read, and no skeleton
+rows follow them. These shots were retaken after that change.
+
+| | Light | Dark |
+|---|---|---|
+| A read error stopped the index (app-8): "Leal couldn’t read the rest of this file…", **Reload**, "Partly read" in the status bar | ![](p1-gate-partly-read-light.png) | ![](p1-gate-partly-read-dark.png) |
+| After a change while reading, reading the file another way is off until Reload. The status bar's delimiter and encoding menus are greyed, and so are View ▸ Use First Row as Header and Treat As's items. Their tooltip (not shown) says "The file changed while Leal was reading it. Reload it first." | ![](p1-gate-reread-off-light.png) | ![](p1-gate-reread-off-dark.png) |
+| "Drive not connected": a real disk image, ejected after Leal had copied the file. There is no banner, only the note; Save is off until the drive is back | ![](p1-gate-drive-not-connected-light.png) | ![](p1-gate-drive-not-connected-dark.png) |
+
+The "Partly read" state comes from the scripted run, which ends the index
+with a read error just after first paint, the way the hosted test does.
+The core has no hook to make a real read fail. Its count is the whole
+file's, because the real index went on in the background of the shot.
 
 ## The file changed or deleted elsewhere (task 1.9)
 
@@ -80,6 +92,18 @@ These replace 1.9's shots, which had no dark deleted banner.
 | Changed on disk: **Reload**, **Keep Editing** | ![](p1-gate-changed-on-disk-light.png) | ![](p1-gate-changed-on-disk-dark.png) |
 | Deleted: **Save As…**, **Keep Editing** | ![](p1-gate-deleted-light.png) | ![](p1-gate-deleted-dark.png) |
 
+## Status bar notes and File ▸ Reload from Disk
+
+| | Light | Dark |
+|---|---|---|
+| Notes: "Working from a copy" (a file opened from a removable drive) and "Encoding attribute ignored" (an unsupported `com.apple.TextEncoding`). Their tooltips (not shown) say why | ![](p1-gate-status-notes-light.png) | ![](p1-gate-status-notes-dark.png) |
+| File ▸ **Reload from Disk**, after another app changed the file | ![](p1-gate-reload-menu-light.png) | ![](p1-gate-reload-menu-dark.png) |
+
+The other notes have no layout of their own: "Read into memory", "Reading
+from the drive" (shown only until the copy is done), "Remembered settings
+ignored" and "Changed on disk" (above). The status bar tests (`StatusText`)
+cover their words.
+
 ## Find and Go to Row (task 1.8)
 
 | | Light | Dark |
@@ -88,12 +112,3 @@ These replace 1.9's shots, which had no dark deleted banner.
 | Find's "wrapped" sign, after ⇧⌘G went back past the first match to the last | ![](p1-gate-find-wrapped-light.png) | ![](p1-gate-find-wrapped-dark.png) |
 
 The Go to Row sheet shows the generic icon: Leal has no app icon yet.
-
-## Not shown here
-
-The phase 1 review's list also named the unsupported or unreadable
-attribute notes, the Memory, Copy and Reading notes, the "Drive not
-connected" note and File ▸ Reload from Disk. These are status bar text and a
-menu item with no layout of their own. The notes are covered by the status
-bar tests (`StatusText`), and "Working from a copy" shows in the hosted
-removable-drive test.

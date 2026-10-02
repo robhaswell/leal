@@ -39,7 +39,13 @@ import os
 ///   removable drive that vanishes, or whose file changes, at that byte
 ///   of the copy. Menus and sheets are windows of their own, which don't
 ///   draw offscreen: their content is drawn on a plain panel where they
-///   would be, as for the details popover.
+///   would be, as for the details popover. `-LealMainMenu File` (or
+///   paths such as `View,View/Treat_As`) draws menus of the menu bar, their
+///   items validated by the window, under the title bar;
+///   `-LealSimulateReadError YES` ends the index with a read error after
+///   first paint (`JobFailure.Failed`, the "Partly read" banner); and
+///   `-LealSimulateFault none` opens the file as if on a removable drive
+///   that doesn't fail.
 /// - `-LealReopen <n>`: once the document is indexed, close it and open
 ///   its file again, `n` times, then quit: each open's "Open to first rows"
 ///   signpost after the first is an open in a running app, without the
@@ -68,10 +74,11 @@ final class ScriptedRun {
         #if DEBUG
         guard let fault = defaults.string(forKey: "LealSimulateFault") else { return }
         let parts = fault.split(separator: ":")
-        guard parts.count == 2, let at = UInt64(parts[1]) else { return }
-        let simulated: SimulatedFault? = switch parts[0] {
-        case "disconnect": .disconnect(at: at)
-        case "change": .change(at: at)
+        guard fault == "none" || parts.count == 2, let at = parts.count == 2 ? UInt64(parts[1]) : 0 else { return }
+        let simulated: SimulatedFault?? = switch parts[0] {
+        case "disconnect": .some(.disconnect(at: at))
+        case "change": .some(.change(at: at))
+        case "none": .some(nil)
         default: nil
         }
         guard let simulated else { return }
@@ -202,6 +209,11 @@ final class ScriptedRun {
                 try? await Task.sleep(for: .milliseconds(20))
             }
         }
+        if has("LealSimulateReadError") {
+            // As if the drive had returned EIO part-way (app-8).
+            let model = content.model
+            model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index, reading: model.readingID)
+        }
         if has("LealWaitForReview") {
             let deadline = Date().addingTimeInterval(30)
             while content.model.review == nil, Date() < deadline {
@@ -277,6 +289,31 @@ final class ScriptedRun {
                 panels.append((picture, NSRect(x: frame.minX - 8, y: frame.maxY + 4, width: size.width, height: size.height)))
             }
         }
+        if let paths = value(of: "LealMainMenu") {
+            // Each menu of the comma-separated paths, validated as the menu
+            // bar would (by the window's controller, where it handles the
+            // item); a submenu opens beside its item in the menu before it.
+            var frames: [String: NSRect] = [:]
+            for path in paths.split(separator: ",").map(String.init) {
+                guard let menu = Self.menu(at: path) else { continue }
+                for item in menu.items {
+                    if let action = item.action, content.responds(to: action) {
+                        item.isEnabled = content.validateMenuItem(item)
+                    }
+                }
+                let picture = MenuPicture(menu: menu)
+                let size = picture.frame.size
+                var frame = NSRect(x: 10, y: window.contentLayoutRect.maxY - size.height - 2, width: size.width, height: size.height)
+                let parentPath = path.split(separator: "/").dropLast().joined(separator: "/")
+                if let parent = frames[parentPath], let parentMenu = Self.menu(at: parentPath),
+                   let row = MenuPicture(menu: parentMenu).items.firstIndex(where: { $0.submenu === menu }) {
+                    let rowTop = parent.maxY - MenuPicture.inset - CGFloat(row) * MenuPicture.rowHeight
+                    frame.origin = NSPoint(x: parent.maxX - 4, y: rowTop + MenuPicture.inset - size.height)
+                }
+                frames[path] = frame
+                panels.append((picture, frame))
+            }
+        }
         if has("LealGoToRow") {
             // The sheet hangs from the title bar, in the middle.
             let (alert, _) = content.goToRowAlert()
@@ -289,6 +326,16 @@ final class ScriptedRun {
         }
         Snapshot.writePNG(of: window, panels: panels, to: url)
         Logger.open.info("Snapshot written to \(url.path(percentEncoded: false), privacy: .public)")
+    }
+
+    /// The menu bar's menu at `path`, such as `File` or `View/Treat_As`
+    /// ("_" for a space: `just snapshot` splits its options at spaces).
+    private static func menu(at path: String) -> NSMenu? {
+        var menu = NSApp.mainMenu
+        for title in path.split(separator: "/").map({ $0.replacingOccurrences(of: "_", with: " ") }) {
+            menu = menu?.items.first { $0.submenu?.title == title || $0.title == title }?.submenu
+        }
+        return menu
     }
 
     private static func write(_ result: [String: Any], to url: URL) {
@@ -307,18 +354,22 @@ final class ScriptedRun {
 /// mark by the item that is on, disabled items greyed.
 @MainActor
 final class MenuPicture: NSView {
-    private let shown: NSMenu
-    private static let rowHeight: CGFloat = 22
-    private static let inset: CGFloat = 5
+    /// The items a menu shows: not hidden ones, nor the alternates that
+    /// show only while Option is held.
+    let items: [NSMenuItem]
+    static let rowHeight: CGFloat = 22
+    static let inset: CGFloat = 5
     private static let checkWidth: CGFloat = 22
     private static var font: NSFont { .menuFont(ofSize: 0) }
 
     init(menu: NSMenu) {
-        self.shown = menu
-        let widest = menu.items.map { ($0.title as NSString).size(withAttributes: [.font: Self.font]).width }.max() ?? 0
+        items = menu.items.filter { !$0.isHidden && !$0.isAlternate }
+        let attributes: [NSAttributedString.Key: Any] = [.font: Self.font]
+        let widest = items.map { ($0.title as NSString).size(withAttributes: attributes).width }.max() ?? 0
+        let keys = items.map { (Self.keyText($0) as NSString).size(withAttributes: attributes).width }.max() ?? 0
         let size = NSSize(
-            width: (Self.checkWidth + widest + 24).rounded(.up),
-            height: CGFloat(menu.items.count) * Self.rowHeight + 2 * Self.inset
+            width: (Self.checkWidth + widest + (keys > 0 ? keys + 28 : 0) + 30).rounded(.up),
+            height: CGFloat(items.count) * Self.rowHeight + 2 * Self.inset
         )
         super.init(frame: NSRect(origin: .zero, size: size))
     }
@@ -330,8 +381,22 @@ final class MenuPicture: NSView {
 
     override var isFlipped: Bool { true }
 
+    /// An item's key equivalent as menus show it, such as "⌘O"; a submenu's
+    /// arrow.
+    private static func keyText(_ item: NSMenuItem) -> String {
+        if item.hasSubmenu { return "›" }
+        guard !item.keyEquivalent.isEmpty else { return "" }
+        let mask = item.keyEquivalentModifierMask
+        var text = ""
+        if mask.contains(.control) { text += "⌃" }
+        if mask.contains(.option) { text += "⌥" }
+        if mask.contains(.shift) || item.keyEquivalent != item.keyEquivalent.lowercased() { text += "⇧" }
+        if mask.contains(.command) { text += "⌘" }
+        return text + item.keyEquivalent.uppercased()
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        for (index, item) in shown.items.enumerated() {
+        for (index, item) in items.enumerated() {
             let top = Self.inset + CGFloat(index) * Self.rowHeight
             if item.isSeparatorItem {
                 NSColor.separatorColor.setFill()
@@ -346,6 +411,9 @@ final class MenuPicture: NSView {
                 ("✓" as NSString).draw(at: NSPoint(x: 8, y: y), withAttributes: attributes)
             }
             (item.title as NSString).draw(at: NSPoint(x: Self.checkWidth, y: y), withAttributes: attributes)
+            let key = Self.keyText(item) as NSString
+            let width = key.size(withAttributes: attributes).width
+            key.draw(at: NSPoint(x: bounds.width - 14 - width, y: y), withAttributes: attributes)
         }
     }
 }
