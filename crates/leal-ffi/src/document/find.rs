@@ -35,6 +35,12 @@ pub struct SearchProgress {
     pub rows_searched: u64,
     /// Every row has been searched.
     pub complete: bool,
+    /// Edits made since are still being counted, in the background: the
+    /// matches and "k of N" may be behind until it is false again, and
+    /// Next and Previous answer `Pending` meanwhile. While it is true, keep
+    /// asking for the progress (or await [`Search::catch_up_job`]), and
+    /// retry a pending Next or Previous once it is false.
+    pub catching_up: bool,
 }
 
 /// The answer to **Next** or **Previous** ([`Search::step`]).
@@ -264,9 +270,23 @@ impl Search {
         })
     }
 
-    /// Stops the search within one chunk. What it found is kept.
+    /// Stops the search within one chunk, and any catch-up job. What it
+    /// found is kept.
     pub fn cancel(&self) {
         self.search.cancel();
+    }
+
+    /// The job counting edits made since the search last caught up, while
+    /// one runs (`SearchProgress.catchingUp`): await it instead of polling,
+    /// then ask for the progress again, since more edits may have come
+    /// meanwhile. `nil` when none runs. Releasing the search cancels it.
+    #[must_use]
+    pub fn catch_up_job(&self) -> Option<Arc<Job>> {
+        self.search.catch_up_job().map(|job| {
+            Arc::new(Job {
+                control: job.control().clone(),
+            })
+        })
     }
 
     /// Where the search has got to.
@@ -282,6 +302,7 @@ impl Search {
                 matches: progress.matches,
                 rows_searched: to_u64(progress.rows_searched),
                 complete: progress.complete,
+                catching_up: progress.catching_up,
             })
         })
     }

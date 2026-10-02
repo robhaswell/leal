@@ -517,6 +517,9 @@
     "Save As…" : {
       "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)"
     },
+    "Save or revert your changes first." : {
+      "comment" : "Error: the file can't be read with another delimiter or encoding while it has unsaved edits"
+    },
     "Searching…" : {
       "comment" : "Find bar count while a search has found nothing yet"
     },
@@ -555,6 +558,9 @@
     },
     "That encoding doesn’t match the file’s byte order mark." : {
       "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
+    },
+    "The change couldn’t be made." : {
+      "comment" : "Error: an edit, undo or redo wasn't applied"
     },
     "The drive it’s on was disconnected." : {
       "comment" : "Open error: the removable drive holding the file vanished"

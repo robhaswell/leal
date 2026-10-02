@@ -81,6 +81,17 @@ enum OpenErrorText {
             )
         case .DeletedElsewhere:
             deletedElsewhere
+        case .UnsavedEdits:
+            // ADR-0008 decision 4's reason. Task 2.5 disables Treat As and
+            // Reopen with Encoding while there are edits; this is the core
+            // refusing if one gets through.
+            String(
+                localized: "Save or revert your changes first.",
+                comment: "Error: the file can't be read with another delimiter or encoding while it has unsaved edits"
+            )
+        case .EditRefused:
+            // Task 2.5 words each refusal where the edit is made.
+            String(localized: "The change couldn’t be made.", comment: "Error: an edit, undo or redo wasn't applied")
         case .DocumentFailed:
             documentFailed
         }

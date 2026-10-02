@@ -102,7 +102,9 @@ use crate::dialect::Encoding;
 use crate::index::{IndexDialect, IndexError};
 
 pub(crate) use collect::Collector;
-pub(crate) use find::{Hit, decided_by_bytes, field_with, has_invalid, next_hit, row_may_have};
+pub(crate) use find::{
+    Hit, decided_by_bytes, field_has, field_with, has_invalid, next_hit, row_may_have, value_has,
+};
 pub(crate) use marks::Mark;
 use marks::RowMarks;
 
@@ -448,6 +450,15 @@ impl Diagnostics {
     /// Whether row `row` is marked as `which` says.
     pub(crate) fn row_is(&self, row: usize, which: Mark) -> bool {
         self.read().marks.is(row, which)
+    }
+
+    /// How many rows have marks (the rows indexed so far, as of the last
+    /// chunk), and the most common field count they are judged against,
+    /// under one lock: for an edited row's marks (task 2.1), which are
+    /// worked out from its edits against the same count.
+    pub(crate) fn marked_rows_and_mode(&self) -> (usize, Option<usize>) {
+        let shared = self.read();
+        (shared.marks.len(), shared.marks.mode())
     }
 
     /// The encoding the diagnostics are for.

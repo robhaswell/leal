@@ -42,6 +42,7 @@ fn a_search_reaches_swift() {
             matches: 2,
             rows_searched: 4,
             complete: true,
+            catching_up: false,
         }
     );
     assert_eq!(

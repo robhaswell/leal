@@ -5,14 +5,20 @@
 //! inspector shows, and what Copy puts on the clipboard. Neither fixes
 //! anything: an invalid byte is the U+FFFD the grid shows, and text after a
 //! closing quote is copied as it reads (ADR-0002 question 6).
+//!
+//! Both read cells as they are now, edits included (ADR-0008 decision 2).
+//! A copy takes the edits as they are when it is made, and keeps them, so
+//! an edit made while a large copy runs doesn't change what it copies.
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
 use super::search::{Settled, index_ended, more_rows};
-use super::{Document, Reading, bytes_in, index_file};
+use super::view::ViewCell;
+use super::{Document, Reading, RowView, bytes_in, index_file};
 use crate::diagnostics::has_invalid;
+use crate::edit::Overlay;
 use crate::index::RowIndex;
 use crate::schedule::{Interval, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{ReadError, Source};
@@ -67,8 +73,8 @@ impl CopiedText {
 impl Document {
     /// Field `column` of physical row `row` in full (up to `max_chars`
     /// characters of it), with its length in characters and lines, for the
-    /// cell inspector. `None` if the row can't be read yet (past the
-    /// indexed rows).
+    /// cell inspector: as it reads now, edits included. `None` if the row
+    /// can't be read yet (past the indexed rows).
     ///
     /// It decodes the whole value to count it, which for a value of many
     /// megabytes takes milliseconds: call it off the main thread.
@@ -83,38 +89,45 @@ impl Document {
         max_chars: usize,
     ) -> Result<Option<CellValue>, ReadError> {
         let encoding = self.current().detection.encoding;
-        let mut values =
-            self.read_rows(row..row.saturating_add(1), |parser, bytes, base, parsed| {
-                let Some(field) = parsed.field(column) else {
-                    return CellValue {
-                        text: String::new(),
-                        truncated: false,
-                        characters: 0,
-                        lines: 0,
-                        invalid: false,
-                        exists: false,
-                    };
+        let mut values = self.read_rows(row..row.saturating_add(1), |view| {
+            let Some(cell) = view.cell(column) else {
+                return CellValue {
+                    text: String::new(),
+                    truncated: false,
+                    characters: 0,
+                    lines: 0,
+                    invalid: false,
+                    exists: false,
                 };
-                let value = parser.display_value_in(bytes, base, field);
-                let raw = field
-                    .start()
-                    .checked_sub(base)
-                    .and_then(|start| bytes.get(start..start + field.len()))
-                    .unwrap_or_default();
-                let characters = value.chars().count();
-                let shown = value
-                    .char_indices()
-                    .nth(max_chars)
-                    .map_or(value.len(), |(at, _)| at);
-                CellValue {
-                    text: value[..shown].to_owned(),
-                    truncated: shown < value.len(),
-                    characters,
-                    lines: line_count(&value),
-                    invalid: has_invalid(raw, encoding),
-                    exists: true,
+            };
+            let value = view.value_of(cell);
+            // An edited value is text: nothing in it is invalid.
+            let invalid = match cell {
+                ViewCell::Field(field) => {
+                    let (bytes, base) = (view.bytes(), view.base());
+                    let raw = field
+                        .start()
+                        .checked_sub(base)
+                        .and_then(|start| bytes.get(start..start + field.len()))
+                        .unwrap_or_default();
+                    has_invalid(raw, encoding)
                 }
-            })?;
+                ViewCell::Edited(_) | ViewCell::Padding => false,
+            };
+            let characters = value.chars().count();
+            let shown = value
+                .char_indices()
+                .nth(max_chars)
+                .map_or(value.len(), |(at, _)| at);
+            CellValue {
+                text: value[..shown].to_owned(),
+                truncated: shown < value.len(),
+                characters,
+                lines: line_count(&value),
+                invalid,
+                exists: true,
+            }
+        })?;
         Ok(values.pop())
     }
 
@@ -137,6 +150,7 @@ impl Document {
         columns: Range<usize>,
     ) -> Result<Option<String>, ReadError> {
         let reading = self.current();
+        let edits = reading.edits.overlay();
         let stale = self.head_is_stale();
         let (index, available) = reading.rows_from(&reading.index, stale);
         let settled = matches!(
@@ -153,6 +167,7 @@ impl Document {
                 &reading,
                 index,
                 (&self.source, &self.head, stale),
+                &edits,
                 rows.start..end,
                 rows.start,
                 &columns,
@@ -166,10 +181,20 @@ impl Document {
     /// the text, in bytes, so the app can ask before a very large copy:
     /// the rows' bytes in the file (past the indexed ones, the rest of the
     /// file as far as the rows reach, at the average row length so far),
-    /// times the share of the columns copied. Quick: no row is read.
+    /// times the share of the columns copied, plus the edited values among
+    /// them (an edit can make a cell much longer than the file's row was).
+    /// Quick: no row is read.
     #[must_use]
     pub fn estimated_copy_bytes(&self, rows: Range<usize>, columns: Range<usize>) -> u64 {
         let reading = self.current();
+        let edited: usize = reading
+            .edits
+            .overlay()
+            .rows_in(rows.clone())
+            .flat_map(|(_, edits)| edits.cells())
+            .filter(|(column, _)| columns.contains(column))
+            .map(|(_, value)| value.len())
+            .sum();
         let index = &reading.index;
         let indexed = index.row_count();
         let scanned = index.rows_extent(0..indexed).map_or(0, |extent| extent.end);
@@ -194,7 +219,8 @@ impl Document {
         let bytes = u128::try_from(known.saturating_add(unknown)).unwrap_or(u128::MAX);
         let share =
             bytes * u128::try_from(copied).unwrap_or(0) / u128::try_from(fields).unwrap_or(1);
-        u64::try_from(share).unwrap_or(u64::MAX)
+        let total = share.saturating_add(u128::try_from(edited).unwrap_or(u128::MAX));
+        u64::try_from(total).unwrap_or(u64::MAX)
     }
 
     /// Copies physical rows `rows` and fields `columns` as tab-separated
@@ -207,10 +233,11 @@ impl Document {
     /// are rows that can't be read because the index stopped with a read
     /// error (its drive vanished); a short row's missing cells are empty.
     ///
-    /// The job keeps what it reads: this reading and the file's bytes (its
-    /// clone). So it finishes, with the cells as they were when it
-    /// started, even if the document closes or the file is read again
-    /// meanwhile: the app has promised its text to the pasteboard. If the
+    /// The job keeps what it reads: this reading, the file's bytes (its
+    /// clone) and the edits as they are now (ADR-0008 decision 2). So it
+    /// finishes, with the cells as they were when it started, even if the
+    /// document closes or the file is read again meanwhile: the app has
+    /// promised its text to the pasteboard. If the
     /// document's index stops before reaching the rows (closing cancels
     /// it), the job has the file indexed again for itself, by an index pass
     /// of its own, which streams a file on a removable drive in chunks.
@@ -221,6 +248,8 @@ impl Document {
     /// versions of the file (p1-review fid-2).
     pub fn copy_cells(&self, rows: Range<usize>, columns: Range<usize>) -> JobHandle<CopiedText> {
         let reading = self.current();
+        // The edits when the copy is made: later ones don't change it.
+        let edits = reading.edits.overlay();
         let source = Arc::clone(&self.source);
         let head = Arc::clone(&self.head);
         let scheduler = self.scheduler.clone();
@@ -280,6 +309,7 @@ impl Document {
                         &reading,
                         index,
                         (&source, &head, stale),
+                        &edits,
                         next..end,
                         rows.start,
                         &columns,
@@ -332,13 +362,18 @@ impl Drop for OwnIndex {
 /// Appends rows `rows` (all in `index`) of a copy that starts at row
 /// `first` to `out`: a line break before each row but the first, a tab
 /// between fields `columns`, and each display value as [`push_tsv_cell`]
-/// writes it. The bytes come from `file`, the source, the first 64 KB and
-/// whether they are stale, as [`bytes_in`] gives them. Returns whether they
-/// came from the first 64 KB.
+/// writes it, with `edits` on top. The bytes come from `file`, the source,
+/// the first 64 KB and whether they are stale, as [`bytes_in`] gives them.
+/// Returns whether they came from the first 64 KB.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one thing a copy step needs; a struct would hold only these"
+)]
 fn append_rows(
     reading: &Reading,
     index: &RowIndex,
     file: (&Source, &[u8], bool),
+    edits: &Overlay,
     rows: Range<usize>,
     first: usize,
     columns: &Range<usize>,
@@ -355,12 +390,20 @@ fn append_rows(
         let parsed = reading
             .parser
             .parse_row_in(index, row, &bytes, extent.start);
+        let view = parsed.as_ref().map(|parsed| {
+            RowView::new(
+                &reading.parser,
+                &bytes,
+                extent.start,
+                parsed,
+                edits.row(row),
+            )
+        });
         for column in columns.clone() {
             if column > columns.start {
                 out.push('\t');
             }
-            if let Some(field) = parsed.as_ref().and_then(|p| p.field(column)) {
-                let value = reading.parser.display_value_in(&bytes, extent.start, field);
+            if let Some(value) = view.as_ref().and_then(|view| view.value(column)) {
                 push_tsv_cell(out, &value);
             }
         }

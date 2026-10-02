@@ -122,6 +122,16 @@ impl RowMarks {
         self.codes.capacity() + self.wide.capacity() * std::mem::size_of::<(u32, u32)>()
     }
 
+    /// How many rows have a code: the rows indexed so far.
+    pub(crate) fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// The most common field count among the rows so far.
+    pub(crate) fn mode(&self) -> Option<usize> {
+        self.mode
+    }
+
     /// True if `row` has a warning or an error. False for a row that isn't
     /// indexed yet.
     pub(crate) fn has(&self, row: usize) -> bool {

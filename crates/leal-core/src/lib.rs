@@ -9,6 +9,7 @@ pub mod detect;
 pub mod diagnostics;
 pub mod dialect;
 pub mod document;
+pub mod edit;
 pub mod find;
 mod growth;
 pub mod index;

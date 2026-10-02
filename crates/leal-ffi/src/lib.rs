@@ -20,10 +20,11 @@ mod platform;
 mod document;
 
 pub use document::{
-    Cell, CellMatch, CellValue, CopyJob, Delimiter, DialectSource, Document, EncodingSource,
-    FirstScreen, IndexProgress, Interpretation, Job, JobFailure, LineEnding, OpenOptions,
-    ProgressObserver, ReviewResult, RowCells, Scheduler, Search, SearchProgress, SearchStep,
-    TextEncoding, TextRange, open_document,
+    Cell, CellEdit, CellMatch, CellPlace, CellValue, CopyJob, Delimiter, DialectSource, Document,
+    EditCommand, EditRefusal, EncodingSource, FirstScreen, IndexProgress, Interpretation, Job,
+    JobFailure, LineEnding, OpenOptions, ProgressObserver, RefusedCommand, ReplayReport,
+    ReviewResult, RowCells, Scheduler, Search, SearchProgress, SearchStep, TextEncoding, TextRange,
+    ValueChange, open_document,
 };
 
 use std::path::{Path, PathBuf};
@@ -114,6 +115,27 @@ pub enum LealError {
         /// The path that was opened.
         path: String,
     },
+    /// The file has unsaved edits, so it can't be read with another
+    /// delimiter or encoding (ADR-0008 decision 4). The app disables
+    /// **Treat As** and **Reopen with Encoding** meanwhile ("Save or revert
+    /// your changes first"); this is the core refusing if one gets through.
+    UnsavedEdits {
+        /// The document's path.
+        path: String,
+    },
+    /// An edit, or an undo, redo or replayed command, wasn't applied: the
+    /// document is unchanged (task 2.1).
+    EditRefused {
+        /// The document's path.
+        path: String,
+        /// Why.
+        refusal: EditRefusal,
+        /// The first cell that couldn't be changed: its row, if the refusal
+        /// is about one.
+        row: Option<u64>,
+        /// Its column, if the refusal is about one.
+        column: Option<u32>,
+    },
     /// The document failed after a panic (DESIGN §3.9): Leal makes no
     /// more calls on it. The app shows an error and offers to reopen the
     /// file.
@@ -181,6 +203,19 @@ impl std::fmt::Display for LealError {
             Self::DeletedElsewhere { path } => {
                 write!(f, "{path} was deleted on its network share")
             }
+            Self::UnsavedEdits { path } => write!(
+                f,
+                "{path} can't be read another way while it has unsaved edits"
+            ),
+            Self::EditRefused {
+                path,
+                refusal,
+                row,
+                column,
+            } => write!(
+                f,
+                "an edit to {path} wasn't applied: {refusal:?} at row {row:?}, column {column:?}"
+            ),
             Self::DocumentFailed { path, message } => {
                 write!(f, "the document {path} failed: {message}")
             }

@@ -50,14 +50,26 @@
 //! delimiter, header or encoding (**Treat as**, **Reopen with encoding…**)
 //! without reopening it: it cancels the old jobs and starts new ones.
 //!
+//! **Edits** (task 2.1, [`crate::edit`]). [`Document::set_cell`] edits a
+//! cell and returns the command, which the app's undo manager keeps;
+//! [`Document::apply`] undoes and redoes, and [`Document::replay`]
+//! recovers a failed document's edits into a fresh one. The edits live in
+//! an overlay shared by the readings that split the file the same way.
+//! Every reader (the grid, the inspector, Copy, Find, the diagnostics marks
+//! and number detection) sees a row through a `RowView`, the row's fields
+//! with the overlay on top, so they all show the cells as they read now
+//! (ADR-0008 decision 2).
+//!
 //! [`Indexer::run`]: crate::index::Indexer::run
 //! [`Indexer::chunked`]: crate::index::Indexer::chunked
 //! [`Priority::P3`]: crate::schedule::Priority::P3
 
+mod editing;
 mod search;
 #[cfg(test)]
 mod tests;
 mod values;
+mod view;
 
 pub use search::{
     CellMatch, SEARCH_CHUNK_BYTES, Search, SearchProgress, SearchStep, SearchSummary,
@@ -79,6 +91,7 @@ use crate::diagnostics::{
     next_hit, row_may_have,
 };
 use crate::dialect::{Encoding, QUOTE};
+use crate::edit::{EditStore, Kinds, Overlay, RowEdits};
 use crate::index::{
     DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
     Status,
@@ -93,6 +106,7 @@ use crate::source::{
     OpenError, Original, OriginalState, OriginalStatus, ReadError, ReadErrorKind, Source, Storage,
     TempFolders, VolumeInfo,
 };
+use view::RowView;
 
 /// Where an occurrence of a diagnostic is, for the details popover's
 /// **Previous** and **Next** (task 1.7): the cell to select.
@@ -281,6 +295,10 @@ pub enum DocumentError {
         /// The file's length.
         len: u64,
     },
+    /// The file has unsaved edits, so it can't be read with another
+    /// delimiter or encoding (ADR-0008 decision 4): edits are tied to how
+    /// the file was split into cells. The header row can still change.
+    UnsavedEdits,
     /// Detection gave a dialect the index or the row parser refused. This
     /// is a bug; the message is English, for logs.
     Internal(String),
@@ -295,6 +313,9 @@ impl fmt::Display for DocumentError {
             DocumentError::TooLarge { len } => write!(
                 f,
                 "the file is {len} bytes; Leal reads files of up to {MAX_FILE_BYTES} bytes"
+            ),
+            DocumentError::UnsavedEdits => f.write_str(
+                "the file can't be read with another delimiter or encoding while it has unsaved edits",
             ),
             DocumentError::Internal(message) => f.write_str(message),
         }
@@ -335,9 +356,11 @@ pub struct Document {
     progress: Option<ProgressCallback>,
     /// The next reading's generation.
     generations: AtomicU64,
-    /// Held by `reinterpret`, so two at once can't leave a reading whose
-    /// jobs nobody cancels.
-    reinterpreting: Mutex<()>,
+    /// Held while the document changes (`reinterpret`, `restart` and every
+    /// edit), so changes happen one at a time: two reinterprets can't leave
+    /// a reading whose jobs nobody cancels, and an edit can't be checked
+    /// against one reading and land in the next.
+    writer: Mutex<()>,
     /// Counts kind searches (`next_with_kind`): a search stops when a
     /// newer one starts.
     searches: AtomicU64,
@@ -370,6 +393,10 @@ struct Reading {
     /// Set once the row cache has been emptied after the file changed
     /// while it was read ([`Document::rows`]).
     cache_dropped: AtomicBool,
+    /// The document's edits (task 2.1). Shared with the readings before and
+    /// after this one while they split the file the same way, so the header
+    /// toggle and a drive reconnecting keep them (ADR-0008 decision 4).
+    edits: Arc<EditStore>,
 }
 
 /// First paint's result (P0), before any job starts.
@@ -465,7 +492,7 @@ impl Document {
         let head: Arc<[u8]> = Arc::from(&*source.read_head(FIRST_PAINT_BYTES)?);
         let source = Arc::new(source);
         let paint = read_first_paint(&source, &head, options.choices)?;
-        let screen = first_screen(&head, len, 0, &paint, options);
+        let screen = first_screen(&head, len, 0, &paint, options, &Overlay::default());
         // First paint is done: everything after this is background work.
         drop(first_paint);
         let context = Context {
@@ -473,7 +500,7 @@ impl Document {
             scheduler,
             progress: progress.as_ref(),
         };
-        let reading = start_jobs(&context, 0, paint, options.choices);
+        let reading = start_jobs(&context, 0, paint, options.choices, Arc::default());
         // One look at the user's file now (a few system calls), so a change
         // between opening it and here isn't missed; watching it starts when
         // the app asks (`watch_original`).
@@ -483,7 +510,7 @@ impl Document {
             head,
             progress,
             generations: AtomicU64::new(1),
-            reinterpreting: Mutex::new(()),
+            writer: Mutex::new(()),
             searches: AtomicU64::new(0),
             reading: RwLock::new(Arc::new(reading)),
             source,
@@ -501,7 +528,10 @@ impl Document {
     /// # Errors
     ///
     /// [`DocumentError::Choice`] if the chosen encoding doesn't fit the
-    /// file's BOM, and [`DocumentError::Read`] with
+    /// file's BOM, [`DocumentError::UnsavedEdits`] if the file has edits
+    /// and would be split into cells another way (another delimiter or
+    /// encoding: ADR-0008 decision 4; the header row can change, and the
+    /// edits are kept), and [`DocumentError::Read`] with
     /// [`ReadErrorKind::ChangedOnDisk`] once the file changed while it was
     /// read ([`changed_on_disk`](Self::changed_on_disk)). The document is
     /// then unchanged.
@@ -518,31 +548,37 @@ impl Document {
         first_screen_rows: usize,
         max_chars: usize,
     ) -> Result<FirstScreen, DocumentError> {
-        let _one_at_a_time = self
-            .reinterpreting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let first_paint = self.scheduler.interval(Interval::FirstPaint);
         let paint = read_first_paint(&self.source, &self.head, choices)?;
         // Checked after detection, so a change noticed meanwhile counts.
         self.refuse_once_stale()?;
+        let old = self.current();
+        let edits = edits_after(&old, &paint.detection)?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let options = OpenOptions {
             choices,
             first_screen_rows,
             max_chars,
         };
-        let screen = first_screen(&self.head, self.source.len(), generation, &paint, options);
+        let screen = first_screen(
+            &self.head,
+            self.source.len(),
+            generation,
+            &paint,
+            options,
+            &edits.overlay(),
+        );
         drop(first_paint);
         // Stop the old jobs first: a removable drive's stream is one pass
         // at a time, so the new index waits for the old one to stop.
-        self.current().cancel();
+        old.cancel();
         let context = Context {
             source: &self.source,
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
-        let reading = start_jobs(&context, generation, paint, choices);
+        let reading = start_jobs(&context, generation, paint, choices, edits);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reading);
         Ok(screen)
     }
@@ -552,13 +588,13 @@ impl Document {
     /// came back, so the index pass carries on copying it. The first screen
     /// is the same as before.
     fn restart(&self) -> Result<u64, DocumentError> {
-        let _one_at_a_time = self
-            .reinterpreting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let old = self.current();
         let paint = read_first_paint(&self.source, &self.head, old.choices)?;
         self.refuse_once_stale()?;
+        // The same choices on the same bytes split the file the same way,
+        // so the edits carry on (ADR-0008 decision 4).
+        let edits = edits_after(&old, &paint.detection)?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         old.cancel();
         let context = Context {
@@ -566,7 +602,7 @@ impl Document {
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
-        let reading = start_jobs(&context, generation, paint, old.choices);
+        let reading = start_jobs(&context, generation, paint, old.choices, edits);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reading);
         Ok(generation)
     }
@@ -584,7 +620,9 @@ impl Document {
     /// Rows `rows` (as many of them as can be read now), each as its
     /// cells, with at most `max_chars` characters of each. Fast enough for
     /// the main thread: it reads the rows' bytes once, as one range, and
-    /// keeps recently parsed rows in a small cache.
+    /// keeps recently parsed rows in a small cache. Cells are as they read
+    /// now: an edited row has its edited values, and as many cells as it
+    /// has now (a hatched cell edited past its end lengthens it).
     ///
     /// Rows the index hasn't reached yet, beyond those in the first 64 KB,
     /// aren't returned: the result is shorter, or empty.
@@ -597,9 +635,7 @@ impl Document {
     /// vanished ([`ReadErrorKind::Disconnected`]) or the file was deleted on
     /// its share ([`ReadErrorKind::Deleted`]).
     pub fn rows(&self, rows: Range<usize>, max_chars: usize) -> Result<Vec<Vec<Cell>>, ReadError> {
-        self.read_rows(rows, |parser, bytes, base, row| {
-            cells(parser, bytes, base, row.fields(), max_chars)
-        })
+        self.read_rows(rows, |view| row_cells(&view, max_chars))
     }
 
     /// Rows `rows`, as for [`rows`](Self::rows), but only their cells in
@@ -618,17 +654,22 @@ impl Document {
         columns: Range<usize>,
         max_chars: usize,
     ) -> Result<Vec<RowCells>, ReadError> {
-        self.read_rows(rows, |parser, bytes, base, row| {
-            let fields = row.fields();
-            // A short row may end before the window starts.
-            let count = fields.len();
+        self.read_rows(rows, |view| {
+            let count = view.len();
+            // Clamped to the row: a window past its end is empty. (`clamp`
+            // panics if its minimum is past its maximum, so the start is
+            // clamped first.)
             let start = columns.start.min(count);
-            let window = fields
-                .get(start..columns.end.clamp(start, count))
-                .unwrap_or_default();
+            let window = start..columns.end.clamp(start, count);
+            let cells = if view.edits().is_none() {
+                let fields = view.parsed().fields().get(window).unwrap_or_default();
+                cells(view.parser(), view.bytes(), view.base(), fields, max_chars)
+            } else {
+                edited_cells(&view, window, max_chars)
+            };
             RowCells {
-                field_count: fields.len(),
-                cells: cells(parser, bytes, base, window, max_chars),
+                field_count: count,
+                cells,
             }
         })
     }
@@ -655,26 +696,23 @@ impl Document {
     pub fn numeric_columns(&self, sample: usize) -> Result<Vec<bool>, ReadError> {
         let first = usize::from(self.current().detection.header);
         let mut columns = NumericColumns::new();
-        self.read_rows(
-            first..first.saturating_add(sample),
-            |parser, bytes, base, row| {
-                for (column, field) in row.fields().iter().enumerate() {
-                    let (text, truncated) =
-                        parser.display_prefix_in(bytes, base, field, NUMBER_MAX_CHARS);
+        self.read_rows(first..first.saturating_add(sample), |view| {
+            for column in 0..view.len() {
+                if let Some((text, truncated)) = view.prefix(column, NUMBER_MAX_CHARS) {
                     columns.add(column, &text, truncated);
                 }
-            },
-        )?;
+            }
+        })?;
         Ok(columns.result())
     }
 
     /// Reads rows `rows` (as many as can be read now) and hands each to
-    /// `each`, with the parser, the bytes holding them and the bytes'
-    /// offset in the file. One read of the file per call.
+    /// `each`, as it reads now: its parsed fields, with the edit overlay on
+    /// top ([`RowView`]). One read of the file per call.
     fn read_rows<T>(
         &self,
         rows: Range<usize>,
-        each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
+        each: impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
         self.read_rows_of(&self.current(), rows, each)
     }
@@ -684,7 +722,7 @@ impl Document {
         &self,
         reading: &Reading,
         rows: Range<usize>,
-        mut each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
+        mut each: impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
         // One look, so the rows and their bytes agree on whether the first
         // 64 KB can be trusted.
@@ -700,19 +738,30 @@ impl Document {
         // `each` runs: `each` may decode whole values, megabytes long for
         // the inspector (`cell_value`), and the main thread's `rows` needs
         // the lock meanwhile (p1-review conc-2).
-        let parsed: Vec<Arc<ParsedRow>> = {
+        let parsed: Vec<(usize, Arc<ParsedRow>)> = {
             let mut cache = reading.cache.lock().unwrap_or_else(PoisonError::into_inner);
             if stale && !reading.cache_dropped.swap(true, Ordering::AcqRel) {
                 // Rows parsed before the change was noticed may be from
                 // either version of the file.
                 cache.clear();
             }
-            rows.filter_map(|r| cache.row_in(index, r, &bytes, base))
+            rows.filter_map(|r| Some((r, cache.row_in(index, r, &bytes, base)?)))
                 .collect()
         };
+        // One look at the edits for the whole call: a reference count, and
+        // for each row a look-up that finds nothing when there are no edits.
+        let overlay = reading.edits.overlay();
         Ok(parsed
             .iter()
-            .map(|row| each(&reading.parser, &bytes, base, row))
+            .map(|(r, row)| {
+                each(RowView::new(
+                    &reading.parser,
+                    &bytes,
+                    base,
+                    row,
+                    overlay.row(*r),
+                ))
+            })
             .collect())
     }
 
@@ -829,44 +878,110 @@ impl Document {
 
     /// True if row `row` has a warning or an error, for its gutter marker
     /// (every such row, not only the report's first locations). False for a
-    /// row not indexed yet.
+    /// row not indexed yet. An edited row is marked as it reads now: its
+    /// edited cells are checked on their new values, and its field count is
+    /// the one it has now (ADR-0008 decision 2).
     #[must_use]
     pub fn row_has_diagnostic(&self, row: usize) -> bool {
-        self.current()
-            .diagnostics
-            .get()
-            .is_some_and(|diagnostics| diagnostics.row_has_diagnostic(row))
+        let reading = self.current();
+        let Some(diagnostics) = reading.diagnostics.get() else {
+            return false;
+        };
+        let overlay = reading.edits.overlay();
+        if let Some(edits) = overlay.row(row) {
+            let (marked, mode) = diagnostics.marked_rows_and_mode();
+            let len = self.edited_len(&reading, row, edits);
+            return row < marked && edited_flags(len, edits, mode).marked;
+        }
+        diagnostics.row_has_diagnostic(row)
     }
 
     /// The first row at or after `from` with a warning or an error, for
-    /// **Next**.
+    /// **Next**. Edited rows are marked as they read now, as for
+    /// [`row_has_diagnostic`](Self::row_has_diagnostic).
     #[must_use]
     pub fn next_row_with_diagnostic(&self, from: usize) -> Option<usize> {
-        self.current()
-            .diagnostics
-            .get()?
-            .next_row_with_diagnostic(from)
+        let reading = self.current();
+        let diagnostics = reading.diagnostics.get()?;
+        let overlay = reading.edits.overlay();
+        if overlay.is_empty() {
+            return diagnostics.next_row_with_diagnostic(from);
+        }
+        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let mut at = from;
+        loop {
+            // The next row the file's own marks give, and any edited row
+            // up to it that is marked now.
+            let next = diagnostics.next_row_with_diagnostic(at);
+            let end = next.map_or(marked, |row| row + 1).min(marked);
+            if let Some((row, _)) = overlay.rows_in(at..end).find(|&(row, edits)| {
+                edited_flags(self.edited_len(&reading, row, edits), edits, mode).marked
+            }) {
+                return Some(row);
+            }
+            let row = next?;
+            if !overlay.contains(row) {
+                return Some(row);
+            }
+            at = row + 1;
+        }
     }
 
     /// The last row before `to` with a warning or an error, for
-    /// **Previous**.
+    /// **Previous**. Edited rows are marked as they read now.
     #[must_use]
     pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
-        self.current()
-            .diagnostics
-            .get()?
-            .previous_row_with_diagnostic(to)
+        let reading = self.current();
+        let diagnostics = reading.diagnostics.get()?;
+        let overlay = reading.edits.overlay();
+        if overlay.is_empty() {
+            return diagnostics.previous_row_with_diagnostic(to);
+        }
+        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let mut at = to;
+        loop {
+            let previous = diagnostics.previous_row_with_diagnostic(at);
+            let start = previous.unwrap_or(0);
+            if let Some((row, _)) =
+                overlay
+                    .rows_in(start..at.min(marked))
+                    .rev()
+                    .find(|&(row, edits)| {
+                        edited_flags(self.edited_len(&reading, row, edits), edits, mode).marked
+                    })
+            {
+                return Some(row);
+            }
+            let row = previous?;
+            if !overlay.contains(row) {
+                return Some(row);
+            }
+            at = row;
+        }
     }
 
     /// Each of rows `rows`' marks (task 1.7): whether its gutter has a
     /// marker, and whether it is ragged, so its missing cells are hatched
     /// (ADR-0002 questions 5 and 7). Rows not indexed yet are unmarked.
+    /// Edited rows are marked as they read now: a short row whose hatched
+    /// cells were filled in up to the common field count is no longer
+    /// ragged, for example.
     #[must_use]
     pub fn row_flags(&self, rows: Range<usize>) -> Vec<RowFlags> {
-        match self.current().diagnostics.get() {
-            Some(diagnostics) => diagnostics.row_flags(rows),
-            None => vec![RowFlags::default(); rows.len()],
+        let reading = self.current();
+        let Some(diagnostics) = reading.diagnostics.get() else {
+            return vec![RowFlags::default(); rows.len()];
+        };
+        let mut flags = diagnostics.row_flags(rows.clone());
+        let overlay = reading.edits.overlay();
+        if !overlay.is_empty() {
+            let (marked, mode) = diagnostics.marked_rows_and_mode();
+            for (row, edits) in overlay.rows_in(rows.start..rows.end.min(marked)) {
+                let len = self.edited_len(&reading, row, edits);
+                flags[row - rows.start] = edited_flags(len, edits, mode);
+            }
         }
+        flags
     }
 
     /// The first occurrence of `kind` in a row at or after `from`, for
@@ -924,15 +1039,56 @@ impl Document {
             return Ok(None);
         };
         let report = diagnostics.report();
-        self.search_kind(
-            &reading,
-            diagnostics,
-            &report,
-            kind,
-            start,
-            direction,
-            search,
-        )
+        let overlay = reading.edits.overlay();
+        if overlay.is_empty() {
+            return self.search_kind(
+                &reading,
+                diagnostics,
+                &report,
+                kind,
+                start,
+                direction,
+                search,
+            );
+        }
+        // With edits: the next occurrence in the file's own rows, unless an
+        // edited row before it has the kind now. An edited row the file's
+        // rows give is passed over, since it was checked as it reads now.
+        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let has = |row: usize, edits: &RowEdits| match kind {
+            DiagnosticKind::RaggedRows => {
+                mode.is_some_and(|mode| self.edited_len(&reading, row, edits) != mode)
+            }
+            other => edits.kinds().contains(Kinds::of(other)),
+        };
+        let forward = direction == Direction::Forward;
+        let mut at = start;
+        loop {
+            let found =
+                self.search_kind(&reading, diagnostics, &report, kind, at, direction, search)?;
+            let edited = if forward {
+                let end = found.map_or(marked, |place| place.row + 1).min(marked);
+                overlay
+                    .rows_in(at..end)
+                    .find(|&(row, edits)| has(row, edits))
+            } else {
+                let start = found.map_or(0, |place| place.row);
+                overlay
+                    .rows_in(start..at.min(marked))
+                    .rev()
+                    .find(|&(row, edits)| has(row, edits))
+            };
+            if let Some((row, _)) = edited {
+                return self.place(&reading, kind, row);
+            }
+            let Some(place) = found else {
+                return Ok(None);
+            };
+            if !overlay.contains(place.row) {
+                return Ok(Some(place));
+            }
+            at = if forward { place.row + 1 } else { place.row };
+        }
     }
 
     /// [`step_to_kind`](Self::step_to_kind), with the report it trusts
@@ -1082,25 +1238,28 @@ impl Document {
 
     /// Where `kind` is in `row`, which has it: the row, and the column to
     /// select. For a ragged row, its first missing cell (a short row) or
-    /// first extra one (a long row); otherwise the first field with the
-    /// kind.
+    /// first extra one (a long row); otherwise the first cell with the
+    /// kind. An edited row is looked at as it reads now.
     fn place(
         &self,
         reading: &Reading,
         kind: DiagnosticKind,
         row: usize,
     ) -> Result<Option<Place>, ReadError> {
+        let overlay = reading.edits.overlay();
         let column = match self.row_bytes(reading, row)? {
             Some(RowBytes { bytes, base, index }) => reading
                 .parser
                 .parse_row_in(index, row, &bytes, base)
                 .and_then(|parsed| {
+                    let view =
+                        RowView::new(&reading.parser, &bytes, base, &parsed, overlay.row(row));
                     if kind == DiagnosticKind::RaggedRows {
-                        let fields = parsed.fields().len();
+                        let cells = view.len();
                         let mode = reading.index.field_count_mode();
-                        Some(mode.map_or(fields, |mode| fields.min(mode)))
+                        Some(mode.map_or(cells, |mode| cells.min(mode)))
                     } else {
-                        field_with(kind, reading.detection.encoding, &bytes, base, &parsed)
+                        view.first_with(kind)
                     }
                 }),
             None => None,
@@ -1360,24 +1519,21 @@ fn read_first_paint(
     })
 }
 
-/// The first screen's rows, from the first 64 KB alone.
+/// The first screen's rows, from the first 64 KB alone, with `edits` (a
+/// reading that keeps the edits: a new header choice).
 fn first_screen(
     head: &[u8],
     len: u64,
     generation: u64,
     paint: &FirstPaint,
     options: OpenOptions,
+    edits: &Overlay,
 ) -> FirstScreen {
     let rows = (0..paint.head_rows.min(options.first_screen_rows))
         .filter_map(|r| {
             let row = paint.parser.parse_row(&paint.head_index, r, head)?;
-            Some(cells(
-                &paint.parser,
-                head,
-                0,
-                row.fields(),
-                options.max_chars,
-            ))
+            let view = RowView::new(&paint.parser, head, 0, &row, edits.row(r));
+            Some(row_cells(&view, options.max_chars))
         })
         .collect();
     FirstScreen {
@@ -1396,6 +1552,7 @@ fn start_jobs(
     generation: u64,
     paint: FirstPaint,
     choices: Choices,
+    edits: Arc<EditStore>,
 ) -> Reading {
     let FirstPaint {
         detection,
@@ -1428,6 +1585,25 @@ fn start_jobs(
         review_job,
         cache: Mutex::new(RowCache::new(parser, DEFAULT_CACHE_ROWS)),
         cache_dropped: AtomicBool::new(false),
+        edits,
+    }
+}
+
+/// The edits a new reading of the file starts with, after `old`: `old`'s,
+/// if the new one splits the file into cells the same way (the same
+/// delimiter, encoding and BOM: a new header choice, or the same choices
+/// again after a drive came back), otherwise none, which is allowed only if
+/// `old` has none (ADR-0008 decision 4).
+fn edits_after(old: &Reading, detection: &Detection) -> Result<Arc<EditStore>, DocumentError> {
+    let same_split = old.detection.delimiter == detection.delimiter
+        && old.detection.encoding == detection.encoding
+        && old.detection.bom == detection.bom;
+    if same_split {
+        Ok(Arc::clone(&old.edits))
+    } else if old.edits.is_empty() {
+        Ok(Arc::default())
+    } else {
+        Err(DocumentError::UnsavedEdits)
     }
 }
 
@@ -1575,6 +1751,36 @@ fn unavailable(source: &Source) -> JobError {
     }
 }
 
+impl Document {
+    /// How many cells edited row `row` has now, as its `RowView` counts
+    /// them ([`RowView::len`]). While the first 64 KB are trusted that is
+    /// the count kept with its edits, made from the same bytes as any read
+    /// of the row now, so no row is read. Once they are stale, the row is
+    /// read from the trusted copy (it may not be there: then the kept
+    /// count).
+    fn edited_len(&self, reading: &Reading, row: usize, edits: &RowEdits) -> usize {
+        if !self.head_is_stale() {
+            return edits.len();
+        }
+        self.read_rows_of(reading, row..row + 1, |view| view.len())
+            .ok()
+            .and_then(|lens| lens.first().copied())
+            .unwrap_or_else(|| edits.len())
+    }
+}
+
+/// An edited row's marks as it reads now, `len` cells long, against the
+/// most common field count `mode`. An edited row is never blank: a blank
+/// line's one cell edited, or a cell past it, gives it a field with bytes
+/// or a second one.
+fn edited_flags(len: usize, edits: &RowEdits, mode: Option<usize>) -> RowFlags {
+    let ragged = mode.is_some_and(|mode| len != mode);
+    RowFlags {
+        marked: ragged || !edits.kinds().is_empty(),
+        ragged,
+    }
+}
+
 /// Cells for `fields` of a parsed row. `bytes` are the file's bytes from
 /// `base` on, and hold the row.
 fn cells(
@@ -1592,6 +1798,34 @@ fn cells(
                 text: text.into_owned(),
                 truncated,
             }
+        })
+        .collect()
+}
+
+/// Every cell of a row as it reads now. A row with no edits takes the same
+/// path as before edits existed ([`cells`]).
+fn row_cells(view: &RowView<'_>, max_chars: usize) -> Vec<Cell> {
+    if view.edits().is_none() {
+        return cells(
+            view.parser(),
+            view.bytes(),
+            view.base(),
+            view.parsed().fields(),
+            max_chars,
+        );
+    }
+    edited_cells(view, 0..view.len(), max_chars)
+}
+
+/// Cells `columns` of an edited row, as it reads now.
+fn edited_cells(view: &RowView<'_>, columns: Range<usize>, max_chars: usize) -> Vec<Cell> {
+    columns
+        .filter_map(|column| {
+            let (text, truncated) = view.prefix(column, max_chars)?;
+            Some(Cell {
+                text: text.into_owned(),
+                truncated,
+            })
         })
         .collect()
 }

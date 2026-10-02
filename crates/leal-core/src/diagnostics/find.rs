@@ -31,24 +31,48 @@ pub(crate) fn field_with(
     base: usize,
     row: &ParsedRow,
 ) -> Option<usize> {
-    let raw = |field: &FieldSpan| -> &[u8] {
+    row.fields()
+        .iter()
+        .position(|field| field_has(kind, encoding, bytes, base, field))
+}
+
+/// Whether `field` has an occurrence of the field-level `kind` (or is the
+/// unterminated quote). `bytes` are the file's bytes from offset `base` on,
+/// and hold the field. `false` for every other kind.
+pub(crate) fn field_has(
+    kind: DiagnosticKind,
+    encoding: Encoding,
+    bytes: &[u8],
+    base: usize,
+    field: &FieldSpan,
+) -> bool {
+    let raw = || -> &[u8] {
         let span = field.span();
         span.start
             .checked_sub(base)
             .and_then(|start| bytes.get(start..start + span.len()))
             .unwrap_or_default()
     };
-    let has: &dyn Fn(&FieldSpan) -> bool = match kind {
-        DiagnosticKind::TextAfterClosingQuote => &|field| field.text_after_quote().is_some(),
-        DiagnosticKind::UnterminatedQuote => &|field| field.unterminated(),
-        DiagnosticKind::NulBytes => &|field| has_nul(raw(field), encoding),
-        DiagnosticKind::InvalidEncoding => &|field| has_invalid(raw(field), encoding),
+    match kind {
+        DiagnosticKind::TextAfterClosingQuote => field.text_after_quote().is_some(),
+        DiagnosticKind::UnterminatedQuote => field.unterminated(),
+        DiagnosticKind::NulBytes => has_nul(raw(), encoding),
+        DiagnosticKind::InvalidEncoding => has_invalid(raw(), encoding),
         DiagnosticKind::RaggedRows
         | DiagnosticKind::MixedLineEndings
         | DiagnosticKind::BlankLines
-        | DiagnosticKind::BomPresent => return None,
-    };
-    row.fields().iter().position(has)
+        | DiagnosticKind::BomPresent => false,
+    }
+}
+
+/// Whether an edited cell's new value has an occurrence of the field-level
+/// `kind`, checked on the value itself (ADR-0008 decision 2). Only a NUL
+/// can be in one: the value is text, so nothing in it is invalid, and the
+/// save quotes it as it needs (DESIGN §3.7), so it has no text after a
+/// closing quote and no unterminated quote. A character the file's
+/// encoding can't hold isn't a diagnostic: saving names it (F5).
+pub(crate) fn value_has(kind: DiagnosticKind, value: &str) -> bool {
+    kind == DiagnosticKind::NulBytes && value.contains('\0')
 }
 
 /// Whether a row whose bytes (line ending included) are `raw` may have

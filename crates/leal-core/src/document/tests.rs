@@ -1118,7 +1118,7 @@ fn the_row_cache_is_not_locked_while_rows_are_read() {
     let free = |rows: Range<usize>| {
         let reading = document.current();
         document
-            .read_rows(rows, |_, _, _, _| reading.cache.try_lock().is_ok())
+            .read_rows(rows, |_| reading.cache.try_lock().is_ok())
             .unwrap()
     };
     assert_eq!(free(0..3), [true; 3], "from the first 64 KB");
@@ -2228,5 +2228,6 @@ fn a_write_to_a_file_read_without_a_clone_is_caught_by_its_event() {
     drop(image);
 }
 
+mod edits;
 mod find;
 mod share;

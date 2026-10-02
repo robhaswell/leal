@@ -31,18 +31,57 @@
 //! for the query ([`Matcher::raw_candidates`]); only rows where it shows up
 //! are split into fields, and only fields where it shows up are checked
 //! value by value. Otherwise (another encoding, or a query with U+FFFD)
-//! every value is checked.
+//! every value is checked. An edited row is never passed over: if the
+//! query is nowhere in its bytes, only its edited values are checked,
+//! otherwise every cell as it reads now.
+//!
+//! **Edits** (ADR-0008 decision 2). A match is a cell as it reads now, so
+//! an edited cell matches on its new value, and stops matching on the one
+//! it replaced. A search keeps up with edits made while it runs or after it
+//! finished: the document logs the row each edit touches, and the search
+//! recounts the rows logged since it last caught up, among those it has
+//! searched, then rebuilds its running counts in one pass (O(M + K) for M
+//! matching rows and K edited ones). The search's job catches up after
+//! each chunk; a chunk searched with older edits than the latest is caught
+//! up the same way, so no count is ever of a mixture. A query from the main
+//! thread does at most a little of it itself (a few rows, while the counts
+//! are small), and otherwise starts a job to do it and says the counts are
+//! catching up ([`SearchProgress::catching_up`]).
 
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::task::Poll;
 
-use super::{Document, Place, Reading, bytes_in};
+use super::{Document, Place, Reading, RowView, bytes_in};
+use crate::edit::RowEdits;
 use crate::find::{FindError, Matcher, Query};
 use crate::index::{RowIndex, Status};
-use crate::schedule::{Interval, Job, JobControl, JobError, JobHandle, Priority};
+use crate::schedule::{Interval, Job, JobControl, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{ReadError, Source};
+
+/// The most edited rows a main-thread query recounts itself before it
+/// leaves the rest to a job.
+const INLINE_ROWS: usize = 64;
+
+/// The most matching rows a main-thread query rebuilds the running counts
+/// over (a pass over them, about a tenth of a millisecond at this size).
+const INLINE_MATCHING_ROWS: usize = 1 << 16;
+
+/// How many rows a catch-up job recounts between checkpoints (DESIGN §3.10
+/// rule 3): a millisecond or so of rows of ordinary width.
+const CATCH_UP_ROWS: usize = 256;
+
+/// Who is catching a search's counts up ([`SearchState::catch_up`]).
+#[derive(Clone, Copy)]
+enum CatchUp<'j> {
+    /// A query on the caller's thread, perhaps the main thread: a little
+    /// work at most, never waiting.
+    Inline,
+    /// A job, which checkpoints as it goes.
+    Job(&'j Job),
+}
 
 /// About how many bytes of rows one chunk of a search covers.
 pub const SEARCH_CHUNK_BYTES: usize = 64 << 10;
@@ -67,6 +106,9 @@ pub struct SearchProgress {
     pub rows_searched: usize,
     /// Whether every row has been searched.
     pub complete: bool,
+    /// Whether edits made since are still being counted, in the background:
+    /// the matches and "k of N" may be behind until it is false again.
+    pub catching_up: bool,
 }
 
 /// The answer to **Next** or **Previous**.
@@ -128,11 +170,27 @@ struct SearchState {
     first_row: usize,
     /// The matches, and where the search has got to.
     found: Mutex<Found>,
+    /// For catch-up jobs.
+    scheduler: Scheduler,
+    /// Held while the counts catch up with edits, so one catch-up runs at a
+    /// time.
+    catching_up: Mutex<()>,
+    /// A catch-up job has been started and hasn't finished.
+    catch_up_started: AtomicBool,
+    /// The latest catch-up job, to cancel when the search is dropped, and
+    /// for the app to wait on.
+    catch_up_job: Mutex<Option<JobHandle<()>>>,
+    /// The search was dropped: no more catch-up jobs.
+    dropped: AtomicBool,
     /// Run once by the next step, between its look at the matches and its
     /// look at whether the search is complete: a test makes the search
     /// finish there.
     #[cfg(test)]
     before_settling: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once by the job between searching a chunk and adding it: a test
+    /// edits there.
+    #[cfg(test)]
+    in_chunk: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The matches found so far.
@@ -148,11 +206,55 @@ struct Found {
     /// Some of the rows searched were read from the first 64 KB kept in
     /// memory, so the search starts again if those turn out stale.
     used_head: bool,
+    /// The counts are right for the edits up to this version of the
+    /// document's edits (`EditStore::since`).
+    synced: usize,
 }
 
 impl Found {
     fn total(&self) -> u64 {
         self.ends.last().copied().unwrap_or(0)
+    }
+
+    /// Each of `counts`' rows (searched rows, in order, each once) has
+    /// that many matching cells now: the rows and their running counts are
+    /// rebuilt in one pass, O(M + K) for M matching rows and K counts.
+    fn merge(&mut self, counts: &[(usize, u64)]) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut rows = Vec::with_capacity(self.rows.len() + counts.len());
+        let mut ends = Vec::with_capacity(rows.capacity());
+        let mut total = 0;
+        let mut push = |row: usize, cells: u64| {
+            if cells > 0 {
+                total += cells;
+                rows.push(u32::try_from(row).unwrap_or(u32::MAX));
+                ends.push(total);
+            }
+        };
+        let mut new = counts.iter().peekable();
+        for i in 0..self.rows.len() {
+            let row = self.row(i);
+            while let Some(&&(edited, cells)) = new.peek()
+                && edited < row
+            {
+                push(edited, cells);
+                new.next();
+            }
+            match new.peek() {
+                Some(&&(edited, cells)) if edited == row => {
+                    push(edited, cells);
+                    new.next();
+                }
+                _ => push(row, self.ends[i] - self.before(i)),
+            }
+        }
+        for &(edited, cells) in new {
+            push(edited, cells);
+        }
+        self.rows = rows;
+        self.ends = ends;
     }
 
     /// Matching cells before `rows[i]`.
@@ -177,6 +279,8 @@ impl Document {
         let reading = self.current();
         let matcher = Matcher::new(query, reading.detection.encoding)?;
         let first_row = usize::from(reading.detection.header);
+        // A search starts from the edits as they are when it starts.
+        let synced = reading.edits.version();
         let state = Arc::new(SearchState {
             reading,
             source: Arc::clone(&self.source),
@@ -185,10 +289,18 @@ impl Document {
             first_row,
             found: Mutex::new(Found {
                 searched: first_row,
+                synced,
                 ..Found::default()
             }),
+            scheduler: self.scheduler.clone(),
+            catching_up: Mutex::new(()),
+            catch_up_started: AtomicBool::new(false),
+            catch_up_job: Mutex::default(),
+            dropped: AtomicBool::new(false),
             #[cfg(test)]
             before_settling: Mutex::default(),
+            #[cfg(test)]
+            in_chunk: Mutex::default(),
         });
         let worker = Arc::clone(&state);
         let job = self
@@ -205,9 +317,11 @@ impl Search {
         &self.job
     }
 
-    /// Stops the search within one chunk. What it found is kept.
+    /// Stops the search within one chunk, and any catch-up job. What it
+    /// found is kept.
     pub fn cancel(&self) {
         self.job.cancel();
+        self.state.cancel_catch_up();
     }
 
     /// The reading searched.
@@ -216,16 +330,45 @@ impl Search {
         self.state.reading.generation
     }
 
-    /// Where the search has got to.
+    /// Where the search has got to. Edits made since it last caught up
+    /// are counted first if that is quick; otherwise a job counts them,
+    /// and `catching_up` says so.
     #[must_use]
     pub fn progress(&self) -> SearchProgress {
+        // A row that can't be read now is recounted next time.
+        let caught_up = self.catch_up().unwrap_or(false);
         let found = self.state.lock();
         SearchProgress {
             generation: self.state.reading.generation,
             matches: found.total(),
             rows_searched: found.searched,
             complete: found.complete,
+            catching_up: !caught_up,
         }
+    }
+
+    /// Catches the counts up with the edits, if that is quick, and
+    /// otherwise starts a job to: whether they are caught up now.
+    fn catch_up(&self) -> Result<bool, ReadError> {
+        if self.state.catch_up(CatchUp::Inline)? {
+            return Ok(true);
+        }
+        SearchState::start_catch_up(&self.state);
+        Ok(false)
+    }
+
+    /// The job catching the counts up with edits, while one is running
+    /// ([`SearchProgress::catching_up`]): wait on it rather than poll, then
+    /// look at the progress again (more edits may have come meanwhile).
+    #[must_use]
+    pub fn catch_up_job(&self) -> Option<JobHandle<()>> {
+        self.state
+            .catch_up_job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|job| !job.control().is_finished())
+            .cloned()
     }
 
     /// **Next** (`forward`) or **Previous** from the cell `from` (a
@@ -234,13 +377,18 @@ impl Search {
     /// `from`, the first match (forward) or the last one. Past the last
     /// match it wraps round to the first, and before the first to the last,
     /// once the search is complete; until then it is
-    /// [`SearchStep::Pending`].
+    /// [`SearchStep::Pending`]. It is also `Pending` while edits are being
+    /// counted ([`SearchProgress::catching_up`]).
     ///
     /// # Errors
     ///
     /// A [`ReadError`] if a matching row can't be read again (a removable
     /// drive that vanished).
     pub fn step(&self, from: Option<Place>, forward: bool) -> Result<SearchStep, ReadError> {
+        // The step needs every edit counted: until then, ask again.
+        if !self.catch_up()? {
+            return Ok(SearchStep::Pending);
+        }
         if forward {
             self.step_forward(from)
         } else {
@@ -373,6 +521,7 @@ impl Search {
     ///
     /// As for [`step`](Self::step).
     pub fn ordinal(&self, place: Place) -> Result<Option<u64>, ReadError> {
+        self.catch_up()?;
         let before = {
             let found = self.state.lock();
             let i = found.rows.partition_point(|&row| to_usize(row) < place.row);
@@ -402,6 +551,7 @@ impl Search {
         columns: Range<usize>,
         max_chars: usize,
     ) -> Result<Vec<CellMatch>, ReadError> {
+        self.catch_up()?;
         let wanted: Vec<usize> = {
             let found = self.state.lock();
             let start = found
@@ -423,11 +573,12 @@ impl Search {
             let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
                 continue;
             };
-            for (column, field) in parsed.fields().iter().enumerate() {
-                if !columns.contains(&column) {
+            let edits = state.reading.edits.row(row);
+            let view = RowView::new(parser, &bytes, base, &parsed, edits.as_deref());
+            for column in columns.start..columns.end.min(view.len()) {
+                let Some(value) = view.value(column) else {
                     continue;
-                }
-                let value = parser.display_value_in(&bytes, base, field);
+                };
                 if state.matcher.is_match(&value) {
                     matches.push(CellMatch {
                         row,
@@ -452,18 +603,36 @@ impl Search {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
+
+    /// Runs `hook` in the job, once, between searching its next chunk and
+    /// adding it.
+    pub(super) fn in_chunk(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .state
+            .in_chunk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
 }
 
 impl Drop for Search {
     fn drop(&mut self) {
         self.job.cancel();
+        // A catch-up job holds the reading: it mustn't outlive the search.
+        self.state.dropped.store(true, Ordering::Release);
+        self.state.cancel_catch_up();
     }
 }
 
 impl std::fmt::Debug for Search {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The fields as they are: `progress` would catch up first.
+        let found = self.state.lock();
         f.debug_struct("Search")
-            .field("progress", &self.progress())
+            .field("generation", &self.state.reading.generation)
+            .field("matches", &found.total())
+            .field("rows_searched", &found.searched)
+            .field("complete", &found.complete)
             .finish_non_exhaustive()
     }
 }
@@ -545,7 +714,14 @@ impl SearchState {
                 }
             }
             let end = chunk_end(index, next, available);
-            let (hits, from_head) = self.search_rows(index, next..end, stale)?;
+            // The chunk is searched with its rows' edits as they are now,
+            // without holding the rest of the overlay (so an edit meanwhile
+            // doesn't copy it); any made meanwhile are caught up as it is
+            // added.
+            let (edits, version) = self.reading.edits.rows_in(next..end);
+            let (hits, from_head) = self.search_rows(index, next..end, stale, &edits)?;
+            drop(edits);
+            self.in_chunk();
             let mut found = self.lock();
             for (row, cells) in hits {
                 let total = found.total() + u64::from(cells);
@@ -554,6 +730,15 @@ impl SearchState {
             }
             found.searched = end;
             found.used_head |= from_head;
+            // The chunk's rows are right as of `version`: anything edited
+            // since is recounted.
+            found.synced = found.synced.min(version);
+            drop(found);
+            self.catch_up(CatchUp::Job(job))?;
+        }
+        if !self.catch_up(CatchUp::Job(job))? {
+            // Cancelled part-way.
+            return Poll::Ready(Err(JobError::Cancelled));
         }
         let available = self.rows_index(self.source.changed_on_disk()).1;
         let mut found = self.lock();
@@ -567,18 +752,23 @@ impl SearchState {
 
     /// The rows of `rows` (in `index`) with matches, how many cells of
     /// each match, and whether they were read from the first 64 KB kept in
-    /// memory (trusted unless `head_stale`).
+    /// memory (trusted unless `head_stale`), with `edits` on top.
     fn search_rows(
         &self,
         index: &RowIndex,
         rows: Range<usize>,
         head_stale: bool,
+        edits: &[(usize, Arc<RowEdits>)],
     ) -> Result<(Vec<(usize, u32)>, bool), JobError> {
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok((Vec::new(), false));
         };
         let (bytes, from_head) = bytes_in(&self.source, &self.head, extent.clone(), head_stale)?;
         let base = extent.start;
+        // Edited rows are checked as they read now, every one: the raw
+        // search below can't see their edited values, so it passes over
+        // them. (`edits` are in row order.)
+        let edited = |row: usize| edits.binary_search_by_key(&row, |&(r, _)| r).is_ok();
         let mut hits = Vec::new();
         // `at` is where `row` starts, in `bytes`.
         let mut at = 0;
@@ -595,9 +785,11 @@ impl SearchState {
             if holder >= rows.end {
                 break;
             }
-            let cells = self.cells_matching(index, holder, &bytes, base);
-            if cells > 0 {
-                hits.push((holder, cells));
+            if !edited(holder) {
+                let cells = self.cells_matching(index, holder, &bytes, base);
+                if cells > 0 {
+                    hits.push((holder, cells));
+                }
             }
             let Some(holder_extent) = index.row_extent(holder) else {
                 break;
@@ -605,7 +797,216 @@ impl SearchState {
             at = holder_extent.end - base;
             row = holder + 1;
         }
+        if !edits.is_empty() {
+            for (row, row_edits) in edits {
+                let cells = self.edited_cells_matching(index, *row, &bytes, base, Some(row_edits));
+                if cells > 0 {
+                    hits.push((*row, cells));
+                }
+            }
+            hits.sort_unstable_by_key(|&(row, _)| row);
+        }
         Ok((hits, from_head))
+    }
+
+    /// How many of row `row`'s cells match as it reads with `edits` (none:
+    /// as the file has it). `bytes` are the file's from `base` on, and hold
+    /// the row. If the query is nowhere in the row's own bytes, only its
+    /// edited values can match, so only they are checked.
+    fn edited_cells_matching(
+        &self,
+        index: &RowIndex,
+        row: usize,
+        bytes: &[u8],
+        base: usize,
+        edits: Option<&RowEdits>,
+    ) -> u32 {
+        let Some(edits) = edits else {
+            return self.cells_matching(index, row, bytes, base);
+        };
+        let parser = &self.reading.parser;
+        let Some(parsed) = parser.parse_row_in(index, row, bytes, base) else {
+            return 0;
+        };
+        let span = parsed.span();
+        let own = bytes
+            .get(..span.end.saturating_sub(base))
+            .unwrap_or_default();
+        let anywhere = self
+            .matcher
+            .raw_candidates(own, span.start.saturating_sub(base))
+            .is_some();
+        let matching = if anywhere {
+            let view = RowView::new(parser, bytes, base, &parsed, Some(edits));
+            view.filled()
+                .into_iter()
+                .filter(|&(_, cell)| self.matcher.is_match(&view.value_of(cell)))
+                .count()
+        } else {
+            edits
+                .cells()
+                .iter()
+                .filter(|(_, value)| self.matcher.is_match(value))
+                .count()
+        };
+        u32::try_from(matching).unwrap_or(u32::MAX)
+    }
+
+    /// Catches the counts up with the edits made since they were last right
+    /// (`Found::synced`): each row those edits touched that the search has
+    /// searched is recounted as it reads now, without holding the counts'
+    /// lock, then the counts are rebuilt in one pass (`Found::merge`). If a
+    /// chunk was added meanwhile, it goes round again. Returns whether the
+    /// counts are caught up.
+    ///
+    /// With no edits since, it returns at once, taking no lock but the
+    /// counts'. A main-thread query ([`CatchUp::Inline`]) does only a
+    /// little: it gives up, returning `false`, if the edits since touched
+    /// more than [`INLINE_ROWS`] rows (or made that many changes), or the
+    /// counts have more than [`INLINE_MATCHING_ROWS`] matching rows to
+    /// rebuild, or another catch-up is running. A job checkpoints every
+    /// [`CATCH_UP_ROWS`] rows, and if it is cancelled it returns `false`
+    /// without moving the counts on.
+    fn catch_up(&self, how: CatchUp<'_>) -> Result<bool, ReadError> {
+        let inline = matches!(how, CatchUp::Inline);
+        let version = self.reading.edits.version();
+        {
+            let found = self.lock();
+            if found.synced == version {
+                return Ok(true);
+            }
+            let behind = version.saturating_sub(found.synced);
+            if inline && (behind > INLINE_ROWS || found.rows.len() > INLINE_MATCHING_ROWS) {
+                return Ok(false);
+            }
+        }
+        let _one_at_a_time = if inline {
+            match self.catching_up.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return Ok(false),
+            }
+        } else {
+            self.catching_up
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        loop {
+            let (synced, searched, matching) = {
+                let found = self.lock();
+                (found.synced, found.searched, found.rows.len())
+            };
+            let (touched, version) = self.reading.edits.since(synced);
+            let touched: Vec<(usize, Option<Arc<RowEdits>>)> = touched
+                .into_iter()
+                .filter(|&(row, _)| row >= self.first_row && row < searched)
+                .collect();
+            let big = touched.len() > INLINE_ROWS
+                || (!touched.is_empty() && matching > INLINE_MATCHING_ROWS);
+            if inline && big {
+                return Ok(false);
+            }
+            let mut counts = Vec::with_capacity(touched.len());
+            for (i, (row, edits)) in touched.into_iter().enumerate() {
+                if let CatchUp::Job(job) = how
+                    && i % CATCH_UP_ROWS == 0
+                    && job.checkpoint().is_err()
+                {
+                    return Ok(false);
+                }
+                let cells = match self.row_bytes(row)? {
+                    Some(RowRead { bytes, base, index }) => {
+                        self.edited_cells_matching(index, row, &bytes, base, edits.as_deref())
+                    }
+                    None => 0,
+                };
+                counts.push((row, u64::from(cells)));
+            }
+            let mut found = self.lock();
+            if found.synced != synced || found.searched != searched {
+                // A chunk was added (or the search started again) meanwhile.
+                continue;
+            }
+            found.merge(&counts);
+            found.synced = version;
+            drop(found);
+            if self.reading.edits.version() == version {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Whether edits have been made since the counts were last right.
+    fn behind(&self) -> bool {
+        self.lock().synced != self.reading.edits.version()
+    }
+
+    /// Starts a job that catches the counts up, unless one is running or
+    /// the search was dropped. The job marks itself finished even if it
+    /// panics, and once it has caught up, starts again if a request came
+    /// while it ran, after its last look.
+    fn start_catch_up(state: &Arc<SearchState>) {
+        if state.dropped.load(Ordering::Acquire)
+            || state.catch_up_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        /// Clears `catch_up_started` when the job ends, however it ends.
+        struct Started<'a>(&'a SearchState);
+        impl Drop for Started<'_> {
+            fn drop(&mut self) {
+                self.0.catch_up_started.store(false, Ordering::Release);
+            }
+        }
+        let worker = Arc::clone(state);
+        let job = state
+            .scheduler
+            .spawn(Priority::P2, Interval::Find, move |job| {
+                let caught_up = {
+                    let _started = Started(&worker);
+                    worker.catch_up(CatchUp::Job(job))
+                };
+                // A request that came after the job's last look found it
+                // still running, so it didn't start another: this does.
+                if matches!(caught_up, Ok(true)) && !job.is_cancelled() && worker.behind() {
+                    SearchState::start_catch_up(&worker);
+                }
+                match caught_up {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(JobError::Cancelled),
+                    Err(error) => Err(JobError::from(error)),
+                }
+            });
+        *state
+            .catch_up_job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(job);
+    }
+
+    /// Cancels the catch-up job, if there is one.
+    fn cancel_catch_up(&self) {
+        if let Some(job) = self
+            .catch_up_job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            job.cancel();
+        }
+    }
+
+    /// The test hook (see the field); nothing outside tests.
+    #[cfg_attr(not(test), expect(clippy::unused_self))]
+    fn in_chunk(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .in_chunk
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
     }
 
     /// How many of row `row`'s cells match. `bytes` are the file's from
@@ -651,7 +1052,7 @@ impl SearchState {
         count
     }
 
-    /// Which of row `row`'s fields match, in order.
+    /// Which of row `row`'s cells match as it reads now, in order.
     fn columns_of(&self, row: usize) -> Result<Vec<usize>, ReadError> {
         let Some(RowRead { bytes, base, index }) = self.row_bytes(row)? else {
             return Ok(Vec::new());
@@ -660,14 +1061,13 @@ impl SearchState {
         let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
             return Ok(Vec::new());
         };
-        Ok(parsed
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| {
-                self.matcher
-                    .is_match(&parser.display_value_in(&bytes, base, field))
-            })
+        let edits = self.reading.edits.row(row);
+        let view = RowView::new(parser, &bytes, base, &parsed, edits.as_deref());
+        // Padding is empty, and a query never is, so it never matches.
+        Ok(view
+            .filled()
+            .into_iter()
+            .filter(|&(_, cell)| self.matcher.is_match(&view.value_of(cell)))
             .map(|(column, _)| column)
             .collect())
     }

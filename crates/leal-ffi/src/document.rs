@@ -905,8 +905,10 @@ impl Document {
         self.failure.get().is_some()
     }
 
-    /// The first screen of rows: from opening, or from the latest
-    /// [`reinterpret`](Self::reinterpret).
+    /// The first screen of rows: the one made at opening, or by the latest
+    /// [`reinterpret`](Self::reinterpret), cached as it was then. It
+    /// doesn't follow edits made since; read rows with
+    /// [`cells`](Self::cells) for the cells as they are now.
     ///
     /// # Errors
     ///
@@ -1312,10 +1314,14 @@ impl Document {
     /// The old jobs are cancelled; [`index_job`](Self::index_job) and
     /// [`review_job`](Self::review_job) give the new ones.
     ///
+    /// While the document has unsaved edits, only the header row choice
+    /// can change, and the edits are kept (ADR-0008 decision 4).
+    ///
     /// # Errors
     ///
-    /// [`LealError::EncodingDoesNotFit`]; the document is then unchanged.
-    /// [`LealError::DocumentFailed`].
+    /// [`LealError::EncodingDoesNotFit`], or [`LealError::UnsavedEdits`]
+    /// for another delimiter or encoding while there are edits; the
+    /// document is then unchanged. [`LealError::DocumentFailed`].
     pub fn reinterpret(&self, options: OpenOptions) -> Result<FirstScreen, LealError> {
         self.call(|| {
             let options = document::OpenOptions::from(options);
@@ -1587,6 +1593,7 @@ fn document_error(path: &str, error: DocumentError) -> LealError {
             path: path_owned,
             byte_count: len,
         },
+        DocumentError::UnsavedEdits => LealError::UnsavedEdits { path: path_owned },
         DocumentError::Internal(message) => LealError::Internal { message },
     }
 }
@@ -1763,8 +1770,12 @@ both_ways!(
     ]
 );
 
+mod editing;
 mod find;
 #[cfg(test)]
 mod tests;
 
+pub use editing::{
+    CellEdit, CellPlace, EditCommand, EditRefusal, RefusedCommand, ReplayReport, ValueChange,
+};
 pub use find::{CellMatch, CellValue, CopyJob, Search, SearchProgress, SearchStep, TextRange};
