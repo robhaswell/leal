@@ -39,11 +39,21 @@
 //!     the file, or new bytes would land inside its quote (ADR-0004
 //!     decision 8). Any edit that breaks this is refused with
 //!     [`SaveError::AfterUnterminatedQuote`]: a row inserted after its row,
-//!     a column after it, or setting it back to its original value after
-//!     something was added behind it. Editing it closes the quote.
+//!     a column or a hatched cell (rule 12) after it, or setting it back to
+//!     its original value after something was added behind it. Editing it
+//!     closes the quote.
 //! 11. A lone CR directly followed by a blank LF row would read back as one
 //!     CRLF, so the blank row's line ending becomes CR (ADR-0004
 //!     decision 10). Only a blank row can start with LF.
+//! 12. A **hatched cell**, past the end of its row (a short row's missing
+//!     field, or any field of a blank line but its first), can be edited
+//!     (ADR-0005 decision 2). The row then gains the delimiters needed to
+//!     reach that column, and the value, at its end before its line ending:
+//!     the cells in between have no bytes at all. A blank line edited in
+//!     column *c* becomes a row of *c* + 1 fields. A hatched cell's value
+//!     is empty, so setting one to `""` is no edit, and setting it back to
+//!     `""` removes the edit and the row's padding with it (F3). Past an
+//!     unterminated quote, rule 10 refuses it.
 //!
 //! Rules 8, 9 and 11 are the "smallest extra change next to the edit" that
 //! keeps ADR-0004 decision 10: reopening the saved file gives the same
@@ -54,7 +64,8 @@
 //! How these map to ADR-0004: rule 3 is decisions 1 and 3 (decision 2,
 //! per-column quoting, is not in yet: see `TODO(ADR-0004 #2)`); rule 4 is
 //! decision 4; rule 5 is decision 9; rule 6 is decision 5; rules 8, 9 and 10
-//! are decisions 6, 7 and 8; rules 9 and 11 are decision 10.
+//! are decisions 6, 7 and 8; rules 9 and 11 are decision 10. Rule 12 is
+//! ADR-0005 decision 2.
 
 use std::fmt;
 
@@ -64,6 +75,12 @@ use crate::dialect::{
 };
 use crate::fidelity::{Change, apply_changes};
 use crate::layout::Layout;
+
+/// The furthest a hatched-cell edit may reach (rule 12): column
+/// `COLUMN_LIMIT - 1`, unless the row is already longer. The same limit as
+/// leal-core's `edit::COLUMN_LIMIT`, which guards against padding a row to
+/// millions of cells by mistake.
+pub const COLUMN_LIMIT: usize = 1 << 20;
 
 /// Whether a value must be quoted wherever it is written: it contains the
 /// delimiter, `"`, CR or LF (§3.7). Checked on the encoded bytes; the
@@ -133,7 +150,8 @@ pub enum Edit {
     SetCell {
         /// Row.
         row: usize,
-        /// Column, less than the row's field count.
+        /// Column: any, since a column past the row's end is a hatched
+        /// cell (rule 12).
         column: usize,
         /// The new display value.
         value: String,
@@ -246,6 +264,26 @@ enum Cell {
     Original(usize),
     /// A new value, replacing original field `field` if there was one.
     Edited { field: Option<usize>, value: String },
+    /// A cell past the end of the row as it was (a hatched cell, rule 12):
+    /// `None`, padding before an edited one, is written with no bytes;
+    /// `Some` is its new value.
+    Appended(Option<String>),
+}
+
+/// Where a cell of the document comes from now, for tests that compare a
+/// reader with the oracle ([`Document::cell_source`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellSource {
+    /// Original field `field` of the source row, unedited.
+    Original {
+        /// The field's index in the original row.
+        field: usize,
+    },
+    /// An edited value.
+    Edited,
+    /// A cell past the end of the original row with no value of its own:
+    /// padding before an edited hatched cell (rule 12). It reads as empty.
+    Padding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,25 +375,50 @@ impl<'a> Document<'a> {
             .max(1)
     }
 
-    /// The display value of a cell now.
+    /// The display value of a cell now. `None` past the end of the row (a
+    /// hatched cell, whose value is empty) or of the document.
     #[must_use]
     pub fn value(&self, row: usize, column: usize) -> Option<String> {
         let r = self.rows.get(row)?;
         Some(match r.cells.get(column)? {
             Cell::Original(f) => self.field_display(r.source?, *f),
             Cell::Edited { value, .. } => value.clone(),
+            Cell::Appended(value) => value.clone().unwrap_or_default(),
         })
     }
 
-    /// The original display value behind a cell, if it came from the file.
+    /// Where cell (`row`, `column`) comes from now, or `None` past the end
+    /// of the row or the document.
+    #[must_use]
+    pub fn cell_source(&self, row: usize, column: usize) -> Option<CellSource> {
+        Some(match self.rows.get(row)?.cells.get(column)? {
+            Cell::Original(field) => CellSource::Original { field: *field },
+            Cell::Edited { .. } | Cell::Appended(Some(_)) => CellSource::Edited,
+            Cell::Appended(None) => CellSource::Padding,
+        })
+    }
+
+    /// The original row behind document row `row`, or `None` for an
+    /// inserted row or past the end.
+    #[must_use]
+    pub fn source_row(&self, row: usize) -> Option<usize> {
+        self.rows.get(row)?.source
+    }
+
+    /// The original display value behind a cell, if it came from the file:
+    /// empty for a cell past the end of an original row (a hatched cell,
+    /// rule 12), whether or not it has been given a value or the row is that
+    /// long now.
     #[must_use]
     pub fn original_value(&self, row: usize, column: usize) -> Option<String> {
         let r = self.rows.get(row)?;
-        let field = match r.cells.get(column)? {
-            Cell::Original(f) => Some(*f),
-            Cell::Edited { field, .. } => *field,
+        let source = r.source?;
+        let field = match r.cells.get(column) {
+            Some(Cell::Original(f)) => Some(*f),
+            Some(Cell::Edited { field, .. }) => *field,
+            Some(Cell::Appended(_)) | None => return Some(String::new()),
         }?;
-        Some(self.field_display(r.source?, field))
+        Some(self.field_display(source, field))
     }
 
     /// The (row, column) now of the original unterminated field, if it is
@@ -380,13 +443,15 @@ impl<'a> Document<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`SaveError::InvalidEdit`] if its coordinates don't exist, and
+    /// Returns [`SaveError::InvalidEdit`] if its coordinates don't exist (a
+    /// cell past [`COLUMN_LIMIT`] and its row's end doesn't), and
     /// [`SaveError::AfterUnterminatedQuote`] if afterwards an original
     /// unterminated field would no longer be the last thing in the file, so
     /// bytes would land inside its quote (ADR-0004 decision 8). That covers
-    /// inserting a row after its row, a column after it, and setting it back
-    /// to its original value once something has been added after it.
-    /// Inserting a row *at* its row index (before it) is allowed.
+    /// inserting a row after its row, a column or a hatched cell after it
+    /// (ADR-0005 decision 2), and setting it back to its original value
+    /// once something has been added after it. Inserting a row *at* its row
+    /// index (before it) is allowed.
     pub fn apply(&mut self, edit: &Edit) -> Result<(), SaveError> {
         let before = self.rows.clone();
         self.apply_unchecked(edit)?;
@@ -405,7 +470,28 @@ impl<'a> Document<'a> {
         let invalid = || SaveError::InvalidEdit(edit.clone());
         match edit {
             Edit::SetCell { row, column, value } => {
-                let source = self.rows.get(*row).ok_or_else(invalid)?.source;
+                let r = self.rows.get_mut(*row).ok_or_else(invalid)?;
+                if *column >= r.cells.len().max(COLUMN_LIMIT) {
+                    return Err(invalid());
+                }
+                if *column >= r.cells.len() {
+                    // Rule 12: a hatched cell. Its value is empty, so `""`
+                    // is no edit.
+                    if !value.is_empty() {
+                        r.cells.resize(*column, Cell::Appended(None));
+                        r.cells.push(Cell::Appended(Some(value.clone())));
+                    }
+                    return Ok(());
+                }
+                if let Cell::Appended(old) = &mut r.cells[*column] {
+                    *old = (!value.is_empty()).then(|| value.clone());
+                    // Padding left at the end is no longer needed.
+                    while r.cells.last() == Some(&Cell::Appended(None)) {
+                        r.cells.pop();
+                    }
+                    return Ok(());
+                }
+                let source = r.source;
                 let original = self.original_value(*row, *column);
                 let cell = self
                     .rows
@@ -415,6 +501,7 @@ impl<'a> Document<'a> {
                 let field = match cell {
                     Cell::Original(f) => Some(*f),
                     Cell::Edited { field, .. } => *field,
+                    Cell::Appended(_) => None,
                 };
                 *cell = match (field, source) {
                     // §3.6: back to the original display value removes the edit.
@@ -633,6 +720,11 @@ impl<'a> Document<'a> {
                 let s = row.source.ok_or(())?;
                 Ok(self.bytes[self.layout.rows[s].fields[*f].span.clone()].to_vec())
             }
+            Cell::Appended(None) => Ok(Vec::new()),
+            Cell::Appended(Some(value)) => {
+                expected_field_bytes(value, self.encoding, self.delimiter, false, quote_all)
+                    .map_err(|_| ())
+            }
             Cell::Edited { field, value } => {
                 // TODO(ADR-0004 #2): a new field (inserted row or column, so
                 // `field` is `None`) should also be quoted when every existing
@@ -703,7 +795,8 @@ impl<'a> Document<'a> {
     }
 
     /// Changes for surviving original row `i` (document row `j`): one per
-    /// edited field if only cells changed, otherwise the whole row.
+    /// edited field, plus one insert at the row's end for edited hatched
+    /// cells (rule 12, F2), if only cells changed; otherwise the whole row.
     fn row_changes(
         &self,
         i: usize,
@@ -714,18 +807,21 @@ impl<'a> Document<'a> {
         changes: &mut Vec<Change>,
     ) {
         let orig = &self.layout.rows[i];
+        let cells = &self.rows[j].cells;
+        let fields = orig.fields.len();
         let same_shape = !untouched
             && ending == orig.line_ending
-            && self.rows[j].cells.len() == orig.fields.len()
-            && self.rows[j].cells.iter().enumerate().all(|(k, c)| match c {
+            && cells.len() >= fields
+            && cells.iter().enumerate().all(|(k, c)| match c {
                 Cell::Original(f) => *f == k,
                 Cell::Edited { field, .. } => *field == Some(k),
+                Cell::Appended(_) => k >= fields,
             });
         let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         if same_shape {
             let quote_all = self.layout.quotes_every_field();
             let mut per_field = Vec::new();
-            for (k, cell) in self.rows[j].cells.iter().enumerate() {
+            for (k, cell) in cells.iter().enumerate().take(fields) {
                 if let Cell::Edited { .. } = cell {
                     let bytes = self
                         .cell_bytes(&self.rows[j], cell, quote_all)
@@ -735,6 +831,19 @@ impl<'a> Document<'a> {
                         per_field.push(Change::replace(span, bytes));
                     }
                 }
+            }
+            // Hatched cells: the delimiter before each, and its bytes, at
+            // the end of the row before its line ending.
+            let mut appended = Vec::new();
+            for cell in &cells[fields..] {
+                appended.push(self.delimiter.byte());
+                appended.extend(
+                    self.cell_bytes(&self.rows[j], cell, quote_all)
+                        .unwrap_or_default(),
+                );
+            }
+            if !appended.is_empty() {
+                per_field.push(Change::insert(orig.span.end, appended));
             }
             // Use the per-field splices only if they reproduce the row
             // exactly. Rules 8 and 9 (`""` rows, a quoted BOM-like first
@@ -1193,12 +1302,82 @@ mod tests {
         assert_eq!(hint(b"a\n", w1252, Some(w1252), &[]), Some(w1252));
     }
 
+    /// ADR-0005 decision 2: a hatched cell gets the delimiters needed to
+    /// reach it, then its value, at the end of the row before its line
+    /// ending, as one insert there (F2).
+    #[test]
+    fn a_hatched_cell_is_appended_to_its_row() {
+        let r = save(b"a,b,c\n1\n2,3,4\n", &[], &[set(1, 2, "x")]).unwrap();
+        assert_eq!(r.bytes, b"a,b,c\n1,,x\n2,3,4\n");
+        assert_eq!(r.changes, vec![Change::insert(7, ",,x")]);
+        // Next to an edit of the row's own field: one splice each.
+        let r = save(b"a,b,c\n1\n", &[], &[set(1, 1, "y"), set(1, 0, "z")]).unwrap();
+        assert_eq!(r.bytes, b"a,b,c\nz,y\n");
+        assert_eq!(
+            r.changes,
+            vec![Change::replace(6..7, "z"), Change::insert(7, ",y")]
+        );
+        // The value is quoted as any edited value is.
+        assert_eq!(
+            out(save(b"a,b\n1\n", &[], &[set(1, 1, "x,y")])),
+            "a,b\n1,\"x,y\"\n"
+        );
+        // With no line ending, at the very end.
+        assert_eq!(out(save(b"a,b\n1", &[], &[set(1, 2, "x")])), "a,b\n1,,x");
+        // A blank line edited in column c becomes a row of c + 1 fields.
+        let r = save(b"a,b,c\n\nd\n", &[], &[set(1, 2, "x")]).unwrap();
+        assert_eq!(r.bytes, b"a,b,c\n,,x\nd\n");
+        assert_eq!(r.changes, vec![Change::insert(6, ",,x")]);
+    }
+
+    /// F3 for hatched cells: their value is empty, so `""` is no edit, and
+    /// setting an edited one back to `""` removes it and its padding.
+    #[test]
+    fn a_hatched_cell_set_back_to_empty_is_no_edit() {
+        let bytes = b"a,b,c,d\n1\n";
+        let r = save(bytes, &[], &[set(1, 3, "")]).unwrap();
+        assert!(r.changes.is_empty());
+        let r = save(bytes, &[], &[set(1, 3, "x"), set(1, 3, "")]).unwrap();
+        assert!(r.changes.is_empty());
+        assert_eq!(r.bytes, bytes);
+        // Padding up to a hatched cell that is still edited stays.
+        let edits = [set(1, 1, "y"), set(1, 3, "x"), set(1, 3, "")];
+        assert_eq!(out(save(bytes, &[], &edits)), "a,b,c,d\n1,y\n");
+        let edits = [set(1, 3, "x"), set(1, 1, "y"), set(1, 1, "")];
+        assert_eq!(out(save(bytes, &[], &edits)), "a,b,c,d\n1,,,x\n");
+        // A blank line comes back blank.
+        let r = save(b"a\n\n", &[], &[set(1, 2, "x"), set(1, 2, "")]).unwrap();
+        assert_eq!(r.bytes, b"a\n\n");
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        assert_eq!(doc.value(1, 3), None);
+        assert_eq!(doc.original_value(1, 3).as_deref(), Some(""));
+        doc.apply(&set(1, 3, "x")).unwrap();
+        assert_eq!(doc.row_len(1), 4);
+        assert_eq!(doc.cell_source(1, 2), Some(CellSource::Padding));
+        assert_eq!(doc.cell_source(1, 3), Some(CellSource::Edited));
+        assert_eq!(doc.value(1, 2).as_deref(), Some(""));
+        assert_eq!(doc.original_value(1, 3).as_deref(), Some(""));
+    }
+
+    /// Rule 12's limit: a hatched cell past [`COLUMN_LIMIT`] is refused.
+    #[test]
+    fn a_hatched_cell_past_the_column_limit_is_refused() {
+        let bytes = b"a\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        let far = set(0, COLUMN_LIMIT, "x");
+        assert_eq!(doc.apply(&far), Err(SaveError::InvalidEdit(far.clone())));
+        doc.apply(&set(0, COLUMN_LIMIT - 1, "x")).unwrap();
+        assert_eq!(doc.row_len(0), COLUMN_LIMIT);
+    }
+
     #[test]
     fn invalid_edits_are_rejected() {
         let bytes = b"a\n";
         let layout = simple_layout(bytes, &[]);
         let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
-        assert!(doc.apply(&set(0, 1, "x")).is_err());
+        assert!(doc.apply(&set(1, 0, "x")).is_err());
         assert!(doc.apply(&Edit::DeleteRow { row: 1 }).is_err());
         assert!(
             doc.apply(&Edit::InsertRow {

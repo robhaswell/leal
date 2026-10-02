@@ -77,6 +77,11 @@ pub struct EditCase {
     /// The edits, in order, in logical coordinates. Every one is valid when
     /// applied in turn.
     pub edits: Vec<Edit>,
+    /// Edits the oracle refused (ADR-0004 decision 8: something after an
+    /// unterminated quote), each with its place: the number of `edits`
+    /// applied before it was tried. Replaying them there must be refused
+    /// too, and change nothing.
+    pub refused: Vec<(usize, Edit)>,
     /// The expected save: the exact output bytes and the splices from the
     /// original, or why saving must fail (an unencodable value, F5, or a
     /// read-only UTF-16 file).
@@ -102,6 +107,7 @@ impl fmt::Debug for EditCase {
             .field("file", &self.file)
             .field("existing_hint", &self.existing_hint)
             .field("edits", &self.edits)
+            .field("refused", &self.refused)
             .field("saved", &format_args!("{saved}"))
             .finish()
     }
@@ -121,6 +127,9 @@ enum RawEdit {
     Set {
         row: Index,
         column: Index,
+        /// Past the row's end instead, by up to [`HATCHED_REACH`] cells: a
+        /// hatched cell (ADR-0005 decision 2).
+        past_end: Option<Index>,
         value: RawValue,
         /// Also set the cell back to its original value afterwards (F3).
         revert: bool,
@@ -169,10 +178,17 @@ fn raw_value() -> impl Strategy<Value = RawValue> {
     ]
 }
 
+/// How far past a row's end a hatched-cell edit reaches: the first missing
+/// cell, or up to two more, so that some edits need padding before them.
+const HATCHED_REACH: usize = 3;
+
 fn raw_edit() -> impl Strategy<Value = RawEdit> {
+    let past_end = prop_oneof![4 => Just(None), 1 => any::<Index>().prop_map(Some)];
     prop_oneof![
-        6 => (any::<Index>(), any::<Index>(), raw_value(), prop::bool::weighted(0.25))
-            .prop_map(|(row, column, value, revert)| RawEdit::Set { row, column, value, revert }),
+        6 => (any::<Index>(), any::<Index>(), past_end, raw_value(), prop::bool::weighted(0.25))
+            .prop_map(|(row, column, past_end, value, revert)| {
+                RawEdit::Set { row, column, past_end, value, revert }
+            }),
         2 => prop_oneof![
             3 => any::<Index>().prop_map(FirstValue::BomLike),
             1 => raw_value().prop_map(FirstValue::Other),
@@ -298,12 +314,14 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
         .then_some(file.encoding);
     let mut doc = file.document().with_existing_hint(existing_hint);
     let mut edits = Vec::new();
+    let mut refused = Vec::new();
     for r in raw {
         let mut step = Vec::new();
         match *r {
             RawEdit::Set {
                 row,
                 column,
+                past_end,
                 value,
                 revert,
             } => {
@@ -315,7 +333,10 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                 if len == 0 {
                     continue;
                 }
-                let column = column.index(len);
+                let column = match past_end {
+                    Some(reach) => len + reach.index(HATCHED_REACH),
+                    None => column.index(len),
+                };
                 let original = doc.original_value(row, column);
                 let value = match value {
                     RawValue::Literal(s) => s.to_owned(),
@@ -385,9 +406,14 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
             }
         }
         for e in step {
-            // Coordinates were resolved against `doc`, so this cannot fail.
+            // Coordinates were resolved against `doc`, so only ADR-0004
+            // decision 8 can refuse it: something after an unterminated
+            // quote, such as a hatched cell past it. A refused edit is kept
+            // apart, for tests that check it is refused.
             if doc.apply(&e).is_ok() {
                 edits.push(e);
+            } else {
+                refused.push((edits.len(), e));
             }
         }
     }
@@ -396,6 +422,7 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
         file,
         existing_hint,
         edits,
+        refused,
         saved,
     }
 }
@@ -430,6 +457,7 @@ mod tests {
             file,
             existing_hint,
             edits,
+            refused: Vec::new(),
             saved,
         }
     }
@@ -454,7 +482,7 @@ mod tests {
                 r#"encoding: Utf8, rows: [ModelRow { fields: [Unquoted("a"), Unquoted("b")], "#,
                 r#"line_ending: Some(Lf) }], diagnostics: [] }, "#,
                 r#"existing_hint: Some(Utf8), "#,
-                r#"edits: [SetCell { row: 0, column: 0, value: "\u{feff}x" }], "#,
+                r#"edits: [SetCell { row: 0, column: 0, value: "\u{feff}x" }], refused: [], "#,
                 r#"saved: Ok(b"\"\xef\xbb\xbfx\",b\n", encoding_hint: Some(Utf8), "#,
                 r#"fixes: [BomLikeQuoted]) }"#,
             )

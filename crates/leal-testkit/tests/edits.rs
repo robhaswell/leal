@@ -260,6 +260,17 @@ fn nothing_can_be_inserted_inside_an_unterminated_quote() {
         doc.apply(&col),
         Err(SaveError::AfterUnterminatedQuote(col.clone()))
     );
+    // A hatched cell past it, too (ADR-0005 decision 2), but not one of
+    // the shorter row before it.
+    let hatched = Edit::SetCell {
+        row: 2,
+        column: 2,
+        value: "z".into(),
+    };
+    assert_eq!(
+        doc.apply(&hatched),
+        Err(SaveError::AfterUnterminatedQuote(hatched.clone()))
+    );
     assert_eq!(doc.save().unwrap().bytes, bytes);
 
     // Before it is fine: the new bytes land ahead of the opening quote.
@@ -581,11 +592,24 @@ fn coverage_counts(
                 seen.push("encoding hint written");
             }
         }
+        // ADR-0004 decision 8: edits refused after an unterminated quote.
+        if !case.refused.is_empty() {
+            seen.push("edit: refused after an unterminated quote");
+        }
         // Replay, looking at the document just before each edit.
         let mut doc = case.file.document();
         for e in &case.edits {
             let rows = doc.row_count();
             let cols = doc.max_row_len();
+            // ADR-0005 decision 2: hatched cells, including a blank line's.
+            if let Edit::SetCell { row, column, .. } = e
+                && *column >= doc.row_len(*row)
+            {
+                seen.push("edit: a hatched cell");
+                if doc.row_len(*row) == 1 && doc.value(*row, 0).as_deref() == Some("") {
+                    seen.push("edit: a hatched cell of an empty one-field row");
+                }
+            }
             match e {
                 Edit::SetCell { row, .. } if rows == 1 && *row == 0 => {
                     seen.push("edit: the only row")
@@ -642,6 +666,9 @@ fn check_coverage(counts: &std::collections::BTreeMap<&str, usize>) -> Result<()
         "encoding hint written",
         "edit: the only row",
         "edit: the only column",
+        "edit: a hatched cell",
+        "edit: a hatched cell of an empty one-field row",
+        "edit: refused after an unterminated quote",
         "delete: the only row",
         "delete: first row",
         "delete: last row",
