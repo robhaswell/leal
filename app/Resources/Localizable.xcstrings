@@ -354,6 +354,12 @@
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
     },
+    "Leal couldn’t read the rest of the file, so it shows the rows it had read. File ▸ Reload from Disk tries again." : {
+      "comment" : "Status bar tooltip: a read error stopped Leal before the end of the file"
+    },
+    "Leal couldn’t read the rest of this file, so it shows only the rows it had read. Reload tries again." : {
+      "comment" : "Banner: a read error (a failing drive, or a full disk while copying) stopped Leal before the end of the file"
+    },
     "Leal couldn’t reload “%@”." : {
       "comment" : "Alert title: Reload failed (task 1.9); the file's name"
     },
@@ -401,6 +407,9 @@
     },
     "Open…" : {
       "comment" : "File menu"
+    },
+    "Partly read" : {
+      "comment" : "Status bar: a read error stopped Leal before the end of the file; it shows the rows it read"
     },
     "Paste" : {
       "comment" : "Edit menu"

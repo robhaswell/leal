@@ -103,6 +103,12 @@ final class DocumentModel: GridDataSource {
     /// The file changed on its drive while it was read (1.1a): the rows
     /// shown may mix two versions.
     private(set) var changedOnDisk = false
+    /// The index stopped before the end of the file, on a read error (a
+    /// drive still there but failing, or the internal disk full while
+    /// copying): no more rows will come for this reading, so the window
+    /// shows the rows read, says so, and offers Reload (phase 1 review,
+    /// app-8).
+    private(set) var readStopped = false
     /// Whether Save could write over the file: not after a disconnection
     /// or a change while reading, nor while its drive is away (ADR-0006).
     /// Save As always can.
@@ -327,7 +333,7 @@ final class DocumentModel: GridDataSource {
                 try await indexJob.finish()
                 self?.indexFinished(generation: generation, handle: number)
             } catch {
-                self?.jobEnded(error)
+                self?.jobEnded(error, job: .index)
             }
         })
         tasks.append(Task { [weak self] in
@@ -335,14 +341,22 @@ final class DocumentModel: GridDataSource {
                 try await reviewJob.finish()
                 self?.reviewFinished(generation: generation, handle: number)
             } catch {
-                self?.jobEnded(error)
+                self?.jobEnded(error, job: .review)
             }
         })
     }
 
-    /// A background job ended with `error` instead of finishing. Internal
-    /// for tests, which end one with a panic.
-    func jobEnded(_ error: any Error) {
+    /// The background jobs of a reading.
+    enum BackgroundJob {
+        /// The row index (P1).
+        case index
+        /// The whole-file review (P2).
+        case review
+    }
+
+    /// Background job `job` ended with `error` instead of finishing.
+    /// Internal for tests, which end one with a panic or a read error.
+    func jobEnded(_ error: any Error, job: BackgroundJob) {
         switch error as? JobFailure {
         case .Panicked?:
             fail(error)
@@ -367,6 +381,16 @@ final class DocumentModel: GridDataSource {
             }
         case .Failed?:
             Logger.document.error("A background job ended: \(String(describing: error), privacy: .public)")
+            // Without the review there are only no suggestions. Without the
+            // index, no more rows come: stop showing progress, show the rows
+            // read, and say so.
+            guard job == .index, !readStopped else { return }
+            readStopped = true
+            if let current = call({ try $0.progress() }), current.generation == generation {
+                progress = current
+            }
+            refreshDriveState()
+            onChange?(.progress)
         }
     }
 
@@ -456,6 +480,8 @@ final class DocumentModel: GridDataSource {
 
     var rowCount: Int {
         guard failure == nil else { return 0 }
+        // After a read error the rows read are all there will be.
+        if readStopped { return loadedRowCount }
         return max(0, Int(progress.estimatedRows) - headerOffset)
     }
 
@@ -464,7 +490,9 @@ final class DocumentModel: GridDataSource {
         return max(0, Int(progress.rows) - headerOffset)
     }
 
-    var isIndexComplete: Bool { progress.complete }
+    /// No more rows will come: the index is complete, or stopped on a read
+    /// error. A pending ⌘↓ or Go to Row then goes to the last row read.
+    var isIndexComplete: Bool { progress.complete || readStopped }
 
     func headerTitle(column: Int) -> HeaderTitle {
         if !interpretation.header {
@@ -829,6 +857,7 @@ final class DocumentModel: GridDataSource {
         reviewedLineEnding = nil
         review = nil
         diagnostics = nil
+        readStopped = false
         flagBlocks.removeAll()
         tiles.removeAll()
         resizedColumns.removeAll()
@@ -957,6 +986,7 @@ final class DocumentModel: GridDataSource {
         progress = report
         diagnostics = nil
         review = nil
+        readStopped = false
         reviewedLineEnding = nil
         flagBlocks.removeAll()
         tiles.removeAll()
@@ -1037,6 +1067,7 @@ final class DocumentModel: GridDataSource {
         refinedSizingStarted = false
         storage = .clone
         changedOnDisk = false
+        readStopped = false
         canSave = true
         original = call({ try $0.original() }) ?? OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
         applyFirstScreen(screen)
@@ -1058,7 +1089,7 @@ final class DocumentModel: GridDataSource {
         StatusSummary(
             rows: rowCount,
             columns: failure == nil ? fileColumnCount : 0,
-            indexing: failure == nil && !progress.complete,
+            indexing: failure == nil && !isIndexComplete,
             fractionIndexed: progress.bytesTotal > 0 ? Double(progress.bytesScanned) / Double(progress.bytesTotal) : 0,
             delimiter: interpretation.delimiter,
             lineEnding: reviewedLineEnding ?? interpretation.lineEnding,
@@ -1069,6 +1100,7 @@ final class DocumentModel: GridDataSource {
             readOnly: isReadOnly,
             storage: storage,
             changedOnDisk: changedOnDisk,
+            readStopped: readStopped,
             original: original.state,
             infoKinds: diagnostics?.diagnostics.filter { $0.severity == .info }.map(\.kind) ?? [],
             warningKinds: Int(diagnostics?.bannerKinds ?? 0),

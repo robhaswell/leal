@@ -23,6 +23,9 @@ struct StatusSummary: Equatable, Sendable {
     var storage: SourceStorage = .clone
     /// The file changed on its drive while it was read (1.1a).
     var changedOnDisk = false
+    /// The index stopped on a read error: the rows shown are all Leal could
+    /// read (phase 1 review, app-8).
+    var readStopped = false
     /// What has happened to the user's file since it was opened (task
     /// 1.9): changed or deleted elsewhere, or its drive not connected.
     var original: OriginalState = .unchanged
@@ -99,6 +102,9 @@ enum StatusText {
     static func storageNote(_ status: StatusSummary) -> String? {
         if status.changedOnDisk {
             return String(localized: "Changed while reading", comment: "Status bar: the file changed on its drive while Leal read it (1.1a)")
+        }
+        if status.readStopped {
+            return String(localized: "Partly read", comment: "Status bar: a read error stopped Leal before the end of the file; it shows the rows it read")
         }
         return switch status.storage {
         case .clone: nil
@@ -296,6 +302,11 @@ enum StatusText {
             lines.append(String(
                 localized: "The file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change.",
                 comment: "Status bar tooltip: the file changed while Leal read it (1.1a, task 1.9)"
+            ))
+        } else if status.readStopped {
+            lines.append(String(
+                localized: "Leal couldn’t read the rest of the file, so it shows the rows it had read. File ▸ Reload from Disk tries again.",
+                comment: "Status bar tooltip: a read error stopped Leal before the end of the file"
             ))
         } else {
             switch status.storage {

@@ -369,6 +369,39 @@ final class ExternalChangesTests: XCTestCase {
         document.close()
     }
 
+    /// A read error that stops the index (`JobFailure.Failed`, such as EIO
+    /// from a failing drive) doesn't leave the window "Indexing…" for good:
+    /// it shows the rows read, says so in a banner and the status bar, ends
+    /// a pending ⌘↓ at the last row read, and Reload tries again (phase 1
+    /// review, app-8). The core has no hook for a read error, so the test
+    /// ends the index the way the model's own task would.
+    func testAReadErrorThatStopsTheIndexIsShownAndOffersReload() async throws {
+        let url = try file("failing.csv", text(rows: 200_000, prefix: "name"))
+        let (document, model, content) = try open(url)
+        content.grid.move(.lastRow)
+        model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index)
+
+        XCTAssertTrue(model.readStopped)
+        XCTAssertTrue(model.isIndexComplete, "no more rows will come")
+        XCTAssertFalse(model.status.indexing)
+        XCTAssertEqual(model.rowCount, model.loadedRowCount, "no skeleton rows for rows that won't come")
+        XCTAssertFalse(content.grid.isJumpingToEnd)
+        XCTAssertEqual(content.grid.activeCell?.row, model.rowCount - 1)
+        let banner = try XCTUnwrap(content.driveBanner)
+        XCTAssertEqual(banner.message, FileBanner.readStoppedMessage)
+        XCTAssertEqual(banner.button?.title, "Reload")
+        XCTAssertTrue(StatusText.segments(model.status).contains("Partly read"))
+        XCTAssertFalse(StatusText.counts(model.status).hasPrefix("Indexing"))
+
+        banner.button?.performClick(nil)
+        XCTAssertFalse(model.readStopped)
+        XCTAssertNil(content.driveBanner)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertEqual(model.rowCount, 200_000)
+        XCTAssertFalse(StatusText.segments(model.status).contains("Partly read"))
+        document.close()
+    }
+
     // MARK: The banner choice and the status bar's words
 
     func testTheFileBannerChoiceAndOrder() {
@@ -385,7 +418,9 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertTrue(FileBanner.changedWhileReading.reloads)
         XCTAssertFalse(FileBanner.deleted.reloads)
         XCTAssertFalse(FileBanner.disconnected.reloads)
-        XCTAssertEqual(Set([FileBanner.changedWhileReading, .changed, .deleted, .disconnected].map(\.key)).count, 4)
+        XCTAssertEqual(Set([FileBanner.changedWhileReading, .changed, .deleted, .disconnected, .readStopped].map(\.key)).count, 5)
+        XCTAssertEqual(FileBanner.applicable(changedWhileReading: false, original: .unchanged, storage: .copy, readStopped: true), [.readStopped])
+        XCTAssertTrue(FileBanner.readStopped.reloads)
     }
 
     func testTheOriginalNotesAndTheirTooltips() {

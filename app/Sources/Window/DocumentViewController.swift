@@ -287,7 +287,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let file = FileBanner.applicable(
             changedWhileReading: model.changedOnDisk,
             original: model.original.state,
-            storage: model.storage
+            storage: model.storage,
+            readStopped: model.readStopped
         ).first { !dismissed.contains($0.key) }
         driveBanner = banner(
             driveBanner,
