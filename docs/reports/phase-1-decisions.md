@@ -82,7 +82,7 @@ ADR-0008 and docs/perf.md.
 | # | Decision |
 |---|---|
 | 1 | ADR-0008 accepted. |
-| 2 | Rob is running `just perf` on this Mac, unlocked. No M1 Air is available; proposal pending Rob: keep the M1 Air as the design target, require about 3× headroom on the M5 Pro, confirm on an Air during beta. |
+| 2 | Rob ran `just perf` unlocked (`docs/perf-runs/2026-10-02-m5pro-unlocked.md`). No M1 Air is available, so Rob **accepted the 3× rule**: the M1 Air stays the design target, the M5 Pro must show about 3× headroom (main-thread work per frame ≤ ~2.8 ms), and an Air is confirmed during the beta. To be written into DESIGN §1. |
 | 3 | Idle memory is measured as **physical footprint**. |
 | 4 | Heap: every malloc zone minus the per-window AppKit baseline; search results counted; AppKit drawing peaks excluded. |
 | 5 | Open is judged warm against 150 ms; the cold open counts as part of launch. |
