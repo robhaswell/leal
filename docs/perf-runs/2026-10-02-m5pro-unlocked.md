@@ -32,3 +32,5 @@ Details:
 - Scroll `bigFileNoPause` run 1: 2,048 of 5,455 late (37.54%), frame p99 16.7 ms, main-thread CPU p50/p99 1.5/4.7 ms, 26 frames busy over 8.3 ms, 16.1 M instructions a frame at 4.23 GHz; while indexing 0 of 171 late (0.00%); while searching 2,037 of 5,436 late (37.47%) (22 searches); heap peak 273.7 MB; screen 120 Hz
 - Scroll `bigFileNoPause` run 2: 8 of 7,542 late (0.11%), frame p99 8.3 ms, main-thread CPU p50/p99 1.5/3.5 ms, 15 frames busy over 8.3 ms, 18.1 M instructions a frame at 4.25 GHz; while indexing 1 of 137 late (0.73%); while searching 8 of 7,521 late (0.11%) (24 searches); heap peak 263.5 MB; screen 120 Hz
 - Scroll `bigFileNoPause` run 3: 5 of 7,552 late (0.07%), frame p99 8.3 ms, main-thread CPU p50/p99 1.4/3.3 ms, 10 frames busy over 8.3 ms, 18.4 M instructions a frame at 4.25 GHz; while indexing 1 of 133 late (0.75%); while searching 5 of 7,530 late (0.07%) (24 searches); heap peak 263.1 MB; screen 120 Hz
+
+> Note (Rob, 2026-10-02): the `bigFileNoPause` run 1 outlier (37% late) happened while Rob was using the Mac and moving windows around. It is not a Leal regression; runs 2 and 3 are representative.
