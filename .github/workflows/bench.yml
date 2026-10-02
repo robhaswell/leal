@@ -2,16 +2,23 @@ name: Benchmarks
 
 # The criterion benchmarks (crates/leal-bench) on each push to `main` that
 # touches code, compared with the commit before the push on the same runner.
-# The job fails when a benchmark is over its DESIGN §1 budget; when, on a
-# quiet run, it is slower than before with the whole 95% interval of the
-# change above +20% on every attempt; or when the base commit's benchmarks
-# fail. If a noise canary (`memchr3_scan`) moved by more than 10%, or a
-# benchmark regressed, it reruns once, benchmarking this commit first
-# where attempt 1 benchmarked the base first, so a drift over the job
-# can't count against this commit twice. If the rerun is noisy, it warns
-# that the run is inconclusive and passes, unless a budget failed. Why it
-# works this way, and what to do when it fails or warns:
-# docs/tasks/1.2b.md.
+# The job fails when a benchmark is over its DESIGN §1 budget; when it is
+# slower than before, with the whole 95% interval of the change above +20%,
+# on every attempt; or when the base commit's benchmarks fail.
+#
+# A short noise canary (`canary/…`) runs just before and after each bench
+# group, and run-wide ones (`baseline/memchr3_scan`, `baseline-late/…`) at
+# the start and end. A canary that moved by more than 10% makes the attempt
+# noisy for its group's benchmarks, or, if run-wide, makes the run noisy.
+# A noisy run (a run-wide canary moved), or a regression, reruns once,
+# benchmarking this commit first where attempt 1 benchmarked the base
+# first, so a drift over the job can't count against this commit twice. A
+# regression on both attempts fails if both were quiet for it; if either
+# was noisy for it, a third attempt reruns only its groups, base first, and
+# it fails only if that attempt shows it too or has no result for it.
+# Anything noise kept from being judged warns
+# ("inconclusive") and passes, unless a budget failed. Why it works this
+# way, and what to do when it fails or warns: docs/tasks/1.2b.md.
 on:
   push:
     branches: [main]
@@ -44,7 +51,12 @@ jobs:
     # The same image as the CI workflow's `check` job: an Apple silicon VM
     # (M1-class, 3 cores), not the reference machine (a base M1 Air).
     runs-on: macos-26
-    timeout-minutes: 45
+    # Two attempts took about 35 minutes at run 37069372104, and the group
+    # canaries add about 2 (50 s an attempt), so about 37. A third attempt
+    # reruns only the groups it rechecks: about 3 minutes for one group, and
+    # at worst another full attempt, about 17 minutes. That is about 54
+    # minutes at worst; 75 leaves room for a slow runner.
+    timeout-minutes: 75
     steps:
       # The full history, so the base commit can be built.
       - uses: actions/checkout@v7
@@ -99,9 +111,10 @@ jobs:
           BASE: ${{ steps.base.outputs.sha }}
         run: just bench-compare "$BASE"
 
-      # The numbers, for the record: criterion's JSON for both sides, and
-      # the first attempt's if there was a rerun. Each attempt's directory
-      # records the order it ran the sides in (`bench-compare-order`).
+      # The numbers, for the record: criterion's JSON for both sides, the
+      # earlier attempts' if there were more than one, and the third
+      # attempt's plan. Each attempt's directory records the order it ran
+      # the sides in (`bench-compare-order`).
       - name: Upload criterion results
         if: always()
         uses: actions/upload-artifact@v7
@@ -110,6 +123,8 @@ jobs:
           path: |
             target/bench-compare/criterion
             target/bench-compare/criterion-attempt-1
+            target/bench-compare/criterion-attempt-2
+            target/bench-compare/third-attempt-plan
           retention-days: 90
           if-no-files-found: ignore
 
@@ -117,4 +132,4 @@ jobs:
       # Rust cache, which is saved after the last step.
       - name: Remove generated files
         if: always()
-        run: rm -rf target/bench-data target/bench-compare/base target/bench-compare/criterion target/bench-compare/criterion-attempt-1
+        run: rm -rf target/bench-data target/bench-compare/base target/bench-compare/criterion target/bench-compare/criterion-attempt-1 target/bench-compare/criterion-attempt-2 target/bench-compare/third-attempt-plan

@@ -82,8 +82,12 @@ serde_json = "1.0.151"
 # Default features minus `plotters`: no charts (CI reads the JSON, and
 # `--noplot` would turn them off anyway), and a much smaller build.
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "rayon"] }
-# The scan in the speed-of-light baseline.
+# The scan in the speed-of-light baseline and the group canaries.
 memchr = "2.8.3"
+# The report tests check that a third attempt's criterion filter selects
+# what it should, with the same regex crate criterion uses. leal-core
+# already depends on it, so it adds nothing to the build.
+regex = "1.13.1"
 # What the benchmarks measure, through its public API only, plus the
 # `test-hooks` feature for opening a file as if it were on a removable drive.
 leal-core = { workspace = true, features = ["test-hooks"] }

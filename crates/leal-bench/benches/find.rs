@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::find::Query;
 use leal_core::schedule::{Scheduler, SchedulerConfig};
@@ -72,6 +73,7 @@ fn find(c: &mut Criterion) {
     document.index_job().wait().expect("indexing");
     document.review_job().wait().expect("the review");
 
+    common::canary(c, "find", Side::Before);
     let mut group = c.benchmark_group("find");
     common::whole_file(&mut group, len);
     group.sample_size(20);
@@ -80,7 +82,12 @@ fn find(c: &mut Criterion) {
         let query = Query::new(text);
         let mut chunk = Duration::ZERO;
         let mut matches = 0;
+        // Criterion calls a benchmark's closure only if the filter selects
+        // it (a third attempt may run this binary for another group), so
+        // the counts are checked only for a search that ran.
+        let mut ran = false;
         group.bench_function(name, |b| {
+            ran = true;
             b.iter(|| {
                 let search = document.find(black_box(&query)).expect("a query");
                 let summary = *search.job().wait().expect("the search");
@@ -88,6 +95,9 @@ fn find(c: &mut Criterion) {
                 matches = summary.matches;
             });
         });
+        if !ran {
+            continue;
+        }
         match name {
             "no_match" | "every_value" => assert_eq!(matches, 0),
             _ => assert!(matches > 1_000, "{name}: {matches} matches"),
@@ -114,7 +124,9 @@ fn find(c: &mut Criterion) {
         }
     });
     let mut group = c.benchmark_group("find");
+    let mut screen_ran = false;
     group.bench_function("screen_during_find", |b| {
+        screen_ran = true;
         b.iter(|| {
             let rows = document
                 .cells(black_box(FIRST_ROW)..FIRST_ROW + 60, 0..12, 128)
@@ -126,7 +138,12 @@ fn find(c: &mut Criterion) {
     group.finish();
     stop.store(true, Ordering::Relaxed);
     let searches = searching.join().expect("the search thread");
-    assert!(searches > 0, "no search ran during the screen benchmark");
+    assert!(
+        searches > 0 || !screen_ran,
+        "no search ran during the screen benchmark"
+    );
+    // After the search thread stopped, so the canary runs without its load.
+    common::canary(c, "find", Side::After);
 
     for (name, matches, chunk) in longest {
         println!(
@@ -134,7 +151,9 @@ fn find(c: &mut Criterion) {
             chunk.as_secs_f64() * 1e3
         );
     }
-    println!("find/screen_during_find: {searches} searches ran meanwhile");
+    if screen_ran {
+        println!("find/screen_during_find: {searches} searches ran meanwhile");
+    }
     drop(document);
     let _ = std::fs::remove_dir_all(&temp_root);
 }

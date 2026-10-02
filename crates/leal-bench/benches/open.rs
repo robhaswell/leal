@@ -39,8 +39,8 @@
 //! `src/report.rs`).
 //! `open/first_paint` is the same open with no load, for comparison.
 
-// Only `reference_file` is used here: one open takes milliseconds, and
-// these set their own sampling rather than `whole_file`'s.
+// Only `reference_file` and `canary` are used here: one open takes
+// milliseconds, and these set their own sampling rather than `whole_file`'s.
 #[allow(dead_code)]
 mod common;
 
@@ -57,6 +57,7 @@ const SHARE_ROUND_TRIP: Duration = Duration::from_millis(20);
 
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, SamplingMode, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::document::{Document, FirstScreen, OpenOptions};
 use leal_core::schedule::{Interval, JobHandle, Priority, Scheduler, SchedulerConfig};
 use leal_core::source::{STREAM_CHUNK_BYTES, SimulatedShare, Source, TempFolders, VolumeInfo};
@@ -272,6 +273,7 @@ fn open(c: &mut Criterion) {
         Document::from_source(source, &scheduler, OPTIONS, None).expect("first paint")
     };
 
+    common::canary(c, "open", Side::Before);
     let mut group = c.benchmark_group("open");
     settings(&mut group);
 
@@ -333,6 +335,7 @@ fn open(c: &mut Criterion) {
     });
     any_ran |= checked;
     group.finish();
+    common::canary(c, "open", Side::After);
     if any_ran {
         report_chunks(&path, &temp);
     }

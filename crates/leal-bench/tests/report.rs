@@ -5,7 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use leal_bench::budgets::Budget;
-use leal_bench::report::{self, Change, Measurement, Outcome, Status, Thresholds, Verdict};
+use leal_bench::report::{
+    self, Canaries, Change, GroupCanary, Measurement, Order, Outcome, Side, Status, Thresholds,
+    Verdict, group_canary_id,
+};
 
 /// The thresholds CI uses: a regression is a confidence interval wholly
 /// above +20%; a canary that moves by more than 10% means noise.
@@ -295,22 +298,31 @@ fn attempt(
     report::evaluate(&found, &budgets, CI)
 }
 
-/// A regression on both attempts fails, whether either was noisy or not.
+/// A regression on both attempts fails at once if both were quiet for it.
+/// If either was noisy for it (here, with no group canaries, the run-wide
+/// ones judge it), a third attempt settles it; where none may run (the
+/// rerun is the last attempt), it fails, as it always did.
 #[test]
 fn a_regression_on_every_attempt_fails() {
     for first_canary in [0.02, -0.15] {
         let first = attempt(first_canary, 0.01, 300.0, 0.0, 0.35);
         assert_eq!(first.outcome(false), Outcome::Rerun);
         for rerun_canary in [0.03, 0.16] {
+            let context = format!("canaries {first_canary} then {rerun_canary}");
             let rerun = attempt(0.01, rerun_canary, 300.0, 0.0, 0.33).after(&first);
-            assert_eq!(status_of(&rerun, "rows/parse"), &Status::Regression);
             assert!(rerun.unconfirmed.is_empty());
+            let quiet = first_canary.abs() < 0.1 && rerun_canary.abs() < 0.1;
+            if quiet {
+                assert_eq!(status_of(&rerun, "rows/parse"), &Status::Regression);
+                // No third attempt: it fails even when one may run.
+                assert_eq!(rerun.outcome(false), Outcome::Fail, "{context}");
+                assert_eq!(rerun.third_attempt_plan(), None);
+            } else {
+                assert_eq!(status_of(&rerun, "rows/parse"), &Status::Recheck);
+                assert_eq!(rerun.outcome(false), Outcome::Rerun, "{context}");
+            }
             let outcome = rerun.outcome(true);
-            assert_eq!(
-                outcome,
-                Outcome::Fail,
-                "canaries {first_canary} then {rerun_canary}"
-            );
+            assert_eq!(outcome, Outcome::Fail, "{context}");
             assert_eq!(outcome.exit_code(), 1);
         }
     }
@@ -519,7 +531,7 @@ fn markdown_lists_every_benchmark() {
     );
     assert!(
         markdown.contains(
-            "| `index/build` | 320 ms |  | -5.0% (-8.0% to -2.0%) | 500 ms (DESIGN §1) | ok |"
+            "| `index/build` | 320 ms |  | -5.0% (-8.0% to -2.0%) | run-wide | 500 ms (DESIGN §1) | ok |"
         ),
         "{markdown}"
     );
@@ -833,16 +845,24 @@ fn a_drift_regression_does_not_repeat_in_the_other_order() {
     assert!(!markdown.contains("too**"), "{markdown}");
 }
 
-/// A real regression shows in both orders, so it still fails.
+/// A real regression shows in both orders, so it still fails. Attempt 1
+/// was noisy, so a third attempt, base first again, confirms it.
 #[test]
 fn a_real_regression_fails_in_both_orders() {
     let first = drift_first();
     let rerun =
         drift_attempt(report::Order::HeadFirst, 0.01, change(0.31), change(0.019)).after(&first);
     assert!(!rerun.same_order());
-    assert_eq!(status_of(&rerun, "rows/parse"), &Status::Regression);
+    assert_eq!(status_of(&rerun, "rows/parse"), &Status::Recheck);
     assert_eq!(rerun.unconfirmed, ["navigate/next_nul_wide"]);
+    assert_eq!(rerun.outcome(false), Outcome::Rerun);
     assert_eq!(rerun.outcome(true), Outcome::Fail);
+
+    let third = drift_attempt(report::Order::BaseFirst, 0.01, change(0.30), change(0.0));
+    let settled = rerun.settle(third);
+    assert_eq!(status_of(&settled, "rows/parse"), &Status::Regression);
+    assert_eq!(settled.rechecked, ["rows/parse"]);
+    assert_eq!(settled.outcome(true), Outcome::Fail);
 }
 
 /// What happened at `2cc71bb`, before the swap: both attempts ran base
@@ -1049,5 +1069,664 @@ fn bench_report_judges_a_head_first_rerun_by_heads_change() {
         );
         let (status, stdout) = run_bench_report_rerun(&dir);
         assert_eq!(status, Some(code), "head {name}: {stdout}");
+    }
+}
+
+// Group canaries and the third attempt (after run 37069372104).
+
+/// `group`'s canaries in the bench target `bench`, moved by `before` and
+/// `after`.
+fn group_canaries(bench: &str, group: &str, before: f64, after: f64) -> [Measurement; 2] {
+    [(Side::Before, before), (Side::After, after)].map(|(side, moved)| {
+        measurement(
+            &group_canary_id(bench, group, side),
+            15e6,
+            Some(change(moved)),
+        )
+    })
+}
+
+/// One attempt shaped like run 37069372104: the first run-wide canary
+/// moved by `run`, the `marks` group's canaries (in `benches/index.rs`) by
+/// `marks`, and `marks/next_wide` changed by `next_wide`. The `rows`
+/// group, with quiet canaries, holds still.
+fn marks_attempt(order: Order, run: f64, marks: (f64, f64), next_wide: f64) -> report::Report {
+    let mut found = vec![
+        measurement("baseline/memchr3_scan", 45.6e6, Some(change(run))),
+        measurement("baseline-late/memchr3_scan", 50.4e6, Some(change(-0.017))),
+        measurement("marks/next_narrow", 27e3, Some(change(0.01))),
+        measurement("marks/next_wide", 767e3, Some(change(next_wide))),
+        measurement("rows/parse", 12e3, Some(change(0.02))),
+    ];
+    found.extend(group_canaries("index", "marks", marks.0, marks.1));
+    found.extend(group_canaries("rows", "rows", 0.01, -0.01));
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut report = report::evaluate(&found, &[], CI);
+    report.order = Some(order);
+    report
+}
+
+/// A group canary's id names its bench target, group and side, and is a
+/// canary of its own kind: not a run-wide one, and never a regression.
+#[test]
+fn group_canary_ids_round_trip() {
+    let id = group_canary_id("index", "marks", Side::Before);
+    assert_eq!(id, "canary/index.marks.before");
+    // Criterion puts the group's name before the canary's own.
+    assert_eq!(
+        format!(
+            "{}/{}",
+            report::GROUP_CANARY,
+            report::group_canary_name("index", "marks", Side::Before)
+        ),
+        id
+    );
+    assert_eq!(
+        GroupCanary::parse(&id),
+        Some(GroupCanary {
+            bench: "index",
+            group: "marks",
+            side: Side::Before
+        })
+    );
+    assert_eq!(
+        GroupCanary::parse("canary/open.open.after").map(|c| c.side),
+        Some(Side::After)
+    );
+    for not_one in [
+        "canary/index.marks",
+        "canary/index.marks.during",
+        "canary/.marks.before",
+        "canary/marks.before",
+        "canaries/index.marks.before",
+        "marks/next_wide",
+        "baseline/memchr3_scan",
+    ] {
+        assert!(!report::is_group_canary(not_one), "{not_one}");
+    }
+    assert!(!report::is_canary(&id));
+    assert_eq!(report::group_of("marks/next_wide"), "marks");
+
+    // Even moved a long way, a group canary is a canary, not a regression,
+    // and doesn't make the run noisy.
+    let found = [measurement(&id, 15e6, Some(change(0.60)))];
+    let report = report::evaluate(&found, &[], CI);
+    assert_eq!(status_of(&report, &id), &Status::NoisyCanary);
+    assert!(!report.noisy);
+    assert_eq!(report.verdict(), Verdict::Pass);
+    assert_eq!(report.problems().count(), 0);
+}
+
+/// A benchmark's noise is judged by its own group's canaries: moved ones
+/// make the attempt noisy for that group only, and quiet ones keep it
+/// quiet even when a run-wide canary, minutes away, moved.
+#[test]
+fn the_nearest_canaries_judge_a_benchmarks_noise() {
+    // The marks canaries moved (+14% before the group): marks is noisy,
+    // rows isn't.
+    let report = marks_attempt(Order::BaseFirst, 0.01, (0.14, 0.02), 0.32);
+    assert!(!report.noisy);
+    let wide = report.row("marks/next_wide").unwrap();
+    assert!(wide.noisy);
+    assert_eq!(
+        wide.canaries,
+        Canaries::Group {
+            before: Some(0.14),
+            after: Some(0.02)
+        }
+    );
+    assert_eq!(wide.status, Status::NoisyRegression);
+    assert!(!report.row("rows/parse").unwrap().noisy);
+    assert_eq!(report.outcome(false), Outcome::Rerun);
+    let markdown = report.markdown();
+    assert!(
+        markdown.contains(
+            "| +32.0% (+29.0% to +35.0%) | +14.0% / +2.0% |  | regression? (noisy for it) |"
+        ),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains(
+            "| `canary/index.marks.before` | 15.0 ms |  | +14.0% (+11.0% to +17.0%) |  |  | \
+             canary moved (noisy for its group) |"
+        ),
+        "{markdown}"
+    );
+
+    // A run-wide canary moved (−20%, as on attempt 1 of run 37069372104),
+    // but the marks canaries held still: noisy run, quiet for marks.
+    let report = marks_attempt(Order::BaseFirst, -0.203, (0.01, -0.02), 0.32);
+    assert!(report.noisy);
+    assert!(!report.row("marks/next_wide").unwrap().noisy);
+    assert_eq!(status_of(&report, "marks/next_wide"), &Status::Regression);
+}
+
+/// A group whose canaries didn't run on both sides (the base is from
+/// before group canaries) is judged by the run-wide canaries.
+#[test]
+fn a_group_without_canaries_on_both_sides_falls_back_to_the_run_wide_ones() {
+    for run in [0.01, 0.15] {
+        let found = [
+            measurement("baseline/memchr3_scan", 47e6, Some(change(run))),
+            // Head ran it, base didn't: no change.
+            measurement("canary/index.marks.before", 15e6, None),
+            measurement("marks/next_wide", 767e3, Some(change(0.32))),
+        ];
+        let report = report::evaluate(&found, &[], CI);
+        let wide = report.row("marks/next_wide").unwrap();
+        assert_eq!(wide.canaries, Canaries::RunWide);
+        assert_eq!(wide.noisy, run > 0.1);
+        let expected = if run > 0.1 {
+            Status::NoisyRegression
+        } else {
+            Status::Regression
+        };
+        assert_eq!(wide.status, expected);
+    }
+}
+
+/// A real, consistent regression on attempts quiet for it fails on the
+/// rerun, with no third attempt, as it always did.
+#[test]
+fn a_consistent_regression_on_quiet_runs_fails() {
+    let first = marks_attempt(Order::BaseFirst, 0.02, (0.01, -0.03), 0.30);
+    assert_eq!(status_of(&first, "marks/next_wide"), &Status::Regression);
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+
+    let rerun = marks_attempt(Order::HeadFirst, -0.01, (0.02, 0.04), 0.29).after(&first);
+    assert_eq!(status_of(&rerun, "marks/next_wide"), &Status::Regression);
+    assert_eq!(rerun.third_attempt_plan(), None);
+    // Fails whether or not a third attempt could run.
+    assert_eq!(rerun.outcome(false), Outcome::Fail);
+    assert_eq!(rerun.outcome(true), Outcome::Fail);
+}
+
+/// Run 37069372104: `marks/next_wide` at +32% on both attempts, in code
+/// identical on both sides, with the marks canaries showing the VM's
+/// contention on each. A third attempt of the marks group alone, base
+/// first and quiet, shows nothing, so it passes, with a warning.
+#[test]
+fn a_regression_on_two_noisy_attempts_and_a_quiet_third_without_it_passes_with_a_warning() {
+    let first = marks_attempt(Order::BaseFirst, -0.203, (0.15, 0.03), 0.324);
+    assert_eq!(
+        status_of(&first, "marks/next_wide"),
+        &Status::NoisyRegression
+    );
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+
+    let rerun = marks_attempt(Order::HeadFirst, 0.031, (0.02, -0.12), 0.313).after(&first);
+    assert_eq!(status_of(&rerun, "marks/next_wide"), &Status::Recheck);
+    assert_eq!(rerun.outcome(false), Outcome::Rerun);
+    // With no third attempt allowed, it fails, as before.
+    assert_eq!(rerun.outcome(true), Outcome::Fail);
+
+    let plan = rerun.third_attempt_plan().unwrap();
+    assert_eq!(plan.groups, ["marks"]);
+    assert_eq!(plan.benches, ["index"]);
+    assert_eq!(plan.to_text(), format!("index\n{}\n", plan.filter));
+
+    let third = marks_attempt(Order::BaseFirst, 0.01, (0.01, 0.02), 0.004);
+    let settled = rerun.settle(third);
+    assert_eq!(settled.attempt, 3);
+    assert_eq!(settled.rechecked, ["marks/next_wide"]);
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Cleared);
+    assert_eq!(settled.outcome(true), Outcome::Pass);
+    assert_eq!(settled.problems().count(), 1, "the warning for next_wide");
+    let markdown = settled.markdown();
+    for expected in [
+        "**Attempt 3** reran the benchmark `marks/next_wide`",
+        "It benchmarked the base commit first, then this commit, for the group `marks` only.",
+        "| `marks/next_wide` | 767 µs |  | +0.4% (-2.6% to +3.4%) | +1.0% / +2.0% |  | \
+         regression? (not on attempt 3) |",
+    ] {
+        assert!(markdown.contains(expected), "{expected}\n\n{markdown}");
+    }
+}
+
+/// A regression on all three attempts fails, whether attempt 3 was quiet
+/// for it or noisy.
+#[test]
+fn a_regression_on_all_three_attempts_fails() {
+    for third_canary in [0.01, 0.18] {
+        let first = marks_attempt(Order::BaseFirst, -0.203, (0.15, 0.03), 0.324);
+        let rerun = marks_attempt(Order::HeadFirst, 0.031, (0.02, -0.12), 0.313).after(&first);
+        let third = marks_attempt(Order::BaseFirst, 0.01, (third_canary, 0.0), 0.30);
+        assert_eq!(
+            third.row("marks/next_wide").unwrap().noisy,
+            third_canary > 0.1
+        );
+        let settled = rerun.settle(third);
+        assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Regression);
+        let outcome = settled.outcome(true);
+        assert_eq!(outcome, Outcome::Fail, "third canary {third_canary}");
+        assert_eq!(outcome.exit_code(), 1);
+    }
+}
+
+/// A third attempt that doesn't show the regression but was itself noisy
+/// for it settles nothing: inconclusive, which warns and passes.
+#[test]
+fn a_noisy_third_attempt_without_the_regression_is_inconclusive() {
+    let first = marks_attempt(Order::BaseFirst, 0.01, (0.15, 0.03), 0.324);
+    let rerun = marks_attempt(Order::HeadFirst, 0.01, (0.02, -0.12), 0.313).after(&first);
+    // The canary after the group got 13% faster on head relative to base:
+    // base slowed, which can hide a regression.
+    let third = marks_attempt(Order::BaseFirst, 0.01, (0.02, -0.13), 0.05);
+    assert!(third.row("marks/next_wide").unwrap().could_hide);
+    let settled = rerun.clone().settle(third);
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Unsettled);
+    let outcome = settled.outcome(true);
+    assert_eq!(outcome, Outcome::Inconclusive);
+    assert_eq!(outcome.exit_code(), 0);
+
+    // Noisy the other way (head slowed, +13%) can fake a regression but
+    // not hide one: it is cleared, as on a quiet attempt.
+    let third = marks_attempt(Order::BaseFirst, 0.01, (0.02, 0.13), 0.05);
+    let wide = third.row("marks/next_wide").unwrap();
+    assert!(wide.noisy && !wide.could_hide);
+    let settled = rerun.settle(third);
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Cleared);
+    assert_eq!(settled.outcome(true), Outcome::Pass);
+}
+
+/// A regression on attempt 1 that the rerun doesn't show is judged the
+/// way attempt 3 judges one: if the rerun's nearest canaries say its base
+/// side slowed, it may have hidden the regression, so it is
+/// `Status::Unsettled` (inconclusive), with the same label; otherwise it
+/// passes with a warning.
+#[test]
+fn a_regression_a_later_attempt_may_have_hidden_is_unsettled_on_the_rerun_too() {
+    let first = marks_attempt(Order::BaseFirst, 0.01, (0.01, 0.02), 0.324);
+    assert_eq!(status_of(&first, "marks/next_wide"), &Status::Regression);
+
+    // The rerun ran head first; its marks canary moved −15% (head's
+    // relative to base), so base slowed. The run-wide canaries are quiet.
+    let rerun = marks_attempt(Order::HeadFirst, 0.01, (-0.15, 0.0), 0.01).after(&first);
+    assert!(!rerun.noisy);
+    assert_eq!(status_of(&rerun, "marks/next_wide"), &Status::Unsettled);
+    assert!(rerun.unconfirmed.is_empty(), "{:?}", rerun.unconfirmed);
+    assert_eq!(rerun.third_attempt_plan(), None);
+    for last_attempt in [false, true] {
+        assert_eq!(rerun.outcome(last_attempt), Outcome::Inconclusive);
+    }
+
+    // The same status, and so the same label, as attempt 3's case.
+    let second = marks_attempt(Order::HeadFirst, 0.01, (0.15, 0.0), 0.313).after(&first);
+    let settled = second.settle(marks_attempt(Order::BaseFirst, 0.01, (-0.15, 0.0), 0.01));
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Unsettled);
+    let label = "| regression? (not shown again, base side slowed) |";
+    assert!(rerun.markdown().contains(label), "{}", rerun.markdown());
+    assert!(settled.markdown().contains(label), "{}", settled.markdown());
+
+    // Moved the other way (+15%, head slowed), the rerun can't have hidden
+    // it: it passes with a warning, as on a quiet rerun.
+    let rerun = marks_attempt(Order::HeadFirst, 0.01, (0.15, 0.0), 0.01).after(&first);
+    assert_eq!(status_of(&rerun, "marks/next_wide"), &Status::Ok);
+    assert_eq!(rerun.unconfirmed, ["marks/next_wide"]);
+    assert_eq!(rerun.outcome(true), Outcome::Pass);
+}
+
+/// The first run after group canaries land compares with a base without
+/// them, so every attempt, the third included, falls back to the run-wide
+/// canaries.
+#[test]
+fn a_third_attempt_against_a_base_without_group_canaries_uses_the_run_wide_ones() {
+    // Head has its canaries, base doesn't: no change for them.
+    let attempt = |order, run: f64, next_wide: f64| {
+        let found = [
+            measurement("baseline/memchr3_scan", 47e6, Some(change(run))),
+            measurement("baseline-late/memchr3_scan", 47e6, Some(change(0.01))),
+            measurement("canary/index.marks.before", 15e6, None),
+            measurement("canary/index.marks.after", 15e6, None),
+            measurement("marks/next_wide", 767e3, Some(change(next_wide))),
+        ];
+        let mut report = report::evaluate(&found, &[], CI);
+        report.order = Some(order);
+        report
+    };
+    let first = attempt(Order::BaseFirst, -0.203, 0.324);
+    assert_eq!(
+        first.row("marks/next_wide").unwrap().canaries,
+        Canaries::RunWide
+    );
+    let rerun = attempt(Order::HeadFirst, 0.01, 0.313).after(&first);
+    assert_eq!(status_of(&rerun, "marks/next_wide"), &Status::Recheck);
+    // The canaries still name the bench target.
+    assert_eq!(rerun.third_attempt_plan().unwrap().benches, ["index"]);
+
+    for (run, next_wide, expected, outcome) in [
+        // Quiet, no regression: cleared.
+        (0.01, 0.0, Status::Cleared, Outcome::Pass),
+        // A run-wide canary 15% faster on head (base slowed): may have
+        // hidden it.
+        (-0.15, 0.0, Status::Unsettled, Outcome::Inconclusive),
+        // 15% slower on head: can't have hidden it. Attempt 3's run-wide
+        // noise doesn't make the result inconclusive on its own.
+        (0.15, 0.0, Status::Cleared, Outcome::Pass),
+        // The regression again: fails, noisy or not.
+        (0.15, 0.30, Status::Regression, Outcome::Fail),
+        (0.01, 0.30, Status::Regression, Outcome::Fail),
+    ] {
+        let settled = rerun
+            .clone()
+            .settle(attempt(Order::BaseFirst, run, next_wide));
+        let context = format!("run {run}, next_wide {next_wide}");
+        assert_eq!(
+            status_of(&settled, "marks/next_wide"),
+            &expected,
+            "{context}"
+        );
+        assert_eq!(settled.outcome(true), outcome, "{context}");
+    }
+}
+
+/// A rechecked benchmark that attempt 3 has no comparison for (it didn't
+/// run, or only on one side) isn't cleared: it regressed on both attempts.
+#[test]
+fn a_third_attempt_with_no_result_for_it_fails() {
+    let first = marks_attempt(Order::BaseFirst, 0.01, (0.15, 0.03), 0.324);
+    let rerun = marks_attempt(Order::HeadFirst, 0.01, (0.02, -0.12), 0.313).after(&first);
+    let missing = report::evaluate(&[], &[], CI);
+    assert_eq!(
+        status_of(&rerun.clone().settle(missing), "marks/next_wide"),
+        &Status::Regression
+    );
+    let uncompared = report::evaluate(&[measurement("marks/next_wide", 767e3, None)], &[], CI);
+    let settled = rerun.settle(uncompared);
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Regression);
+    assert_eq!(settled.outcome(true), Outcome::Fail);
+}
+
+/// Budgets are unaffected: one over budget fails on any attempt, a third
+/// one included, and before any third attempt runs.
+#[test]
+fn budgets_are_unaffected_by_the_third_attempt() {
+    let budgets = [Budget {
+        id: "marks/next_wide",
+        max_ms: 1.0,
+        source: "test",
+    }];
+    let attempt = |order, marks, next_wide, median_ns| {
+        let mut found = vec![
+            measurement("baseline/memchr3_scan", 47e6, Some(change(0.01))),
+            measurement("marks/next_wide", median_ns, Some(change(next_wide))),
+        ];
+        found.extend(group_canaries("index", "marks", marks, 0.0));
+        let mut report = report::evaluate(&found, &budgets, CI);
+        report.order = Some(order);
+        report
+    };
+    let first = attempt(Order::BaseFirst, 0.15, 0.32, 0.8e6);
+    let rerun = attempt(Order::HeadFirst, 0.0, 0.31, 0.8e6).after(&first);
+    assert_eq!(rerun.outcome(false), Outcome::Rerun);
+
+    // Over budget on attempt 3, which cleared the regression: fails.
+    let settled = rerun
+        .clone()
+        .settle(attempt(Order::BaseFirst, 0.0, 0.0, 1.2e6));
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::OverBudget);
+    assert_eq!(settled.outcome(true), Outcome::Fail);
+
+    // Within budget on attempt 3: cleared, and passes.
+    let settled = rerun.settle(attempt(Order::BaseFirst, 0.0, 0.0, 0.8e6));
+    assert_eq!(status_of(&settled, "marks/next_wide"), &Status::Cleared);
+    assert_eq!(settled.outcome(true), Outcome::Pass);
+
+    // Over budget on the rerun: fails there, with no third attempt.
+    let rerun = attempt(Order::HeadFirst, 0.0, 0.31, 1.2e6).after(&first);
+    assert_eq!(rerun.outcome(false), Outcome::Fail);
+}
+
+/// The third attempt's filter (a criterion regex over benchmark ids)
+/// selects every benchmark in the groups to recheck and their canaries,
+/// and nothing else.
+#[test]
+fn the_third_attempt_selects_only_the_groups_to_recheck() {
+    let mut found = vec![
+        measurement("marks/next_wide", 767e3, Some(change(0.32))),
+        measurement("rows/parse", 12e3, Some(change(0.31))),
+        measurement("index/build", 300e6, Some(change(0.30))),
+    ];
+    found.extend(group_canaries("index", "marks", 0.15, 0.0));
+    found.extend(group_canaries("rows", "rows", 0.15, 0.0));
+    found.extend(group_canaries("index", "index", 0.0, 0.0));
+    let first = report::evaluate(&found, &[], CI);
+    let rerun = report::evaluate(&found, &[], CI).after(&first);
+    // index/build was quiet for it on both: it fails, and isn't rechecked.
+    assert_eq!(status_of(&rerun, "index/build"), &Status::Regression);
+    assert_eq!(rerun.outcome(false), Outcome::Fail);
+
+    let plan = rerun.third_attempt_plan().unwrap();
+    assert_eq!(plan.groups, ["marks", "rows"]);
+    assert_eq!(plan.benches, ["index", "rows"]);
+    let filter = regex::Regex::new(&plan.filter).unwrap();
+    for selected in [
+        "marks/next_wide",
+        "marks/previous_narrow",
+        "rows/parse",
+        "canary/index.marks.before",
+        "canary/index.marks.after",
+        "canary/rows.rows.before",
+    ] {
+        assert!(filter.is_match(selected), "{selected} by {}", plan.filter);
+    }
+    for left_out in [
+        "index/build",
+        "worst/blank_lines",
+        "marksx/next",
+        "canary/index.index.before",
+        "canary/index.worst.after",
+        "baseline/memchr3_scan",
+        "baseline-late/memchr3_scan",
+        "navigate/next_rows",
+    ] {
+        assert!(!filter.is_match(left_out), "{left_out} by {}", plan.filter);
+    }
+
+    // A group with no canary: every bench target runs, filtered.
+    let found = [measurement("edits/screen", 1e3, Some(change(0.4)))];
+    let noisy = [
+        measurement("baseline/memchr3_scan", 47e6, Some(change(0.2))),
+        measurement("edits/screen", 1e3, Some(change(0.4))),
+    ];
+    let rerun = report::evaluate(&found, &[], CI).after(&report::evaluate(&noisy, &[], CI));
+    let plan = rerun.third_attempt_plan().unwrap();
+    assert!(plan.benches.is_empty());
+    assert_eq!(plan.to_text().lines().next(), Some(""));
+}
+
+/// Every bench group in `benches/` has its canaries around it: for each
+/// `benchmark_group("<group>")`, the file calls
+/// `common::canary(c, "<group>", Side::Before)` somewhere before it and
+/// `common::canary(c, "<group>", Side::After)` somewhere after it. So no
+/// group is judged only by the run-wide canaries. (It checks the order in
+/// the source, not that nothing else runs in between.)
+#[test]
+fn every_bench_group_has_canaries() {
+    let benches = Path::new(env!("CARGO_MANIFEST_DIR")).join("benches");
+    let mut checked = 0;
+    for entry in fs::read_dir(&benches).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        // The baseline's own memchr3_scan is the run-wide canary.
+        if path.extension().is_none_or(|extension| extension != "rs") || name == "baseline.rs" {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
+        for (at, _) in source.match_indices("benchmark_group(\"") {
+            let rest = &source[at + "benchmark_group(\"".len()..];
+            let group = rest.split('"').next().unwrap();
+            let before = format!("common::canary(c, \"{group}\", Side::Before);");
+            let after = format!("common::canary(c, \"{group}\", Side::After);");
+            assert!(
+                source[..at].contains(&before),
+                "{name}: no `{before}` before the group"
+            );
+            assert!(
+                rest.contains(&after),
+                "{name}: no `{after}` after the group"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 8, "only {checked} groups found");
+}
+
+/// Writes `id`'s result into `<dir>/criterion` with head's change
+/// `head_change`, as criterion leaves it for the order already written
+/// there: inverted on a head-first attempt.
+fn write_head(dir: &Path, id: &str, median_ns: f64, head_change: f64) {
+    let criterion = dir.join("criterion");
+    let head = change(head_change);
+    let written = if report::read_order(&criterion).unwrap() == Some(Order::HeadFirst) {
+        head.inverted()
+    } else {
+        head
+    };
+    write_bench(&criterion, id, median_ns, None, Some(written));
+}
+
+/// One attempt of run 37069372104's shape, as `bench-compare` leaves it in
+/// `<dir>/criterion`: the budgets' benchmarks at 60% of budget, the
+/// run-wide canaries quiet, the marks canaries moved by `marks`, and
+/// `marks/next_wide` changed by `next_wide`. A third attempt (`partial`)
+/// has only the marks group, its canaries and the run-wide canaries.
+fn write_marks_attempt(dir: &Path, order: &str, partial: bool, marks: (f64, f64), next_wide: f64) {
+    fs::create_dir_all(dir.join("criterion")).unwrap();
+    write_order(dir, order);
+    if !partial {
+        for budget in leal_bench::budgets::BUDGETS {
+            write_head(dir, budget.id, budget.max_ms * 0.6e6, 0.04);
+        }
+        write_head(dir, "marks/next_narrow", 27e3, 0.01);
+    }
+    write_head(dir, "baseline/memchr3_scan", 47e6, 0.02);
+    write_head(dir, "baseline-late/memchr3_scan", 47e6, -0.01);
+    write_head(dir, "canary/index.marks.before", 15e6, marks.0);
+    write_head(dir, "canary/index.marks.after", 15e6, marks.1);
+    write_head(dir, "marks/next_wide", 767e3, next_wide);
+}
+
+/// Runs `bench-report` with `args` then `<dir>/criterion`, as
+/// `bench-compare` does on GitHub Actions.
+fn run_bench_report_with(dir: &Path, args: &[&Path]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bench-report"))
+        .args(args)
+        .arg(dir.join("criterion"))
+        .env("GITHUB_ACTIONS", "true")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+    )
+}
+
+/// `bench-report` end to end, as `bench-compare` runs it: the rerun asks
+/// for a third attempt (exit 3) and writes its plan; the third attempt,
+/// of the marks group alone, passes with a warning if it is quiet and
+/// doesn't show the regression, fails if it shows it, and is inconclusive
+/// if it is noisy for it and doesn't. It doesn't report the budgets of the
+/// groups it didn't run as missing.
+#[test]
+fn bench_report_runs_a_third_attempt_for_a_regression_on_noisy_attempts() {
+    let dir = scratch("bin-third");
+    let (first, second) = (dir.join("first"), dir.join("second"));
+    write_marks_attempt(&first, "base-first", false, (0.15, 0.03), 0.324);
+    write_marks_attempt(&second, "head-first", false, (0.02, -0.12), 0.313);
+    let plan_file = dir.join("plan");
+    let first_criterion = first.join("criterion");
+    let (code, stdout) = run_bench_report_with(
+        &second,
+        &[
+            Path::new("--first-attempt"),
+            &first_criterion,
+            Path::new("--plan"),
+            &plan_file,
+        ],
+    );
+    assert_eq!(code, Some(3), "{stdout}");
+    assert!(stdout.contains("**Third attempt:**"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "::warning::benchmark marks/next_wide regressed on both attempts, but at least one \
+             was noisy for it; rerunning its group a third time, base first"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("::error::"), "{stdout}");
+    let plan = fs::read_to_string(&plan_file).unwrap();
+    assert!(plan.starts_with("index\n^"), "{plan}");
+
+    // Without --plan, the rerun is the last attempt, and it fails as before.
+    let (code, stdout) =
+        run_bench_report_with(&second, &[Path::new("--first-attempt"), &first_criterion]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("::error::benchmark marks/next_wide is a regression"),
+        "{stdout}"
+    );
+
+    let second_criterion = second.join("criterion");
+    let third_args = [
+        Path::new("--first-attempt"),
+        &first_criterion,
+        Path::new("--second-attempt"),
+        &second_criterion,
+    ];
+    for (name, marks, next_wide, code, expected) in [
+        (
+            "quiet",
+            (0.01, 0.02),
+            0.004,
+            0,
+            "::warning::benchmark marks/next_wide regressed on attempts 1 and 2 (at least one \
+             noisy for it) but not on attempt 3 (base first), with no sign that its base side \
+             slowed, so it passed",
+        ),
+        (
+            "regressed",
+            (0.01, 0.02),
+            0.30,
+            1,
+            "::error::benchmark marks/next_wide is a regression: it regressed on all three \
+             attempts",
+        ),
+        (
+            "noisy",
+            (-0.14, 0.02),
+            0.004,
+            0,
+            "::warning::benchmark marks/next_wide regressed on attempts 1 and 2 but not on \
+             attempt 3 (base first), whose nearest canaries say its base side slowed, which can \
+             hide a regression, so it wasn't judged",
+        ),
+        (
+            "no-result",
+            (0.01, 0.02),
+            0.004,
+            1,
+            "::error::benchmark marks/next_wide regressed on attempts 1 and 2, and attempt 3 has \
+             no result for it",
+        ),
+    ] {
+        let third = dir.join(name);
+        write_marks_attempt(&third, "base-first", true, marks, next_wide);
+        if name == "no-result" {
+            // It ran on head only, so criterion compared nothing.
+            fs::remove_dir_all(third.join("criterion/marks_next_wide/change")).unwrap();
+        }
+        let (status, stdout) = run_bench_report_with(&third, &third_args);
+        assert_eq!(status, Some(code), "{name}: {stdout}");
+        assert!(stdout.contains(expected), "{name}: {expected}\n\n{stdout}");
+        assert!(
+            !stdout.contains("has a budget but no result"),
+            "{name}: {stdout}"
+        );
+        assert!(stdout.contains("**Attempt 3** reran"), "{name}: {stdout}");
+        if code == 0 {
+            assert!(!stdout.contains("::error::"), "{name}: {stdout}");
+        }
     }
 }

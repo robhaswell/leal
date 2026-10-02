@@ -16,10 +16,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::diagnostics::DiagnosticKind;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
+
+// Only `canary` is used here: the file is made below, and the benchmarks
+// take microseconds, so they keep criterion's default sampling.
+#[allow(dead_code)]
+mod common;
 
 const ROWS: usize = 120_000;
 const FIELDS: usize = 200;
@@ -84,6 +90,7 @@ fn navigate(c: &mut Criterion) {
         assert!(count > 2_000, "{kind:?}: {count}");
     }
 
+    common::canary(c, "navigate", Side::Before);
     let mut group = c.benchmark_group("navigate");
     group
         .warm_up_time(Duration::from_secs(1))
@@ -137,6 +144,7 @@ fn navigate(c: &mut Criterion) {
         });
     }
     group.finish();
+    common::canary(c, "navigate", Side::After);
     drop(document);
     let _ = std::fs::remove_dir_all(&temp_root);
 }

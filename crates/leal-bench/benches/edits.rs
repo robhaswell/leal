@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::find::Query;
 use leal_core::schedule::{Scheduler, SchedulerConfig};
@@ -76,6 +77,7 @@ fn edits(c: &mut Criterion) {
         rows
     };
 
+    common::canary(c, "edits", Side::Before);
     let mut group = c.benchmark_group("edits");
     group.bench_function("screen", |b| b.iter(read_screen));
 
@@ -161,6 +163,7 @@ fn edits(c: &mut Criterion) {
         });
     });
     group.finish();
+    common::canary(c, "edits", Side::After);
     drop(document);
     let _ = std::fs::remove_dir_all(&temp_root);
 }

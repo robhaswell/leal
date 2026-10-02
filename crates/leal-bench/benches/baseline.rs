@@ -17,6 +17,9 @@
 //! which is the case for a file the user just opened. A cold read from disk
 //! needs `sudo purge` between iterations and isn't measured here.
 
+// `canary` isn't used here: this group's own `memchr3_scan` is the
+// run-wide canary.
+#[allow(dead_code)]
 mod common;
 
 use std::fs::File;

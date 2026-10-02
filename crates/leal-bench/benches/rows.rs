@@ -24,11 +24,13 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::index::{CodeUnit, IndexDialect, RowIndex};
 use leal_core::rows::{DEFAULT_CACHE_ROWS, Encoding, ParsedRow, RowCache, RowParser};
 
-// Only `reference_file` is used here: these benchmarks take microseconds,
-// so they keep criterion's default sampling rather than `whole_file`'s.
+// Only `reference_file` and `canary` are used here: these benchmarks take
+// microseconds, so they keep criterion's default sampling rather than
+// `whole_file`'s.
 #[allow(dead_code)]
 mod common;
 
@@ -63,6 +65,7 @@ fn rows(c: &mut Criterion) {
     let screen = FIRST_ROW..FIRST_ROW + SCREEN_ROWS;
     let cells = (SCREEN_ROWS * leal_bench::reference::COLUMNS) as u64;
 
+    common::canary(c, "rows", Side::Before);
     let mut group = c.benchmark_group("rows");
     group.throughput(Throughput::Elements(cells));
 
@@ -166,6 +169,7 @@ fn rows(c: &mut Criterion) {
     }
 
     group.finish();
+    common::canary(c, "rows", Side::After);
 }
 
 /// How much of a cell the grid decodes: more than a 260 px column can show

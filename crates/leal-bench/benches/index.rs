@@ -23,6 +23,7 @@ use std::hint::black_box;
 use std::sync::atomic::AtomicBool;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use leal_bench::report::Side;
 use leal_core::diagnostics::DiagnosticKind;
 use leal_core::dialect::Encoding;
 use leal_core::index::{CHUNK_BYTES, CodeUnit, IndexDialect, RowIndex};
@@ -43,6 +44,7 @@ fn index(c: &mut Criterion) {
     let bytes = std::fs::read(&path).expect("reading the reference file");
     let len = bytes.len() as u64;
 
+    common::canary(c, "index", Side::Before);
     let mut group = c.benchmark_group("index");
     common::whole_file(&mut group, len);
 
@@ -156,6 +158,7 @@ fn index(c: &mut Criterion) {
         });
     });
     group.finish();
+    common::canary(c, "index", Side::After);
 }
 
 /// A BOM (FF FE), then the first half of `bytes` (cut back to whole UTF-8
@@ -228,6 +231,7 @@ fn worst(c: &mut Criterion) {
             encoding: Encoding::Utf8,
         },
     ];
+    common::canary(c, "worst", Side::Before);
     let mut group = c.benchmark_group("worst");
     for case in cases {
         common::whole_file(&mut group, case.len as u64);
@@ -277,6 +281,7 @@ fn worst(c: &mut Criterion) {
     }
     plain_chunks();
     group.finish();
+    common::canary(c, "worst", Side::After);
 }
 
 /// The plain index's longest chunk ([`CHUNK_BYTES`]) on its worst file:
@@ -318,6 +323,7 @@ fn plain_chunks() {
 /// exact count from the side list, walked alongside.
 fn marks(c: &mut Criterion) {
     const ROWS: usize = 400_000;
+    common::canary(c, "marks", Side::Before);
     let mut group = c.benchmark_group("marks");
     for (name, fields) in [("narrow", 3), ("wide", 130)] {
         let row = format!("{}\n", vec!["a"; fields].join(","));
@@ -346,6 +352,7 @@ fn marks(c: &mut Criterion) {
         });
     }
     group.finish();
+    common::canary(c, "marks", Side::After);
 }
 
 criterion_group!(benches, index, worst, marks);

@@ -464,6 +464,7 @@ dependencies = [
  "criterion",
  "leal-core",
  "memchr",
+ "regex",
  "serde_json",
 ]
 

@@ -75,7 +75,7 @@ reference-file:
     fi
     echo "reference-file: $file matches crates/leal-bench/reference.sha256"
 
-# Benchmark `base` and this checkout on this machine, one after the other (a rerun swaps the order), and report budgets, regressions and noise. CI runs it on each push to main.
+# Benchmark `base` and this checkout on this machine, one after the other (a rerun swaps the order, and a third attempt reruns only the groups it must), and report budgets, regressions and noise. CI runs it on each push to main.
 bench-compare base="main" regression="0.20" noise="0.10":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -113,9 +113,10 @@ bench-compare base="main" regression="0.20" noise="0.10":
 
     # One side's benchmarks, in the directory $1 with the target directory
     # $2, passing the rest to criterion: everything (the `baseline` group
-    # included), then that group again as `baseline-late`, to catch noise
-    # that started part-way through. The steps are chained with `&&`
-    # because `set -e` is off inside a function called with `||`.
+    # included, and each group's canaries, `canary/…`), then that group
+    # again as `baseline-late`, to catch noise that started part-way
+    # through. The steps are chained with `&&` because `set -e` is off
+    # inside a function called with `||`.
     run_side() {
         local dir="$1" target="$2"
         shift 2
@@ -124,6 +125,39 @@ bench-compare base="main" regression="0.20" noise="0.10":
             && CARGO_TARGET_DIR="$target" cargo bench --package leal-bench -- "$@" \
             && CARGO_TARGET_DIR="$target" LEAL_BENCH_BASELINE_GROUP=baseline-late \
                 cargo bench --package leal-bench --bench baseline -- "$@"
+        )
+    }
+
+    # One side's benchmarks for a third attempt, as `run_side`, but only
+    # what the plan from bench-report selects: the run-wide canary, then
+    # the bench groups to recheck and their canaries (in the bench targets
+    # `$plan_benches` names, or all of them if it names none, filtered by
+    # `$plan_filter`), then the late canary. If this side lacks a bench
+    # target the plan names (a group moved between targets, say), every
+    # target runs on this side, still filtered, so nothing is missed.
+    run_groups() {
+        local dir="$1" target="$2" bench every=no
+        shift 2
+        local benches=()
+        for bench in $plan_benches; do
+            if [ -f "$dir/crates/leal-bench/benches/$bench.rs" ]; then
+                benches+=(--bench "$bench")
+            else
+                every=yes
+            fi
+        done
+        if [ "$every" = yes ]; then
+            benches=()
+        fi
+        (
+            cd "$dir" \
+            && CARGO_TARGET_DIR="$target" cargo bench --package leal-bench --bench baseline -- \
+                "$@" '^baseline/memchr3_scan$' \
+            && CARGO_TARGET_DIR="$target" cargo bench --package leal-bench \
+                ${benches[@]+"${benches[@]}"} -- "$@" "$plan_filter" \
+            && CARGO_TARGET_DIR="$target" LEAL_BENCH_BASELINE_GROUP=baseline-late \
+                cargo bench --package leal-bench --bench baseline -- \
+                "$@" '^baseline-late/memchr3_scan$'
         )
     }
     head_target="${CARGO_TARGET_DIR:-$root/target}"
@@ -144,6 +178,8 @@ bench-compare base="main" regression="0.20" noise="0.10":
     #   head-first (`report::collect`). So criterion's console lines on
     #   this attempt show the change the other way round.
     #
+    # - third: as base-first, but only the groups to recheck (`run_groups`).
+    #
     # Either way, a benchmark that only one side has isn't compared
     # (`--baseline-lenient`), and one that this checkout removed has no
     # `new/`, so it doesn't show up with the base's numbers.
@@ -155,6 +191,12 @@ bench-compare base="main" regression="0.20" noise="0.10":
                 run_side "$work/base" "$work/base-target" --save-baseline base || fail "$base_fails"
                 clear_new
                 run_side "$root" "$head_target" --baseline-lenient base
+                ;;
+            third)
+                order=base-first
+                run_groups "$work/base" "$work/base-target" --save-baseline base || fail "$base_fails"
+                clear_new
+                run_groups "$root" "$head_target" --baseline-lenient base
                 ;;
             head-first)
                 run_side "$root" "$head_target" --save-baseline head
@@ -170,13 +212,24 @@ bench-compare base="main" regression="0.20" noise="0.10":
         echo "bench-compare: compared with ${sha:0:12} ({{ base }}), attempt $attempt, $order"
     }
 
-    # A noisy run (a `memchr3_scan` canary moved), or one with a regression,
-    # is rerun once. A budget fails on either attempt. A regression fails
-    # only if every attempt shows it: the rerun's bench-report is given the
-    # first attempt's results (--first-attempt). If the rerun is noisy, or
-    # shows a regression the first attempt didn't, bench-report warns that
-    # the run is inconclusive and passes: a noisy runner is no reason to
-    # turn CI red (docs/tasks/1.2b.md).
+    # Up to three attempts. A budget fails on any of them. A regression
+    # fails only if every attempt shows it, and inconclusive (something
+    # noise kept from being judged) warns and passes: a noisy runner is no
+    # reason to turn CI red. A canary that moved by more than {{ noise }}
+    # makes the run noisy if it is a run-wide one (`baseline/memchr3_scan`
+    # or `baseline-late/memchr3_scan`), and the attempt noisy for a group's
+    # benchmarks if it is one of that group's canaries. The rules are in
+    # crates/leal-bench/src/report.rs, the history in docs/tasks/1.2b.md.
+    #
+    # 1. Both sides, base first. A noisy run or a regression is rerun.
+    # 2. The rerun: both sides, head first, judged with attempt 1's results
+    #    (--first-attempt). A regression on both attempts, both quiet for
+    #    it, fails. If either was noisy for it, bench-report writes a plan
+    #    (--plan) and asks for a third attempt.
+    # 3. Only the groups in the plan, base first, judged with both earlier
+    #    attempts (--second-attempt). A regression to recheck fails if
+    #    attempt 3 shows it too, noisy for it or quiet, or has no result
+    #    for it.
     #
     # Attempt 1 runs base first and the rerun head first. A drift over the
     # job (the runner warming up, a neighbour's load building) counts
@@ -184,15 +237,21 @@ bench-compare base="main" regression="0.20" noise="0.10":
     # against base on the rerun, so it can't fail both. With base first on
     # both attempts, it failed main at 2cc71bb (docs/tasks/1.2b.md).
     first="$work/criterion-attempt-1"
-    rm -rf "$first"
-    for attempt in 1 2; do
+    second="$work/criterion-attempt-2"
+    plan="$work/third-attempt-plan"
+    plan_benches=""
+    plan_filter=""
+    rm -rf "$first" "$second" "$plan"
+    for attempt in 1 2 3; do
         # An array, so that empty means no argument. The `+` form keeps an
         # empty one from tripping `set -u` in macOS's bash 3.2.
-        last_attempt=()
+        report_args=()
         if [ "$has_base" = no ]; then
-            last_attempt=(--last-attempt)
+            report_args=(--last-attempt)
         elif [ "$attempt" = 2 ]; then
-            last_attempt=(--first-attempt "$first")
+            report_args=(--first-attempt "$first" --plan "$plan")
+        elif [ "$attempt" = 3 ]; then
+            report_args=(--first-attempt "$first" --second-attempt "$second")
         fi
         rm -rf "$CRITERION_HOME"
         mkdir -p "$CRITERION_HOME"
@@ -200,25 +259,37 @@ bench-compare base="main" regression="0.20" noise="0.10":
             run_side "$root" "$head_target"
         elif [ "$attempt" = 1 ]; then
             measure base-first
-        else
+        elif [ "$attempt" = 2 ]; then
             measure head-first
+        else
+            measure third
         fi
 
         status=0
         cargo run --release --quiet --package leal-bench --bin bench-report -- \
-            --regression "{{ regression }}" --noise "{{ noise }}" ${last_attempt[@]+"${last_attempt[@]}"} \
+            --regression "{{ regression }}" --noise "{{ noise }}" ${report_args[@]+"${report_args[@]}"} \
             "$CRITERION_HOME" || status=$?
         case "$status" in
             0) exit 0 ;;
             3)
-                warn "bench-compare: a canary moved by more than {{ noise }} or a benchmark regressed; rerunning both sides once, head first this time (a regression fails only if the rerun shows it too)"
-                mv "$CRITERION_HOME" "$first"
+                if [ "$attempt" = 1 ]; then
+                    warn "bench-compare: a run-wide canary moved by more than {{ noise }} or a benchmark regressed; rerunning both sides once, head first this time (a regression fails only if every attempt shows it)"
+                    mv "$CRITERION_HOME" "$first"
+                elif [ "$attempt" = 2 ]; then
+                    # The bench targets on the first line (none for all of
+                    # them), the criterion filter on the second.
+                    { read -r plan_benches; read -r plan_filter; } < "$plan"
+                    warn "bench-compare: a benchmark regressed on both attempts, but at least one was noisy for it; rerunning only its groups, base first (bench targets: ${plan_benches:-all}; filter: $plan_filter). It fails only if this attempt shows the regression too"
+                    mv "$CRITERION_HOME" "$second"
+                else
+                    break
+                fi
                 ;;
             *) exit "$status" ;;
         esac
     done
-    # Only reachable if bench-report asked for a rerun on the last attempt.
-    fail "bench-compare: bench-report asked for a rerun after the last attempt"
+    # Only reachable if bench-report asked for another attempt after the third.
+    fail "bench-compare: bench-report asked for another attempt after the third"
 
 # Build the universal libleal_ffi.a and generate the Swift bindings (profile: debug or release).
 ffi profile="debug" test_exports="auto":
