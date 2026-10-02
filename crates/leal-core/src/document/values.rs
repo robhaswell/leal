@@ -137,7 +137,8 @@ impl Document {
         columns: Range<usize>,
     ) -> Result<Option<String>, ReadError> {
         let reading = self.current();
-        let (index, available) = self.rows_index(&reading);
+        let stale = self.head_is_stale();
+        let (index, available) = reading.rows_from(&reading.index, stale);
         let settled = matches!(
             index_ended(&reading.index, reading.index_job.control()),
             Some(Ok(()))
@@ -151,7 +152,7 @@ impl Document {
             append_rows(
                 &reading,
                 index,
-                (&self.source, &self.head),
+                (&self.source, &self.head, stale),
                 rows.start..end,
                 rows.start,
                 &columns,
@@ -213,6 +214,11 @@ impl Document {
     /// document's index stops before reaching the rows (closing cancels
     /// it), the job has the file indexed again for itself, by an index pass
     /// of its own, which streams a file on a removable drive in chunks.
+    ///
+    /// If the file turns out to have changed while it was read, after the
+    /// job took rows from the first 64 KB kept in memory, it starts again
+    /// over the checked copy's rows only: it never gives text from both
+    /// versions of the file (p1-review fid-2).
     pub fn copy_cells(&self, rows: Range<usize>, columns: Range<usize>) -> JobHandle<CopiedText> {
         let reading = self.current();
         let source = Arc::clone(&self.source);
@@ -222,20 +228,40 @@ impl Document {
         let mut out = String::new();
         let mut next = rows.start;
         let mut own: Option<OwnIndex> = None;
+        // Whether `out` has rows read from the first 64 KB.
+        let mut used_head = false;
         self.scheduler
             .spawn_resumable(Priority::P2, Interval::Copy, move |job| {
-                while next < rows.end {
+                loop {
                     job.checkpoint()?;
+                    // One look per step, for the rows and their bytes.
+                    let stale = source.changed_on_disk();
+                    if stale && used_head {
+                        out.clear();
+                        next = rows.start;
+                        used_head = false;
+                    }
+                    if next >= rows.end {
+                        // Unless the file changed since this step looked.
+                        if source.changed_on_disk() == stale {
+                            break;
+                        }
+                        continue;
+                    }
                     let (filled, filler) = match &own {
                         Some(own) => (&*own.index, own.job.control()),
                         None => (&*reading.index, reading.index_job.control()),
                     };
                     let indexed = filled.row_count();
-                    let (index, available) = reading.rows_from(filled, source.changed_on_disk());
+                    let (index, available) = reading.rows_from(filled, stale);
                     if next >= available {
                         match more_rows(filled, filler, indexed, job) {
                             Ok(Settled::Done) => {
-                                if next >= reading.rows_from(filled, source.changed_on_disk()).1 {
+                                // No more rows will come: done, unless the
+                                // index or the file moved on since this step
+                                // looked.
+                                let now = source.changed_on_disk();
+                                if now == stale && next >= reading.rows_from(filled, now).1 {
                                     break;
                                 }
                             }
@@ -250,10 +276,10 @@ impl Document {
                         continue;
                     }
                     let end = rows.end.min(available).min(next + COPY_CHUNK_ROWS);
-                    append_rows(
+                    used_head |= append_rows(
                         &reading,
                         index,
-                        (&source, &head),
+                        (&source, &head, stale),
                         next..end,
                         rows.start,
                         &columns,
@@ -306,21 +332,22 @@ impl Drop for OwnIndex {
 /// Appends rows `rows` (all in `index`) of a copy that starts at row
 /// `first` to `out`: a line break before each row but the first, a tab
 /// between fields `columns`, and each display value as [`push_tsv_cell`]
-/// writes it. The bytes come from `file`, the source and the first 64 KB,
-/// as [`bytes_in`] gives them.
+/// writes it. The bytes come from `file`, the source, the first 64 KB and
+/// whether they are stale, as [`bytes_in`] gives them. Returns whether they
+/// came from the first 64 KB.
 fn append_rows(
     reading: &Reading,
     index: &RowIndex,
-    file: (&Source, &[u8]),
+    file: (&Source, &[u8], bool),
     rows: Range<usize>,
     first: usize,
     columns: &Range<usize>,
     out: &mut String,
-) -> Result<(), ReadError> {
+) -> Result<bool, ReadError> {
     let Some(extent) = index.rows_extent(rows.clone()) else {
-        return Ok(());
+        return Ok(false);
     };
-    let bytes = bytes_in(file.0, file.1, extent.clone())?;
+    let (bytes, from_head) = bytes_in(file.0, file.1, extent.clone(), file.2)?;
     for row in rows {
         if row > first {
             out.push('\n');
@@ -338,7 +365,7 @@ fn append_rows(
             }
         }
     }
-    Ok(())
+    Ok(from_head)
 }
 
 /// Appends one cell to tab-separated text, the way spreadsheets put cells

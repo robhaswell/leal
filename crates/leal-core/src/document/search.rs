@@ -124,8 +124,9 @@ struct SearchState {
     source: Arc<Source>,
     head: Arc<[u8]>,
     matcher: Matcher,
-    /// The matches, and where the search has got to: it starts at row 1 if
-    /// the file has a header row.
+    /// The first row searched: 1 if the file has a header row.
+    first_row: usize,
+    /// The matches, and where the search has got to.
     found: Mutex<Found>,
     /// Run once by the next step, between its look at the matches and its
     /// look at whether the search is complete: a test makes the search
@@ -144,6 +145,9 @@ struct Found {
     /// Every row before this one has been searched.
     searched: usize,
     complete: bool,
+    /// Some of the rows searched were read from the first 64 KB kept in
+    /// memory, so the search starts again if those turn out stale.
+    used_head: bool,
 }
 
 impl Found {
@@ -178,6 +182,7 @@ impl Document {
             source: Arc::clone(&self.source),
             head: Arc::clone(&self.head),
             matcher,
+            first_row,
             found: Mutex::new(Found {
                 searched: first_row,
                 ..Found::default()
@@ -492,32 +497,55 @@ impl SearchState {
         self.found.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The rows searches read ([`Reading::rows_from`] the reading's index).
-    fn rows_index(&self) -> (&RowIndex, usize) {
-        self.reading
-            .rows_from(&self.reading.index, self.source.changed_on_disk())
+    /// The rows searches read ([`Reading::rows_from`] the reading's
+    /// index), with the first 64 KB trusted unless `head_stale`.
+    fn rows_index(&self, head_stale: bool) -> (&RowIndex, usize) {
+        self.reading.rows_from(&self.reading.index, head_stale)
     }
 
     /// One turn of the job: search the rows that can be read, a chunk at a
     /// time, and once caught up with the index, end the turn until it has
     /// more ([`more_rows`]). The search's place is `found.searched`, so a
     /// turn starts where the last one stopped.
+    ///
+    /// Each step looks once at whether the first 64 KB are stale, for both
+    /// the rows and their bytes. If they turn stale after the search read
+    /// rows from them, it starts again from the first row, over the checked
+    /// copy's rows only: a search never finishes with matches from both
+    /// versions of the file (p1-review fid-2).
     fn turn(&self, job: &Job) -> Poll<Result<SearchSummary, JobError>> {
         loop {
             job.checkpoint()?;
-            let next = self.lock().searched;
+            let stale = self.source.changed_on_disk();
+            let next = {
+                let mut found = self.lock();
+                if stale && found.used_head {
+                    found.rows.clear();
+                    found.ends.clear();
+                    found.searched = self.first_row;
+                    found.used_head = false;
+                }
+                found.searched
+            };
             let indexed = self.reading.index.row_count();
-            let (index, available) = self.rows_index();
+            let (index, available) = self.rows_index(stale);
             if next >= available {
                 let control = self.reading.index_job.control();
                 match more_rows(&self.reading.index, control, indexed, job)? {
-                    Settled::Done if next >= self.rows_index().1 => break,
-                    Settled::Done => continue,
+                    Settled::Done => {
+                        // No more rows will come. Finished, unless the
+                        // index or the file moved on since this step looked.
+                        let now = self.source.changed_on_disk();
+                        if now == stale && next >= self.rows_index(now).1 {
+                            break;
+                        }
+                        continue;
+                    }
                     Settled::Waiting => return Poll::Pending,
                 }
             }
             let end = chunk_end(index, next, available);
-            let hits = self.search_rows(index, next..end)?;
+            let (hits, from_head) = self.search_rows(index, next..end, stale)?;
             let mut found = self.lock();
             for (row, cells) in hits {
                 let total = found.total() + u64::from(cells);
@@ -525,8 +553,9 @@ impl SearchState {
                 found.ends.push(total);
             }
             found.searched = end;
+            found.used_head |= from_head;
         }
-        let available = self.rows_index().1;
+        let available = self.rows_index(self.source.changed_on_disk()).1;
         let mut found = self.lock();
         found.complete = true;
         found.searched = found.searched.max(available);
@@ -536,17 +565,19 @@ impl SearchState {
         }))
     }
 
-    /// The rows of `rows` (in `index`) with matches, and how many cells of
-    /// each match.
+    /// The rows of `rows` (in `index`) with matches, how many cells of
+    /// each match, and whether they were read from the first 64 KB kept in
+    /// memory (trusted unless `head_stale`).
     fn search_rows(
         &self,
         index: &RowIndex,
         rows: Range<usize>,
-    ) -> Result<Vec<(usize, u32)>, JobError> {
+        head_stale: bool,
+    ) -> Result<(Vec<(usize, u32)>, bool), JobError> {
         let Some(extent) = index.rows_extent(rows.clone()) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
-        let bytes = self.read(extent.clone())?;
+        let (bytes, from_head) = bytes_in(&self.source, &self.head, extent.clone(), head_stale)?;
         let base = extent.start;
         let mut hits = Vec::new();
         // `at` is where `row` starts, in `bytes`.
@@ -574,7 +605,7 @@ impl SearchState {
             at = holder_extent.end - base;
             row = holder + 1;
         }
-        Ok(hits)
+        Ok((hits, from_head))
     }
 
     /// How many of row `row`'s cells match. `bytes` are the file's from
@@ -645,7 +676,8 @@ impl SearchState {
     /// and the index that has the row, if one does
     /// ([`rows_index`](Self::rows_index)).
     fn row_bytes(&self, row: usize) -> Result<Option<RowRead<'_>>, ReadError> {
-        let (index, available) = self.rows_index();
+        let stale = self.source.changed_on_disk();
+        let (index, available) = self.rows_index(stale);
         if row >= available {
             return Ok(None);
         }
@@ -654,15 +686,10 @@ impl SearchState {
         };
         let base = extent.start;
         Ok(Some(RowRead {
-            bytes: self.read(extent)?,
+            bytes: bytes_in(&self.source, &self.head, extent, stale)?.0,
             base,
             index,
         }))
-    }
-
-    /// The file's bytes in `extent` ([`bytes_in`]).
-    fn read(&self, extent: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
-        bytes_in(&self.source, &self.head, extent)
     }
 }
 

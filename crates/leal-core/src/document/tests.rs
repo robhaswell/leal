@@ -1890,6 +1890,79 @@ fn after_a_change_while_reading_no_reader_uses_the_stale_first_64_kb() {
     readers_agree_on(&document, 1, "nm1q");
 }
 
+/// p1-review fid-2, the follow-up: a Find and a Copy that took rows from
+/// the first 64 KB before the file turned out to have changed while it was
+/// read don't deliver them. Both start again over the checked copy's rows
+/// only, so what they give agrees with the grid: no match in a row the grid
+/// no longer has, and no copied row past its end.
+#[test]
+fn a_find_or_copy_spanning_a_change_gives_only_the_copys_rows() {
+    let dir = Dir::new("fault-change-jobs");
+    let bytes = named_rows(2000);
+    let path = dir.file("usb.csv", &bytes);
+    let source = Source::open_simulating_fault(
+        &path,
+        &dir.temp(),
+        4096,
+        Some(SimulatedFault::Change { at: 10_000 }),
+    )
+    .unwrap();
+    let gate = Gate::closed();
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (document, screen) = Document::from_source(source, &scheduler, options(30), None).unwrap();
+    assert_eq!(
+        screen.row_count, 2001,
+        "the whole file is in the first 64 KB"
+    );
+    // With the index held, both read the first 64 KB's rows, and wait.
+    let late = document.find(&crate::find::Query::new("nm1500q")).unwrap();
+    let every = document.find(&crate::find::Query::new("nm")).unwrap();
+    let copy = document.copy_cells(1..2011, 0..3);
+    let deadline = std::time::Instant::now() + LONG;
+    while (late.progress().rows_searched < 2001 || every.progress().rows_searched < 2001)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(late.progress().matches, 1, "found in the first 64 KB");
+    assert!(!copy.is_finished());
+
+    gate.open();
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    let indexed = document.row_count();
+    assert!(indexed < 1000, "the grid ends early: {indexed} rows");
+    for search in [&late, &every] {
+        assert_eq!(search.job().control().wait_timeout(LONG), Some(Ok(())));
+        assert!(search.progress().complete);
+        assert_eq!(search.progress().rows_searched, indexed);
+    }
+    assert_eq!(late.progress().matches, 0);
+    assert_eq!(late.step(None, true).unwrap(), SearchStep::NotFound);
+    // Every name but row 2's, in the rows the grid has.
+    assert_eq!(every.progress().matches, (indexed - 2) as u64);
+
+    assert_eq!(copy.control().wait_timeout(LONG), Some(Ok(())));
+    let text = copy.wait().unwrap().take().unwrap();
+    let parser = document.current().parser;
+    let expected: Vec<String> = expected_rows(&bytes, parser, usize::MAX)[1..indexed]
+        .iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (column, cell) in row.iter().enumerate() {
+                if column > 0 {
+                    line.push('\t');
+                }
+                push_tsv_cell(&mut line, &cell.text);
+            }
+            line
+        })
+        .collect();
+    assert_eq!(text, expected.join("\n"));
+}
+
 #[test]
 fn watching_stops_when_the_document_is_dropped() {
     let dir = Dir::new("original-drop");

@@ -667,12 +667,15 @@ impl Document {
         rows: Range<usize>,
         mut each: impl FnMut(&RowParser, &[u8], usize, &ParsedRow) -> T,
     ) -> Result<Vec<T>, ReadError> {
-        let (index, available) = self.rows_index(reading);
+        // One look, so the rows and their bytes agree on whether the first
+        // 64 KB can be trusted.
+        let stale = self.head_is_stale();
+        let (index, available) = reading.rows_from(&reading.index, stale);
         let rows = rows.start..rows.end.min(available);
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok(Vec::new());
         };
-        let bytes = self.bytes_of(extent.clone())?;
+        let bytes = self.bytes_of(extent.clone(), stale)?;
         let base = extent.start;
         // The cache is locked only to find (or parse) the rows, never while
         // `each` runs: `each` may decode whole values, megabytes long for
@@ -680,7 +683,7 @@ impl Document {
         // the lock meanwhile (p1-review conc-2).
         let parsed: Vec<Arc<ParsedRow>> = {
             let mut cache = reading.cache.lock().unwrap_or_else(PoisonError::into_inner);
-            if self.head_is_stale() && !reading.cache_dropped.swap(true, Ordering::AcqRel) {
+            if stale && !reading.cache_dropped.swap(true, Ordering::AcqRel) {
                 // Rows parsed before the change was noticed may be from
                 // either version of the file.
                 cache.clear();
@@ -709,9 +712,10 @@ impl Document {
         reading.rows_from(&reading.index, self.head_is_stale())
     }
 
-    /// The bytes of `extent` ([`bytes_in`]).
-    fn bytes_of(&self, extent: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
-        bytes_in(&self.source, &self.head, extent)
+    /// The bytes of `extent` ([`bytes_in`]), with the first 64 KB trusted
+    /// unless `head_stale`.
+    fn bytes_of(&self, extent: Range<usize>, head_stale: bool) -> Result<Cow<'_, [u8]>, ReadError> {
+        Ok(bytes_in(&self.source, &self.head, extent, head_stale)?.0)
     }
 
     /// Whether the first 64 KB kept in memory may be a different version
@@ -1018,14 +1022,15 @@ impl Document {
         reading: &'r Reading,
         row: usize,
     ) -> Result<Option<RowBytes<'_, 'r>>, ReadError> {
-        let (index, available) = self.rows_index(reading);
+        let stale = self.head_is_stale();
+        let (index, available) = reading.rows_from(&reading.index, stale);
         if row >= available {
             return Ok(None);
         }
         let Some(extent) = index.row_extent(row) else {
             return Ok(None);
         };
-        let bytes = self.bytes_of(extent.clone())?;
+        let bytes = self.bytes_of(extent.clone(), stale)?;
         Ok(Some(RowBytes {
             bytes,
             base: extent.start,
@@ -1239,20 +1244,28 @@ impl Reading {
     }
 }
 
-/// The bytes of `extent`: from the first 64 KB kept in memory (`head`) if
-/// they hold it and can be trusted, otherwise one read of `source`. Once
-/// the file changed while it was read without a snapshot
-/// ([`Source::changed_on_disk`]), the first 64 KB may be a different
-/// version from the rest, so from then on bytes come only from the
-/// checked copy (task 1.9; for every reader since p1-review fid-2).
+/// The bytes of `extent`, and whether they came from the first 64 KB kept
+/// in memory (`head`): from there if it holds them and `head_stale` is
+/// false, otherwise one read of `source`. Once the file changed while it
+/// was read without a snapshot ([`Source::changed_on_disk`]), the first
+/// 64 KB may be a different version from the rest, so from then on bytes
+/// come only from the checked copy (task 1.9; for every reader since
+/// p1-review fid-2).
+///
+/// The caller looks at `changed_on_disk` once and passes the same answer
+/// here and to [`Reading::rows_from`], so the rows of one read and their
+/// bytes agree. A job that keeps what it reads (Copy, Find) uses the
+/// second value to know it holds rows from the first 64 KB, which it must
+/// drop if they turn out stale before it finishes.
 fn bytes_in<'a>(
     source: &'a Source,
     head: &'a [u8],
     extent: Range<usize>,
-) -> Result<Cow<'a, [u8]>, ReadError> {
+    head_stale: bool,
+) -> Result<(Cow<'a, [u8]>, bool), ReadError> {
     match head.get(extent.clone()) {
-        Some(bytes) if !source.changed_on_disk() => Ok(Cow::Borrowed(bytes)),
-        _ => source.read_range(extent),
+        Some(bytes) if !head_stale => Ok((Cow::Borrowed(bytes), true)),
+        _ => Ok((source.read_range(extent)?, false)),
     }
 }
 
