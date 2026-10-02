@@ -564,17 +564,16 @@ final class FindTests: XCTestCase {
         XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 10 characters · invalid bytes shown as �")
 
         // A very long value with no line breaks: its first 64,000
-        // characters, said so, and shown without stalling the window (a
-        // million characters took 800 ms on an M5 Pro; the 1.8 review).
+        // characters, said so. Showing it all stalled the window (a million
+        // characters took 800 ms on an M5 Pro; the 1.8 review); the cut is
+        // what keeps it quick, so the test checks the cut, not the time
+        // (phase 1 review, tests-11).
         content.grid.select(CellPosition(row: 1, column: 2))
-        let started = Date()
         await content.inspectorTask?.value
         content.view.layoutSubtreeIfNeeded()
         content.view.displayIfNeeded()
-        let elapsed = Date().timeIntervalSince(started)
         XCTAssertEqual(content.inspector.textView.string.count, Int(DocumentModel.inspectorMaxCharacters))
         XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 1,200,000 characters · value truncated: the first 64,000 shown")
-        XCTAssertLessThan(elapsed, 0.25, "showing a long value took \(elapsed) s")
 
         // A short row's missing cell.
         content.grid.select(CellPosition(row: 2, column: 2))

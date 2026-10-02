@@ -10,7 +10,6 @@
 use super::*;
 use std::borrow::Cow;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 
 /// `n` bytes that differ from position to position, so a chunk delivered at
 /// the wrong offset can't compare equal.
@@ -676,15 +675,13 @@ fn a_drive_that_cant_clone_is_streamed_not_read_at_open() {
     fs::create_dir(&given).unwrap();
     let temp = dir.temp_folders();
 
-    let start = Instant::now();
+    // No wall-clock bound here (phase 1 review, tests-11): that nothing is
+    // read at open is checked below (still `Reading`, no slice, an empty
+    // internal copy), and the time is the gated benchmark
+    // `open/first_paint_removable_under_load`'s.
     let source = open_on_exfat(&path, &temp, given.clone(), chunk);
     let first = source.read_range(0..64 * 1024).unwrap();
-    let first_paint = start.elapsed();
     assert_eq!(&*first, &bytes[..64 * 1024]);
-    assert!(
-        first_paint < Duration::from_millis(150),
-        "first paint took {first_paint:?}"
-    );
 
     assert_eq!(source.storage(), Storage::Reading);
     assert_eq!(source.as_slice(), None);
