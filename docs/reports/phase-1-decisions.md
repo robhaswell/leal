@@ -16,24 +16,24 @@ ADR-0008 and docs/perf.md.
    screen. PLAN ticks 1.10 although this is still open. *Recommend:* run it
    before approving; if scrolling still drops frames unlocked, the next step
    is an ADR (ADR-0001's fallback), which needn't hold up phase 2. →
-   `docs/perf.md`, "Measuring on a base M1 Air, or an unlocked Mac"
+   `docs/perf.md`, "Measuring on a base M1 Air"
 3. **Idle memory: footprint or RSS.** 10.9 MB footprint against 65–68 MB
    RSS. *Recommend:* footprint (Activity Monitor's figure); `just perf` says
-   "pending Rob" until then. → `docs/perf.md`, "Decisions for Rob"
+   "pending Rob" until then. → `docs/perf.md`, "Decisions"
 4. **What the heap budget counts.** *Recommend:* every malloc zone minus
    the per-window AppKit baseline (about 21 MB), search results included,
    AppKit's drawing peaks left out: about 7 MB settled. → `docs/perf.md`,
-   "Decisions for Rob"
+   "Decisions"
 5. **Open to first rows: cold or warm.** 95 ms cold, 36 ms warm here; on
    an Air the cold open is likely over 150 ms. *Recommend:* judge the warm
    open against 150 ms, and the cold open as part of launch (450 ms, 263 ms
-   here). → `docs/perf.md`, "Decisions for Rob"
+   here). → `docs/perf.md`, "Decisions"
 6. **Launch to empty window**, when Leal opens no empty window.
    *Recommend:* keep measuring to the end of `applicationDidFinishLaunching`.
-   → `docs/perf.md`, "Decisions for Rob"
+   → `docs/perf.md`, "Decisions"
 7. **Search memory**: 12 bytes per matching row (120 MB on the 1 GB file).
    *Recommend:* accept for v1; a compact store is listed under PLAN 4.1. →
-   `docs/perf.md`, "Decisions for Rob"
+   `docs/perf.md`, "Decisions"
 8. **Network shares on option C** (stream a share rather than read it all
    at open), which would change accepted ADR-0006. *Recommend:* keep
    ADR-0006's read-or-copy at open for v1. Streaming needs reads kept off
@@ -62,7 +62,7 @@ ADR-0008 and docs/perf.md.
     *Recommend:* keep them for now; tightening them after a few weeks of
     history is listed under PLAN 4.1. → `docs/tasks/1.2b.md`, open
     questions
-14. **Minimum macOS and a Mac App Store build** (DESIGN §8, items 3 and 4).
+14. **Minimum macOS and a Mac App Store build** (DESIGN §8, items 3 and 5).
     *Recommend:* macOS 14 as drafted, and decide the App Store question by
     4.5. → `docs/DESIGN.md` §8
 15. **Approve phase 1** and tag `phase-1`, once the items above are

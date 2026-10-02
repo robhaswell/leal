@@ -40,19 +40,45 @@ columns, UTF-8, quoted fields containing some newlines.
 
 | Metric | Budget |
 |---|---|
-| Launch to empty window | < 300 ms |
-| Open to first rows visible | < 150 ms, **independent of file size**, before indexing finishes |
+| Launch, to the end of `applicationDidFinishLaunching` | < 300 ms |
+| Launched with a file, to its first rows (the cold open) | < 450 ms |
+| Open to first rows visible, in a running app | < 150 ms, **independent of file size**, before indexing finishes |
 | Full index built | < 500 ms |
 | Scrolling | No dropped frames at 120 Hz, **including while background work runs** |
 | Cell edit to screen | < 16 ms |
 | Filter with full scan | < 300 ms |
 | Sort on one column | < 1 s |
 | Save after one edit | < 500 ms |
-| Leal's own heap for the reference file (not counting mapped file pages) | < 40 MB |
-| Idle app with no document | < 30 MB resident |
+| Leal's own heap for the reference file (see below) | < 40 MB |
+| Idle app with no document | < 30 MB physical footprint |
 
-These budgets are checked by benchmarks in CI (core) and Instruments runs
-before each release (app). A regression past a budget blocks release.
+What the budgets mean (decided by Rob at the phase 1 gate, 2026-10-02):
+
+- **Launch** is measured from the process starting to the end of
+  `applicationDidFinishLaunching`. Leal opens no empty window, so that is
+  when it can take File ▸ Open.
+- **Open** is judged warm: a file opened in an app that is already
+  running. The cold open, when the app is launched with a file, counts as
+  part of launch: launch with a file to its first rows, against the launch
+  and open budgets together (< 450 ms).
+- **Heap** is every malloc zone minus the per-window AppKit baseline
+  (about 21 MB, measured with a two-row file open). Search results count.
+  AppKit's brief drawing peaks while scrolling don't. Mapped file pages
+  aren't in the heap.
+- **Search memory** of 12 bytes per matching row is accepted for v1: 12 MB
+  on the reference file when every row matches.
+- **Idle memory** is the physical footprint, which Activity Monitor shows
+  as Memory. Resident size (RSS) also counts shared system libraries.
+- **The 3× rule.** The base M1 Air stays the design target. None is
+  available, so the faster Mac the budgets are measured on (an M5 Pro)
+  must show about 3× headroom: main-thread work per scroll frame of at
+  most about 2.8 ms (a third of a 120 Hz frame), as well as no dropped
+  frames. It is checked at p50 and p99 (p50 and p99: proposed, awaiting
+  Rob). An Air is checked during the beta.
+
+These budgets are checked by benchmarks in CI (core) and by `just perf`
+and Instruments runs before each release (app; docs/perf.md). A regression
+past a budget blocks release.
 
 **First paint and scrolling come first.** Reading the file always wins over
 preparing to filter, sort or analyse it. No background work may delay the
@@ -114,9 +140,6 @@ keyboard navigation and accessibility are Leal's own code rather than
 
 ### 3.1 Source: getting bytes without copying them
 
-> Proposed, see ADR-0008 §1 (Leal's own save), §6 (Save As from an
-> incomplete document) and §9 (the check before saving, and SMB shares).
-
 On open, the core never reads the whole file into its heap.
 
 1. **Clone** the file with `clonefile(2)` into a temporary folder **on the
@@ -131,10 +154,9 @@ program truncates a mapped file, reading the missing pages crashes the process
 (SIGBUS). The clone cannot be changed by other programs, so Leal cannot crash
 this way, and it always has a stable snapshot of what it opened.
 
-Fallbacks, only when the volume can't clone at all and isn't removable
-(network shares, and internal volumes that aren't APFS). Removable drives
-that can't clone, such as exFAT USB sticks, follow the removable-drives path
-below instead. An EXDEV error means "clone elsewhere", not "no cloning":
+Fallbacks, only when an internal volume can't clone at all (one that isn't
+APFS). Removable drives and network shares follow the path below instead.
+An EXDEV error means "clone elsewhere", not "no cloning":
 - up to 512 MB: read the file into memory, and show a small status bar note;
 - above that: copy to the temporary directory, then map the copy.
 
@@ -145,18 +167,59 @@ The original file is watched with kqueue, on one small thread per open
 document in leal-core (1.9). If it changes, the window shows a banner with
 **Reload** and **Keep Editing**; if it is deleted or moved to the Trash,
 the banner has **Save As…** and **Keep Editing**, since there is nothing to
-reload. Saving checks the original's identity (inode, size, mtime) against
-what was opened, and asks before overwriting a file changed elsewhere.
+reload.
 
-**Removable drives (ADR-0006).** A clone on a removable drive can vanish if
-the drive is unplugged, and touching mapped pages then crashes the process.
-So for files on removable volumes, Leal never maps the external clone:
-first paint and early scrolling use ordinary reads (which fail with an
-error, not a crash); the indexing pass also copies the file to Leal's
-temporary folder on the internal disk; and once the copy is complete, Leal
-maps the internal copy and drops the external clone. If the drive vanishes
-first, Leal shows a banner, keeps the rows it has read and the user's edits,
-blocks Save until the drive returns, and offers Save As.
+**Checking before a save** (ADR-0008 decision 9). Saving checks the
+original's identity (inode, size, mtime) against what was opened, and asks
+before overwriting a file changed elsewhere. The check runs immediately
+before writing, whatever the watcher last said: it opens the file afresh
+and reads its identity with `fstat`, which makes network file systems
+revalidate.
+
+**Leal's own save is not an outside change** (ADR-0008 decision 1). After
+a successful save, Leal rebases the document onto the file it just wrote:
+- it takes a new snapshot (a clone, or a copy on removable drives and
+  shares) and re-indexes it;
+- it gives the watcher the new identity, and treats the event from its own
+  write as expected;
+- it clears the "changed elsewhere" flag;
+- edits and undo carry on (§3.6).
+
+Saving twice in a row never shows a banner or an "overwrite?" prompt.
+
+**Removable drives and network shares (ADR-0006, ADR-0009).** A file on a
+removable drive or a network share (SMB, NFS) can vanish if the drive is
+unplugged or the share drops out, and touching mapped pages then crashes
+the process. So for these files Leal never maps anything on the external
+volume:
+1. First paint and early scrolling use ordinary reads, which fail with an
+   error, not a crash.
+2. The indexing pass streams the file and copies it to Leal's temporary
+   folder on the internal disk.
+3. Once the copy is complete, Leal maps the internal copy and drops what it
+   held on the external volume.
+4. If the drive or share vanishes first, Leal shows a "disconnected"
+   banner, keeps the rows it has read and the user's edits, blocks Save
+   until the drive or share returns, and offers Save As. Save As from an
+   incomplete document writes only complete rows (§3.7, ADR-0008 decision
+   6).
+
+Shares have three more rules (ADR-0009):
+- **Never read uncopied bytes on the main thread.** A hard NFS mount or an
+  SMB reconnect can block a read for a long time. Rows not yet copied are
+  read on a background thread, and the grid shows them as loading until
+  they arrive.
+- **Network errors are ambiguous, not fatal.** ETIMEDOUT, EHOSTDOWN,
+  EHOSTUNREACH, ENETDOWN, ENETUNREACH and ECONNRESET are retried briefly
+  in the background before Leal treats the share as disconnected.
+- **ESTALE or ENOENT on a share** may mean another computer deleted the
+  file, and is reported as that (the deleted banner), not as a disconnect.
+
+**Known v1 limitation: changes on SMB shares.** SMB clients cache file
+details, so a change that another computer makes to a file on an SMB share
+may not show: during the copy, to the watcher (which sees only this Mac's
+changes), or even to the fresh `fstat` before a save. Leal may miss such a
+change in v1 (ADR-0008 decision 9, ADR-0009).
 
 ### 3.2 Dialect and encoding detection
 
@@ -286,10 +349,6 @@ field says so before the change is committed.
 
 ### 3.6 Edits
 
-> Proposed, see ADR-0008 §1 (rebasing after a save), §2 (every reader sees
-> edits), §3 (editing starts from the full value), §4 (re-reading with
-> unsaved edits) and §5 (recovering edits after an internal error).
-
 > Reverting by value, including cells with invalid bytes: ADR-0004 §9.
 > Editing hatched cells: ADR-0005 §2.
 
@@ -302,7 +361,35 @@ The original bytes are never modified. Edits live in an overlay:
 
 Every change is a command storing both the old and new values, in logical
 coordinates. This gives undo/redo, and lets undo history survive a save: after
-saving, the saved file becomes the new base and the stored values still apply.
+saving, the saved file becomes the new base and the stored values still apply
+(§3.1, ADR-0008 decision 1). The same commands can be replayed into a freshly
+opened document, which reports any command that no longer applies; this is
+how a failed document's edits are recovered (§3.9, ADR-0008 decision 5).
+
+**Edits are visible everywhere** (ADR-0008 decision 2). Every reader goes
+through the overlay: the grid, find (it matches edited values, and stops
+matching the values they replaced), copy (the copy snapshots the overlay
+when it is made), the inspector, the diagnostics markers (an edited cell is
+checked again on its new value), and column widths and number detection.
+
+**Editing starts from the full value** (ADR-0008 decision 3). The in-cell
+editor and the inspector start from the core's full display value, never
+from the grid's shortened text or its ↵ ⇥ ␀ symbols. A value too long for
+the inspector's 64,000-character view is loaded in full before it can be
+edited. Committing a long or multiline value unchanged is no edit.
+
+**Re-reading a document that has unsaved edits** (ADR-0008 decision 4).
+Edits are tied to how the file was split into cells, so they can't move
+across a new delimiter or encoding:
+- **Reload** and **Revert to Saved** ask to discard the edits first. Revert
+  goes through the same path as Reload (§4.3).
+- **Treat As** and **Reopen with encoding** are disabled while there are
+  unsaved edits, with "Save or revert your changes first" as the reason.
+  The core refuses a new delimiter or encoding meanwhile.
+- **The header-row toggle** stays available. It changes only how row 1 is
+  displayed, not where the edits are.
+- **A drive coming back** keeps the edits, because Leal has confirmed the
+  file is unchanged.
 
 Setting a cell back to exactly its original display value removes the edit,
 so the original bytes (including their quoting) come back.
@@ -314,10 +401,6 @@ blank line edited in column *c* becomes a row of *c* + 1 fields. Edits past
 an unterminated quote are still rejected (ADR-0004 §8).
 
 ### 3.7 Saving
-
-> Proposed, see ADR-0008 §1 (after a save), §6 (Save As from an incomplete
-> document), §7 (Save As UTF-8), §8 (attributes written on save) and §9
-> (the check before writing).
 
 > Edge cases (quoting new fields, end-of-file line endings, ragged rows and
 > blank lines, empty rows, BOM-like starts, unterminated quotes, the reopen
@@ -350,12 +433,45 @@ Leal remembers them in extended attributes instead (§3.2).
 
 The app saves through `NSDocument`'s safe-save: the core writes to the
 temporary URL AppKit provides, which is then swapped in atomically. File
-permissions, extended attributes and Finder metadata are preserved.
+permissions, extended attributes and Finder metadata are preserved, except
+the two attributes Leal writes itself (below). Just before writing, Leal
+checks that the original hasn't changed elsewhere; after a save it rebases
+the document onto the new file, so its own save never looks like an outside
+change (§3.1, ADR-0008 decisions 1 and 9).
+
+**Attributes written on save** (ADR-0008 decision 8). On every save, Leal
+writes the interpretation attribute (§3.2), with a fingerprint of the bytes
+it just wrote (ADR-0007), whenever:
+- a reopen's first paint or whole-file review would guess differently;
+- the user chose the delimiter or header; or
+- the choice came from the attribute.
+
+Otherwise it removes any old attribute. The same rule applies to
+`com.apple.TextEncoding`, comparing against both the first-64 KB and
+whole-file guesses. Attributes copied over from the old file never keep a
+stale fingerprint.
 
 If a new value cannot be represented in the file's encoding (for example an
 emoji in a Windows-1252 file), saving stops with a message naming the cells,
 and offers **Save As UTF-8** instead. Leal never drops or substitutes
 characters.
+
+**Save As UTF-8** (ADR-0008 decision 7) keeps line endings, quoting style
+and delimiters, in meaning. It writes a UTF-8 BOM only if the original file
+had a BOM. It sets `com.apple.TextEncoding` to UTF-8 and rewrites the
+interpretation attribute for the new bytes. Text that can't be converted
+(an unpaired surrogate or odd final byte in UTF-16, or an unmapped byte in
+a single-byte encoding) makes it refuse and name the cells, as F5 requires.
+The user can edit those cells and try again. Nothing is substituted
+silently.
+
+**Save As from an incomplete document** (ADR-0008 decision 6): a drive or
+share disconnected, or the file changed while it was being read (§3.1).
+Save As writes only **complete rows** from the bytes Leal trusts, cut at
+the last row boundary, with the user's edits applied. It never writes half
+a row, half a character or an open quote. The dialog says plainly that the
+copy is incomplete ("about N of M rows"). Nothing is added to the file to
+mark it.
 
 ### 3.8 Views: filter and sort
 
@@ -376,9 +492,6 @@ of physical row numbers to show, in order.
 
 ### 3.9 Threading and the FFI boundary
 
-> Proposed, see ADR-0008 §5 (a failed document's unsaved edits are
-> recovered, not lost).
-
 - A document is an `Arc`-shared object. Reads for visible cells are synchronous
   and must take under 1 ms. They are safe to call on the main thread.
 - Indexing, filtering, sorting and saving are long jobs. They run on
@@ -396,6 +509,13 @@ of physical row numbers to show, in order.
   a caught panic, that document is treated as failed: Leal makes no further
   calls on its handle, and the app shows an error and offers to reopen the
   file.
+- **A failed document's unsaved edits are not lost** (ADR-0008 decision 5).
+  The app keeps its own record of the edit commands (the undo history), and
+  the failure alert offers **Recover changes**: Leal opens the file afresh
+  and replays the commands into it (§3.6). If the file is unchanged, the
+  window carries on with the edits. If it changed, or a command no longer
+  applies, Leal offers Save As of what it could recover, and names any
+  edits it couldn't apply.
 
 ### 3.10 First paint and work priority
 
@@ -404,7 +524,7 @@ lower-priority work must never delay higher-priority work.
 
 | Priority | Work | When | QoS |
 |---|---|---|---|
-| **P0** | Clone, map, detect dialect and encoding from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
+| **P0** | Clone, map (ordinary reads on removable drives and shares, §3.1), detect dialect and encoding from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
 | **P1** | Row index (§3.3) and diagnostics (§3.5), in one pass (1.5); parsing rows as the user scrolls | Straight after P0 | User-initiated |
 | **P2** | Whole-file dialect and encoding check (§3.2), refined column widths, number detection for alignment | Alongside or after P1 | Utility |
 | **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, paused while the user scrolls or edits (rule 3) |
@@ -490,12 +610,14 @@ to run concurrently and asserts first paint is still under 150 ms.
 
 ### 4.3 Documents
 
-> Proposed, see ADR-0008 §4 (Revert to Saved goes through Reload) and §10
-> (no Versions browser in v1, since autosave-in-place is off).
-
-- `NSDocument`-based: Open Recent, window tabs, Save, Save As, Revert, dirty
-  indicator, Versions where supported.
+- `NSDocument`-based: Open Recent, window tabs, Save, Save As, Revert to
+  Saved, dirty indicator.
 - **Autosave-in-place is off.** Leal only writes the file when the user saves.
+- **No Versions browser in v1** (ADR-0008 decision 10). AppKit's Versions
+  browser needs autosave-in-place, so v1 offers **Revert to Saved** only.
+- **Revert to Saved** asks to discard unsaved edits first, and goes through
+  the same path as File ▸ Reload from Disk, never AppKit's default
+  `read(from:)` (§3.6, ADR-0008 decision 4).
 - UTF-16 files open read-only in v1, with a notice and **Save As UTF-8**.
 - Sandbox-compatible from the start (security-scoped access, temp files in the
   container), so a Mac App Store build stays possible.
@@ -608,8 +730,11 @@ Decided:
 2. **Header row:** trust the detection. When no header is detected, the
    header shows 1, 2, 3… in grey, and a "Header row" toggle in the status bar
    switches it (ADR-0002, question 13).
+3. **Minimum macOS:** 14 Sonoma (Rob, phase 1 gate, 2026-10-02).
+4. **No column drag-to-reorder in v1** (Rob, phase 1 gate). It isn't in the
+   mockups; the column map (§3.6) keeps it possible later.
 
 Open:
 
-3. **Minimum macOS.** Draft assumes 14 Sonoma.
-4. **Mac App Store** as well as direct download? The design keeps it possible.
+5. **Mac App Store** as well as direct download? Decided at PLAN 4.5. The
+   design keeps it possible.

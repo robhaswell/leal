@@ -15,16 +15,20 @@
 //!
 //! - **Launch** and **idle memory**: `--app` with no document. The
 //!   "Launched" signpost gives the time from the process starting; after
-//!   `--settle` seconds `heap -s` gives the footprint and heap, and `ps`
-//!   the resident size.
+//!   `--settle` seconds `heap -s` gives the footprint (which the idle
+//!   budget is judged on) and heap, and `ps` the resident size.
 //! - **Open**, **index** and **heap**: `--app` with `--file`. The app's
 //!   "Open to first rows" signpost and the core's "First paint" and "Index"
 //!   give the times; `heap -s` the memory once the review has finished and
-//!   the app has settled.
+//!   the app has settled. This cold open is judged as part of launch; the
+//!   open budget is judged on opens in a running app (`--bench-app`,
+//!   `-LealReopen`).
 //! - **Scrolling**: `--bench-app` (a `LEAL_BENCH` build) scrolling itself
 //!   (`ScrollBench`): after the load; from the first rows, with a search
 //!   running (background work pausing as rule 3 says); and on `--big-file`
 //!   from the first rows with nothing pausing (the stress case).
+//!
+//! The verdicts follow DESIGN §1's notes on what each budget means.
 //!
 //! Writes every run's numbers to `--out` (default `target/perf`) as JSON.
 
@@ -38,8 +42,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use leal_bench::perf::{
-    HeapReport, Row, ScrollRun, Signpost, Spread, Timeline, Verdict, collect, launched_after_ms,
-    scroll_verdict, table,
+    HeapReport, PerfRun, Row, SCENARIOS, ScrollRun, Signpost, Spread, Timeline, collect,
+    launched_after_ms, table,
 };
 use serde_json::{Value, json};
 
@@ -252,190 +256,14 @@ fn run() -> Result<(), String> {
 
 // MARK: The table
 
-/// The report for a run's numbers, as `leal-perf` saves them.
+/// The report for a run's numbers, as `leal-perf` saves them. The rows
+/// and their verdicts are `PerfRun::rows`, in `leal_bench::perf`.
 fn render(raw: &Value) -> String {
-    let maps = |key: &str| -> Vec<HashMap<String, f64>> {
-        raw[key]
-            .as_array()
-            .map(|runs| {
-                runs.iter()
-                    .filter_map(Value::as_object)
-                    .map(|m| {
-                        m.iter()
-                            .filter_map(|(k, v)| Some((k.clone(), v.as_f64()?)))
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let launches = maps("launches");
-    let opens = maps("opens");
-    let reopens: Vec<f64> = raw["reopensMs"]
-        .as_array()
-        .map(|v| v.iter().filter_map(Value::as_f64).collect())
-        .unwrap_or_default();
-    let mut scrolls: HashMap<&str, Vec<(Value, ScrollRun)>> = HashMap::new();
-    if let Some(all) = raw["scrolls"].as_object() {
-        for name in SCENARIOS {
-            for json in all
-                .get(name)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(run) = ScrollRun::parse(json) {
-                    scrolls.entry(name).or_default().push((json.clone(), run));
-                }
-            }
-        }
-    }
-    let rows = rows(&launches, &opens, &reopens, &scrolls);
-    format_report(&raw["environment"], &rows, &launches, &opens, &scrolls)
+    let run = PerfRun::parse(raw);
+    format_report(&raw["environment"], &run.rows(), &run)
 }
 
-/// The scroll runs, in the order the report lists them.
-const SCENARIOS: [&str; 3] = ["afterLoad", "duringLoadWithFind", "bigFileNoPause"];
-
-fn rows(
-    launches: &[HashMap<String, f64>],
-    opens: &[HashMap<String, f64>],
-    reopens: &[f64],
-    scrolls: &HashMap<&str, Vec<(Value, ScrollRun)>>,
-) -> Vec<Row> {
-    let spread = |maps: &[HashMap<String, f64>], key: &str| Spread::of(&collect(maps, key));
-    let ms = |s: Option<Spread>| s.map_or("—".to_owned(), |s| s.describe("ms", 1));
-    let mb = |s: Option<Spread>| s.map_or("—".to_owned(), |s| s.describe("MB", 1));
-    let launch = spread(launches, "launchedAfterMs");
-    let open = spread(opens, "openToFirstRowsMs");
-    let reopen = Spread::of(reopens);
-    let index = spread(opens, "indexMs");
-    let heap = spread(opens, "heapMB");
-    let idle = spread(launches, "footprintMB");
-    let idle_rss = spread(launches, "residentMB");
-    let empty = Vec::new();
-    let scroll_row = |name: &str, budget: &str, how: &str| {
-        let runs: Vec<ScrollRun> = scrolls
-            .get(name)
-            .unwrap_or(&empty)
-            .iter()
-            .map(|(_, r)| r.clone())
-            .collect();
-        let measured = if runs.is_empty() {
-            "—".to_owned()
-        } else {
-            runs.iter()
-                .map(ScrollRun::describe)
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        // Say so when a run's display wasn't 120 Hz: its verdict comes from
-        // frame work, not from frames seen to drop (docs/perf.md).
-        let slow: Vec<String> = runs
-            .iter()
-            .filter(|r| !r.at_budget_rate())
-            .map(|r| format!("{} Hz", r.screen_fps))
-            .collect();
-        let how = if slow.is_empty() {
-            how.to_owned()
-        } else {
-            format!(
-                "{how}. **120 Hz judged from frame work; the display is {}**",
-                slow.first().map_or("", String::as_str)
-            )
-        };
-        Row {
-            budget: budget.to_owned(),
-            measured,
-            how,
-            verdict: scroll_verdict(&runs),
-        }
-    };
-    // The budget is for the reference file: not the 1 GB variant.
-    let heap_peak: Vec<f64> = ["afterLoad", "duringLoadWithFind"]
-        .iter()
-        .filter_map(|name| scrolls.get(name))
-        .flatten()
-        .map(|(_, r)| r.heap_peak_mb)
-        .filter(|&v| v > 0.0)
-        .collect();
-    let heap_peak = Spread::of(&heap_peak);
-    vec![
-        Row {
-            budget: "Launch to empty window < 300 ms".into(),
-            measured: ms(launch),
-            how: "process start to `applicationDidFinishLaunching` (\"Launched\" signpost); Leal opens no empty window".into(),
-            verdict: Verdict::below(launch, 300.0),
-        },
-        Row {
-            budget: "Open to first rows < 150 ms".into(),
-            measured: ms(open),
-            how: "`read(from:)` to the grid's first draw with rows (\"Open to first rows\" signpost), reference file, the app launched with it: includes the process's first window".into(),
-            verdict: Verdict::below(open, 150.0),
-        },
-        Row {
-            budget: "… in a running app".into(),
-            measured: ms(reopen),
-            how: "the same signpost when the file is closed and opened again in the running app (bench build, `-LealReopen`)".into(),
-            verdict: Verdict::below(reopen, 150.0),
-        },
-        Row {
-            budget: "Full index < 500 ms".into(),
-            measured: ms(index),
-            how: "the core's \"Index\" signpost in the app, reference file, with diagnostics".into(),
-            verdict: Verdict::below(index, 500.0),
-        },
-        scroll_row(
-            "afterLoad",
-            "Scrolling: no dropped frames at 120 Hz",
-            "`ScrollBench` flings, reference file, after indexing; late = missed a refresh",
-        ),
-        scroll_row(
-            "duringLoadWithFind",
-            "… including while background work runs",
-            "the same from the first rows, while the index and review run, with a search running throughout",
-        ),
-        scroll_row(
-            "bigFileNoPause",
-            "… stress: background work not pausing (beyond the budget)",
-            "1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input",
-        ),
-        Row {
-            budget: "Leal's heap, reference file < 40 MB".into(),
-            measured: format!("{} after opening; peak while scrolling {}", mb(heap), mb(heap_peak)),
-            how: "`heap -s` (all malloc zones) after the review finished; the bench's `malloc_zone_statistics` peak".into(),
-            verdict: match (Verdict::below(heap, 40.0), Verdict::below(heap_peak, 40.0)) {
-                // `--no-scroll`: the peak wasn't measured.
-                (Verdict::Pass, Verdict::Untested) => Verdict::SettledOnly,
-                (Verdict::Untested, v) | (v, Verdict::Untested) => v,
-                (Verdict::Pass, Verdict::Pass) => Verdict::Pass,
-                (Verdict::Fail, _) | (_, Verdict::Fail) => Verdict::Fail,
-                _ => Verdict::Mixed,
-            },
-        },
-        Row {
-            budget: "Idle app, no document < 30 MB resident".into(),
-            measured: format!("{} footprint; {} resident (RSS)", mb(idle), mb(idle_rss)),
-            how: format!(
-                "`heap -s` physical footprint (Activity Monitor's Memory) after the app settles; RSS also counts shared system libraries{}",
-                if Verdict::below(idle_rss, 30.0) == Verdict::Pass {
-                    ""
-                } else {
-                    ", so it is over 30 MB for any AppKit app"
-                }
-            ),
-            verdict: Verdict::idle(idle, idle_rss, 30.0),
-        },
-    ]
-}
-
-fn format_report(
-    environment: &Value,
-    rows: &[Row],
-    launches: &[HashMap<String, f64>],
-    opens: &[HashMap<String, f64>],
-    scrolls: &HashMap<&str, Vec<(Value, ScrollRun)>>,
-) -> String {
+fn format_report(environment: &Value, rows: &[Row], run: &PerfRun) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "## leal-perf\n");
@@ -452,29 +280,29 @@ fn format_report(
     let _ = writeln!(
         out,
         "- `open` to \"Launched\": {}",
-        describe(launches, "openCommandToLaunchedMs", "ms")
+        describe(&run.launches, "openCommandToLaunchedMs", "ms")
     );
-    let _ = writeln!(out, "- Idle heap: {}", describe(launches, "heapMB", "MB"));
     let _ = writeln!(
         out,
-        "- With the file: launch to first rows {}; the core's first paint {}; footprint after opening {}",
-        describe(opens, "launchToFirstRowsMs", "ms"),
-        describe(opens, "firstPaintMs", "ms"),
-        describe(opens, "footprintMB", "MB")
+        "- Idle heap: {}",
+        describe(&run.launches, "heapMB", "MB")
+    );
+    let _ = writeln!(
+        out,
+        "- With the file: the cold open (`read(from:)` to first rows, the app launched with it) {}; the core's first paint {}; footprint after opening {}",
+        describe(&run.opens, "openToFirstRowsMs", "ms"),
+        describe(&run.opens, "firstPaintMs", "ms"),
+        describe(&run.opens, "footprintMB", "MB")
     );
     for name in SCENARIOS {
-        let Some(runs) = scrolls.get(name) else {
-            continue;
-        };
-        for (i, (_, r)) in runs.iter().enumerate() {
+        for (i, r) in run.scroll_runs(name).iter().enumerate() {
             let _ = writeln!(
                 out,
-                "- Scroll `{name}` run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {:.1}/{:.1} ms, {} frames busy over 8.3 ms, {:.1} M instructions a frame at {:.2} GHz; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB; screen {} Hz{}",
+                "- Scroll `{name}` run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {}, {} frames busy over 8.3 ms, {:.1} M instructions a frame at {:.2} GHz; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB; screen {} Hz{}",
                 i + 1,
                 ScrollRun::describe_late(r.late, r.frames),
                 r.p99_ms,
-                r.cpu_p50_ms,
-                r.cpu_p99_ms,
+                r.describe_cpu(),
                 r.busy_over_120hz,
                 r.instructions_mean,
                 r.ghz,
@@ -922,6 +750,7 @@ fn environment() -> Value {
     ];
     json!({
         "summary": format!("{model}, {cpu}, load {load}, screen {locked}"),
+        "model": model,
         "lines": lines,
     })
 }

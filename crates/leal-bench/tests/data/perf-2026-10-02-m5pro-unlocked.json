@@ -1,0 +1,302 @@
+{
+ "environment": {
+  "lines": [
+   "Machine: Mac17,8, Apple M5 Pro (6 performance + 12 efficiency cores), 48 GB, macOS 27.0",
+   "Power: Now drawing from 'AC Power'; powermode 0",
+   "Load average: { 5.25 4.24 3.18 }; 1091 processes",
+   "Screen: unlocked",
+   "Displays: Display Type: Built-in Liquid Retina XDR Display; Resolution: 3456 x 2234 Retina; Main Display: Yes; Resolution: 2560 x 1440 (QHD/WQHD - Wide Quad High Definition); UI Looks like: 2560 x 1440 @ 60.00Hz"
+  ],
+  "summary": "Mac17,8, Apple M5 Pro, load { 5.25 4.24 3.18 }, screen unlocked"
+ },
+ "launches": [
+  {
+   "footprintMB": 17.2,
+   "heapMB": 9.631423950195312,
+   "launchedAfterMs": 432.807,
+   "openCommandToLaunchedMs": 453.5379409790039,
+   "residentMB": 77.5625
+  },
+  {
+   "footprintMB": 17.1,
+   "heapMB": 9.628662109375,
+   "launchedAfterMs": 159.277,
+   "openCommandToLaunchedMs": 175.89092254638672,
+   "residentMB": 80.40625
+  },
+  {
+   "footprintMB": 17.1,
+   "heapMB": 9.6494140625,
+   "launchedAfterMs": 133.204,
+   "openCommandToLaunchedMs": 143.98598670959473,
+   "residentMB": 80.234375
+  }
+ ],
+ "opens": [
+  {
+   "firstPaintMs": 1.8520355224609375,
+   "footprintMB": 58.9,
+   "footprintPeakMB": 149.0,
+   "heapMB": 29.74410915374756,
+   "indexMs": 214.86306190490723,
+   "launchToFirstRowsMs": 313.4269714355469,
+   "openToFirstRowsMs": 114.67504501342773,
+   "reviewMs": 607.8240871429443
+  },
+  {
+   "firstPaintMs": 1.8558502197265625,
+   "footprintMB": 58.7,
+   "footprintPeakMB": 148.6,
+   "heapMB": 29.770262718200684,
+   "indexMs": 170.3200340270996,
+   "launchToFirstRowsMs": 355.1299571990967,
+   "openToFirstRowsMs": 95.41201591491699,
+   "reviewMs": 613.9919757843018
+  },
+  {
+   "firstPaintMs": 1.7809867858886719,
+   "footprintMB": 58.8,
+   "footprintPeakMB": 148.8,
+   "heapMB": 29.74630641937256,
+   "indexMs": 163.03396224975586,
+   "launchToFirstRowsMs": 312.3049736022949,
+   "openToFirstRowsMs": 95.92294692993164,
+   "reviewMs": 582.319974899292
+  }
+ ],
+ "reopensMs": [
+  42.40894317626953,
+  36.12709045410156,
+  36.47494316101074,
+  41.14794731140137,
+  37.44006156921387,
+  41.459083557128906,
+  38.94805908203125,
+  38.74802589416504,
+  37.85300254821777,
+  37.940025329589844,
+  46.90098762512207,
+  36.94796562194824,
+  33.68711471557617,
+  42.320966720581055,
+  40.60816764831543
+ ],
+ "scrolls": {
+  "afterLoad": [
+   {
+    "heapPeakMB": 44.98219299316406,
+    "heapSettledMB": 28.594635009765625,
+    "screenMaxFPS": 120,
+    "findRuns": 0,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7554,
+     "late": 4,
+     "p99": 8.33333341870457,
+     "cpuP50": 2.926917,
+     "cpuP99": 5.84575,
+     "busyOver120Hz": 12,
+     "instructionsMean": 18.46729605056927,
+     "mainThreadGHz": 2.438210979859284
+    }
+   },
+   {
+    "heapPeakMB": 39.705780029296875,
+    "heapSettledMB": 31.673080444335938,
+    "screenMaxFPS": 120,
+    "findRuns": 0,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7552,
+     "late": 3,
+     "p99": 8.33333341870457,
+     "cpuP50": 2.81775,
+     "cpuP99": 6.385208,
+     "busyOver120Hz": 27,
+     "instructionsMean": 12.97887280468752,
+     "mainThreadGHz": 2.425595731874949
+    }
+   },
+   {
+    "heapPeakMB": 45.607208251953125,
+    "heapSettledMB": 35.29545593261719,
+    "screenMaxFPS": 120,
+    "findRuns": 0,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7549,
+     "late": 6,
+     "p99": 8.33333341870457,
+     "cpuP50": 3.635375,
+     "cpuP99": 6.812542,
+     "busyOver120Hz": 40,
+     "instructionsMean": 18.285947165849745,
+     "mainThreadGHz": 2.4215826343479905
+    }
+   }
+  ],
+  "bigFileNoPause": [
+   {
+    "heapPeakMB": 273.6796875,
+    "heapSettledMB": 175.10853576660156,
+    "screenMaxFPS": 120,
+    "findRuns": 22,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 5455,
+     "late": 2048,
+     "p99": 16.680375090800226,
+     "cpuP50": 1.455125,
+     "cpuP99": 4.711375,
+     "busyOver120Hz": 26,
+     "instructionsMean": 16.0698641094409,
+     "mainThreadGHz": 4.233169211613708
+    },
+    "whileIndexing": {
+     "frames": 171,
+     "late": 0
+    },
+    "whileFinding": {
+     "frames": 5436,
+     "late": 2037
+    }
+   },
+   {
+    "heapPeakMB": 263.51283264160156,
+    "heapSettledMB": 118.39337158203124,
+    "screenMaxFPS": 120,
+    "findRuns": 24,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7542,
+     "late": 8,
+     "p99": 8.33333341870457,
+     "cpuP50": 1.513416,
+     "cpuP99": 3.453667,
+     "busyOver120Hz": 15,
+     "instructionsMean": 18.080958524131542,
+     "mainThreadGHz": 4.248918432942094
+    },
+    "whileIndexing": {
+     "frames": 137,
+     "late": 1
+    },
+    "whileFinding": {
+     "frames": 7521,
+     "late": 8
+    }
+   },
+   {
+    "heapPeakMB": 263.12196350097656,
+    "heapSettledMB": 263.01780700683594,
+    "screenMaxFPS": 120,
+    "findRuns": 24,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7552,
+     "late": 5,
+     "p99": 8.33333341870457,
+     "cpuP50": 1.42275,
+     "cpuP99": 3.303625,
+     "busyOver120Hz": 10,
+     "instructionsMean": 18.354503892214,
+     "mainThreadGHz": 4.252357648211167
+    },
+    "whileIndexing": {
+     "frames": 133,
+     "late": 1
+    },
+    "whileFinding": {
+     "frames": 7530,
+     "late": 5
+    }
+   }
+  ],
+  "duringLoadWithFind": [
+   {
+    "heapPeakMB": 52.850387573242195,
+    "heapSettledMB": 40.44300842285156,
+    "screenMaxFPS": 120,
+    "findRuns": 18,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7553,
+     "late": 4,
+     "p99": 8.33333341870457,
+     "cpuP50": 2.866041,
+     "cpuP99": 6.720625,
+     "busyOver120Hz": 32,
+     "instructionsMean": 13.752275200317724,
+     "mainThreadGHz": 2.429989944503306
+    },
+    "whileIndexing": {
+     "frames": 8,
+     "late": 2
+    },
+    "whileFinding": {
+     "frames": 7553,
+     "late": 4
+    }
+   },
+   {
+    "heapPeakMB": 40.919952392578125,
+    "heapSettledMB": 40.73609924316406,
+    "screenMaxFPS": 120,
+    "findRuns": 18,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7553,
+     "late": 4,
+     "p99": 8.33333341870457,
+     "cpuP50": 3.05425,
+     "cpuP99": 7.05,
+     "busyOver120Hz": 42,
+     "instructionsMean": 14.68750337428841,
+     "mainThreadGHz": 2.244664183525119
+    },
+    "whileIndexing": {
+     "frames": 3,
+     "late": 0
+    },
+    "whileFinding": {
+     "frames": 7553,
+     "late": 4
+    }
+   },
+   {
+    "heapPeakMB": 48.49650573730469,
+    "heapSettledMB": 40.73191833496094,
+    "screenMaxFPS": 120,
+    "findRuns": 18,
+    "displayLinkStalls": 0,
+    "windowVisible": true,
+    "scroll": {
+     "frames": 7557,
+     "late": 2,
+     "p99": 8.33333341870457,
+     "cpuP50": 2.738334,
+     "cpuP99": 6.499417,
+     "busyOver120Hz": 24,
+     "instructionsMean": 14.26402642966789,
+     "mainThreadGHz": 2.2941689886193393
+    },
+    "whileIndexing": {
+     "frames": 4,
+     "late": 2
+    },
+    "whileFinding": {
+     "frames": 7557,
+     "late": 2
+    }
+   }
+  ]
+ }
+}

@@ -232,7 +232,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Hitches and footprint are re-measured on an unlocked screen, and on
       a base M1 Air if one is available, and recorded in the notes.
     - Column drag-to-reorder (1–2 days) isn't in the mockups, so the notes
-      ask Rob at the phase 1 gate whether it is in v1.
+      ask Rob at the phase 1 gate whether it is in v1. *Answered: not in
+      v1 (Rob, 2026-10-02; DESIGN §8).*
   - The status-bar "Header row" toggle (ADR-0002 question 13, mockup 06b).
   - The status bar says where the encoding came from (BOM, attribute or
     guess), as 1.2 reports it; 1.7 adds the controls for changing the
@@ -335,7 +336,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Check the plain index's 1 MiB chunks against the 5 ms rule on a
     blank-lines file (1.5 open question).
   - Rob to rerun `just bench-scroll` on an unlocked Mac, and on a base M1
-    Air if one is available.
+    Air if one is available. *Done on the unlocked M5 Pro, 2026-10-02
+    (`just perf`: docs/perf-runs/2026-10-02-m5pro-unlocked.md); no Air is
+    available, so the 3× rule applies (DESIGN §1, 2.0a).*
 
 ## Phase 2 — Editing
 
@@ -346,10 +349,32 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     show as loading.
   - Network errnos are retried briefly in the background before a
     disconnect; ESTALE/ENOENT on a share is reported as the file deleted.
-  - Document the SMB change-detection limit in DESIGN §3.1.
+  - DESIGN §3.1 already describes shares and the SMB change-detection
+    limit (ADR-0009); correct it if what is built differs.
   - Tests: a simulated slow and failing share via test hooks, and a real
     SMB share if one is available.
   - Done before 2.1, because it changes the source layer 2.x builds on.
+
+- [ ] **2.0a Scrolling headroom** (DESIGN §1, the 3× rule). Rob's unlocked
+  `just perf` run fails the 3× rule: main-thread work per scroll frame is
+  p50 2.7–3.6 ms and p99 5.8–7.0 ms on the M5 Pro (docs/perf.md).
+  - It doesn't block 2.1: phase 2 goes ahead alongside it (phase 1
+    decision 2). If the headroom can't be reached, the next step is an ADR
+    on ADR-0001's fallback (option C).
+  - Main-thread work per frame is at most 2.8 ms at p50 and p99 (p50 and
+    p99: proposed, awaiting Rob) on the M5 Pro, unlocked, with the app
+    launched with `open`, in every reference-file scroll run.
+  - Regression guard: late frames and GPU memory (footprint) are no worse
+    than in Rob's unlocked run.
+  - About half of each frame is AppKit rebuilding the whole visible
+    content layer on every scroll step (1.6a, docs/tasks/1.10.md).
+  - Tiled drawing was tried and rejected in 1.10: about 10 times more late
+    frames and about 180 MB more GPU memory
+    (`docs/tasks/1.10-tiles.patch`). Don't retry it as it is.
+  - Look at the per-frame Swift and FFI work, and at the clock speed:
+    normal scrolling ran at about 2.4 GHz.
+  - Measured with `just perf`; the results go in docs/perf.md. A change to
+    the grid's drawing design needs an ADR (ADR-0001).
 
 - [ ] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
   - Editing a hatched (missing) cell of a short or blank row is allowed:
@@ -365,16 +390,16 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     snapshots the overlay when the copy is made), the diagnostics marks
     and Previous/Next (an edited cell is checked on its new value), and
     column widths and number detection. Tests edit a cell, then find,
-    copy and step to it. (ADR-0008 decision 2, pending)
+    copy and step to it. (ADR-0008 decision 2)
   - Edits are tied to how the file was split into cells, so the core
     refuses a new delimiter or encoding while there are unsaved edits. The
     header-row choice can still change, and a drive-reconnect `restart`
     keeps the edits, because the file's identity is verified unchanged.
-    (ADR-0008 decision 4, pending)
+    (ADR-0008 decision 4)
   - The edit commands (logical coordinates, old and new values) can be
     replayed into a freshly opened document, which reports any command
     that no longer applies, so a failed document's edits can be recovered.
-    (ADR-0008 decision 5, pending)
+    (ADR-0008 decision 5)
   - Decide whether header-row cells (file row 0, not a grid row) can be
     edited; an ADR if it changes DESIGN. (phase 1 review)
 - [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
@@ -409,7 +434,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     bytes Leal trusts, cut at the last row boundary, with the edits
     applied: never half a row, half a character or an open quote, and no
     marker in the file. It reports how many rows it wrote, for the dialog.
-    Tested on the exFAT disk-image case. (ADR-0008 decision 6, pending)
+    Tested on the exFAT disk-image case. (ADR-0008 decision 6)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
   - Covers every single-byte encoding Leal supports. (ADR-0005 decision 5)
@@ -421,7 +446,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     surrogate or odd final byte in UTF-16, an unmapped byte in a
     single-byte encoding) makes it refuse and name the cells; nothing is
     substituted. The UTF-16 generator gains unpaired surrogates and odd
-    final bytes to cover it. (ADR-0008 decision 7, pending)
+    final bytes to cover it. (ADR-0008 decision 7)
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
     and the product, with a unit test and edit-strategy coverage; this
@@ -456,32 +481,30 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     or copy on removable drives), re-indexed; the watcher gets the new
     identity and treats the event from Leal's own replace as expected;
     `diverged` is cleared; edits and undo carry on. A hosted test saves
-    twice in a row and sees no banner and no prompt. (ADR-0008 decision 1,
-    pending)
+    twice in a row and sees no banner and no prompt. (ADR-0008 decision 1)
   - The inspector, find highlights, copy and the diagnostics marks show
     edited values (2.1's overlay); a hosted test edits a cell, then finds,
-    copies and steps to it. (ADR-0008 decision 2, pending)
+    copies and steps to it. (ADR-0008 decision 2)
   - The in-cell editor and the inspector start from the core's full
     display value, never the grid's shortened text or its ↵ ⇥ ␀ symbols.
     A value longer than the inspector's 64,000 characters is loaded in
     full before it can be edited. A test commits an untouched long value
-    and an untouched multiline value and gets no edit. (ADR-0008 decision
-    3, pending)
+    and an untouched multiline value and gets no edit. (ADR-0008
+    decision 3)
   - Reload and Revert to Saved ask before discarding unsaved edits, and
     Revert goes through the model's Reload, never NSDocument's default
     `read(from:)`. Treat As and Reopen with Encoding are disabled while
     there are unsaved edits ("Save or revert your changes first"); the
     Header row toggle stays available; a drive coming back keeps the
-    edits. Each has a test. (ADR-0008 decision 4, pending)
+    edits. Each has a test. (ADR-0008 decision 4)
   - If a document fails (DESIGN §3.9) with unsaved edits, the alert offers
     **Recover changes**: Leal opens the file afresh and replays the undo
     history's commands. If the file is unchanged the window carries on;
     otherwise Leal offers Save As of what it recovered and names the edits
-    it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5,
-    pending)
+    it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5)
   - Save As from an incomplete document says plainly that the copy is
     incomplete ("about N of M rows"); this wires the drive banners' Save
-    As… (`SEAM(2.5)`). (ADR-0008 decision 6, pending)
+    As… (`SEAM(2.5)`). (ADR-0008 decision 6)
   - On every save, the interpretation attribute is written with
     `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
     paint or whole-file review would guess differently, when the user
@@ -490,13 +513,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     `com.apple.TextEncoding`, against both the first-64 KB and the
     whole-file guess. A hosted test checks that after Save the attributes
     are the new values, not ones NSDocument copied from the old file.
-    (ADR-0008 decision 8, pending)
+    (ADR-0008 decision 8)
   - The check before writing opens the file afresh and reads its identity
     with `fstat`, so network file systems revalidate; tested on a share if
-    one is available. (ADR-0008 decision 9, pending)
+    one is available. (ADR-0008 decision 9)
   - Revert to Saved only, with no Versions browser: autosave-in-place
-    stays off and `preservesVersions` stays false. (ADR-0008 decision 10,
-    pending)
+    stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
   - The user sees one prompt about a file changed elsewhere, never both
     Leal's and NSDocument's own. Decide what Save does for a deleted file
     (`can_save()` is true today). (phase 1 review)
@@ -545,7 +567,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Tighten `bench-compare`'s 20% regression and 10% noise thresholds
       once CI has a few weeks of history (1.2b).
     - A more compact store for find matches than 12 bytes per matching
-      row (120 MB on the 1 GB file), unless Rob accepts it (1.10).
+      row (120 MB on the 1 GB file). Rob accepted 12 bytes for v1 (DESIGN
+      §1), so this is an improvement, not a fix (1.10).
     - An age limit for the records of volumes that never come back (1.1).
     - A home folder on an external drive puts the scratch copy there too,
       so it isn't internal (1.1a, 1.3a).
@@ -569,4 +592,5 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   GitHub Actions release, Homebrew cask. *Needs the Apple Developer Program.*
   - Hardened runtime on, if 1.6 left it off; the sandbox entitlements are
     reviewed for the signed build.
+  - Decide whether to also ship a Mac App Store build (DESIGN §8).
 - [ ] **4.6 Public beta, then 1.0.**
