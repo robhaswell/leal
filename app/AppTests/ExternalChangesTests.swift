@@ -340,6 +340,54 @@ final class ExternalChangesTests: XCTestCase {
         document.close()
     }
 
+    /// After a change while reading, the file can't be read another way
+    /// until it is reloaded (the core refuses: the first 64 KB Leal holds
+    /// may be the old version). Treat As, Reopen with Encoding and the
+    /// Header row are off, in the menus and the status bar, and say to
+    /// Reload first; Reload turns them back on.
+    func testAChangeWhileReadingTurnsOffReadingTheFileAnotherWay() async throws {
+        simulateDrive(.change(at: 16_384))
+        let url = try file("exfat.csv", text(rows: 20_000, prefix: "name"))
+        let (document, model, content) = try open(url)
+        let treatAs = menuItem(#selector(DocumentViewController.treatAsDelimiter(_:)))
+        treatAs.representedObject = DelimiterBox(.semicolon)
+        let reopen = menuItem(#selector(DocumentViewController.reopenWithEncoding(_:)))
+        reopen.representedObject = EncodingBox(.windows1252)
+        let header = menuItem(#selector(DocumentViewController.toggleHeaderRow(_:)))
+        let items = [treatAs, reopen, header]
+        try await waitUntil("the change is seen") { model.changedOnDisk }
+        XCTAssertFalse(model.canReinterpret)
+        XCTAssertEqual(items.map { content.validateMenuItem($0) }, [false, false, false])
+        XCTAssertEqual(items.map(\.toolTip), Array(repeating: StatusText.reloadFirst, count: 3))
+        XCTAssertEqual(StatusText.reloadFirst, "The file changed while Leal was reading it. Reload it first.")
+        let bar = content.statusBar
+        XCTAssertEqual(bar.delimiterButton?.isEnabled, false)
+        XCTAssertEqual(bar.delimiterButton?.toolTip, StatusText.reloadFirst)
+        XCTAssertEqual(bar.encodingButton?.isEnabled, false)
+        XCTAssertEqual(bar.encodingButton?.toolTip, StatusText.reloadFirst)
+        XCTAssertFalse(bar.headerToggle.isEnabled)
+        XCTAssertEqual(bar.headerToggle.toolTip, StatusText.reloadFirst)
+        // Asked anyway (a key equivalent, a stale menu): nothing happens.
+        let before = model.interpretation
+        content.treatAs(.semicolon)
+        content.reopen(encoding: .windows1252)
+        content.toggleHeaderRow(nil)
+        XCTAssertEqual(model.interpretation, before)
+
+        // Reload: the file can be read another way again.
+        DocumentModel.openForTesting = nil
+        try XCTUnwrap(content.driveBanner?.button).performClick(nil)
+        XCTAssertFalse(model.changedOnDisk)
+        XCTAssertEqual(items.map { content.validateMenuItem($0) }, [true, true, true])
+        XCTAssertEqual(items.map(\.toolTip), [nil, nil, nil])
+        XCTAssertEqual(bar.delimiterButton?.isEnabled, true)
+        XCTAssertEqual(bar.encodingButton?.isEnabled, true)
+        XCTAssertTrue(bar.headerToggle.isEnabled)
+        content.treatAs(.semicolon)
+        XCTAssertEqual(model.interpretation.delimiter, .semicolon)
+        document.close()
+    }
+
     func testADisconnectedDriveThatComesBackIsReconnectedAndSaveIsAllowed() async throws {
         simulateDrive(.disconnect(at: 100_000))
         let url = try file("usb.csv", text(rows: 20_000, prefix: "name"))

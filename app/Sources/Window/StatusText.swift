@@ -208,6 +208,15 @@ enum StatusText {
         String(localized: "Encoding: \(encoding), menu", comment: "VoiceOver: the status bar's Reopen with Encoding button; the encoding as the bar shows it")
     }
 
+    /// Why Treat As, Reopen with Encoding and the Header row are off after
+    /// the file changed while Leal read it.
+    static var reloadFirst: String {
+        String(
+            localized: "The file changed while Leal was reading it. Reload it first.",
+            comment: "Tooltip of Treat As, Reopen with Encoding and the Header row while they are off: the file changed while it was read (1.1a)"
+        )
+    }
+
     static var treatAsHelp: String {
         String(localized: "Treat the file as separated by another delimiter", comment: "Status bar tooltip of the delimiter menu")
     }

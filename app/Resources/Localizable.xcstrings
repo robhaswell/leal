@@ -562,6 +562,9 @@
     "The file changed since Leal remembered its delimiter (%@), so Leal guessed again." : {
       "comment" : "Status bar tooltip: Leal's remembered delimiter no longer fits; its name"
     },
+    "The file changed while Leal was reading it. Reload it first." : {
+      "comment" : "Tooltip of Treat As, Reopen with Encoding and the Header row while they are off: the file changed while it was read (1.1a)"
+    },
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"
     },

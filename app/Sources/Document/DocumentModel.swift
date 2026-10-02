@@ -856,9 +856,17 @@ final class DocumentModel: GridDataSource {
         reinterpret(encoding: encoding)
     }
 
+    /// Whether the file may be read again another way (Treat As, Reopen
+    /// with Encoding, the Header row): not once it changed while it was
+    /// read, when the first 64 KB Leal holds may be from the old version.
+    /// The core refuses then (`ChangedOnDisk`); the window turns the three
+    /// off and says to Reload first.
+    var canReinterpret: Bool { failure == nil && !changedOnDisk }
+
     /// Reads the file again with the given choices, keeping the user's
     /// earlier ones for the rest. Nothing is reopened (PLAN 1.3).
     private func reinterpret(delimiter: Delimiter? = nil, header: Bool? = nil, encoding: TextEncoding? = nil) {
+        guard canReinterpret else { return }
         let current = interpretation
         let options = OpenOptions(
             delimiter: delimiter ?? (current.delimiterSource == .user ? current.delimiter : nil),

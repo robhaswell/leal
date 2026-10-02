@@ -358,6 +358,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             )
         }
 
+        // The suggestions read the file again too: off until a Reload.
+        for suggestion in [delimiterBanner, encodingBanner] {
+            suggestion?.button?.isEnabled = model.canReinterpret
+            suggestion?.button?.toolTip = rereadReason
+        }
+
         let order = [driveBanner, readOnlyBanner, diagnosticsBanner, delimiterBanner, encodingBanner].compactMap { $0 }
         if banners.arrangedSubviews != order {
             for view in banners.arrangedSubviews { banners.removeArrangedSubview(view); view.removeFromSuperview() }
@@ -536,18 +542,28 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         reopen(encoding: encoding)
     }
 
+    /// Why reading the file another way is off, if it is for a reason the
+    /// user can act on: it changed while Leal read it, so Reload first. The
+    /// core refuses to read it again then (`ChangedOnDisk`).
+    private var rereadReason: String? {
+        model.changedOnDisk && !model.isFailed ? StatusText.reloadFirst : nil
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(toggleHeaderRow(_:)):
             menuItem.state = model.interpretation.header ? .on : .off
-            return !model.isFailed
+            menuItem.toolTip = rereadReason
+            return model.canReinterpret
         case #selector(treatAsDelimiter(_:)):
             menuItem.state = MainMenu.delimiter(of: menuItem) == model.interpretation.delimiter ? .on : .off
-            return !model.isFailed
+            menuItem.toolTip = rereadReason
+            return model.canReinterpret
         case #selector(reopenWithEncoding(_:)):
             let encoding = MainMenu.encoding(of: menuItem)
             menuItem.state = encoding == model.interpretation.encoding ? .on : .off
-            return !model.isFailed && encoding.map(model.interpretation.encodingChoices.contains) == true
+            menuItem.toolTip = rereadReason
+            return model.canReinterpret && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
             return !model.isFailed && model.diagnostics?.diagnostics.isEmpty == false
         case #selector(showFind(_:)):

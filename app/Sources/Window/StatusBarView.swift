@@ -56,7 +56,7 @@ final class StatusBarView: NSView {
         headerToggle.title = String(localized: "Header row: off", comment: "Status bar button: no header row; click to use the first row as the header (mockup 06b)")
         headerToggle.target = self
         headerToggle.action = #selector(toggleHeader(_:))
-        headerToggle.toolTip = String(localized: "Use the first row as the header row", comment: "Tooltip of the Header row: off button")
+        headerToggle.toolTip = Self.headerToggleHelp
         badge.isBordered = false
         badge.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
         badge.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
@@ -106,6 +106,10 @@ final class StatusBarView: NSView {
         set {}
     }
 
+    private static var headerToggleHelp: String {
+        String(localized: "Use the first row as the header row", comment: "Tooltip of the Header row: off button")
+    }
+
     func show(_ status: StatusSummary) {
         let items = StatusText.items(status)
         if items != shown {
@@ -118,6 +122,15 @@ final class StatusBarView: NSView {
         progress.doubleValue = status.fractionIndexed
         percent.stringValue = StatusText.percent(status.fractionIndexed)
         headerToggle.isHidden = status.header || status.indexing
+        // After a change while reading, the file can't be read another way
+        // until it is reloaded: the menus and the toggle are off, and say so.
+        let reread = !status.changedOnDisk
+        headerToggle.isEnabled = reread
+        headerToggle.toolTip = reread ? Self.headerToggleHelp : StatusText.reloadFirst
+        delimiterButton?.isEnabled = reread
+        delimiterButton?.toolTip = reread ? StatusText.treatAsHelp : StatusText.reloadFirst
+        encodingButton?.isEnabled = reread
+        encodingButton?.toolTip = reread ? StatusText.reopenHelp : StatusText.reloadFirst
         badge.isHidden = status.warningKinds == 0
         badge.title = status.warningKinds.formatted()
         badge.toolTip = DiagnosticsText.badgeHelp(kinds: status.warningKinds)
