@@ -145,7 +145,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     as an ADR: `,` for files with no delimiter, `header = false` for a
     single-row file, and a final odd byte in a UTF-16 file reported as
     `invalid_encoding` (0.2 notes, the "Open when written" list).
-- [ ] **1.2a Real-world exports in the corpus** (DESIGN §5, layer 2).
+- [ ] **1.2a Real-world exports in the corpus** (moved to phase 4 by Rob, 2026-10-02) (DESIGN §5, layer 2).
   *Rob supplies the files.*
   - Real exports replace or verify the seven imitations in
     `tests/corpus/exports/`: Excel for Windows (UTF-8 BOM and
@@ -338,6 +338,18 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     Air if one is available.
 
 ## Phase 2 — Editing
+
+- [ ] **2.0 Network shares stream** (ADR-0009). Route network-share files
+  through the removable-drive path (ADR-0006 option C), with ADR-0009's
+  safety rules:
+  - Never read an uncopied range on the main thread; rows not yet copied
+    show as loading.
+  - Network errnos are retried briefly in the background before a
+    disconnect; ESTALE/ENOENT on a share is reported as the file deleted.
+  - Document the SMB change-detection limit in DESIGN §3.1.
+  - Tests: a simulated slow and failing share via test hooks, and a real
+    SMB share if one is available.
+  - Done before 2.1, because it changes the source layer 2.x builds on.
 
 - [ ] **2.1 Edit overlay and commands** — cell edits, undo/redo (§3.6).
   - Editing a hatched (missing) cell of a short or blank row is allowed:

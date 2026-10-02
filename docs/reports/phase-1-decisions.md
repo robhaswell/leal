@@ -82,16 +82,16 @@ ADR-0008 and docs/perf.md.
 | # | Decision |
 |---|---|
 | 1 | ADR-0008 accepted. |
-| 2 | Rob runs `just perf` on this Mac, unlocked. No M1 Air is available; proposal pending Rob: keep the M1 Air as the design target, require about 3× headroom on the M5 Pro, confirm on an Air during beta. |
+| 2 | Rob is running `just perf` on this Mac, unlocked. No M1 Air is available; proposal pending Rob: keep the M1 Air as the design target, require about 3× headroom on the M5 Pro, confirm on an Air during beta. |
 | 3 | Idle memory is measured as **physical footprint**. |
 | 4 | Heap: every malloc zone minus the per-window AppKit baseline; search results counted; AppKit drawing peaks excluded. |
 | 5 | Open is judged warm against 150 ms; the cold open counts as part of launch. |
 | 6 | Launch measured to the end of `applicationDidFinishLaunching`. |
 | 7 | Search memory accepted for v1. |
-| 8 | Open: explained to Rob; recommendation is to keep ADR-0006 for v1. |
+| 8 | Network shares stream like removable drives, prioritising first paint: **ADR-0009** (accepted), PLAN task 2.0. |
 | 9 | Screenshots of the unmocked UI approved. |
 | 10 | No column drag-to-reorder in v1. |
-| 11 | Open: explained to Rob (how to make the exports). |
+| 11 | 1.2a moves to phase 4 (Rob: ignore for now). |
 | 12 | Deferred: Rob tests a real USB stick later. |
 | 13 | Benchmark thresholds kept. |
 | 14 | macOS 14 minimum; the App Store question is decided by 4.5. |

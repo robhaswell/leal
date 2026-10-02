@@ -1,6 +1,6 @@
 # 0006 — Files on removable drives
 
-- Status: accepted (option C, approved by Rob, 2026-10-01)
+- Status: accepted (option C, approved by Rob, 2026-10-01); network shares changed by ADR-0009
 - Date: 2026-10-01
 
 ## Context
