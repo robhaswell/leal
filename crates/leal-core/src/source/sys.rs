@@ -3,7 +3,8 @@
 //! volume's mount flags, the memory map itself, whether this is the main
 //! thread, and for watching the
 //! user's file, a kernel event queue (`kqueue`) and an open file's current
-//! path (`F_GETPATH`). (Ordinary reads at an
+//! path (`F_GETPATH`); and for the simulated share's delay (a test hook),
+//! a kernel timer that isn't coalesced. (Ordinary reads at an
 //! offset, `pread`, need no `unsafe`: the standard library has them as
 //! `FileExt::read_at`.)
 //!
@@ -365,6 +366,32 @@ impl Kqueue {
             })
             .collect())
     }
+}
+
+/// TEST HOOK: blocks the calling thread for `duration`, on a kernel timer
+/// the system may not coalesce (`EVFILT_TIMER` with `NOTE_CRITICAL`), so
+/// it wakes on time whatever the thread's QoS. `thread::sleep` doesn't: at
+/// background QoS, or in a background process (`taskpolicy -b`; GitHub's
+/// macOS runners behave like one, docs/tasks/2.0.md), the kernel may defer
+/// its wake-up by up to 32 times the sleep, capped at 100 ms, so a 20 ms
+/// sleep takes up to 120 ms. A simulated share's round trip must take its
+/// delay, as a real one does: a network read wakes when the reply arrives,
+/// not on a coalesced timer.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn sleep_strictly(duration: Duration) -> io::Result<()> {
+    let queue = Kqueue::new()?;
+    queue.change(libc::kevent {
+        ident: 0,
+        filter: libc::EVFILT_TIMER,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_NSECONDS | libc::NOTE_CRITICAL,
+        data: isize::try_from(duration.as_nanos()).unwrap_or(isize::MAX),
+        udata: std::ptr::null_mut(),
+    })?;
+    // The timer is the queue's only event; none means a signal
+    // interrupted the wait, and the timer is still set.
+    while queue.wait(None)?.is_empty() {}
+    Ok(())
 }
 
 /// Swaps the files at `a` and `b` atomically (`renamex_np` with

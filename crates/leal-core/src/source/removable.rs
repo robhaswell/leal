@@ -181,7 +181,8 @@ impl ShareRules {
 #[derive(Clone, Copy, Debug)]
 pub struct SimulatedShare {
     /// How long every read of the share takes: first paint's, and each
-    /// chunk of the copy (and each retry).
+    /// chunk of the copy (and each retry). Timed strictly, so it is the
+    /// same at any QoS and in a background process.
     pub read_delay: Duration,
     /// Reads of the share that fail, if any.
     pub failure: Option<SimulatedShareFailure>,
@@ -1249,7 +1250,11 @@ impl Removable {
         if !stat {
             simulated.reads.fetch_add(1, Ordering::Relaxed);
             if !simulated.read_delay.is_zero() {
-                std::thread::sleep(simulated.read_delay);
+                // On a strict timer: `thread::sleep` can overshoot by up
+                // to 100 ms in a background process (`sys::sleep_strictly`).
+                if sys::sleep_strictly(simulated.read_delay).is_err() {
+                    std::thread::sleep(simulated.read_delay);
+                }
             }
         }
         let mut failure = simulated

@@ -30,7 +30,8 @@
 //!
 //! `open/first_paint_slow_share_small` and `open/first_paint_slow_share`
 //! open a 1 MiB file and the reference file as on a share whose every read
-//! takes 20 ms (`SimulatedShare::read_delay`), with no other load: first
+//! takes 20 ms (`SimulatedShare::read_delay`, on a timer the system may not
+//! coalesce, so it is 20 ms on a CI runner too), with no other load: first
 //! paint must be one round trip, whatever the file's size. Before
 //! measuring, the benchmark checks with the simulated share's read counts
 //! that first paint reads the share once for each file. The timing itself

@@ -486,6 +486,30 @@ fn the_retries_stop_at_their_window() {
     assert!(took < Duration::from_millis(600), "took {took:?}");
 }
 
+/// A slow share's read takes its delay (`sys::sleep_strictly`, a kernel
+/// timer in nanoseconds): never less, and not some other unit of it.
+#[test]
+fn a_slow_shares_read_takes_its_delay() {
+    let dir = TempDir::new("share-delay");
+    let path = dir.file("a.csv", &contents(30_000));
+    let delay = Duration::from_millis(20);
+    let source = open_share(
+        &path,
+        &dir.temp_folders(),
+        10_000,
+        SimulatedShare {
+            read_delay: delay,
+            hold_at: Some(0),
+            ..quick_share()
+        },
+    );
+    let started = Instant::now();
+    source.read_head(64 * 1024).unwrap();
+    let took = started.elapsed();
+    assert!(took >= delay, "took {took:?}");
+    assert!(took < Duration::from_secs(1), "took {took:?}");
+}
+
 /// A failed `fstat` after a good read (`Attempt::Stat`): a network error is
 /// retried and recovers; `ESTALE` with the file still there is only a
 /// disconnection; anything else disconnects the share.
