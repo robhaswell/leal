@@ -75,7 +75,7 @@ reference-file:
     fi
     echo "reference-file: $file matches crates/leal-bench/reference.sha256"
 
-# Benchmark `base` and this checkout on this machine, one after the other, and report budgets, regressions and noise. CI runs it on each push to main.
+# Benchmark `base` and this checkout on this machine, one after the other (a rerun swaps the order), and report budgets, regressions and noise. CI runs it on each push to main.
 bench-compare base="main" regression="0.20" noise="0.10":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -83,8 +83,9 @@ bench-compare base="main" regression="0.20" noise="0.10":
     warn() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::$*"; else echo "warning: $*" >&2; fi; }
     fail() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*"; else echo "error: $*" >&2; fi; exit 1; }
 
-    # Both sides share one criterion directory: `base` saves its results as
-    # the `base` baseline, and this checkout's run compares with it. Running
+    # Both sides share one criterion directory: the side that runs first
+    # saves its results as a baseline, and criterion compares the other
+    # side's with it (see `measure`). Running
     # both on the same machine within minutes is what makes the comparison
     # meaningful on a shared CI runner (docs/tasks/1.2b.md).
     root="$PWD"
@@ -125,6 +126,49 @@ bench-compare base="main" regression="0.20" noise="0.10":
                 cargo bench --package leal-bench --bench baseline -- "$@"
         )
     }
+    head_target="${CARGO_TARGET_DIR:-$root/target}"
+    # Remove every benchmark's `new/`, its latest results.
+    clear_new() { find "$CRITERION_HOME" -type d -name new -prune -exec rm -rf {} +; }
+
+    # Both sides, in the order $1. The side that runs first saves its
+    # results as a baseline, and criterion compares the second with it,
+    # writing the median's change to `change/`. That leaves this
+    # checkout's (head's) results in `new/`, where bench-report reads
+    # them, and the order in `bench-compare-order`.
+    #
+    # - base-first: base saves `base`, head compares with it. The change
+    #   is head's, relative to base.
+    # - head-first: head saves `head`, base compares with it, and head's
+    #   saved results then become `new/`. The change is base's, relative
+    #   to head, and bench-report inverts it, because the order file says
+    #   head-first (`report::collect`). So criterion's console lines on
+    #   this attempt show the change the other way round.
+    #
+    # Either way, a benchmark that only one side has isn't compared
+    # (`--baseline-lenient`), and one that this checkout removed has no
+    # `new/`, so it doesn't show up with the base's numbers.
+    measure() {
+        local order="$1" base_fails
+        base_fails="bench-compare: the benchmarks at ${sha:0:12} ({{ base }}) failed, so there is nothing to compare with"
+        case "$order" in
+            base-first)
+                run_side "$work/base" "$work/base-target" --save-baseline base || fail "$base_fails"
+                clear_new
+                run_side "$root" "$head_target" --baseline-lenient base
+                ;;
+            head-first)
+                run_side "$root" "$head_target" --save-baseline head
+                clear_new
+                run_side "$work/base" "$work/base-target" --baseline-lenient head || fail "$base_fails"
+                clear_new
+                find "$CRITERION_HOME" -type f -path '*/head/benchmark.json' | while IFS= read -r file; do
+                    mv "$(dirname "$file")" "$(dirname "$(dirname "$file")")/new"
+                done
+                ;;
+        esac
+        echo "$order" > "$CRITERION_HOME/bench-compare-order"
+        echo "bench-compare: compared with ${sha:0:12} ({{ base }}), attempt $attempt, $order"
+    }
 
     # A noisy run (a `memchr3_scan` canary moved), or one with a regression,
     # is rerun once. A budget fails on either attempt. A regression fails
@@ -133,6 +177,12 @@ bench-compare base="main" regression="0.20" noise="0.10":
     # shows a regression the first attempt didn't, bench-report warns that
     # the run is inconclusive and passes: a noisy runner is no reason to
     # turn CI red (docs/tasks/1.2b.md).
+    #
+    # Attempt 1 runs base first and the rerun head first. A drift over the
+    # job (the runner warming up, a neighbour's load building) counts
+    # against whichever side runs second: against head on attempt 1 and
+    # against base on the rerun, so it can't fail both. With base first on
+    # both attempts, it failed main at 2cc71bb (docs/tasks/1.2b.md).
     first="$work/criterion-attempt-1"
     rm -rf "$first"
     for attempt in 1 2; do
@@ -146,16 +196,12 @@ bench-compare base="main" regression="0.20" noise="0.10":
         fi
         rm -rf "$CRITERION_HOME"
         mkdir -p "$CRITERION_HOME"
-        if [ "$has_base" = yes ]; then
-            run_side "$work/base" "$work/base-target" --save-baseline base \
-                || fail "bench-compare: the benchmarks at ${sha:0:12} ({{ base }}) failed, so there is nothing to compare with"
-            # Keep only the saved baseline, so a benchmark that this checkout
-            # removed doesn't show up in the report with the base's numbers.
-            find "$CRITERION_HOME" -type d -name new -prune -exec rm -rf {} +
-            run_side "$root" "${CARGO_TARGET_DIR:-$root/target}" --baseline-lenient base
-            echo "bench-compare: compared with ${sha:0:12} ({{ base }}), attempt $attempt"
+        if [ "$has_base" = no ]; then
+            run_side "$root" "$head_target"
+        elif [ "$attempt" = 1 ]; then
+            measure base-first
         else
-            run_side "$root" "${CARGO_TARGET_DIR:-$root/target}"
+            measure head-first
         fi
 
         status=0
@@ -165,7 +211,7 @@ bench-compare base="main" regression="0.20" noise="0.10":
         case "$status" in
             0) exit 0 ;;
             3)
-                warn "bench-compare: a canary moved by more than {{ noise }} or a benchmark regressed; rerunning both sides once (a regression fails only if the rerun shows it too)"
+                warn "bench-compare: a canary moved by more than {{ noise }} or a benchmark regressed; rerunning both sides once, head first this time (a regression fails only if the rerun shows it too)"
                 mv "$CRITERION_HOME" "$first"
                 ;;
             *) exit "$status" ;;

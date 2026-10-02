@@ -4,11 +4,14 @@ name: Benchmarks
 # touches code, compared with the commit before the push on the same runner.
 # The job fails when a benchmark is over its DESIGN §1 budget; when, on a
 # quiet run, it is slower than before with the whole 95% interval of the
-# change above +20%; or when the base commit's benchmarks fail. If a noise
-# canary (`memchr3_scan`) moved by more than 10%, it reruns once; if the
-# rerun is noisy too, it warns that the run is inconclusive and passes,
-# unless a budget failed. Why it works this way, and what to do when it
-# fails or warns: docs/tasks/1.2b.md.
+# change above +20% on every attempt; or when the base commit's benchmarks
+# fail. If a noise canary (`memchr3_scan`) moved by more than 10%, or a
+# benchmark regressed, it reruns once, benchmarking this commit first
+# where attempt 1 benchmarked the base first, so a drift over the job
+# can't count against this commit twice. If the rerun is noisy, it warns
+# that the run is inconclusive and passes, unless a budget failed. Why it
+# works this way, and what to do when it fails or warns:
+# docs/tasks/1.2b.md.
 on:
   push:
     branches: [main]
@@ -97,7 +100,8 @@ jobs:
         run: just bench-compare "$BASE"
 
       # The numbers, for the record: criterion's JSON for both sides, and
-      # the first attempt's if there was a rerun.
+      # the first attempt's if there was a rerun. Each attempt's directory
+      # records the order it ran the sides in (`bench-compare-order`).
       - name: Upload criterion results
         if: always()
         uses: actions/upload-artifact@v7

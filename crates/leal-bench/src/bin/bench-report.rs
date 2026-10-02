@@ -17,7 +17,13 @@
 //! rerun, which is the last attempt (it implies `--last-attempt`). A
 //! regression fails only if the first attempt showed it too. One that only
 //! the rerun shows, or a noisy rerun, is inconclusive. On the last attempt,
-//! inconclusive is a warning and exits with 0. On GitHub Actions it also
+//! inconclusive is a warning and exits with 0.
+//!
+//! If a criterion directory has a `bench-compare-order` file
+//! (`report::ORDER_FILE`), the report says which order that attempt ran
+//! the sides in. `just bench-compare` runs attempt 1 base first and the
+//! rerun head first, so a drift over the job can't fail both; if both
+//! attempts ran in the same order, it warns. On GitHub Actions it also
 //! writes the table to the job summary, headed with the outcome, and each
 //! problem as an annotation.
 
@@ -27,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use leal_bench::budgets::BUDGETS;
-use leal_bench::report::{self, Outcome, Report, Status, Thresholds};
+use leal_bench::report::{self, Order, Outcome, Report, Status, Thresholds};
 
 const USAGE: &str = "usage: bench-report [--regression FRACTION] [--noise FRACTION] \
                      [--last-attempt] [--first-attempt FIRST_DIR] CRITERION_DIR";
@@ -45,7 +51,14 @@ fn main() -> ExitCode {
 fn read_report(dir: &Path, thresholds: Thresholds) -> Result<Report, String> {
     let measurements =
         report::collect(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
-    Ok(report::evaluate(&measurements, BUDGETS, thresholds))
+    let mut report = report::evaluate(&measurements, BUDGETS, thresholds);
+    report.order = report::read_order(dir).map_err(|e| format!("reading the order: {e}"))?;
+    Ok(report)
+}
+
+/// " (base first)", or nothing if the order isn't known.
+fn ran(order: Option<Order>) -> String {
+    order.map_or_else(String::new, |order| format!(" ({})", order.short()))
 }
 
 fn run() -> Result<Outcome, String> {
@@ -134,6 +147,11 @@ fn run() -> Result<Outcome, String> {
             println!("{level}: {message}");
         }
     };
+    let unconfirmed_on_rerun = format!(
+        "regressed on the rerun{} but not on attempt 1{}, so it wasn't judged",
+        ran(report.order),
+        ran(report.first_order)
+    );
     for row in report.problems() {
         let (level, what) = match row.status {
             Status::Regression if outcome == Outcome::Rerun => {
@@ -141,10 +159,7 @@ fn run() -> Result<Outcome, String> {
             }
             Status::Regression => ("error", "is a regression"),
             Status::NoisyRegression => ("warning", "may be a regression (noisy run)"),
-            Status::UnconfirmedRegression => (
-                "warning",
-                "regressed on the rerun but not on attempt 1, so it wasn't judged",
-            ),
+            Status::UnconfirmedRegression => ("warning", unconfirmed_on_rerun.as_str()),
             Status::NoisyCanary => ("warning", "moved, so the run was noisy"),
             Status::OverBudget => ("error", "is over budget"),
             Status::Missing => ("error", "has a budget but no result"),
@@ -155,7 +170,19 @@ fn run() -> Result<Outcome, String> {
     for id in &report.unconfirmed {
         annotate(
             "warning",
-            &format!("benchmark {id} regressed on attempt 1 but not on the rerun, so it passed"),
+            &format!(
+                "benchmark {id} regressed on attempt 1{} but not on the rerun{}, so it passed",
+                ran(report.first_order),
+                ran(report.order)
+            ),
+        );
+    }
+    if report.same_order() {
+        annotate(
+            "warning",
+            "bench-compare ran both attempts in the same order, so a drift over the job \
+             counted against the same side twice; it should run the rerun head first \
+             (docs/tasks/1.2b.md)",
         );
     }
     if outcome == Outcome::Inconclusive {

@@ -741,3 +741,313 @@ fn bench_report_passes_a_quiet_run() {
     assert!(!stdout.contains("::warning::"), "{stdout}");
     assert!(summary.contains("## Benchmarks: pass"), "{summary}");
 }
+
+/// The order's names in `bench-compare-order`, and reading that file: none
+/// when `bench-compare` wrote none, an error when it names no order.
+#[test]
+fn read_order_reads_what_bench_compare_writes() {
+    use report::Order;
+
+    for order in [Order::BaseFirst, Order::HeadFirst] {
+        assert_eq!(order.name().parse::<Order>(), Ok(order));
+    }
+    assert_eq!(Order::BaseFirst.name(), "base-first");
+    assert_eq!(Order::HeadFirst.name(), "head-first");
+    assert!("base".parse::<Order>().is_err());
+
+    let dir = scratch("order");
+    assert_eq!(report::read_order(&dir).unwrap(), None);
+    // `echo` adds a newline.
+    fs::write(dir.join(report::ORDER_FILE), "head-first\n").unwrap();
+    assert_eq!(report::read_order(&dir).unwrap(), Some(Order::HeadFirst));
+    // The order file isn't a benchmark.
+    assert!(report::collect(&dir).unwrap().is_empty());
+    fs::write(dir.join(report::ORDER_FILE), "sideways\n").unwrap();
+    assert!(report::read_order(&dir).is_err());
+}
+
+/// One attempt's results in the case that swapping the order is for
+/// (main at `2cc71bb`, compared with `33e4bef`): `rows/parse` and
+/// `navigate/next_nul_wide` changed by `parse` and `nul`, the first
+/// canary by `early`, and the attempt ran in `order`.
+fn drift_attempt(order: report::Order, early: f64, parse: Change, nul: Change) -> report::Report {
+    let found = [
+        measurement("baseline/memchr3_scan", 48e6, Some(change(early))),
+        measurement("baseline-late/memchr3_scan", 50e6, Some(change(0.02))),
+        measurement("rows/parse", 13.7e3, Some(parse)),
+        measurement("navigate/next_nul_wide", 4.06e3, Some(nul)),
+    ];
+    let mut report = report::evaluate(&found, &[], CI);
+    report.order = Some(order);
+    report
+}
+
+/// Attempt 1 at `2cc71bb`, base first: noisy (`baseline/memchr3_scan`
+/// −13.3%), with `rows/parse` at +26.4% (+25.7% to +26.8%) and
+/// `navigate/next_nul_wide` at +40.0% (+34.6% to +47.7%).
+fn drift_first() -> report::Report {
+    drift_attempt(
+        report::Order::BaseFirst,
+        -0.133,
+        Change {
+            median: 0.264,
+            lower: 0.257,
+            upper: 0.268,
+        },
+        Change {
+            median: 0.400,
+            lower: 0.346,
+            upper: 0.477,
+        },
+    )
+}
+
+/// The rerun runs head first, so the drift that slowed head on attempt 1
+/// slows base instead, and the regressions don't repeat: the run passes,
+/// naming them. The rerun's numbers are what a quiet Mac measured for the
+/// same commits (`rows/parse` −3.6%, `next_nul_wide` +1.9%).
+#[test]
+fn a_drift_regression_does_not_repeat_in_the_other_order() {
+    use report::Order;
+
+    let first = drift_first();
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+
+    let rerun = drift_attempt(Order::HeadFirst, 0.01, change(-0.036), change(0.019)).after(&first);
+    assert_eq!(rerun.first_order, Some(Order::BaseFirst));
+    assert_eq!(rerun.order, Some(Order::HeadFirst));
+    assert!(!rerun.same_order());
+    assert_eq!(status_of(&rerun, "rows/parse"), &Status::Ok);
+    assert_eq!(rerun.unconfirmed, ["navigate/next_nul_wide", "rows/parse"]);
+    assert_eq!(rerun.outcome(true), Outcome::Pass);
+
+    let markdown = rerun.markdown();
+    for expected in [
+        "This attempt benchmarked this commit first, then the base commit.",
+        "Attempt 1 benchmarked the base commit first, then this commit.",
+        "Regressed on attempt 1 but not on this attempt, so not failed: \
+         `navigate/next_nul_wide`, `rows/parse`.",
+    ] {
+        assert!(markdown.contains(expected), "{expected}\n\n{markdown}");
+    }
+    assert!(!markdown.contains("too**"), "{markdown}");
+}
+
+/// A real regression shows in both orders, so it still fails.
+#[test]
+fn a_real_regression_fails_in_both_orders() {
+    let first = drift_first();
+    let rerun =
+        drift_attempt(report::Order::HeadFirst, 0.01, change(0.31), change(0.019)).after(&first);
+    assert!(!rerun.same_order());
+    assert_eq!(status_of(&rerun, "rows/parse"), &Status::Regression);
+    assert_eq!(rerun.unconfirmed, ["navigate/next_nul_wide"]);
+    assert_eq!(rerun.outcome(true), Outcome::Fail);
+}
+
+/// What happened at `2cc71bb`, before the swap: both attempts ran base
+/// first and both showed the drift. The rule is unchanged (a regression on
+/// every attempt fails), but the report says the order was the same.
+#[test]
+fn the_same_order_on_both_attempts_is_flagged() {
+    let first = drift_first();
+    let rerun =
+        drift_attempt(report::Order::BaseFirst, 0.08, change(0.264), change(0.264)).after(&first);
+    assert!(rerun.same_order());
+    assert_eq!(rerun.outcome(true), Outcome::Fail);
+    assert!(
+        rerun
+            .markdown()
+            .contains("**Attempt 1 benchmarked the base commit first, then this commit too**"),
+        "{}",
+        rerun.markdown()
+    );
+
+    // An unknown order (an attempt from before the swap) is never the same.
+    let mut unknown = drift_first();
+    unknown.order = None;
+    let rerun =
+        drift_attempt(report::Order::HeadFirst, 0.01, change(0.0), change(0.0)).after(&unknown);
+    assert_eq!(rerun.first_order, None);
+    assert!(!rerun.same_order());
+}
+
+/// Writes `bench-compare-order` into `<dir>/criterion`.
+fn write_order(dir: &Path, order: &str) {
+    fs::write(
+        dir.join("criterion").join(report::ORDER_FILE),
+        format!("{order}\n"),
+    )
+    .unwrap();
+}
+
+/// `bench-report` reads each attempt's order, names it in the annotations
+/// and the table, warns when both attempts ran in the same order, and
+/// fails (exit 2) on an order file it can't read.
+#[test]
+fn bench_report_reports_each_attempts_order() {
+    // `rows/parse` as `bench-compare` leaves it: on a head-first attempt,
+    // criterion's change is base's relative to head. Write the order first.
+    let parse = |dir: &Path, regressed: bool| {
+        let head = change(if regressed { 0.31 } else { -0.036 });
+        let head_first =
+            report::read_order(&dir.join("criterion")).unwrap() == Some(report::Order::HeadFirst);
+        let written = if head_first { head.inverted() } else { head };
+        write_bench(
+            &dir.join("criterion"),
+            "rows/parse",
+            12e3,
+            None,
+            Some(written),
+        );
+    };
+
+    let dir = scratch("bin-order-swapped");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    write_order(&dir.join("first"), "base-first");
+    parse(&dir.join("first"), true);
+    write_run(&dir, 0.6, -0.01);
+    write_order(&dir, "head-first");
+    parse(&dir, false);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(
+        stdout.contains(
+            "::warning::benchmark rows/parse regressed on attempt 1 (base first) but not on \
+             the rerun (head first), so it passed"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("This attempt benchmarked this commit first"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("same order"), "{stdout}");
+
+    let dir = scratch("bin-order-rerun-only");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    write_order(&dir.join("first"), "base-first");
+    parse(&dir.join("first"), false);
+    write_run(&dir, 0.6, -0.01);
+    write_order(&dir, "head-first");
+    parse(&dir, true);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(
+        stdout.contains(
+            "::warning::benchmark rows/parse regressed on the rerun (head first) but not on \
+             attempt 1 (base first), so it wasn't judged"
+        ),
+        "{stdout}"
+    );
+
+    let dir = scratch("bin-order-same");
+    write_run(&dir.join("first"), 0.6, -0.01);
+    write_order(&dir.join("first"), "base-first");
+    parse(&dir.join("first"), true);
+    write_run(&dir, 0.6, -0.01);
+    write_order(&dir, "base-first");
+    parse(&dir, true);
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("::warning::bench-compare ran both attempts in the same order"),
+        "{stdout}"
+    );
+
+    write_order(&dir, "sideways");
+    let (code, stdout) = run_bench_report_rerun(&dir);
+    assert_eq!(code, Some(2), "{stdout}");
+}
+
+/// Inverting a change gives the other side's change relative to this one:
+/// +25% one way is −20% the other, the interval's ends swap, and inverting
+/// twice gives the change back.
+#[test]
+fn inverting_a_change_swaps_the_sides() {
+    let base_vs_head = Change {
+        median: 0.25,
+        lower: 0.10,
+        upper: 0.50,
+    };
+    let head_vs_base = base_vs_head.inverted();
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+    assert!(close(head_vs_base.median, -0.20), "{head_vs_base:?}");
+    assert!(
+        close(head_vs_base.lower, 1.0 / 1.5 - 1.0),
+        "{head_vs_base:?}"
+    );
+    assert!(
+        close(head_vs_base.upper, 1.0 / 1.1 - 1.0),
+        "{head_vs_base:?}"
+    );
+    assert!(head_vs_base.lower < head_vs_base.median);
+    assert!(head_vs_base.median < head_vs_base.upper);
+    let back = head_vs_base.inverted();
+    assert!(close(back.median, 0.25), "{back:?}");
+    assert!(close(back.lower, 0.10), "{back:?}");
+    assert!(close(back.upper, 0.50), "{back:?}");
+    assert!(close(change(0.0).inverted().median, 0.0));
+}
+
+/// On a head-first attempt, criterion compared base with head, so
+/// `collect` inverts every change to be head's relative to base. On a
+/// base-first attempt, or with no order recorded, it leaves them alone.
+#[test]
+fn collect_inverts_the_changes_of_a_head_first_attempt() {
+    let dir = scratch("collect-head-first");
+    // Base 25% slower than head: head is 20% faster than base.
+    write_bench(&dir, "rows/parse", 12e3, None, Some(change(0.25)));
+    // Only head has it, so there is nothing to invert.
+    write_bench(&dir, "rows/new", 12e3, None, None);
+    let find = |found: &[Measurement], id: &str| found.iter().find(|m| m.id == id).unwrap().clone();
+
+    let found = report::collect(&dir).unwrap();
+    assert_eq!(find(&found, "rows/parse").change, Some(change(0.25)));
+    fs::write(dir.join(report::ORDER_FILE), "base-first\n").unwrap();
+    let found = report::collect(&dir).unwrap();
+    assert_eq!(find(&found, "rows/parse").change, Some(change(0.25)));
+
+    fs::write(dir.join(report::ORDER_FILE), "head-first\n").unwrap();
+    let found = report::collect(&dir).unwrap();
+    let parse = find(&found, "rows/parse");
+    assert_eq!(parse.change, Some(change(0.25).inverted()));
+    assert!((parse.change.unwrap().median + 0.20).abs() < 1e-12);
+    // The median time is head's in either order: it isn't a change.
+    assert!((parse.median_ns - 12e3).abs() < 1e-9, "{parse:?}");
+    assert_eq!(find(&found, "rows/new").change, None);
+
+    fs::write(dir.join(report::ORDER_FILE), "sideways\n").unwrap();
+    assert!(report::collect(&dir).is_err());
+}
+
+/// A head-first rerun as `bench-compare` leaves it, with criterion's
+/// changes the wrong way round: a real head regression still fails when
+/// attempt 1 showed it too, and head getting faster (base slower) never
+/// does.
+#[test]
+fn bench_report_judges_a_head_first_rerun_by_heads_change() {
+    for (name, head_change, code) in [("slower", 0.31, 1), ("faster", -0.31, 0)] {
+        let dir = scratch(&format!("bin-head-first-{name}"));
+        write_run(&dir.join("first"), 0.6, -0.01);
+        write_order(&dir.join("first"), "base-first");
+        write_bench(
+            &dir.join("first").join("criterion"),
+            "rows/parse",
+            12e3,
+            None,
+            Some(change(0.31)),
+        );
+        write_run(&dir, 0.6, -0.01);
+        write_order(&dir, "head-first");
+        write_bench(
+            &dir.join("criterion"),
+            "rows/parse",
+            12e3,
+            None,
+            Some(change(head_change).inverted()),
+        );
+        let (status, stdout) = run_bench_report_rerun(&dir);
+        assert_eq!(status, Some(code), "head {name}: {stdout}");
+    }
+}

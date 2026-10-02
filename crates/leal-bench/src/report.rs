@@ -41,6 +41,24 @@
 //! on both sides, because noise began part-way through it
 //! (`docs/tasks/1.2b.md`).
 //!
+//! **The two attempts run the sides in opposite orders** ([`Order`]).
+//! Attempt 1 benchmarks the base commit first, then this checkout (head);
+//! the rerun benchmarks head first, then base. A steady drift over the job
+//! (the runner warming up, or a neighbour's load building) counts against
+//! whichever side runs second, so it counts against head on one attempt
+//! and for it on the other, and can't fail both. On main at `2cc71bb`,
+//! both attempts ran base first, and both showed `rows/parse` at +26%,
+//! which a run on a quiet Mac put at −3.6% (`docs/tasks/1.2b.md`).
+//! `bench-compare` records each attempt's order in its criterion
+//! directory ([`ORDER_FILE`], read by [`read_order`]), and the report says
+//! which order each attempt ran in.
+//!
+//! Criterion compares the side that runs second with the one that ran
+//! first. So on a head-first attempt, criterion's `change/` is base's
+//! change relative to head, and [`collect`] inverts it
+//! ([`Change::inverted`]): every change in a report is head's, relative to
+//! base.
+//!
 //! `sequential_read`, the other baseline benchmark, is reported for
 //! information only ([`Status::Info`]): it is no canary, has no budget and
 //! can't regress. It takes about 7 ms on CI and depends on the page cache
@@ -94,6 +112,84 @@ pub fn is_baseline(id: &str) -> bool {
         .is_some_and(|(group, _)| BASELINE_GROUPS.contains(&group))
 }
 
+/// Which side `just bench-compare` benchmarked first on an attempt.
+///
+/// Attempt 1 runs [`Order::BaseFirst`] and the rerun [`Order::HeadFirst`],
+/// so a drift over the job counts against head on one attempt and against
+/// base on the other (see the module docs). Criterion compares the second
+/// side with the first, so on a head-first attempt [`collect`] inverts its
+/// changes, and either way a report's change is head's, relative to base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// The base commit's benchmarks, then this checkout's.
+    BaseFirst,
+    /// This checkout's benchmarks, then the base commit's.
+    HeadFirst,
+}
+
+/// The file in an attempt's criterion directory that records its
+/// [`Order`]: `base-first` or `head-first`. `bench-compare` writes it.
+pub const ORDER_FILE: &str = "bench-compare-order";
+
+impl Order {
+    /// The order's name in [`ORDER_FILE`].
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BaseFirst => "base-first",
+            Self::HeadFirst => "head-first",
+        }
+    }
+
+    /// The order in a few words, for annotations: "base first".
+    #[must_use]
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::BaseFirst => "base first",
+            Self::HeadFirst => "head first",
+        }
+    }
+
+    /// The order as a sentence's object, for the report.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::BaseFirst => "the base commit first, then this commit",
+            Self::HeadFirst => "this commit first, then the base commit",
+        }
+    }
+}
+
+impl std::str::FromStr for Order {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        [Self::BaseFirst, Self::HeadFirst]
+            .into_iter()
+            .find(|order| order.name() == name)
+            .ok_or_else(|| format!("`{name}` is not `base-first` or `head-first`"))
+    }
+}
+
+/// Reads the [`Order`] that `bench-compare` recorded in `dir`
+/// ([`ORDER_FILE`]), or `None` if it recorded none (a base with no
+/// benchmarks, so nothing was compared).
+///
+/// # Errors
+///
+/// The file exists but can't be read, or doesn't name an order.
+pub fn read_order(dir: &Path) -> io::Result<Option<Order>> {
+    let file = dir.join(ORDER_FILE);
+    match fs::read_to_string(&file) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|why: String| malformed(&file, &why)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// One benchmark's result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Measurement {
@@ -117,6 +213,25 @@ pub struct Change {
     pub lower: f64,
     /// The upper end of criterion's 95% confidence interval.
     pub upper: f64,
+}
+
+impl Change {
+    /// The change the other way round: if this is A's change relative to
+    /// B, the result is B's relative to A. A median ratio of `1 + c`
+    /// becomes `1 / (1 + c)`, so +25% becomes −20%. The interval's ends
+    /// swap, because the larger change becomes the smaller one. Inverting
+    /// only ever reverses the order of two changes, so the inverted ends
+    /// are still criterion's 95% interval: criterion takes them as percentiles of its bootstrap
+    /// distribution, and inverting every resample keeps their order.
+    #[must_use]
+    pub fn inverted(self) -> Self {
+        let invert = |change: f64| 1.0 / (1.0 + change) - 1.0;
+        Self {
+            median: invert(self.median),
+            lower: invert(self.upper),
+            upper: invert(self.lower),
+        }
+    }
 }
 
 /// The limits the report checks changes against, as fractions.
@@ -247,17 +362,31 @@ pub struct Report {
     /// For a rerun ([`Report::after`]): the benchmarks that regressed on
     /// the first attempt but not on this one, sorted by id.
     pub unconfirmed: Vec<String>,
+    /// The order this attempt ran the sides in, if known
+    /// ([`read_order`]). [`evaluate`] leaves it `None`.
+    pub order: Option<Order>,
+    /// For a rerun ([`Report::after`]): the first attempt's order.
+    pub first_order: Option<Order>,
 }
 
-/// Reads every benchmark result under `dir`, sorted by id.
+/// Reads every benchmark result under `dir`, sorted by id. If `dir`'s
+/// [`ORDER_FILE`] says the attempt ran head first, criterion compared
+/// base with head, so each change is inverted ([`Change::inverted`]) to be
+/// head's, relative to base.
 ///
 /// # Errors
 ///
-/// `dir` can't be read, or a result file is missing or malformed.
+/// `dir` can't be read, a result file is missing or malformed, or the
+/// order file is malformed ([`read_order`]).
 pub fn collect(dir: &Path) -> io::Result<Vec<Measurement>> {
     let mut found = Vec::new();
     visit(dir, &mut found)?;
     found.sort_by(|a, b| a.id.cmp(&b.id));
+    if read_order(dir)? == Some(Order::HeadFirst) {
+        for measurement in &mut found {
+            measurement.change = measurement.change.map(Change::inverted);
+        }
+    }
     Ok(found)
 }
 
@@ -391,6 +520,8 @@ pub fn evaluate(
         thresholds,
         noisy,
         unconfirmed: Vec::new(),
+        order: None,
+        first_order: None,
     }
 }
 
@@ -445,7 +576,17 @@ impl Report {
             .filter(|row| first.regressed(&row.id) && !self.regressed(&row.id))
             .map(|row| row.id.clone())
             .collect();
+        self.first_order = first.order;
         self
+    }
+
+    /// For a rerun: true if both attempts are known to have run the sides
+    /// in the same order, so a drift over the job counted against the same
+    /// side twice. `bench-compare` swaps the order on the rerun, so this
+    /// means something is wrong with it.
+    #[must_use]
+    pub fn same_order(&self) -> bool {
+        matches!((self.first_order, self.order), (Some(first), Some(this)) if first == this)
     }
 
     /// What to do with this report.
@@ -537,6 +678,29 @@ impl Report {
             CANARIES[1],
             percent(self.thresholds.noise),
         );
+        if let Some(order) = self.order {
+            let _ = write!(out, " This attempt benchmarked {}.", order.describe());
+        }
+        match self.first_order {
+            Some(first) if self.same_order() => {
+                let _ = write!(
+                    out,
+                    " **Attempt 1 benchmarked {} too**, so a drift over the job counted \
+                     against the same side on both attempts.",
+                    first.describe()
+                );
+            }
+            Some(first) => {
+                let _ = write!(
+                    out,
+                    " Attempt 1 benchmarked {}. A drift over the job counts against \
+                     whichever side runs second, so it can't make a regression show in \
+                     both orders.",
+                    first.describe()
+                );
+            }
+            None => {}
+        }
         if self.noisy {
             out.push_str(" **This run was noisy**, so regressions in it can't be judged.");
         }
