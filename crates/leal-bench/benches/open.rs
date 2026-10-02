@@ -31,9 +31,11 @@
 //! `open/first_paint_slow_share_small` and `open/first_paint_slow_share`
 //! open a 1 MiB file and the reference file as on a share whose every read
 //! takes 20 ms (`SimulatedShare::read_delay`), with no other load: first
-//! paint must be one round trip, whatever the file's size. Both are
-//! budgeted at 60 ms, and the benchmark itself checks, before measuring,
-//! that the two differ by less than one round trip.
+//! paint must be one round trip, whatever the file's size. Before
+//! measuring, the benchmark checks with the simulated share's read counts
+//! that first paint reads the share once for each file. The timing itself
+//! is judged only against the budget, 60 ms for both (budget-only in
+//! `src/report.rs`).
 //! `open/first_paint` is the same open with no load, for comparison.
 
 // Only `reference_file` is used here: one open takes milliseconds, and
@@ -304,29 +306,29 @@ fn open(c: &mut Criterion) {
     // A slow share: first paint is one round trip, whatever the size.
     let small = dir.join("small.csv");
     write_prefix(&path, &small, 1 << 20);
-    let open_slow = |file: &Path| {
-        let share = SimulatedShare {
-            read_delay: SHARE_ROUND_TRIP,
-            ..SimulatedShare::default()
-        };
+    let slow_share = SimulatedShare {
+        read_delay: SHARE_ROUND_TRIP,
+        ..SimulatedShare::default()
+    };
+    let open_slow = |file: &Path, share: SimulatedShare| {
         let source = Source::open_simulating_share(file, &temp, STREAM_CHUNK_BYTES, share)
             .expect("opening the file");
         Document::from_source(source, &scheduler, OPTIONS, None).expect("first paint")
     };
     let mut checked = false;
-    let mut check_round_trips = || {
+    let mut check_reads = || {
         if !checked {
             checked = true;
-            check_one_round_trip(&small, &path, open_slow);
+            check_one_read(&small, &path, slow_share, open_slow);
         }
     };
     group.bench_function("first_paint_slow_share_small", |b| {
-        check_round_trips();
-        b.iter_custom(|iters| time_opens(iters, || open_slow(&small)));
+        check_reads();
+        b.iter_custom(|iters| time_opens(iters, || open_slow(&small, slow_share)));
     });
     group.bench_function("first_paint_slow_share", |b| {
-        check_round_trips();
-        b.iter_custom(|iters| time_opens(iters, || open_slow(&path)));
+        check_reads();
+        b.iter_custom(|iters| time_opens(iters, || open_slow(&path, slow_share)));
     });
     any_ran |= checked;
     group.finish();
@@ -347,39 +349,37 @@ fn write_prefix(from: &Path, to: &Path, len: usize) {
     std::fs::write(to, &bytes[..end]).expect("writing the small file");
 }
 
-/// The median of five first paints of each file on the slow share: each is
-/// about one round trip (under three), and the large file's is less than a
-/// round trip slower than the small one's. A first paint that read more of
-/// the file than its start would fail this.
-fn check_one_round_trip(
+/// First paint of each file on `share` reads the share once (one round
+/// trip), the small file and the large one alike: a first paint that read
+/// more of the file than its start would fail this. Counted with the
+/// simulated share's test hooks, not timed: a shared runner's wall clock is
+/// too noisy to tell one round trip from several, so the timing is left to
+/// the benchmarks' budgets. The copy's reads are held (`hold_at`), so every
+/// read counted is first paint's; dropping the document cancels them.
+fn check_one_read(
     small: &Path,
     large: &Path,
-    mut open: impl FnMut(&Path) -> (Document, FirstScreen),
+    share: SimulatedShare,
+    open: impl Fn(&Path, SimulatedShare) -> (Document, FirstScreen),
 ) {
-    let mut median = |file: &Path| {
-        let mut times: Vec<Duration> = (0..5)
-            .map(|_| {
-                let started = Instant::now();
-                let opened = open(file);
-                let took = started.elapsed();
-                drop(opened);
-                took
-            })
-            .collect();
-        times.sort();
-        times[2]
+    let held = SimulatedShare {
+        hold_at: Some(0),
+        ..share
     };
-    let (small_time, large_time) = (median(small), median(large));
-    for (name, time) in [("small", small_time), ("large", large_time)] {
-        assert!(
-            time < SHARE_ROUND_TRIP * 3,
-            "first paint on the slow share ({name} file) took {time:?}, more than one round trip"
+    for (name, file) in [("small", small), ("large", large)] {
+        let (document, screen) = open(file, held);
+        assert_eq!(screen.rows.len(), OPTIONS.first_screen_rows);
+        let source = document.source();
+        // First paint's reads, and the reads of the share tried and failed.
+        assert_eq!(
+            (
+                source.simulated_head_reads(),
+                source.simulated_share_reads()
+            ),
+            (1, (1, 0)),
+            "first paint on the slow share ({name} file) read it more than once"
         );
     }
-    assert!(
-        large_time < small_time + SHARE_ROUND_TRIP,
-        "first paint on the slow share grows with the file: {small_time:?} small, {large_time:?} large"
-    );
 }
 
 /// Prints the longest stretch of work between two checkpoints in the index
