@@ -310,27 +310,39 @@ final class NetworkShareTests: XCTestCase {
     /// (task 2.0 re-review).
     func testASharePeriodicCheckBacksOffAfterTheSameFailureThreeTimes() async throws {
         DocumentModel.shareRecheckInterval = .milliseconds(50)
+        // Its own mounts and activations: another agent's disk image or a
+        // window coming to the front would otherwise reset the back-off
+        // (the flakiness seen under load, task 2.0a re-review).
+        let workspace = NotificationCenter()
+        let app = NotificationCenter()
+        DocumentModel.notificationCentersForTesting = (workspace, app)
+        defer { DocumentModel.notificationCentersForTesting = nil }
         let url = try file("share.csv", rows: 20_000)
         // Not "away" (it has a count), so each check reconnects, and each
         // copy then fails at the same chunk.
         _ = simulateShare(failure: SimulatedShareFailure(at: 100_000, errno: EACCES, times: 1_000))
         let (document, model, content) = try await open(url)
         // Three failures in a row at the same place (counted once the window
-        // has seen each reading, so one more reading may slip in), then it
-        // settles.
-        try await waitUntil("failed and reconnected") {
-            model.generation >= 2 && model.storage == .disconnected && model.isIndexComplete
+        // has seen each reading, so one more reading may slip in), then the
+        // checks stop: no recheck pending and no look under way.
+        try await waitUntil("backed off") {
+            model.isShareSettledForTesting && model.storage == .disconnected && model.isIndexComplete
         }
-        try await Task.sleep(for: .milliseconds(500))
         let settled = model.generation
-        try await Task.sleep(for: .milliseconds(500))
-        XCTAssertEqual(model.generation, settled, "no more checks once backed off")
+        XCTAssertGreaterThanOrEqual(settled, 2)
         XCTAssertLessThanOrEqual(settled, 4, "backed off after a few identical failures")
-        XCTAssertEqual(model.storage, .disconnected)
         XCTAssertEqual(content.driveBanner?.message, DiagnosticsText.disconnected)
+        // Nothing is left that would read it again: a few check intervals
+        // later, still the same reading (the run loop and timers run while
+        // waiting on the main actor).
+        for _ in 0..<5 {
+            try await Task.sleep(for: DocumentModel.shareRecheckInterval)
+            XCTAssertTrue(model.isShareSettledForTesting, "a check started after backing off")
+        }
+        XCTAssertEqual(model.generation, settled, "no more checks once backed off")
 
         // Activation tries again.
-        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        app.post(name: NSApplication.didBecomeActiveNotification, object: nil)
         try await waitUntil("checked again") { model.generation > settled }
         document.close()
     }

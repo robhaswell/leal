@@ -78,6 +78,10 @@ final class DocumentModel: GridDataSource {
     /// (task 2.0 review): an SMB session that reconnects by itself fires no
     /// mount notification. Tests shorten it.
     static var shareRecheckInterval: Duration = .seconds(5)
+    /// Where the model hears of mounts and app activations: the system's
+    /// centres, or a test's own, so that another process's disk image or a
+    /// window of another app coming and going doesn't reach the test.
+    static var notificationCentersForTesting: (workspace: NotificationCenter, app: NotificationCenter)?
     /// Rows per block of the row-flags cache (gutter markers and hatching).
     nonisolated static let flagBlockRows = 64
 
@@ -577,6 +581,13 @@ final class DocumentModel: GridDataSource {
     /// row: Leal stops looking for it by itself.
     private var isShareBackedOff: Bool {
         (lastDisconnection?.times ?? 0) >= Self.shareRecheckLimit
+    }
+
+    /// The periodic check has stopped for a share that keeps failing at the
+    /// same place, and no look at the file is under way: nothing will read
+    /// it again by itself. For tests.
+    var isShareSettledForTesting: Bool {
+        isShareBackedOff && shareRecheck == nil && checkingOriginal == nil
     }
 
     private func recheckShareWhileDisconnected() {
@@ -1160,11 +1171,12 @@ final class DocumentModel: GridDataSource {
     /// deleted file's path while Leal was in the background).
     private func observeVolumesAndActivation() {
         guard observers.isEmpty else { return }
-        let workspace = NSWorkspace.shared.notificationCenter
+        let workspace = Self.notificationCentersForTesting?.workspace ?? NSWorkspace.shared.notificationCenter
+        let app = Self.notificationCentersForTesting?.app ?? NotificationCenter.default
         let names = [
             (workspace, NSWorkspace.didMountNotification),
             (workspace, NSWorkspace.didUnmountNotification),
-            (NotificationCenter.default, NSApplication.didBecomeActiveNotification),
+            (app, NSApplication.didBecomeActiveNotification),
         ]
         for (center, name) in names {
             let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
