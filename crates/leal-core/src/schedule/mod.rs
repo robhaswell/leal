@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use input::Input;
 pub use job::{Job, JobControl, JobError, JobHandle};
-use job::{JobState, run_job};
+use job::{JobState, contain, run_job};
 
 /// The smallest background pool: two threads, so that a P3 job can run
 /// and still leave a thread for P2 work ("P3 never takes the pool's last
@@ -276,7 +276,14 @@ impl Scheduler {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(background_threads)
             .thread_name(|i| format!("leal-background-{i}"))
-            .start_handler(move |_| start_platform.thread_started(ThreadClass::Background))
+            .start_handler(move |_| {
+                contain(|| start_platform.thread_started(ThreadClass::Background));
+            })
+            // Every job's work, callbacks and platform calls contain their
+            // own panics, so nothing should get this far. If something
+            // does, the panic hook has printed it; without a handler, rayon
+            // would abort the app.
+            .panic_handler(|_| {})
             .build()
             .map_err(|error| StartError {
                 message: error.to_string(),
@@ -398,7 +405,7 @@ impl Scheduler {
                     thread::Builder::new()
                         .name("leal-index".to_owned())
                         .spawn(move || {
-                            platform.thread_started(ThreadClass::Index);
+                            contain(|| platform.thread_started(ThreadClass::Index));
                             task.run();
                         });
                 if let Err(error) = spawned {
@@ -501,7 +508,8 @@ fn default_background_threads(performance_cores: Option<usize>) -> usize {
 }
 
 /// An interval reported to the [`Platform`]: begun when made, ended when
-/// dropped (DESIGN §3.10, "Measuring it").
+/// dropped (DESIGN §3.10, "Measuring it"). A panic in the platform's
+/// `begin` or `end` is contained: the work it measures goes on.
 #[must_use = "the interval ends when the guard is dropped"]
 pub struct IntervalGuard {
     platform: Arc<dyn Platform>,
@@ -511,7 +519,7 @@ pub struct IntervalGuard {
 
 impl IntervalGuard {
     fn begin(platform: Arc<dyn Platform>, interval: Interval, id: u64) -> Self {
-        platform.begin(interval, id);
+        contain(|| platform.begin(interval, id));
         IntervalGuard {
             platform,
             interval,
@@ -522,7 +530,7 @@ impl IntervalGuard {
 
 impl Drop for IntervalGuard {
     fn drop(&mut self) {
-        self.platform.end(self.interval, self.id);
+        contain(|| self.platform.end(self.interval, self.id));
     }
 }
 

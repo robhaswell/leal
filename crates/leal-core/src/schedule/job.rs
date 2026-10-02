@@ -195,6 +195,10 @@ impl JobControl {
     /// behind another.
     ///
     /// [`Scheduler::spawn_after`]: super::Scheduler::spawn_after
+    ///
+    /// A panic in `then` is contained: it doesn't reach the thread that
+    /// runs it (on the background pool, an uncaught panic would abort the
+    /// app), and the other callbacks waiting for the job still run.
     pub fn on_finish(&self, then: impl FnOnce() + Send + 'static) {
         {
             let mut outcome = self.lock();
@@ -203,7 +207,7 @@ impl JobControl {
                 return;
             }
         }
-        then();
+        contain(then);
     }
 
     /// The longest the job worked between two checkpoints so far, not
@@ -228,9 +232,10 @@ impl JobControl {
             }
         };
         self.inner.finished.notify_all();
-        // Outside the lock, so a callback may look at the job.
+        // Outside the lock, so a callback may look at the job. Each on its
+        // own: one that panics doesn't keep the rest from running.
         for then in waiting {
-            then();
+            contain(then);
         }
     }
 
@@ -501,6 +506,19 @@ where
         control,
         run: Box::new(run),
     }
+}
+
+/// Runs `f`, containing a panic in it: the panic hook has already printed
+/// it, and it goes no further. For code that runs on a scheduler thread
+/// but isn't a job's work, such as [`JobControl::on_finish`]'s callbacks
+/// and the [`Platform`](super::Platform)'s methods: on the background pool,
+/// an uncaught panic would abort the app, and on an index thread it would
+/// end the thread before the job's outcome is recorded (DESIGN §3.9: a
+/// failure is a failed document, never a crash).
+pub(super) fn contain(f: impl FnOnce()) {
+    // `AssertUnwindSafe`: nothing `f` was changing is looked at again by
+    // the code that called it.
+    let _ = panic::catch_unwind(AssertUnwindSafe(f));
 }
 
 /// The text of a panic, if it had one.

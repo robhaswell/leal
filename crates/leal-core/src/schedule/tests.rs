@@ -596,6 +596,82 @@ fn spawn_after_waits_for_the_other_job() {
     assert_eq!(never.wait(), Err::<&(), _>(JobError::Cancelled));
 }
 
+/// A callback that panics as a job finishes is contained (p1-review
+/// conc-5): on the pool, rayon would otherwise abort the process (this
+/// test's), and on an index thread the callbacks after it would never run.
+/// The callbacks after it still run, and the pool carries on.
+#[test]
+fn a_panicking_on_finish_callback_is_contained() {
+    let (scheduler, _) = scheduler(2, IDLE_AFTER_INPUT);
+    for priority in [Priority::P2, Priority::P1] {
+        let (job, started, go) = chunked_job(&scheduler, priority);
+        assert_eq!(started.recv_timeout(LONG), Ok(0));
+        let (ran_tx, ran) = mpsc::channel();
+        job.control()
+            .on_finish(|| panic!("deliberate panic in a callback"));
+        job.control().on_finish(move || ran_tx.send(()).unwrap());
+        job.cancel();
+        go.send(()).unwrap();
+        assert_eq!(
+            job.control().wait_timeout(LONG),
+            Some(Err(JobError::Cancelled))
+        );
+        assert_eq!(ran.recv_timeout(LONG), Ok(()), "{priority:?}");
+        // Asked after the job finished, it runs on this thread: contained
+        // here too.
+        job.control()
+            .on_finish(|| panic!("deliberate panic, run at once"));
+    }
+    for _ in 0..4 {
+        let after = scheduler.spawn(Priority::P2, Interval::Review, |_| Ok(1));
+        assert_eq!(after.wait(), Ok(&1));
+    }
+}
+
+/// A platform whose every method panics.
+struct PanickingPlatform;
+
+impl Platform for PanickingPlatform {
+    fn thread_started(&self, _: ThreadClass) {
+        panic!("deliberate panic in thread_started");
+    }
+
+    fn begin(&self, _: Interval, _: u64) {
+        panic!("deliberate panic in begin");
+    }
+
+    fn end(&self, _: Interval, _: u64) {
+        panic!("deliberate panic in end");
+    }
+}
+
+/// A panic in the platform (the app's signposts and thread QoS) doesn't
+/// take the work it measures down, on any thread (p1-review conc-5).
+#[test]
+fn a_panicking_platform_is_contained() {
+    let scheduler = Scheduler::new(SchedulerConfig {
+        platform: Arc::new(PanickingPlatform),
+        background_threads: Some(2),
+        idle_after_input: IDLE_AFTER_INPUT,
+    })
+    .unwrap();
+    drop(scheduler.interval(Interval::FirstPaint));
+    for priority in [Priority::P1, Priority::P2, Priority::P3] {
+        let job = scheduler.spawn(priority, Interval::Review, |job| {
+            job.checkpoint()?;
+            Ok(7)
+        });
+        assert_eq!(job.wait(), Ok(&7), "{priority:?}");
+    }
+    // A job that pauses for the user has a `Paused` interval too.
+    scheduler.note_user_input();
+    let paused = scheduler.spawn(Priority::P2, Interval::Review, |job| {
+        job.checkpoint()?;
+        Ok(8)
+    });
+    assert_eq!(paused.wait(), Ok(&8));
+}
+
 #[test]
 fn the_longest_chunk_is_recorded_without_pauses() {
     let (scheduler, _) = scheduler(2, IDLE_AFTER_INPUT);
