@@ -1,4 +1,5 @@
 import AppKit
+import LealFFI
 import os
 
 // Only in the builds `just bench-scroll` and `just snapshot` make
@@ -24,8 +25,21 @@ import os
 ///   the find bar (04a); `-LealInspector YES` shows the cell inspector
 ///   (05a); `-LealShortcuts YES` draws the shortcut sheet (06c) instead
 ///   of the window; `-LealWaitForChange YES` waits (up to 45 s) until the
-///   file has changed on disk, so the task 1.9 banner shows. The app
-///   changes nothing: whoever runs it changes the file.
+///   file has changed on disk, so the task 1.9 banner shows, or its
+///   simulated drive was disconnected. The app changes nothing: whoever
+///   runs it changes the file.
+///   For the phase 1 gate's screenshots of the UI with no mockup (cons-11):
+///   `-LealWaitForReview YES` waits for the review, so a suggestion banner
+///   shows; `-LealMenu treatAs|reopen` draws the status bar's Treat As or
+///   Reopen with Encoding menu above its button; `-LealGoToRow YES` draws
+///   the Go to Row sheet; `-LealFindWrap YES`, with `-LealFind`, steps
+///   back past the first match, so the "wrapped" sign shows; and, in a
+///   Debug build, whose core has the test hooks, `-LealSimulateFault
+///   disconnect:<byte>` or `change:<byte>` opens the file as if on a
+///   removable drive that vanishes, or whose file changes, at that byte
+///   of the copy. Menus and sheets are windows of their own, which don't
+///   draw offscreen: their content is drawn on a plain panel where they
+///   would be, as for the details popover.
 /// - `-LealReopen <n>`: once the document is indexed, close it and open
 ///   its file again, `n` times, then quit: each open's "Open to first rows"
 ///   signpost after the first is an open in a running app, without the
@@ -46,6 +60,33 @@ final class ScriptedRun {
 
     private init(defaults: UserDefaults) {
         self.defaults = defaults
+    }
+
+    /// Before any document opens (`applicationWillFinishLaunching`): a
+    /// simulated removable drive, if asked for.
+    static func prepare(defaults: UserDefaults) {
+        #if DEBUG
+        guard let fault = defaults.string(forKey: "LealSimulateFault") else { return }
+        let parts = fault.split(separator: ":")
+        guard parts.count == 2, let at = UInt64(parts[1]) else { return }
+        let simulated: SimulatedFault? = switch parts[0] {
+        case "disconnect": .disconnect(at: at)
+        case "change": .change(at: at)
+        default: nil
+        }
+        guard let simulated else { return }
+        DocumentModel.openForTesting = { path, environment, options, observer in
+            try debugOpenDocumentWithFault(
+                path: path,
+                temp: environment.temp,
+                scheduler: environment.scheduler,
+                options: options,
+                observer: observer,
+                chunkBytes: 4096,
+                fault: simulated
+            )
+        }
+        #endif
     }
 
     static func startIfAsked(defaults: UserDefaults) {
@@ -156,7 +197,14 @@ final class ScriptedRun {
         }
         if has("LealWaitForChange") {
             let deadline = Date().addingTimeInterval(45)
-            while content.model.original.state == .unchanged, !content.model.changedOnDisk, Date() < deadline {
+            while content.model.original.state == .unchanged, !content.model.changedOnDisk,
+                  content.model.storage != .disconnected, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        if has("LealWaitForReview") {
+            let deadline = Date().addingTimeInterval(30)
+            while content.model.review == nil, Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(20))
             }
         }
@@ -189,6 +237,17 @@ final class ScriptedRun {
             }
             try? await Task.sleep(for: .milliseconds(300))
         }
+        if has("LealFindWrap") {
+            // Back past the first match: round to the last, with the sign,
+            // which shows for 0.7 s.
+            let steps = content.find.steps
+            content.findPrevious(nil)
+            let deadline = Date().addingTimeInterval(10)
+            while content.find.steps == steps, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            try? await Task.sleep(for: .milliseconds(30))
+        }
         if has("LealShortcuts"), let menu = NSApp.mainMenu {
             // The shortcut sheet (mockup 06c) in place of the window.
             ShortcutSheet.writePNG(menu: menu, to: url)
@@ -206,6 +265,28 @@ final class ScriptedRun {
             let x = min(button.maxX + 12, window.frame.width - 8) - size.width
             panels.append((details, NSRect(x: x, y: button.minY - 8 - size.height, width: size.width, height: size.height)))
         }
+        if let which = value(of: "LealMenu") {
+            // The status bar's menu, opening upwards from its button, as it
+            // does at the bottom of the screen.
+            let bar = content.statusBar
+            let menu = which == "reopen" ? bar.reopenMenu() : bar.treatAsMenu()
+            if let button = which == "reopen" ? bar.encodingButton : bar.delimiterButton {
+                let frame = button.convert(button.bounds, to: nil)
+                let picture = MenuPicture(menu: menu)
+                let size = picture.frame.size
+                panels.append((picture, NSRect(x: frame.minX - 8, y: frame.maxY + 4, width: size.width, height: size.height)))
+            }
+        }
+        if has("LealGoToRow") {
+            // The sheet hangs from the title bar, in the middle.
+            let (alert, _) = content.goToRowAlert()
+            alert.layout()
+            if let sheet = alert.window.contentView {
+                let size = sheet.frame.size
+                let top = window.contentLayoutRect.maxY
+                panels.append((sheet, NSRect(x: ((window.frame.width - size.width) / 2).rounded(), y: top - size.height, width: size.width, height: size.height)))
+            }
+        }
         Snapshot.writePNG(of: window, panels: panels, to: url)
         Logger.open.info("Snapshot written to \(url.path(percentEncoded: false), privacy: .public)")
     }
@@ -217,6 +298,54 @@ final class ScriptedRun {
             Logger.open.info("Benchmark written to \(url.path(percentEncoded: false), privacy: .public)")
         } catch {
             Logger.open.error("Couldn’t write the benchmark: \(String(describing: error), privacy: .public)")
+        }
+    }
+}
+
+/// A menu's items as AppKit draws them in a menu, for a snapshot: menus are
+/// windows of their own, which don't draw offscreen. The title, a check
+/// mark by the item that is on, disabled items greyed.
+@MainActor
+final class MenuPicture: NSView {
+    private let shown: NSMenu
+    private static let rowHeight: CGFloat = 22
+    private static let inset: CGFloat = 5
+    private static let checkWidth: CGFloat = 22
+    private static var font: NSFont { .menuFont(ofSize: 0) }
+
+    init(menu: NSMenu) {
+        self.shown = menu
+        let widest = menu.items.map { ($0.title as NSString).size(withAttributes: [.font: Self.font]).width }.max() ?? 0
+        let size = NSSize(
+            width: (Self.checkWidth + widest + 24).rounded(.up),
+            height: CGFloat(menu.items.count) * Self.rowHeight + 2 * Self.inset
+        )
+        super.init(frame: NSRect(origin: .zero, size: size))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("not used")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        for (index, item) in shown.items.enumerated() {
+            let top = Self.inset + CGFloat(index) * Self.rowHeight
+            if item.isSeparatorItem {
+                NSColor.separatorColor.setFill()
+                NSRect(x: 10, y: top + Self.rowHeight / 2, width: bounds.width - 20, height: 1).fill()
+                continue
+            }
+            let color: NSColor = item.isEnabled ? .labelColor : .tertiaryLabelColor
+            let attributes: [NSAttributedString.Key: Any] = [.font: Self.font, .foregroundColor: color]
+            let height = (item.title as NSString).size(withAttributes: attributes).height
+            let y = top + (Self.rowHeight - height) / 2
+            if item.state == .on {
+                ("✓" as NSString).draw(at: NSPoint(x: 8, y: y), withAttributes: attributes)
+            }
+            (item.title as NSString).draw(at: NSPoint(x: Self.checkWidth, y: y), withAttributes: attributes)
         }
     }
 }

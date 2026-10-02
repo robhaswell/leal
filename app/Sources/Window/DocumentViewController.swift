@@ -687,6 +687,19 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// it, and goes there.
     @objc func goToRow(_ sender: Any?) {
         guard let window = view.window else { return }
+        let (alert, field) = goToRowAlert()
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            guard let number = FindText.rowNumber(from: field.stringValue) else {
+                NSSound.beep()
+                return
+            }
+            self?.goTo(rowNumber: number)
+        }
+    }
+
+    /// The Go to Row sheet and its row number field.
+    func goToRowAlert() -> (NSAlert, NSTextField) {
         let alert = NSAlert()
         alert.messageText = FindText.goToRowTitle
         alert.informativeText = FindText.goToRowMessage(rows: model.rowCount, exact: model.isIndexComplete)
@@ -697,14 +710,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         alert.addButton(withTitle: FindText.go)
         alert.addButton(withTitle: FindText.cancel)
         alert.window.initialFirstResponder = field
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
-            guard let number = FindText.rowNumber(from: field.stringValue) else {
-                NSSound.beep()
-                return
-            }
-            self?.goTo(rowNumber: number)
-        }
+        return (alert, field)
     }
 
     /// Goes to row `number` (from 1, as the gutter numbers rows). Past the

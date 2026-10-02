@@ -9,6 +9,13 @@ import os
 /// (`ScriptedRun`).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        #if LEAL_BENCH
+        // Before the files Leal was opened with are read.
+        if !Self.isTestHost { ScriptedRun.prepare(defaults: .standard) }
+        #endif
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = MainMenu.make()
         // A test host opens nothing and doesn't take focus (0.3 notes).
