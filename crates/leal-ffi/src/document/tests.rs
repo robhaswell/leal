@@ -436,6 +436,7 @@ fn diagnostics_reach_swift() {
 /// The test export opens a file as if on a removable drive that vanishes
 /// part-way through the copy (task 1.7's banner tests).
 #[test]
+#[cfg(feature = "test-exports")]
 fn a_simulated_disconnection_reaches_swift() {
     let dir = TempDir::new("fault");
     let mut bytes = b"id,name\n".to_vec();
@@ -679,6 +680,7 @@ fn the_original_is_watched_and_swift_is_told() {
 /// Task 1.9: a document whose drive went away reconnects when Swift checks
 /// after the drive is back, with a new generation and new jobs.
 #[test]
+#[cfg(feature = "test-exports")]
 fn a_disconnected_document_reconnects_when_checked() {
     let dir = TempDir::new("reconnect");
     let mut bytes = b"id,name\n".to_vec();
