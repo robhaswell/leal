@@ -154,9 +154,10 @@ program truncates a mapped file, reading the missing pages crashes the process
 (SIGBUS). The clone cannot be changed by other programs, so Leal cannot crash
 this way, and it always has a stable snapshot of what it opened.
 
-Fallbacks, only when an internal volume can't clone at all (one that isn't
-APFS). Removable drives and network shares follow the path below instead.
-An EXDEV error means "clone elsewhere", not "no cloning":
+Fallbacks, only when the volume can't clone at all and can't vanish (an
+internal volume that isn't APFS). Removable drives and network shares
+follow the path below instead. An EXDEV error means "clone elsewhere", not
+"no cloning":
 - up to 512 MB: read the file into memory, and show a small status bar note;
 - above that: copy to the temporary directory, then map the copy.
 
@@ -187,13 +188,25 @@ a successful save, Leal rebases the document onto the file it just wrote:
 
 Saving twice in a row never shows a banner or an "overwrite?" prompt.
 
+**Opening off the main thread.** The app opens every file's core document
+on a background queue, before AppKit makes its window. Reload and every
+check of the original run there too. This holds for every file, not only
+shares: asking whether a file is on a share would itself touch its volume,
+and the open costs the same on either thread. The main thread builds the
+window from the first 64 KB already read. An open that takes more than
+half a second shows "Opening…", and the app stays responsive.
+
 **Removable drives and network shares (ADR-0006, ADR-0009).** A file on a
-removable drive or a network share (SMB, NFS) can vanish if the drive is
-unplugged or the share drops out, and touching mapped pages then crashes
-the process. So for these files Leal never maps anything on the external
-volume:
-1. First paint and early scrolling use ordinary reads, which fail with an
-   error, not a crash.
+volume that can vanish is never mapped from that volume, because touching
+mapped pages of a vanished volume crashes the process. These volumes are
+removable drives (external drives, disk images) and network shares. A
+share is any volume that isn't local (`MNT_LOCAL` missing), or whose file
+system is `smbfs`, `nfs`, `afpfs`, `webdav` or `ftp`. A share is
+recognised before the "same volume as Leal's temporary folder" shortcut,
+so files in a network home folder are shares too. For these files:
+1. First paint uses ordinary reads, which fail with an error, not a crash.
+   On a removable drive, early scrolling reads the drive the same way. On
+   a share, rows come only from the copy (below).
 2. The indexing pass streams the file and copies it to Leal's temporary
    folder on the internal disk.
 3. Once the copy is complete, Leal maps the internal copy and drops what it
@@ -204,22 +217,68 @@ volume:
    incomplete document writes only complete rows (§3.7, ADR-0008 decision
    6).
 
-Shares have three more rules (ADR-0009):
-- **Never read uncopied bytes on the main thread.** A hard NFS mount or an
-  SMB reconnect can block a read for a long time. Rows not yet copied are
-  read on a background thread, and the grid shows them as loading until
-  they arrive.
-- **Network errors are ambiguous, not fatal.** ETIMEDOUT, EHOSTDOWN,
-  EHOSTUNREACH, ENETDOWN, ENETUNREACH and ECONNRESET are retried briefly
-  in the background before Leal treats the share as disconnected.
-- **ESTALE or ENOENT on a share** may mean another computer deleted the
-  file, and is reported as that (the deleted banner), not as a disconnect.
+A removable drive is cloned on the drive if it can clone. A share is never
+cloned: Leal makes nothing on the user's share. It reads the user's file
+itself, and checks it with `fstat` after every read.
 
-**Known v1 limitation: changes on SMB shares.** SMB clients cache file
-details, so a change that another computer makes to a file on an SMB share
-may not show: during the copy, to the watcher (which sees only this Mac's
-changes), or even to the fresh `fstat` before a save. Leal may miss such a
-change in v1 (ADR-0008 decision 9, ADR-0009).
+Shares have more rules (ADR-0009):
+- **The share is never read on the main thread,** where a share that stops
+  answering would freeze the app. Only first paint's 64 KB read and the
+  indexing pass read it, both in the background. Rows are read only from
+  the internal copy; rows not copied yet show as loading until the pass
+  brings them. Debug builds assert this. A share's files are closed on a
+  thread of their own, because a close on a hung share can block.
+- **Network errors are retried.** `ETIMEDOUT`, `EHOSTDOWN`, `EHOSTUNREACH`,
+  `ENETDOWN`, `ENETUNREACH`, `ECONNRESET`, `ECONNREFUSED`, `ECONNABORTED`,
+  `ENOTCONN`, `EPIPE`, `ESHUTDOWN`, `EAGAIN` and `EIO` (SMB's timed-out
+  request) are retried with backoff, from 100 ms, doubling. A retry starts
+  only within about 3.5 s of the first failure. If the read still fails,
+  the share is disconnected. Any other failure on a share disconnects it
+  at once, without retries; it is never an ordinary read error.
+- **`ESTALE` or `ENOENT` is checked against the path** where the file is
+  now, because an NFS server that restarted gives `ESTALE` for a file that
+  is still there:
+  - the same file there: only the handle went stale, so the share is
+    disconnected, and it reconnects;
+  - another file there: the file was replaced, so it changed while being
+    read, and the banner offers Reload;
+  - nothing there, with its folder present on the same device: another
+    computer deleted it (**Deleted**, below);
+  - anything else (no folder, a folder on another device such as an empty
+    mount point, or a look that fails): disconnected.
+- **Deleted** is a state of its own. As when disconnected, the rows copied
+  stay readable and Save is off. Unlike a disconnection, it never
+  reconnects. Its banner says the file was deleted on another computer
+  while Leal was reading it, and that Leal shows the rows it had read. Its
+  button is **Save As…**. It replaces the plain "deleted" banner.
+- **Changes during the copy.** The copy's first chunks are checked against
+  first paint's bytes, which catches a change between the two even when
+  the size and time are put back. A short read of the file is a change. A
+  change found by a look at the file during the copy means the file
+  changed while being read, because the rest of the copy would be the new
+  version.
+- **Reconnecting.** A disconnected share reconnects, if the file is
+  unchanged, when a volume mounts, when the app becomes active, or at a
+  check every 5 s. The check is needed because an SMB session that comes
+  back by itself posts no mount notification. The copy then carries on.
+  After three disconnections in a row at the same place, the periodic
+  check stops, and the banner stays; a mount, app activation or Reload
+  starts it again.
+
+**Known v1 limits.**
+- **Changes on SMB and NFS shares.** Network clients cache file details,
+  so a change that another computer makes may not show: during the copy,
+  to the watcher (which sees only this Mac's changes), or even to the
+  fresh `fstat` before a save. Leal may miss such a change in v1 (ADR-0008
+  decision 9, ADR-0009).
+- **A network home folder** puts Leal's temporary folder on the network
+  too. The complete copy is then read with ordinary reads, never mapped,
+  so the whole-file review (§3.2) doesn't run. Rows are read from that
+  copy on the main thread, so a home share that stops answering can stall
+  the window. Save still works.
+- **Revert to Saved** is AppKit's second read of the file, on the main
+  thread. Nothing saves in phase 1, so it can't be reached yet; task 2.5
+  sends it through Reload.
 
 ### 3.2 Dialect and encoding detection
 
@@ -524,7 +583,7 @@ lower-priority work must never delay higher-priority work.
 
 | Priority | Work | When | QoS |
 |---|---|---|---|
-| **P0** | Clone, map (ordinary reads on removable drives and shares, §3.1), detect dialect and encoding from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
+| **P0** | Off the main thread (§3.1): clone, map (ordinary reads on removable drives and shares), detect dialect and encoding from the first 64 KB. On the main thread: parse the first screen of rows, paint | Immediately, before anything else starts | User-initiated (the open), user-interactive (paint) |
 | **P1** | Row index (§3.3) and diagnostics (§3.5), in one pass (1.5); parsing rows as the user scrolls | Straight after P0 | User-initiated |
 | **P2** | Whole-file dialect and encoding check (§3.2), refined column widths, number detection for alignment | Alongside or after P1 | Utility |
 | **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, paused while the user scrolls or edits (rule 3) |

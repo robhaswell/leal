@@ -342,7 +342,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ## Phase 2 — Editing
 
-- [ ] **2.0 Network shares stream** (ADR-0009). Route network-share files
+- [x] **2.0 Network shares stream** (ADR-0009). Route network-share files
   through the removable-drive path (ADR-0006 option C), with ADR-0009's
   safety rules:
   - Never read an uncopied range on the main thread; rows not yet copied
@@ -497,6 +497,13 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     there are unsaved edits ("Save or revert your changes first"); the
     Header row toggle stays available; a drive coming back keeps the
     edits. Each has a test. (ADR-0008 decision 4)
+  - Revert runs off the main thread, like Reload (`reloadInBackground`):
+    AppKit's `read(from:)` reads on the main thread, where a share must
+    never be read. (2.0, `SEAM(2.5)` in `CSVDocument.read(from:)`)
+  - When the open couldn't read the file's modification date
+    (`PendingOpens.Facts.modified` is nil), Save's check before writing
+    looks at the file afresh rather than take it as unchanged. (2.0,
+    `SEAM(2.5)`)
   - If a document fails (DESIGN §3.9) with unsaved edits, the alert offers
     **Recover changes**: Leal opens the file afresh and replays the undo
     history's commands. If the file is unchanged the window carries on;
