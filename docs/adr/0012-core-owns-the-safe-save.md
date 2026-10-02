@@ -1,4 +1,4 @@
-# 0012 — The core does the safe save; three save details
+# 0012 — The core does the safe save; four save details
 
 - Status: proposed
 - Date: 2026-10-03
@@ -7,7 +7,7 @@
 
 ## Context
 
-Task 2.2 built the save writer. Three parts need a decision, because they
+Task 2.2 built the save writer. Four parts need a decision, because they
 change DESIGN or settle a conflict between two ADRs. Details are in
 `docs/tasks/2.2.md`, "Decisions and interpretations".
 
@@ -26,7 +26,25 @@ core does it, all under one lock:
 
 If AppKit does the swap, there is a gap between Leal's check and the
 rename. A change made in that gap goes unseen, and Leal's own rename can
-show up as an outside change. Task 2.5 overrides NSDocument's save to start
+show up as an outside change. With the core doing it, Leal's own watcher
+can't miss a change: the rename swaps the files (`renamex_np` with
+`RENAME_SWAP`), Leal checks the file it swapped out against the one it
+checked, and swaps back and refuses if they differ. A write by another
+process through a descriptor it already holds can still land in the old
+file after the swap; no Mac API closes that.
+
+Taking the replace from NSDocument means the core takes over NSDocument's
+guards too:
+- **Files the user can't write.** A rename only needs write access to the
+  folder, so the core checks that the file itself is writable and not
+  locked before it writes anything. If either check fails, it refuses with
+  a distinct reason, so the app can offer Duplicate or Unlock.
+- **Metadata is copied best-effort, by an explicit policy.** Each
+  extended attribute is copied on its own, following the system's save
+  rules (`XATTR_OPERATION_INTENT_SAVE`) plus a keep-list (Finder info,
+  tags). Attributes that can't be set are skipped and logged, so one
+  protected attribute never makes a file unsaveable. Leal's two attributes
+  are then written, and the ACL, mode and flags come last. Task 2.5 overrides NSDocument's save to start
 the core's job. Nothing changes for the user: the replace is still atomic
 and metadata is kept. It still works in the sandbox, because the app hands
 the core the replacement folder that `FileManager` gives it.
@@ -54,8 +72,22 @@ oracle. Keeping it is harmless and matches what other apps wrote. The
 other option is to remove it, following ADR-0008 decision 8 literally, and
 change the oracle.
 
+**4. Undo across a save works by value.**
+
+After a save, the saved file is the new base (DESIGN §3.6), and undo
+puts a cell's earlier value back; it doesn't restore the earlier bytes.
+So undoing an edit to a missing cell after saving leaves an empty field
+(`a,,` instead of `a`), and a field that was saved quoted stays quoted.
+F3 ("undoing all edits restores byte-identical output") holds from the
+last save, not from the file as first opened. Restoring the bytes would
+need a structural "remove fields" command, and the user would see the
+same values either way.
+
 ## Consequences
 
+- DESIGN §5's F3 says it holds from the last save (decision 4).
+- ADR-0008 decision 8's wording on BOM files is read as ADR-0004
+  decision 11 (decision 3).
 - DESIGN §3.7's safe-save paragraph is rewritten (the proposed wording is
   in `docs/tasks/2.2.md`, "Proposed DESIGN wording").
 - PLAN 2.5 overrides NSDocument's save to start the core's save job, and
