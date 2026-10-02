@@ -1,6 +1,6 @@
 # Phase 1 gate — decisions for Rob
 
-Date: 2026-10-02 · Status: **awaiting Rob**
+Date: 2026-10-02 · Status: **decided by Rob, 2026-10-02** (open items noted)
 
 Every decision or approval the phase 1 gate needs from Rob, with a
 recommendation and where to look. Collected from the phase 1 review,
@@ -76,3 +76,23 @@ ADR-0008 and docs/perf.md.
 - **1.8:** find's Next wraps, with a brief "wrapped" sign and no beep.
   Use Selection for Find (⌘E) and the system find pasteboard are deferred
   to PLAN 4.4. A copy over about 100 MB asks first. → `docs/tasks/1.8.md`
+
+## Rob's answers (2026-10-02)
+
+| # | Decision |
+|---|---|
+| 1 | ADR-0008 accepted. |
+| 2 | Rob runs `just perf` on this Mac, unlocked. No M1 Air is available; proposal pending Rob: keep the M1 Air as the design target, require about 3× headroom on the M5 Pro, confirm on an Air during beta. |
+| 3 | Idle memory is measured as **physical footprint**. |
+| 4 | Heap: every malloc zone minus the per-window AppKit baseline; search results counted; AppKit drawing peaks excluded. |
+| 5 | Open is judged warm against 150 ms; the cold open counts as part of launch. |
+| 6 | Launch measured to the end of `applicationDidFinishLaunching`. |
+| 7 | Search memory accepted for v1. |
+| 8 | Open: explained to Rob; recommendation is to keep ADR-0006 for v1. |
+| 9 | Screenshots of the unmocked UI approved. |
+| 10 | No column drag-to-reorder in v1. |
+| 11 | Open: explained to Rob (how to make the exports). |
+| 12 | Deferred: Rob tests a real USB stick later. |
+| 13 | Benchmark thresholds kept. |
+| 14 | macOS 14 minimum; the App Store question is decided by 4.5. |
+| 15 | Phase 1 approved. |

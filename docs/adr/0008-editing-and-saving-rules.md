@@ -1,6 +1,6 @@
 # 0008 — Editing and saving: decisions from the phase 1 review
 
-- Status: proposed (Rob decides at the phase 1 gate)
+- Status: accepted (approved by Rob, 2026-10-02)
 - Date: 2026-10-02
 
 ## Context
