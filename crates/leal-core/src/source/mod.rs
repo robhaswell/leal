@@ -16,14 +16,12 @@
 //!    crash Leal (SIGBUS), and Leal keeps a stable snapshot of what it
 //!    opened.
 //!
-//! Only when the file's volume can't clone at all (`ENOTSUP`: HFS+, exFAT,
-//! network shares) and isn't a removable drive (an internal partition, or a
-//! network share, which ADR-0006 leaves here) does it fall back: a file of
-//! up to [`MEMORY_FALLBACK_MAX_BYTES`] is read into memory, a larger one is
+//! Only when the file's volume can't clone at all (`ENOTSUP`: HFS+, exFAT)
+//! and can't vanish (an internal partition) does it fall back: a file of up
+//! to [`MEMORY_FALLBACK_MAX_BYTES`] is read into memory, a larger one is
 //! copied to Leal's temporary directory and the copy is mapped. Both read
-//! the file in full, with ordinary reads, inside `open`, so a vanishing
-//! share gives an error, not a crash. [`Source::storage`] says which
-//! happened, so the app can show its status bar note.
+//! the file in full, with ordinary reads, inside `open`. [`Source::storage`]
+//! says which happened, so the app can show its status bar note.
 //!
 //! **Removable drives (ADR-0006).** A file on a removable drive (an
 //! external drive, a disk image) is never mapped from that volume, because touching a mapped page of a file whose drive was
@@ -41,14 +39,32 @@
 //! ejectable" properties, which the app passes in [`VolumeInfo`], and from
 //! the volume's own mount flags.
 //!
+//! **Network shares (ADR-0009)** (SMB, NFS, AFP, WebDAV: a volume without
+//! `MNT_LOCAL`, or with a network file system's name) take the same path,
+//! with three rules on top. The share is never read on the main thread:
+//! [`Source::read_range`] doesn't read bytes of a share that aren't copied
+//! yet ([`ReadErrorKind::NotCopied`]), and only first paint
+//! ([`Source::read_head`]) and the stream, both in the background, read it.
+//! Network errors (`ETIMEDOUT`, `EIO` and the like) are retried for at most
+//! [`NETWORK_RETRY_WINDOW`] ([`NETWORK_RETRY_DELAYS`]) before the share
+//! counts as [`Storage::Disconnected`], as it does at once after any other
+//! failure. `ENOENT` or `ESTALE` from the share is decided by the file's
+//! path: nothing there, in a folder still on the share, means another
+//! computer deleted it ([`Storage::Deleted`]); another file there means it
+//! was replaced ([`ReadErrorKind::ChangedOnDisk`]); the same file, or no
+//! folder, is a disconnection.
+//!
 //! # Reading the bytes
 //!
 //! - [`Source::as_slice`]: the whole file as one `&[u8]`, for a mapped or
 //!   in-memory source. `None` for a file on a removable drive until its
 //!   copy is complete.
-//! - [`Source::read_range`]: any range, always: borrowed from the slice
-//!   when there is one, read with `pread` otherwise. First paint reads its
-//!   first 64 KB this way, and rows are read by their extent.
+//! - [`Source::read_range`]: any range: borrowed from the slice when there
+//!   is one, read with `pread` otherwise. Rows are read by their extent.
+//!   On a network share, only what is copied (every row the index has).
+//! - [`Source::read_head`]: the first 64 KB, for first paint. It is
+//!   `read_range`, except that on a network share it reads the share, so it
+//!   is called off the main thread.
 //! - [`Source::stream`]: the whole file once, in order, in chunks of
 //!   [`STREAM_CHUNK_BYTES`], cancellable between chunks (ADR-0005 decision
 //!   6). This is the pass the index runs on, and for a removable drive it
@@ -90,9 +106,12 @@ use memmap2::Mmap;
 use error::Step;
 pub use error::{OpenError, OpenErrorKind, ReadError, ReadErrorKind};
 pub use original::{MOVE_WINDOW, Original, OriginalState, OriginalStatus, PENDING_POLL};
+#[cfg(test)]
+pub(crate) use removable::PRETEND_MAIN_THREAD;
+pub use removable::{NETWORK_RETRY_DELAYS, NETWORK_RETRY_WINDOW, forbid_share_use_on_main_thread};
+use removable::{Origin, Removable, ShareRules};
 #[cfg(any(test, feature = "test-hooks"))]
-pub use removable::SimulatedFault;
-use removable::{Origin, Removable};
+pub use removable::{SimulatedFault, SimulatedShare, SimulatedShareFailure};
 use temp::TempFolder;
 pub use temp::TempFolders;
 #[cfg(test)]
@@ -173,12 +192,24 @@ pub enum Storage {
     /// [`Copy`](Self::Copy).
     Reading,
     /// The file's removable drive was disconnected before its copy was
-    /// complete. The first [`Source::available_len`] bytes (what was
-    /// copied) can still be read; reads past them fail with
-    /// [`ReadErrorKind::Disconnected`]. Save is refused, because it needs
-    /// the bytes that were never read; Save As is allowed (ADR-0006). The
-    /// app shows the "drive disconnected" banner (PLAN 1.7).
+    /// complete, or its network share stopped answering (ADR-0009). The
+    /// first [`Source::available_len`] bytes (what was copied) can still be
+    /// read; reads past them fail with [`ReadErrorKind::Disconnected`].
+    /// Save is refused, because it needs the bytes that were never read;
+    /// Save As is allowed (ADR-0006). The app shows the "drive
+    /// disconnected" banner (PLAN 1.7).
     Disconnected,
+    /// The file is on a network share and another computer deleted it
+    /// before its copy was complete: the share answered `ENOENT` or
+    /// `ESTALE`, and nothing is at the file's path, whose folder is still on
+    /// the share (ADR-0009). A file replaced by another is a change while
+    /// reading instead. As for
+    /// [`Disconnected`](Self::Disconnected), the first
+    /// [`Source::available_len`] bytes can still be read, Save is refused
+    /// and Save As is allowed; reads past them fail with
+    /// [`ReadErrorKind::Deleted`]. Unlike a disconnection, it never
+    /// reconnects: the file is gone. The app says the file was deleted.
+    Deleted,
 }
 
 /// What the app knows about the volume a file is on, for
@@ -259,6 +290,13 @@ struct Options {
     /// A fault to pretend happens to a removable drive (tests only).
     #[cfg(any(test, feature = "test-hooks"))]
     fault: Option<SimulatedFault>,
+    /// How a pretend network share behaves (tests only). A pretend share
+    /// can't clone, as real ones can't.
+    #[cfg(any(test, feature = "test-hooks"))]
+    share: Option<SimulatedShare>,
+    /// Pretend Leal's temporary folder is on a network volume (tests only).
+    #[cfg(test)]
+    copy_on_network: bool,
 }
 
 impl Default for Options {
@@ -269,6 +307,10 @@ impl Default for Options {
             chunk_len: STREAM_CHUNK_BYTES,
             #[cfg(any(test, feature = "test-hooks"))]
             fault: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            share: None,
+            #[cfg(test)]
+            copy_on_network: false,
         }
     }
 }
@@ -287,6 +329,10 @@ enum VolumeCheck {
     /// through the `test-hooks` feature (`Source::open_simulating_removable`).
     #[cfg(any(test, feature = "test-hooks"))]
     Removable,
+    /// Treat the volume as a network share (ADR-0009):
+    /// `Source::open_simulating_share`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    Network,
 }
 
 impl Source {
@@ -423,9 +469,42 @@ impl Source {
         )
     }
 
+    /// TEST HOOK, not for product code: opens `path` as if it were on a
+    /// network share (ADR-0009) that can't clone and behaves as `share`
+    /// says: slow, or failing with a given error. The source reads the
+    /// user's file itself, copies it in chunks of `chunk_len`, and follows
+    /// a share's rules: [`read_range`](Self::read_range) never reads what
+    /// isn't copied, network errors are retried after `share`'s delays, and
+    /// `ENOENT` or `ESTALE` is decided by the path. For the tests of
+    /// task 2.0, through leal-ffi's `test-exports` too.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn open_simulating_share(
+        path: &Path,
+        temp: &TempFolders,
+        chunk_len: usize,
+        share: SimulatedShare,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_options(
+            path,
+            temp,
+            VolumeInfo::default(),
+            Options {
+                volume: VolumeCheck::Network,
+                chunk_len,
+                share: Some(share),
+                ..Options::default()
+            },
+        )
+    }
+
     /// [`open_on`](Self::open_on), with options so tests can reach the copy
     /// fallback with small files, choose the stream's chunk size, and
-    /// pretend a volume is internal or removable.
+    /// pretend a volume is internal, removable or a network share.
     fn open_with_options(
         path: &Path,
         temp: &TempFolders,
@@ -438,32 +517,58 @@ impl Source {
         let (file, identity) = open_regular(path)?;
         let attributes = RawAttributes::read(&file);
 
-        let removable = can_vanish(&file, &identity, temp, &volume, options.volume);
+        let kind = volume_kind(&file, &identity, temp, &volume, options.volume);
+        // The one routing decision for ADR-0006 option C: removable drives
+        // and network shares (ADR-0009) are both read with ordinary reads
+        // and copied in the background, never mapped from their volume.
+        let removable = kind != VolumeKind::Fixed;
         let removable_source = |origin| -> Result<_, OpenError> {
             let copy_error = |error| OpenError::new(path, Step::Copy, error);
             let copy = temp.create().map_err(copy_error)?;
+            let share = (kind == VolumeKind::Network).then(|| share_rules(&options));
             #[cfg_attr(
                 not(any(test, feature = "test-hooks")),
                 expect(unused_mut, reason = "only the test hook changes it")
             )]
-            let mut removable = Removable::new(path, origin, &copy, options.chunk_len)?;
+            let mut removable = Removable::new(path, origin, &copy, options.chunk_len, share)?;
             #[cfg(any(test, feature = "test-hooks"))]
             removable.set_fault(options.fault);
+            #[cfg(test)]
+            if options.copy_on_network {
+                removable.set_copy_on_network();
+            }
+            if kind == VolumeKind::Network {
+                // Opening a file on a share used the share: never on the
+                // main thread (ADR-0009). Debug builds panic here if so.
+                removable.note_share_use();
+            }
             Ok((
                 Bytes::Removable(Box::new(removable)),
                 Some(copy),
                 Storage::Reading,
             ))
         };
-        let (bytes, temp_folder, storage) = match clone(&file, path, temp, volume_folder)? {
+        // A share isn't cloned, or even asked to: nothing is made on the
+        // user's share (task 2.0 review), and smbfs and nfs can't clone
+        // anyway. It is read from the user's file itself. A folder the app
+        // gave for it is removed as it is dropped (the app gives none for a
+        // share).
+        let cloned = if kind == VolumeKind::Network {
+            drop(volume_folder);
+            None
+        } else {
+            clone(&file, path, temp, volume_folder)?
+        };
+        let (bytes, temp_folder, storage) = match cloned {
             Some(clone) if removable => removable_source(Origin::Clone(clone))?,
             Some(clone) => {
                 let map = map_file(path, &clone.file_path())?;
                 (Bytes::Mapped(map), Some(clone), Storage::Clone)
             }
-            // A removable drive that can't clone (exFAT, FAT, HFS+): read the
-            // user's file itself, never mapped, and stream it to the internal
-            // disk, rather than reading it all before first paint.
+            // A removable drive that can't clone (exFAT, FAT, HFS+), or a
+            // network share: read the user's file itself, never mapped, and
+            // stream it to the internal disk, rather than reading it all
+            // before first paint.
             None if removable => removable_source(Origin::Original {
                 file,
                 path: path.to_owned(),
@@ -520,22 +625,50 @@ impl Source {
     /// each such read checks the file's size and modification time
     /// afterwards; bytes read after a detected change are never returned.
     /// This never waits: it may be called on the main thread (DESIGN §3.9).
+    /// So on a network share it never reads the share itself (ADR-0009):
+    /// only bytes already in the internal copy can be read, which every row
+    /// the index has is.
     ///
     /// # Errors
     ///
-    /// Only for a file on a removable drive before its copy is complete:
-    /// [`ReadErrorKind::Disconnected`] if the drive has vanished and the
-    /// range wasn't copied before it did (the source is then
-    /// [`Storage::Disconnected`]), [`ReadErrorKind::ChangedOnDisk`] if the
-    /// user's file (read without a clone) has changed since it was opened,
-    /// or [`ReadErrorKind::Other`] for any
-    /// other read error, which leaves the source as it was.
+    /// Only for a file on a removable drive or a network share before its
+    /// copy is complete: [`ReadErrorKind::Disconnected`] if the drive has
+    /// vanished (or the share stopped answering) and the range wasn't
+    /// copied before it did (the source is then [`Storage::Disconnected`]),
+    /// [`ReadErrorKind::Deleted`] if the file on a share was deleted
+    /// elsewhere before the range was copied, [`ReadErrorKind::NotCopied`]
+    /// for a range of a share that isn't copied yet,
+    /// [`ReadErrorKind::ChangedOnDisk`] if the user's file (read without a
+    /// clone) has changed since it was opened, or [`ReadErrorKind::Other`]
+    /// for any other read error, which leaves the source as it was.
     pub fn read_range(&self, range: Range<usize>) -> Result<Cow<'_, [u8]>, ReadError> {
         let range = clamp(range, self.len_usize());
         match &self.bytes {
             Bytes::Mapped(map) => Ok(Cow::Borrowed(&map[range])),
             Bytes::Owned(bytes) => Ok(Cow::Borrowed(&bytes[range])),
             Bytes::Removable(removable) => removable.read_range(range),
+        }
+    }
+
+    /// The first `len` bytes of the file (all of it, if it is shorter), for
+    /// first paint: [`read_range`](Self::read_range)`(0..len)`, except on a
+    /// network share, where it reads the share itself (ADR-0009). That read
+    /// may block for as long as the share takes to answer, and a network
+    /// error is retried for up to [`NETWORK_RETRY_WINDOW`], so **on a share
+    /// it must be called off the main thread**. A debug build panics if it
+    /// isn't, in an app ([`forbid_share_use_on_main_thread`]). Nothing can
+    /// cancel it: no open can be cancelled. Without a clone, the bytes are
+    /// kept until the copy's first chunks are checked against them
+    /// (`ChangedOnDisk` if they differ).
+    ///
+    /// # Errors
+    ///
+    /// As for [`read_range`](Self::read_range), except
+    /// [`ReadErrorKind::NotCopied`].
+    pub fn read_head(&self, len: usize) -> Result<Cow<'_, [u8]>, ReadError> {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.read_head(len),
+            Bytes::Mapped(_) | Bytes::Owned(_) => self.read_range(0..len),
         }
     }
 
@@ -548,7 +681,8 @@ impl Source {
     ///
     /// For a file on an internal volume the chunks are borrowed from the
     /// map or memory, and nothing else happens. For a file on a removable
-    /// drive (ADR-0006), each chunk is also written to Leal's copy on the
+    /// drive (ADR-0006) or a network share (ADR-0009), each chunk is also
+    /// written to Leal's copy on the
     /// internal disk before it is handed over; after the last one, the copy
     /// is mapped (the source becomes [`Storage::Copy`]) and the clone on
     /// the drive, if there is one, is deleted. Without a clone (a drive that
@@ -559,16 +693,19 @@ impl Source {
     /// Only one pass runs at a time; a second call waits for the first to
     /// finish (so `on_chunk` must not call `stream` itself). `on_chunk` may
     /// call [`read_range`](Self::read_range). Run it on a background thread:
-    /// it reads the whole file, and after an `EIO` it waits briefly to tell
-    /// a pulled drive from a bad block.
+    /// it reads the whole file, after an `EIO` it waits briefly to tell a
+    /// pulled drive from a bad block, and on a share it retries a network
+    /// error for up to about 3 s (a cancel stops the wait).
     ///
     /// # Errors
     ///
     /// [`ReadErrorKind::Cancelled`] if `cancel` was set. For a file on a
     /// removable drive, also:
     /// - [`ReadErrorKind::Disconnected`] when the pass reaches bytes that
-    ///   weren't copied before the drive vanished (the chunks before them
-    ///   have been delivered);
+    ///   weren't copied before the drive vanished, or the share stopped
+    ///   answering (the chunks before them have been delivered);
+    /// - [`ReadErrorKind::Deleted`] likewise, when the file on a share was
+    ///   deleted elsewhere;
     /// - [`ReadErrorKind::ChangedOnDisk`] when the user's file (read
     ///   without a clone) has changed since it was opened, including being
     ///   truncated or appended to. The pass stops, the copy is never mapped,
@@ -603,7 +740,8 @@ impl Source {
 
     /// How many bytes, from the start of the file, can be read: all of
     /// them, except after the file's removable drive was disconnected
-    /// ([`Storage::Disconnected`]), when it is what had been copied.
+    /// ([`Storage::Disconnected`]) or the file on its share was deleted
+    /// ([`Storage::Deleted`]), when it is what had been copied.
     #[must_use]
     pub fn available_len(&self) -> u64 {
         let available = match &self.bytes {
@@ -619,13 +757,112 @@ impl Source {
     ///   bytes that were never read (ADR-0006). Save As is allowed; it
     ///   writes the [`available_len`](Self::available_len) bytes, and the
     ///   app explains that the rest is missing;
+    /// - likewise once the file on a network share was deleted elsewhere
+    ///   before its copy was complete ([`Storage::Deleted`]);
     /// - once the user's file changed while it was being read
     ///   ([`changed_on_disk`](Self::changed_on_disk)), because the bytes
     ///   Leal holds may mix old and new contents, and Save would write that
     ///   mix over the file. The app offers Reload (task 1.9).
     #[must_use]
     pub fn can_save(&self) -> bool {
-        self.storage() != Storage::Disconnected && !self.changed_on_disk()
+        !matches!(self.storage(), Storage::Disconnected | Storage::Deleted)
+            && !self.changed_on_disk()
+    }
+
+    /// Whether the file is on a network share (ADR-0009): it is read like a
+    /// file on a removable drive, and the share is never read on the main
+    /// thread. It stays `true` once the copy is complete. The app opens and
+    /// reloads such a file off the main thread.
+    #[must_use]
+    pub fn is_on_network_share(&self) -> bool {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.is_share(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    /// TEST HOOK, not for product code: how many times the file's network
+    /// share was read on the main thread, which ADR-0009 forbids (a debug
+    /// build also panics). The app's tests check that it stays 0.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn share_reads_on_main_thread(&self) -> usize {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.share_reads_on_main_thread(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => 0,
+        }
+    }
+
+    /// Where the user's file is now, as the watcher follows it (task 1.9):
+    /// a look at a file read without a clone (`ENOENT` or `ESTALE` from a
+    /// share) uses this path, not the one it was opened at.
+    pub(crate) fn note_original_path(&self, path: &Path) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.note_original_path(path);
+        }
+    }
+
+    /// For tests of a simulated share: the callback its files' closing
+    /// threads call. `None` otherwise, and always in the shipped app.
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        expect(clippy::unused_self, reason = "only the test hooks have a callback")
+    )]
+    pub(crate) fn share_close_hook(&self) -> Option<fn()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Bytes::Removable(removable) = &self.bytes {
+            return removable.share_close_hook();
+        }
+        None
+    }
+
+    /// The file's share is about to be used outside this source (the
+    /// watcher's look at the file, `Document::check_original`): never on the
+    /// main thread (ADR-0009). Nothing for a file that isn't on a share.
+    pub(crate) fn note_share_use(&self) {
+        if let Bytes::Removable(removable) = &self.bytes
+            && removable.is_share()
+        {
+            removable.note_share_use();
+        }
+    }
+
+    /// TEST HOOK, not for product code: for a source from
+    /// [`open_simulating_share`](Self::open_simulating_share) with a
+    /// `hold_at`, the held reads go on.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn simulated_share_release(&self) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.simulated_share_release();
+        }
+    }
+
+    /// TEST HOOK, not for product code: how many first paint reads of a
+    /// simulated share there have been.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn simulated_head_reads(&self) -> usize {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.simulated_head_reads(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => 0,
+        }
+    }
+
+    /// TEST HOOK, not for product code: for a source from
+    /// [`open_simulating_share`](Self::open_simulating_share), how many
+    /// reads of the share have been tried (retries included), and how many
+    /// of them were made to fail.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn simulated_share_reads(&self) -> (usize, usize) {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.simulated_share_reads(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => (0, 0),
+        }
     }
 
     /// Whether the user's file changed on disk while Leal was reading it.
@@ -686,7 +923,9 @@ impl Source {
 
     /// TEST HOOK, not for product code: the drive of a source opened with
     /// [`open_simulating_fault`](Self::open_simulating_fault) is plugged
-    /// back in. A simulated drive stays away until then, so the app's
+    /// back in, or the share of one opened with
+    /// [`open_simulating_share`](Self::open_simulating_share) answers
+    /// again. A simulated drive stays away until then, so the app's
     /// checks (on activation, on a volume mounting) can't bring it back by
     /// themselves. [`reconnect`](Self::reconnect) then works as for a real
     /// drive.
@@ -782,43 +1021,58 @@ fn stream_slice(
     Ok(())
 }
 
-/// Whether the file's clone must be treated as being on a removable drive
-/// (ADR-0006).
-fn can_vanish(
+/// The rules a share is read with: a real share's, or (tests only) a
+/// pretend one's.
+fn share_rules(options: &Options) -> ShareRules {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(share) = &options.share {
+        return ShareRules::simulated(*share);
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = options;
+    ShareRules::new()
+}
+
+/// What kind of volume the file is on, for how to read it: a fixed volume
+/// is mapped; a removable drive (ADR-0006) or a network share (ADR-0009)
+/// is read with ordinary reads and copied in the background.
+fn volume_kind(
     file: &File,
     identity: &FileIdentity,
     temp: &TempFolders,
     volume: &VolumeInfo,
     check: VolumeCheck,
-) -> bool {
+) -> VolumeKind {
     match check {
         VolumeCheck::Detect => {}
         #[cfg(test)]
-        VolumeCheck::Internal => return false,
+        VolumeCheck::Internal => return VolumeKind::Fixed,
         #[cfg(any(test, feature = "test-hooks"))]
-        VolumeCheck::Removable => return true,
+        VolumeCheck::Removable => return VolumeKind::Removable,
+        #[cfg(any(test, feature = "test-hooks"))]
+        VolumeCheck::Network => return VolumeKind::Network,
+    }
+    // A share first, before the shortcut below: a network home folder puts
+    // the scratch directory on the share too, and its files are still on a
+    // share (task 2.0 review). One `fstatfs`, about a microsecond.
+    let flags = volume::flags(file).ok();
+    if flags.is_some_and(|flags| !flags.local || flags.network_type) {
+        return VolumeKind::Network;
     }
     // The scratch directory is on the boot volume, which can't vanish
     // without the Mac going with it, and copying a file to its own volume
-    // would gain nothing. This also keeps opening a file there as fast as
-    // before: one `stat`, and no detection. The scratch directory may not
-    // exist yet, so this asks its nearest folder that does.
+    // would gain nothing. This also keeps opening a file there fast: one
+    // `stat`. The scratch directory may not exist yet, so this asks its
+    // nearest folder that does.
     let on_scratch_volume = temp
         .scratch()
         .ancestors()
         .find_map(|folder| fs::metadata(folder).ok())
         .is_some_and(|scratch| scratch.dev() == identity.device);
     if on_scratch_volume {
-        return false;
+        return VolumeKind::Fixed;
     }
-    // The one routing decision for ADR-0006 option C. Network shares stay
-    // on the 1.1 fallbacks until Rob decides otherwise (the proposal is in
-    // docs/tasks/1.1a.md); streaming them too means adding
-    // `VolumeKind::Network` here.
-    matches!(
-        volume::kind(volume, volume::flags(file).ok()),
-        VolumeKind::Removable
-    )
+    volume::kind(volume, flags)
 }
 
 impl fmt::Debug for Source {

@@ -12,6 +12,7 @@ use proptest::prelude::*;
 
 mod original;
 mod removable;
+mod share;
 
 /// A temporary directory that is deleted when the test ends.
 struct TempDir(PathBuf);

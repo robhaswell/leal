@@ -67,8 +67,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::FileIdentity;
@@ -382,6 +382,36 @@ impl Original {
         let mut inner = self.shared.lock();
         let now = inner.clock.manual.expect("the clock isn't stopped");
         inner.clock.manual = Some(now + by);
+    }
+}
+
+impl Original {
+    /// The file is on a network share (ADR-0009), and the document is being
+    /// let go of: the descriptor kept for its events is closed on a thread
+    /// of its own, because the last `close(2)` of a file on a share that
+    /// has stopped answering can block (task 2.0 review). `on_close` (tests
+    /// only) is called there once it is closed. If a look holds the state
+    /// now, the watching thread is in that look; it holds the state too,
+    /// and lets go of it (and the descriptor) on its own thread.
+    pub(crate) fn close_on_own_thread(&self, on_close: Option<fn()>) {
+        let mut inner = match self.shared.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let watched = inner.watched.take();
+        drop(inner);
+        let close = move || {
+            drop(watched);
+            if let Some(on_close) = on_close {
+                on_close();
+            }
+        };
+        // If the thread can't be started, the closure (and the descriptor)
+        // is dropped here instead.
+        let _ = thread::Builder::new()
+            .name("leal-share-close".to_owned())
+            .spawn(close);
     }
 }
 

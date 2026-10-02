@@ -1,5 +1,5 @@
 //! Whether a file's volume can vanish while it is open: a removable drive
-//! (ADR-0006, PLAN 1.1a).
+//! (ADR-0006, PLAN 1.1a) or a network share (ADR-0009).
 //!
 //! Two sources of facts, either of which saying "it can vanish" is enough:
 //!
@@ -14,9 +14,12 @@
 //!   check, but Apple doesn't document whether every external fixed disk
 //!   does, which is why the app's facts come first).
 //!
-//! A volume that isn't local (`MNT_LOCAL` missing) is a network share. It
-//! can vanish too, but ADR-0006 leaves it on the 1.1 fallbacks, so it gets
-//! its own [`VolumeKind::Network`].
+//! A volume that isn't local (`MNT_LOCAL` missing), or whose file system is
+//! a network one by name (`f_fstypename`: `smbfs`, `nfs`, `afpfs`,
+//! `webdav`, `ftp`), is a network share: [`VolumeKind::Network`]. Either is
+//! enough, so a network file system that sets `MNT_LOCAL` anyway is still a
+//! share. Shares take the removable-drive path too (ADR-0009), with their
+//! own safety rules (`removable::ShareRules`).
 //!
 //! If the flags can't be read, the volume is assumed to be removable: the
 //! removable path is always correct, only slower to map.
@@ -29,6 +32,10 @@ use super::{VolumeInfo, sys};
 /// define.
 const MNT_REMOVABLE: u32 = 0x0000_0200;
 
+/// The `f_fstypename`s of macOS's network file systems: SMB (`mount_smbfs`),
+/// NFS, AFP, WebDAV and FTP.
+const NETWORK_FILE_SYSTEMS: [&str; 5] = ["smbfs", "nfs", "afpfs", "webdav", "ftp"];
+
 /// The mount flags that matter here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VolumeFlags {
@@ -36,16 +43,26 @@ pub(super) struct VolumeFlags {
     pub(super) local: bool,
     /// `MNT_REMOVABLE`: removable media, or a device on an external bus.
     pub(super) removable: bool,
+    /// The file system type is a network one ([`NETWORK_FILE_SYSTEMS`]).
+    pub(super) network_type: bool,
 }
 
 /// The mount flags of the volume `file` is on.
 pub(super) fn flags(file: &File) -> std::io::Result<VolumeFlags> {
-    let flags = sys::volume_flags(file)?;
+    let (flags, type_name) = sys::volume_flags(file)?;
     let local = u32::try_from(libc::MNT_LOCAL).unwrap_or(0);
     Ok(VolumeFlags {
         local: flags & local != 0,
         removable: flags & MNT_REMOVABLE != 0,
+        network_type: is_network_file_system(&type_name),
     })
+}
+
+/// Whether `type_name` (an `f_fstypename`) is a network file system.
+pub(super) fn is_network_file_system(type_name: &str) -> bool {
+    NETWORK_FILE_SYSTEMS
+        .iter()
+        .any(|name| type_name.eq_ignore_ascii_case(name))
 }
 
 /// What kind of volume a file is on, for choosing how to read it.
@@ -55,18 +72,16 @@ pub(super) enum VolumeKind {
     Fixed,
     /// A removable drive (ADR-0006 option C): never mapped from there.
     Removable,
-    /// A network share (`MNT_LOCAL` missing). It can vanish too, but
-    /// ADR-0006 keeps it on the 1.1 fallbacks (it can't clone, so it is
-    /// read into memory or copied at open, which is safe). Streaming it
-    /// like a removable drive is a proposal for Rob; see
-    /// `docs/tasks/1.1a.md`.
+    /// A network share (ADR-0009): read like a removable drive, and also
+    /// never read on the main thread past what is copied, with network
+    /// errors retried and a vanished file reported as deleted.
     Network,
 }
 
 /// The kind of volume these facts and flags describe. `flags` is `None` if
 /// they couldn't be read; then the volume is assumed to be removable.
 pub(super) fn kind(info: &VolumeInfo, flags: Option<VolumeFlags>) -> VolumeKind {
-    if flags.is_some_and(|flags| !flags.local) {
+    if flags.is_some_and(|flags| !flags.local || flags.network_type) {
         return VolumeKind::Network;
     }
     let facts_known = info.is_internal.is_some() || info.is_ejectable.is_some();

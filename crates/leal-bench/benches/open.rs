@@ -21,7 +21,19 @@
 //! with `pread`, and the index copies the file as it goes. That uses
 //! `Source::open_simulating_removable`, so the file is really on the
 //! internal SSD (in the page cache): it measures the code path, not a USB
-//! drive. Both are budgeted at 150 ms in `src/budgets.rs`.
+//! drive. `open/first_paint_share_under_load` opens it as if it were on a
+//! network share (ADR-0009, task 2.0), through
+//! `Source::open_simulating_share` with no added delay: no clone, first
+//! paint reads the user's file with `pread` (`Source::read_head`), and the
+//! index pass copies it. All three are budgeted at 150 ms in
+//! `src/budgets.rs`.
+//!
+//! `open/first_paint_slow_share_small` and `open/first_paint_slow_share`
+//! open a 1 MiB file and the reference file as on a share whose every read
+//! takes 20 ms (`SimulatedShare::read_delay`), with no other load: first
+//! paint must be one round trip, whatever the file's size. Both are
+//! budgeted at 60 ms, and the benchmark itself checks, before measuring,
+//! that the two differ by less than one round trip.
 //! `open/first_paint` is the same open with no load, for comparison.
 
 // Only `reference_file` is used here: one open takes milliseconds, and
@@ -37,11 +49,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// How long each read of the slow simulated share takes.
+const SHARE_ROUND_TRIP: Duration = Duration::from_millis(20);
+
 use criterion::measurement::WallTime;
 use criterion::{BenchmarkGroup, Criterion, SamplingMode, criterion_group, criterion_main};
 use leal_core::document::{Document, FirstScreen, OpenOptions};
 use leal_core::schedule::{Interval, JobHandle, Priority, Scheduler, SchedulerConfig};
-use leal_core::source::{STREAM_CHUNK_BYTES, Source, TempFolders, VolumeInfo};
+use leal_core::source::{STREAM_CHUNK_BYTES, SimulatedShare, Source, TempFolders, VolumeInfo};
 
 /// A screenful.
 const OPTIONS: OpenOptions = OpenOptions {
@@ -243,6 +258,17 @@ fn open(c: &mut Criterion) {
         Document::from_source(source, &scheduler, OPTIONS, None).expect("first paint")
     };
 
+    let open_share = || {
+        let source = Source::open_simulating_share(
+            &path,
+            &temp,
+            STREAM_CHUNK_BYTES,
+            SimulatedShare::default(),
+        )
+        .expect("opening the reference file");
+        Document::from_source(source, &scheduler, OPTIONS, None).expect("first paint")
+    };
+
     let mut group = c.benchmark_group("open");
     settings(&mut group);
 
@@ -268,13 +294,92 @@ fn open(c: &mut Criterion) {
         load.ensure();
         b.iter_custom(|iters| time_opens(iters, open_removable));
     });
+    group.bench_function("first_paint_share_under_load", |b| {
+        load.ensure();
+        b.iter_custom(|iters| time_opens(iters, open_share));
+    });
     any_ran |= load.started.is_some();
     load.finish();
+
+    // A slow share: first paint is one round trip, whatever the size.
+    let small = dir.join("small.csv");
+    write_prefix(&path, &small, 1 << 20);
+    let open_slow = |file: &Path| {
+        let share = SimulatedShare {
+            read_delay: SHARE_ROUND_TRIP,
+            ..SimulatedShare::default()
+        };
+        let source = Source::open_simulating_share(file, &temp, STREAM_CHUNK_BYTES, share)
+            .expect("opening the file");
+        Document::from_source(source, &scheduler, OPTIONS, None).expect("first paint")
+    };
+    let mut checked = false;
+    let mut check_round_trips = || {
+        if !checked {
+            checked = true;
+            check_one_round_trip(&small, &path, open_slow);
+        }
+    };
+    group.bench_function("first_paint_slow_share_small", |b| {
+        check_round_trips();
+        b.iter_custom(|iters| time_opens(iters, || open_slow(&small)));
+    });
+    group.bench_function("first_paint_slow_share", |b| {
+        check_round_trips();
+        b.iter_custom(|iters| time_opens(iters, || open_slow(&path)));
+    });
+    any_ran |= checked;
     group.finish();
     if any_ran {
         report_chunks(&path, &temp);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes the first rows of `from`, about `len` bytes up to a line's end, to
+/// `to`.
+fn write_prefix(from: &Path, to: &Path, len: usize) {
+    let bytes = std::fs::read(from).expect("reading the reference file");
+    let end = bytes[..len.min(bytes.len())]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(bytes.len(), |at| at + 1);
+    std::fs::write(to, &bytes[..end]).expect("writing the small file");
+}
+
+/// The median of five first paints of each file on the slow share: each is
+/// about one round trip (under three), and the large file's is less than a
+/// round trip slower than the small one's. A first paint that read more of
+/// the file than its start would fail this.
+fn check_one_round_trip(
+    small: &Path,
+    large: &Path,
+    mut open: impl FnMut(&Path) -> (Document, FirstScreen),
+) {
+    let mut median = |file: &Path| {
+        let mut times: Vec<Duration> = (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                let opened = open(file);
+                let took = started.elapsed();
+                drop(opened);
+                took
+            })
+            .collect();
+        times.sort();
+        times[2]
+    };
+    let (small_time, large_time) = (median(small), median(large));
+    for (name, time) in [("small", small_time), ("large", large_time)] {
+        assert!(
+            time < SHARE_ROUND_TRIP * 3,
+            "first paint on the slow share ({name} file) took {time:?}, more than one round trip"
+        );
+    }
+    assert!(
+        large_time < small_time + SHARE_ROUND_TRIP,
+        "first paint on the slow share grows with the file: {small_time:?} small, {large_time:?} large"
+    );
 }
 
 /// Prints the longest stretch of work between two checkpoints in the index

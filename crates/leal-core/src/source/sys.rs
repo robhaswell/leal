@@ -1,6 +1,7 @@
 //! The system calls [`super`] needs that the standard library doesn't wrap:
 //! cloning a file, reading an extended attribute, clearing `O_NONBLOCK`, a
-//! volume's mount flags, the memory map itself, and for watching the
+//! volume's mount flags, the memory map itself, whether this is the main
+//! thread, and for watching the
 //! user's file, a kernel event queue (`kqueue`) and an open file's current
 //! path (`F_GETPATH`). (Ordinary reads at an
 //! offset, `pread`, need no `unsafe`: the standard library has them as
@@ -166,8 +167,9 @@ pub(super) fn map_read_only(file: &File) -> io::Result<Mmap> {
 }
 
 /// The mount flags (`f_flags`, the `MNT_*` constants) of the volume the
-/// open file `file` is on, from `fstatfs(2)`.
-pub(super) fn volume_flags(file: &File) -> io::Result<u32> {
+/// open file `file` is on, and the name of its file system type
+/// (`f_fstypename`, such as `apfs`, `smbfs` or `nfs`), from `fstatfs(2)`.
+pub(super) fn volume_flags(file: &File) -> io::Result<(u32, String)> {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `fstatfs` writes one `struct statfs` to the pointer, which
     // points at uninitialised memory of exactly that type and size, owned by
@@ -179,7 +181,25 @@ pub(super) fn volume_flags(file: &File) -> io::Result<u32> {
     }
     // SAFETY: `fstatfs` returned 0, so it filled in the whole struct.
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_flags)
+    // `f_fstypename` is a fixed array of C chars, NUL-terminated when the
+    // name is shorter than the array. Read up to the NUL, or the whole
+    // array, without trusting it to have one.
+    let name: Vec<u8> = stats
+        .f_fstypename
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c.to_ne_bytes()[0])
+        .collect();
+    Ok((stats.f_flags, String::from_utf8_lossy(&name).into_owned()))
+}
+
+/// Whether the calling thread is the process's main thread
+/// (`pthread_main_np(3)`): the one AppKit draws on. Network shares are
+/// never read from it (ADR-0009).
+pub(super) fn is_main_thread() -> bool {
+    // SAFETY: `pthread_main_np` takes no arguments, touches no memory of
+    // ours, and only reports whether the calling thread is the initial one.
+    unsafe { libc::pthread_main_np() == 1 }
 }
 
 /// The path the open file `file` has now, with `fcntl(F_GETPATH)`. It

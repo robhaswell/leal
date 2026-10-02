@@ -146,9 +146,9 @@ impl std::error::Error for OpenError {
 /// Why [`Source::read_range`](super::Source::read_range) or
 /// [`Source::stream`](super::Source::stream) failed.
 ///
-/// Reads can only fail for a file on a removable drive, before its copy on
-/// the internal disk is complete (ADR-0006), or when a stream is cancelled
-/// or finds the file changed on disk.
+/// Reads can only fail for a file on a removable drive or a network share,
+/// before its copy on the internal disk is complete (ADR-0006, ADR-0009),
+/// or when a stream is cancelled or finds the file changed on disk.
 /// The [`Display`](fmt::Display) text is English and meant for logs.
 #[derive(Debug)]
 pub struct ReadError {
@@ -165,6 +165,25 @@ pub enum ReadErrorKind {
     /// bytes copied before it vanished can still be read, nothing after
     /// them can, and Save is refused.
     Disconnected,
+    /// The file is on a network share and was deleted by another computer
+    /// before the bytes asked for were copied: the share answered `ENOENT`
+    /// or `ESTALE`, and nothing is at the file's path, whose folder is still
+    /// on the share (ADR-0009). (A file replaced by another gives
+    /// [`ChangedOnDisk`](Self::ChangedOnDisk).) The source is now
+    /// [`Storage::Deleted`](super::Storage::Deleted): as after a
+    /// disconnection, the bytes copied before can still be read, nothing
+    /// after them can, and Save is refused; but the share is still there,
+    /// so this is reported as the file deleted elsewhere, not as a
+    /// disconnection, and the source never reconnects.
+    Deleted,
+    /// The file is on a network share, and the bytes asked for aren't in
+    /// the internal copy yet. [`Source::read_range`](super::Source::read_range)
+    /// never reads a share itself, because a read of a share can block for
+    /// a long time and it may be on the main thread (ADR-0009): rows past
+    /// the copy come from the index pass, which reads the share in the
+    /// background. Nothing in Leal asks for such bytes (every row it reads
+    /// is one the index pass has copied), so this means a bug.
+    NotCopied,
     /// The stream's cancel flag was set.
     Cancelled,
     /// The pass is complete and the internal copy is mapped, but the
@@ -197,6 +216,28 @@ impl ReadError {
             io::ErrorKind::NotConnected,
             "the drive holding the file was disconnected",
         ))
+    }
+
+    /// The file on a share was deleted elsewhere; `error` is what the read
+    /// reported (`ENOENT` or `ESTALE`).
+    pub(crate) fn deleted(error: io::Error) -> Self {
+        Self::new(ReadErrorKind::Deleted, error)
+    }
+
+    /// The file was found deleted earlier, so this read wasn't tried.
+    pub(crate) fn already_deleted() -> Self {
+        Self::deleted(io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    /// The bytes asked for are on a share and not copied yet.
+    pub(crate) fn not_copied() -> Self {
+        Self::new(
+            ReadErrorKind::NotCopied,
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the bytes are on a network share and not copied yet",
+            ),
+        )
     }
 
     pub(crate) fn cancelled() -> Self {
@@ -241,6 +282,14 @@ impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
             ReadErrorKind::Disconnected => write!(f, "the drive was disconnected: {}", self.error),
+            ReadErrorKind::Deleted => write!(
+                f,
+                "the file was deleted on its network share: {}",
+                self.error
+            ),
+            ReadErrorKind::NotCopied => f.write_str(
+                "the bytes are on a network share and haven't been copied yet; they are read in the background",
+            ),
             ReadErrorKind::Cancelled => f.write_str("cancelled"),
             ReadErrorKind::ChangedOnDisk => f.write_str(
                 "the file changed on disk while it was being read, so the copy may mix old and new bytes",

@@ -94,8 +94,14 @@ pub fn is_canary(id: &str) -> bool {
 /// Benchmarks gated on their budget only, never on change between commits,
 /// because shared runners make them too noisy to compare: the simulated
 /// removable open reads through `pread` under background load, and its
-/// 95% interval spans tens of percent between identical commits.
-pub const BUDGET_ONLY: [&str; 1] = ["open/first_paint_removable_under_load"];
+/// 95% interval spans tens of percent between identical commits. The
+/// simulated network share's open (task 2.0) reads the same way.
+pub const BUDGET_ONLY: [&str; 4] = [
+    "open/first_paint_removable_under_load",
+    "open/first_paint_share_under_load",
+    "open/first_paint_slow_share_small",
+    "open/first_paint_slow_share",
+];
 
 /// True if `id` is gated on its budget only (see [`BUDGET_ONLY`]).
 #[must_use]

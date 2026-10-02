@@ -62,6 +62,9 @@ impl Scheduler {
         // If it can't be raised, opening many documents fails later with
         // "too many open files", and watching says so.
         let _ = crate::platform::raise_open_file_limit();
+        // The app's main thread draws: from now on, a network share used
+        // there is a bug the core's debug builds catch (ADR-0009).
+        source::forbid_share_use_on_main_thread();
         let config = SchedulerConfig {
             platform: Arc::new(MacPlatform),
             ..SchedulerConfig::default()
@@ -595,6 +598,9 @@ pub enum JobFailure {
     DriveDisconnected,
     /// The file changed while it was read without a snapshot.
     ChangedOnDisk,
+    /// The file on a network share was deleted by another computer before
+    /// it was read (ADR-0009).
+    DeletedElsewhere,
     /// The job's work panicked. DESIGN §3.9: the document is then treated
     /// as failed ([`Document::is_failed`]); the app shows an error and
     /// offers to reopen the file.
@@ -615,6 +621,7 @@ impl std::fmt::Display for JobFailure {
             Self::Cancelled => f.write_str("cancelled"),
             Self::DriveDisconnected => f.write_str("the drive was disconnected"),
             Self::ChangedOnDisk => f.write_str("the file changed on disk"),
+            Self::DeletedElsewhere => f.write_str("the file was deleted on its network share"),
             Self::Panicked { message } => write!(f, "the job panicked: {message}"),
             Self::Failed { message } => f.write_str(message),
         }
@@ -629,6 +636,7 @@ impl From<JobError> for JobFailure {
             JobError::Cancelled => Self::Cancelled,
             JobError::Read(ReadErrorKind::Disconnected) => Self::DriveDisconnected,
             JobError::Read(ReadErrorKind::ChangedOnDisk) => Self::ChangedOnDisk,
+            JobError::Read(ReadErrorKind::Deleted) => Self::DeletedElsewhere,
             JobError::Panicked(message) => Self::Panicked { message },
             other => Self::Failed {
                 message: other.to_string(),
@@ -780,7 +788,9 @@ impl Failure {
 /// indexing (P1) and the review (P2) in the background, on `scheduler`.
 /// It returns once the first screen is ready (well under 150 ms, however
 /// large the file), without waiting for the index. Call it off the main
-/// thread if the file may be on a slow drive.
+/// thread if the file may be on a slow drive, and always if it may be on a
+/// network share (ADR-0009): first paint reads the share, which can block,
+/// and a debug build panics if that happens on the main thread.
 ///
 /// `observer`, if given, is told about indexing progress.
 ///
@@ -1034,6 +1044,29 @@ impl Document {
     /// [`LealError::DocumentFailed`].
     pub fn storage(&self) -> Result<SourceStorage, LealError> {
         self.call(|| Ok(self.document.storage().into()))
+    }
+
+    /// How many bytes, from the start of the file, can be read: all of them,
+    /// except after a disconnection or a deletion before the copy was
+    /// complete, when it is what was copied. A share that fails at the same
+    /// place each time it reconnects is a bad read, not a share coming and
+    /// going (task 2.0).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn available_bytes(&self) -> Result<u64, LealError> {
+        self.call(|| Ok(self.document.source().available_len()))
+    }
+
+    /// Whether the file is on a network share (ADR-0009). The app then
+    /// reloads it off the main thread, because opening it reads the share.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn is_on_network_share(&self) -> Result<bool, LealError> {
+        self.call(|| Ok(self.document.source().is_on_network_share()))
     }
 
     /// The index job (P1) of the current reading.
@@ -1332,10 +1365,100 @@ impl Document {
     /// For a document from [`debug_open_document_with_fault`]: its
     /// simulated drive is plugged back in (task 1.9). The next
     /// [`check_original`](Self::check_original) reconnects it, as for a
-    /// real drive.
+    /// real drive. For one from [`debug_open_document_simulating_share`]:
+    /// its share answers again.
     pub fn debug_simulate_drive_back(&self) {
         self.document.source().simulate_drive_back();
     }
+
+    /// How many times the document's network share was read on the main
+    /// thread, which ADR-0009 forbids (task 2.0). The app's tests check
+    /// that it stays 0.
+    #[must_use]
+    pub fn debug_share_reads_on_main_thread(&self) -> u64 {
+        to_u64(self.document.source().share_reads_on_main_thread())
+    }
+
+    /// For a document from [`debug_open_document_simulating_share`] with
+    /// `hold_at`: the copy's reads held there go on.
+    pub fn debug_share_release(&self) {
+        self.document.source().simulated_share_release();
+    }
+}
+
+/// Reads of a simulated network share that fail, for the app's tests
+/// (`test-exports`). See `leal_core::source::SimulatedShareFailure`.
+#[cfg(feature = "test-exports")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SimulatedShareFailure {
+    /// Reads of bytes from this one on fail.
+    pub at: u64,
+    /// With this error code (an errno, such as `ETIMEDOUT` or `ESTALE`).
+    pub errno: i32,
+    /// This many times, then they work again; `nil`: until
+    /// [`Document::debug_simulate_drive_back`].
+    pub times: Option<u32>,
+    /// The `fstat` after the read fails, not the read.
+    #[uniffi(default = false)]
+    pub on_stat: bool,
+    /// The read leaves junk in half its buffer before failing.
+    #[uniffi(default = false)]
+    pub partial: bool,
+}
+
+/// The waits between retries of a simulated share's network errors: short,
+/// so the app's tests needn't wait the real 3 s.
+#[cfg(feature = "test-exports")]
+const SIMULATED_RETRY_DELAYS: &[std::time::Duration] = &[std::time::Duration::from_millis(5); 5];
+
+/// [`open_document`], as if the file were on a network share (ADR-0009,
+/// task 2.0) that can't clone: copied in chunks of `chunk_bytes`, each read
+/// of the share taking `read_delay_ms`, failing as `failure` says, and the
+/// copy's reads past `hold_at` waiting for [`Document::debug_share_release`]
+/// (so a test can look at the document part-way through). For
+/// the app's tests of loading rows and of the share's banners
+/// (`test-exports`). Call it off the main thread, as for a real share.
+///
+/// # Errors
+///
+/// As for [`open_document`].
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test export, mirroring open_document and the share's knobs"
+)]
+pub fn debug_open_document_simulating_share(
+    path: &str,
+    temp: TempLocations,
+    scheduler: &Scheduler,
+    options: OpenOptions,
+    observer: Option<Arc<dyn ProgressObserver>>,
+    chunk_bytes: u32,
+    read_delay_ms: u32,
+    failure: Option<SimulatedShareFailure>,
+    hold_at: Option<u64>,
+) -> Result<Arc<Document>, LealError> {
+    use leal_core::source::{SimulatedShare, SimulatedShareFailure as Core, Source};
+    let temp = TempFolders::from(temp);
+    let share = SimulatedShare {
+        read_delay: std::time::Duration::from_millis(u64::from(read_delay_ms)),
+        failure: failure.map(|failure| Core {
+            at: usize::try_from(failure.at).unwrap_or(usize::MAX),
+            errno: failure.errno,
+            times: failure.times,
+            on_stat: failure.on_stat,
+            partial: failure.partial,
+        }),
+        retry_delays: SIMULATED_RETRY_DELAYS,
+        retry_window: None,
+        hold_at: hold_at.map(|at| usize::try_from(at).unwrap_or(usize::MAX)),
+        on_close: None,
+    };
+    let source =
+        Source::open_simulating_share(Path::new(path), &temp, to_usize(chunk_bytes), share)
+            .map_err(|error| LealError::from_open(path, &error))?;
+    debug_document_from(path, source, scheduler, options, observer)
 }
 
 /// A P2 job that panics, for the app's tests (`test-exports`).
@@ -1401,6 +1524,18 @@ pub fn debug_open_document_with_fault(
     let source =
         Source::open_simulating_fault(Path::new(path), &temp, to_usize(chunk_bytes), fault)
             .map_err(|error| LealError::from_open(path, &error))?;
+    debug_document_from(path, source, scheduler, options, observer)
+}
+
+/// A document for the test exports, from a source they opened.
+#[cfg(feature = "test-exports")]
+fn debug_document_from(
+    path: &str,
+    source: leal_core::source::Source,
+    scheduler: &Scheduler,
+    options: OpenOptions,
+    observer: Option<Arc<dyn ProgressObserver>>,
+) -> Result<Arc<Document>, LealError> {
     let progress = observer.map(|observer| -> document::ProgressCallback {
         Arc::new(move |progress| observer.index_progressed(progress.into()))
     });
@@ -1461,11 +1596,16 @@ fn read_error(path: &str, error: &ReadError) -> LealError {
     match error.kind() {
         ReadErrorKind::Disconnected => LealError::DriveDisconnected { path },
         ReadErrorKind::ChangedOnDisk => LealError::ChangedOnDisk { path },
-        ReadErrorKind::Cancelled | ReadErrorKind::Other => LealError::Io {
-            path,
-            code: error.raw_os_error(),
-            message: error.to_string(),
-        },
+        ReadErrorKind::Deleted => LealError::DeletedElsewhere { path },
+        // `NotCopied` never reaches Swift: every row the core serves is in
+        // the copy. If it did, it is an I/O error for the logs.
+        ReadErrorKind::Cancelled | ReadErrorKind::NotCopied | ReadErrorKind::Other => {
+            LealError::Io {
+                path,
+                code: error.raw_os_error(),
+                message: error.to_string(),
+            }
+        }
     }
 }
 

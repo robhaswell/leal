@@ -106,6 +106,14 @@ pub enum LealError {
         /// The path that was opened.
         path: String,
     },
+    /// The file is on a network share and was deleted by another computer
+    /// before the bytes needed were read (ADR-0009). Not a disconnection:
+    /// the share is there, the file isn't. (A file replaced by another is
+    /// [`LealError::ChangedOnDisk`].)
+    DeletedElsewhere {
+        /// The path that was opened.
+        path: String,
+    },
     /// The document failed after a panic (DESIGN §3.9): Leal makes no
     /// more calls on it. The app shows an error and offers to reopen the
     /// file.
@@ -170,6 +178,9 @@ impl std::fmt::Display for LealError {
                 write!(f, "the drive holding {path} was disconnected")
             }
             Self::ChangedOnDisk { path } => write!(f, "{path} changed while it was being read"),
+            Self::DeletedElsewhere { path } => {
+                write!(f, "{path} was deleted on its network share")
+            }
             Self::DocumentFailed { path, message } => {
                 write!(f, "the document {path} failed: {message}")
             }
@@ -214,9 +225,15 @@ pub enum SourceStorage {
     /// mapped, until it has been copied to the internal disk (ADR-0006).
     Reading,
     /// The file's removable drive was disconnected before the copy was
-    /// complete. What was copied can still be read; Save is refused and
-    /// Save As is allowed. The app shows the "drive disconnected" banner.
+    /// complete, or its network share stopped answering (ADR-0009). What
+    /// was copied can still be read; Save is refused and Save As is
+    /// allowed. The app shows the "drive disconnected" banner.
     Disconnected,
+    /// The file is on a network share and another computer deleted it
+    /// before the copy was complete (ADR-0009). As for `Disconnected`, what
+    /// was copied can still be read, Save is refused and Save As is
+    /// allowed, but it never reconnects. The app says the file was deleted.
+    Deleted,
 }
 
 impl From<source::Storage> for SourceStorage {
@@ -227,6 +244,7 @@ impl From<source::Storage> for SourceStorage {
             source::Storage::Copy => Self::Copy,
             source::Storage::Reading => Self::Reading,
             source::Storage::Disconnected => Self::Disconnected,
+            source::Storage::Deleted => Self::Deleted,
         }
     }
 }
@@ -280,6 +298,12 @@ impl Source {
     pub fn storage(&self) -> SourceStorage {
         self.source.storage().into()
     }
+
+    /// Whether the file is on a network share (ADR-0009).
+    #[must_use]
+    pub fn is_on_network_share(&self) -> bool {
+        self.source.is_on_network_share()
+    }
 }
 
 /// Opens the file at `path` and takes a snapshot of it. See
@@ -288,6 +312,8 @@ impl Source {
 /// `volume` is what Foundation says about the file's volume: a folder on it
 /// for the clone, and whether it is internal and ejectable, which decides
 /// whether the file is treated as being on a removable drive (ADR-0006).
+/// Call it off the main thread: the file may be on a network share
+/// (ADR-0009).
 ///
 /// # Errors
 ///
@@ -492,6 +518,7 @@ mod tests {
             (source::Storage::Copy, SourceStorage::Copy),
             (source::Storage::Reading, SourceStorage::Reading),
             (source::Storage::Disconnected, SourceStorage::Disconnected),
+            (source::Storage::Deleted, SourceStorage::Deleted),
         ] {
             assert_eq!(SourceStorage::from(core), ffi);
         }

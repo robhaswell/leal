@@ -4,10 +4,10 @@
 //! [`Document::open`] does the first-paint work (P0) on the calling thread
 //! and returns the [`FirstScreen`] without waiting for anything else:
 //!
-//! 1. open the [`Source`] (clone and map, or, on a removable drive,
-//!    ordinary reads);
-//! 2. read the first 64 KB (one read) and [`detect()`] the encoding and
-//!    dialect from it;
+//! 1. open the [`Source`] (clone and map, or, on a removable drive or a
+//!    network share, ordinary reads);
+//! 2. read the first 64 KB (one read, [`Source::read_head`]) and
+//!    [`detect()`] the encoding and dialect from it;
 //! 3. index those 64 KB on their own and parse the first screen of rows
 //!    from them. Their offsets are the same as in the whole file, so they
 //!    serve rows until the real index has them.
@@ -15,10 +15,10 @@
 //! Only then does it start the background jobs, through the [`Scheduler`]:
 //!
 //! - **P1, the row index**, on its own thread. On an internal volume it
-//!   scans the mapped file ([`Indexer::run`]). On a removable drive it
-//!   scans [`Source::stream`]'s chunks ([`Indexer::chunked`]), the same
-//!   pass that copies the file to the internal disk (ADR-0006), so the
-//!   file is read once.
+//!   scans the mapped file ([`Indexer::run`]). On a removable drive or a
+//!   network share it scans [`Source::stream`]'s chunks
+//!   ([`Indexer::chunked`]), the same pass that copies the file to the
+//!   internal disk (ADR-0006, ADR-0009), so the file is read once.
 //! - **P2, the review** ([`review_with`]): the whole-file encoding and
 //!   delimiter check, which can only *suggest* a change (ADR-0005 decision
 //!   4). It runs alongside the index on a mapped file. On a removable drive
@@ -39,7 +39,14 @@
 //! thread if need be: from the first 64 KB while the index hasn't reached
 //! them, then from the index, with one read of the file per call (a slice
 //! of the map, or one `pread` on a removable drive before its copy is
-//! mapped). [`Document::reinterpret`] reads the file again with another
+//! mapped). Every row the index has is already in the internal copy (the
+//! stream copies each chunk before the index sees it), so on a network
+//! share rows are never read from the share itself: a row the index
+//! hasn't reached isn't returned, and the grid shows it as loading until
+//! the index pass, in the background, brings it (ADR-0009).
+//!
+//! **Opening a file on a network share** must be off the main thread
+//! ([`Document::open`]): first paint reads the share. [`Document::reinterpret`] reads the file again with another
 //! delimiter, header or encoding (**Treat as**, **Reopen with encoding…**)
 //! without reopening it: it cancels the old jobs and starts new ones.
 //!
@@ -264,7 +271,8 @@ pub enum DocumentError {
     /// The file couldn't be opened.
     Open(OpenError),
     /// The start of the file couldn't be read (a removable drive that
-    /// vanished straight after opening).
+    /// vanished straight after opening, or a network share that stopped
+    /// answering).
     Read(ReadError),
     /// The user's encoding doesn't fit the file's BOM.
     Choice(ChoiceError),
@@ -400,6 +408,12 @@ impl Document {
     /// `temp` and `volume` are as for [`Source::open_on`]. `progress`, if
     /// given, is told about indexing progress.
     ///
+    /// It reads the file's volume, so call it off the main thread if the
+    /// file may be on a network share: a share that stops answering can
+    /// block it, and first paint's read of a share retries network errors
+    /// for up to about 3 s (ADR-0009). A debug build panics if a share is
+    /// read on the main thread.
+    ///
     /// # Errors
     ///
     /// [`DocumentError::Open`] if the file can't be opened,
@@ -446,8 +460,9 @@ impl Document {
             return Err(DocumentError::TooLarge { len });
         }
         // The one read first paint makes. On an internal volume it is a
-        // slice of the map; the copy costs a few microseconds.
-        let head: Arc<[u8]> = Arc::from(&*source.read_range(0..FIRST_PAINT_BYTES)?);
+        // slice of the map; the copy costs a few microseconds. On a network
+        // share it is the one read of the share outside the index pass.
+        let head: Arc<[u8]> = Arc::from(&*source.read_head(FIRST_PAINT_BYTES)?);
         let source = Arc::new(source);
         let paint = read_first_paint(&source, &head, options.choices)?;
         let screen = first_screen(&head, len, 0, &paint, options);
@@ -577,9 +592,10 @@ impl Document {
     /// # Errors
     ///
     /// A [`ReadError`] if the bytes can't be read. That happens only for a
-    /// file on a removable drive whose copy isn't complete: for example,
-    /// rows that weren't copied before the drive vanished
-    /// ([`ReadErrorKind::Disconnected`]).
+    /// file on a removable drive or a network share whose copy isn't
+    /// complete: for example, rows that weren't copied before the drive
+    /// vanished ([`ReadErrorKind::Disconnected`]) or the file was deleted on
+    /// its share ([`ReadErrorKind::Deleted`]).
     pub fn rows(&self, rows: Range<usize>, max_chars: usize) -> Result<Vec<Vec<Cell>>, ReadError> {
         self.read_rows(rows, |parser, bytes, base, row| {
             cells(parser, bytes, base, row.fields(), max_chars)
@@ -1136,10 +1152,11 @@ impl Document {
         let platform = self.scheduler.platform();
         let started = move || platform.thread_started(ThreadClass::Watcher);
         self.original.watch_on(started, move |status| {
-            if status.written
-                && let Some(source) = source.upgrade()
-            {
-                source.note_original_written();
+            if let Some(source) = source.upgrade() {
+                source.note_original_path(&status.path);
+                if changes_what_is_read(&source, status) {
+                    source.note_original_written();
+                }
             }
             on_change(status);
         })
@@ -1160,8 +1177,11 @@ impl Document {
     /// It makes a few system calls, which can block on a network volume:
     /// call it off the main thread.
     pub fn check_original(&self) -> OriginalStatus {
+        // It looks at the file: never on the main thread for a share.
+        self.source.note_share_use();
         let status = self.original.check();
-        if status.written {
+        self.source.note_original_path(&status.path);
+        if changes_what_is_read(&self.source, &status) {
             self.source.note_original_written();
         }
         let back = matches!(
@@ -1201,6 +1221,14 @@ impl Document {
 impl Drop for Document {
     fn drop(&mut self) {
         self.current().cancel();
+        // The watcher's descriptor on a share is closed on a thread of its
+        // own, as the source's file is (task 2.0 review): closing a file on
+        // a share that has stopped answering can block, and the app may let
+        // go of a document anywhere.
+        if self.source.is_on_network_share() {
+            self.original
+                .close_on_own_thread(self.source.share_close_hook());
+        }
     }
 }
 
@@ -1273,6 +1301,17 @@ fn bytes_in<'a>(
         Some(bytes) if !head_stale => Ok((Cow::Borrowed(bytes), true)),
         _ => Ok((source.read_range(extent)?, false)),
     }
+}
+
+/// Whether `status` means the file read without a snapshot changed under
+/// the copy ([`Source::note_original_written`]): a write the watcher saw,
+/// or, for a file on a network share, any change a look found. A share's
+/// watcher doesn't see another computer's writes, so on a share a change
+/// found by `check` (on activation, a mount, the periodic check) is the
+/// only sign, and the rest of the copy would be the new version
+/// (task 2.0 review). Once the copy is complete it does nothing.
+fn changes_what_is_read(source: &Source, status: &OriginalStatus) -> bool {
+    status.written || (source.is_on_network_share() && status.state == OriginalState::Changed)
 }
 
 /// P0: detection from the first 64 KB, and the index of those 64 KB.
@@ -1521,12 +1560,15 @@ fn start_checks(
 }
 
 /// Why the whole file isn't there to review: its removable drive vanished
-/// before the copy was complete, or it changed while it was read.
+/// (or its share stopped answering) before the copy was complete, it was
+/// deleted on its share, or it changed while it was read.
 fn unavailable(source: &Source) -> JobError {
     if source.changed_on_disk() {
         JobError::Read(ReadErrorKind::ChangedOnDisk)
     } else if source.storage() == Storage::Disconnected {
         JobError::Read(ReadErrorKind::Disconnected)
+    } else if source.storage() == Storage::Deleted {
+        JobError::Read(ReadErrorKind::Deleted)
     } else {
         JobError::Failed("the whole file isn't available to review".to_owned())
     }

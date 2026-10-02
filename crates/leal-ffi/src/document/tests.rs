@@ -480,6 +480,113 @@ fn a_simulated_disconnection_reaches_swift() {
     assert!(!document.can_save().unwrap());
 }
 
+/// The test export opens a file as if on a network share (task 2.0): a
+/// share that recovers from network errors is read whole; one that doesn't
+/// is disconnected, as a drive; one whose file was deleted elsewhere says
+/// so; and nothing reads the share on the main thread (these tests aren't
+/// on it, so the count is 0 here; the app's tests check it there).
+#[test]
+#[cfg(feature = "test-exports")]
+fn a_simulated_share_reaches_swift() {
+    let dir = TempDir::new("share");
+    let mut bytes = b"id,name\n".to_vec();
+    for i in 0..20_000 {
+        bytes.extend_from_slice(format!("{i},name {i}\n").as_bytes());
+    }
+    let path = dir.file("share.csv", &bytes);
+    let scheduler = Scheduler::new().unwrap();
+    let open = |failure| {
+        debug_open_document_simulating_share(
+            &path,
+            dir.locations(),
+            &scheduler,
+            options(),
+            None,
+            8192,
+            0,
+            failure,
+            None,
+        )
+        .unwrap()
+    };
+
+    let recovers = open(Some(SimulatedShareFailure {
+        at: 100_000,
+        errno: libc::ETIMEDOUT,
+        times: Some(2),
+        on_stat: false,
+        partial: false,
+    }));
+    assert!(recovers.is_on_network_share().unwrap());
+    assert_eq!(block_on(recovers.index_job().unwrap().wait()), Ok(()));
+    assert_eq!(recovers.storage().unwrap(), SourceStorage::Copy);
+    assert_eq!(recovers.row_count().unwrap(), 20_001);
+    assert!(recovers.can_save().unwrap());
+    assert_eq!(recovers.debug_share_reads_on_main_thread(), 0);
+
+    let away = open(Some(SimulatedShareFailure {
+        at: 100_000,
+        errno: libc::EHOSTUNREACH,
+        times: None,
+        on_stat: false,
+        partial: false,
+    }));
+    assert_eq!(
+        block_on(away.index_job().unwrap().wait()),
+        Err(JobFailure::DriveDisconnected)
+    );
+    assert_eq!(away.storage().unwrap(), SourceStorage::Disconnected);
+    assert!(!away.can_save().unwrap());
+
+    // Deleted by another computer while the copy is held before the
+    // failing read: the share's ESTALE, with nothing at the path.
+    let doomed = dir.file("doomed.csv", &bytes);
+    let deleted = debug_open_document_simulating_share(
+        &doomed,
+        dir.locations(),
+        &scheduler,
+        options(),
+        None,
+        8192,
+        0,
+        Some(SimulatedShareFailure {
+            at: 100_000,
+            errno: libc::ESTALE,
+            times: None,
+            on_stat: false,
+            partial: false,
+        }),
+        Some(100_000),
+    )
+    .unwrap();
+    std::fs::remove_file(&doomed).unwrap();
+    deleted.debug_share_release();
+    assert_eq!(
+        block_on(deleted.index_job().unwrap().wait()),
+        Err(JobFailure::DeletedElsewhere)
+    );
+    assert_eq!(deleted.storage().unwrap(), SourceStorage::Deleted);
+    assert!(!deleted.can_save().unwrap());
+    // The rows read before stay.
+    let rows = deleted.row_count().unwrap();
+    assert!(rows > 100);
+    assert_eq!(deleted.rows(0, 3, 100).unwrap().len(), 3);
+}
+
+/// The core's job errors become Swift's: a deleted file on a share is its
+/// own failure, not a disconnection.
+#[test]
+fn a_deleted_file_is_its_own_job_failure() {
+    assert_eq!(
+        JobFailure::from(JobError::Read(ReadErrorKind::Deleted)),
+        JobFailure::DeletedElsewhere
+    );
+    assert_eq!(
+        JobFailure::from(JobError::Read(ReadErrorKind::Disconnected)),
+        JobFailure::DriveDisconnected
+    );
+}
+
 #[test]
 fn every_interpretation_note_converts() {
     use leal_core::detect::Note;

@@ -34,6 +34,25 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 150.0,
         source: "DESIGN §1",
     },
+    // A file on a network share (ADR-0009) keeps the same first-paint
+    // budget: the reason the share takes the removable path.
+    Budget {
+        id: "open/first_paint_share_under_load",
+        max_ms: 150.0,
+        source: "DESIGN §1, ADR-0009",
+    },
+    // A share whose every read takes 20 ms: first paint is one round trip,
+    // whatever the file's size (task 2.0 review).
+    Budget {
+        id: "open/first_paint_slow_share_small",
+        max_ms: 60.0,
+        source: "ADR-0009",
+    },
+    Budget {
+        id: "open/first_paint_slow_share",
+        max_ms: 60.0,
+        source: "ADR-0009",
+    },
     // "Full index built: < 500 ms" for the reference file, on the calling
     // thread and through the progressive path the app uses.
     Budget {

@@ -2217,3 +2217,4 @@ fn a_write_to_a_file_read_without_a_clone_is_caught_by_its_event() {
 }
 
 mod find;
+mod share;

@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 
 /// `n` bytes that differ from position to position, so a chunk delivered at
 /// the wrong offset can't compare equal.
-fn contents(n: usize) -> Vec<u8> {
+pub(super) fn contents(n: usize) -> Vec<u8> {
     (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
 }
 
@@ -34,17 +34,17 @@ fn open_removable(path: &Path, temp: &TempFolders, chunk_len: usize) -> Source {
 }
 
 /// What one `stream` pass delivered.
-struct Streamed {
+pub(super) struct Streamed {
     /// Each chunk's offset and length, in order.
-    chunks: Vec<(usize, usize)>,
+    pub(super) chunks: Vec<(usize, usize)>,
     /// The chunks' bytes, concatenated.
-    bytes: Vec<u8>,
-    result: Result<(), ReadError>,
+    pub(super) bytes: Vec<u8>,
+    pub(super) result: Result<(), ReadError>,
 }
 
 /// Runs `stream` to the end, calling `during(chunk number, source)` after
 /// each chunk.
-fn stream_with(
+pub(super) fn stream_with(
     source: &Source,
     cancel: &AtomicBool,
     mut during: impl FnMut(usize, &Source),
@@ -63,12 +63,12 @@ fn stream_with(
     }
 }
 
-fn stream_all(source: &Source) -> Streamed {
+pub(super) fn stream_all(source: &Source) -> Streamed {
     stream_with(source, &AtomicBool::new(false), |_, _| {})
 }
 
 /// The chunks a pass over `len` bytes in chunks of `chunk_len` delivers.
-fn expected_chunks(len: usize, chunk_len: usize) -> Vec<(usize, usize)> {
+pub(super) fn expected_chunks(len: usize, chunk_len: usize) -> Vec<(usize, usize)> {
     (0..len)
         .step_by(chunk_len)
         .map(|offset| (offset, chunk_len.min(len - offset)))
@@ -81,7 +81,7 @@ fn read_all(source: &Source) -> Vec<u8> {
     source.read_range(0..len).unwrap().into_owned()
 }
 
-fn kind<T: fmt::Debug>(result: Result<T, ReadError>) -> ReadErrorKind {
+pub(super) fn kind<T: fmt::Debug>(result: Result<T, ReadError>) -> ReadErrorKind {
     result.unwrap_err().kind()
 }
 
@@ -400,7 +400,7 @@ fn a_crash_mid_copy_leaves_both_folders_for_cleanup() {
 /// The rule (PLAN 1.1a): a local volume is removable unless it is known to
 /// be internal and not ejectable. Either Foundation's facts or the volume's
 /// own mount flags saying it is removable is enough. A network share is
-/// its own kind, which ADR-0006 leaves on the 1.1 fallbacks.
+/// its own kind (ADR-0009), by its mount flags or its file system's name.
 #[test]
 fn the_removable_rule() {
     use volume::VolumeKind::{Fixed, Network, Removable};
@@ -412,6 +412,7 @@ fn the_removable_rule() {
     let internal_flags = VolumeFlags {
         local: true,
         removable: false,
+        network_type: false,
     };
     for (info, kind) in [
         (facts(Some(true), Some(false)), Fixed),
@@ -428,7 +429,13 @@ fn the_removable_rule() {
         assert_eq!(volume::kind(&info, Some(internal_flags)), kind, "{info:?}");
     }
     let no_facts = facts(None, None);
-    let flags = |local, removable| Some(VolumeFlags { local, removable });
+    let flags = |local, removable| {
+        Some(VolumeFlags {
+            local,
+            removable,
+            network_type: false,
+        })
+    };
     assert_eq!(volume::kind(&no_facts, flags(true, true)), Removable);
     assert_eq!(
         volume::kind(&no_facts, None),
@@ -444,7 +451,39 @@ fn the_removable_rule() {
     for info in [facts(None, None), facts(Some(false), Some(true))] {
         assert_eq!(volume::kind(&info, flags(false, false)), Network);
         assert_eq!(volume::kind(&info, flags(false, true)), Network);
+        // A network file system that says it is local is still a share.
+        let named = VolumeFlags {
+            local: true,
+            removable: false,
+            network_type: true,
+        };
+        assert_eq!(volume::kind(&info, Some(named)), Network);
     }
+}
+
+/// The network file systems are known by their `f_fstypename`, in any
+/// case; local ones aren't (ADR-0009).
+#[test]
+fn network_file_systems_are_known_by_name() {
+    for name in ["smbfs", "nfs", "afpfs", "webdav", "ftp", "SMBFS"] {
+        assert!(volume::is_network_file_system(name), "{name}");
+    }
+    for name in ["apfs", "hfs", "exfat", "msdos", "devfs", "", "smb", "nfs4x"] {
+        assert!(!volume::is_network_file_system(name), "{name}");
+    }
+}
+
+/// A file in a temporary directory is on a local APFS volume: the type
+/// name `fstatfs` gives isn't a network one, and the volume is local.
+#[test]
+fn a_local_volume_is_not_a_share() {
+    let dir = TempDir::new("local-flags");
+    let path = dir.file("a.csv", b"a\n");
+    let flags = volume::flags(&File::open(&path).unwrap()).unwrap();
+    assert!(flags.local);
+    assert!(!flags.network_type);
+    let (_, name) = sys::volume_flags(&File::open(&path).unwrap()).unwrap();
+    assert_eq!(name, "apfs");
 }
 
 /// A file on the scratch directory's volume (the boot volume) is mapped as
