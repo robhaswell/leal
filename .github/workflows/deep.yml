@@ -2,14 +2,16 @@ name: Deep tests
 
 # `just test-deep`: every Rust test, with far more property-test cases than
 # the 256 per test that `just check` runs. On each push to `main` (20,000
-# cases, beside the CI workflow's jobs) and nightly (100,000 cases). Deep runs
-# found bugs that 256-case runs missed (docs/tasks/0.2.md).
+# cases, beside the CI workflow's jobs), and nightly or by hand (100,000
+# cases). Deep runs found bugs that 256-case runs missed (docs/tasks/0.2.md).
 on:
   push:
     branches: [main]
   schedule:
     # 03:17 UTC, away from the top of the hour, when scheduled runs queue.
     - cron: "17 3 * * *"
+  # Runs the nightly configuration, so a change to it can be checked at once:
+  # `gh workflow run deep.yml`.
   workflow_dispatch:
 
 permissions:
@@ -25,10 +27,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The nightly run is split into 6 shards, each on its own runner, because
+  # it doesn't fit in one 60-minute job. On the 3-core runner the push run
+  # (20,000 cases) took about 20 minutes at ed09773, and 100,000 cases take
+  # about 4.6 times as long (36 against 8 minutes at 94fc18a), so one runner
+  # would need about 95 minutes. Scaling each test's time in the ed09773 push
+  # run by 5 and dealing the tests out as nextest's `slice` partition does
+  # gives shards of 4 to 24 minutes; the longest single test is about 20
+  # minutes. Add shards when one gets near 40 minutes.
   test-deep:
-    name: just test-deep
+    name: just test-deep (${{ matrix.shard }}/${{ github.event_name == 'push' && 1 || 6 }})
     runs-on: macos-26
     timeout-minutes: 60
+    strategy:
+      # Every shard runs to the end, so one night reports every failure.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'push' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -45,8 +60,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # proptest picks a new random seed each run. When a case fails, the
-      # log shows the minimal failing input.
+      # log shows the minimal failing input. The nextest `deep` profile kills
+      # a single test after 45 minutes (.config/nextest.toml).
       - name: Run deep tests
         env:
-          CASES: ${{ github.event_name == 'schedule' && '100000' || '20000' }}
-        run: just test-deep "$CASES"
+          CASES: ${{ github.event_name == 'push' && '20000' || '100000' }}
+          PARTITION: slice:${{ matrix.shard }}/${{ github.event_name == 'push' && 1 || 6 }}
+        run: just test-deep "$CASES" --partition "$PARTITION"

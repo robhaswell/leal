@@ -1,5 +1,19 @@
 # cargo-nextest configuration (https://nexte.st/docs/configuration/).
 
+# A test that hangs (a stuck `hdiutil attach`, a deadlocked scheduler test)
+# is killed instead of holding a CI runner until the job's timeout. The
+# slowest test in `just check` takes about 15 s on the CI runner, so a test
+# is reported SLOW after 60 s and killed after 5 minutes.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# `just test-deep`. With 100,000 property-test cases (the nightly run), the
+# slowest tests take about 20 minutes each on the CI runner, so a test is
+# killed after 45 minutes, within the deep workflow's 60-minute job timeout.
+# Overrides for the default profile (the disk-images group) apply here too.
+[profile.deep]
+slow-timeout = { period = "300s", terminate-after = 9 }
+
 [test-groups]
 # Tests that create and attach disk images with `hdiutil`. Run in parallel,
 # `hdiutil create` and `attach` sometimes fail ("Resource busy"), so these

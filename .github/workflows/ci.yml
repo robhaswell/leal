@@ -22,10 +22,17 @@ env:
 # macOS 26 image. The app job uses `xcode-27`, GitHub's image with Xcode 27
 # (a public preview as of October 2026), to match local development. If that
 # image is withdrawn or queues badly, fall back to `macos-26` with Xcode 26.6.
+#
+# Each job has a timeout, so a hang (a stuck `hdiutil` or test host) fails
+# the job instead of holding the runner for GitHub's 6-hour default. At
+# 646c9d6, `check` took about 2 minutes and `check-all` about 7, with a warm
+# cache. nextest also kills a single test after 5 minutes
+# (.config/nextest.toml).
 jobs:
   check:
     name: just check
     runs-on: macos-26
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -54,6 +61,7 @@ jobs:
   check-all:
     name: just check-all
     runs-on: xcode-27
+    timeout-minutes: 60
     env:
       # The Xcode the app is built and tested with. Change it deliberately,
       # together with README.md and docs/tasks/0.3.md.
@@ -99,6 +107,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: just check-all
+
+      # The build with the scripted runs (`LEAL_BENCH`: the scroll bench,
+      # `just perf`'s hooks and `just snapshot`), with zero warnings. Nothing
+      # else compiles that code, so without this it could break unnoticed
+      # until someone next measures or takes screenshots. A build only; it
+      # reuses the debug library `check-all` just built.
+      - name: Build the scripted-run app
+        run: just _app-scripted debug
 
       # The XCTest suite again, against the Rust release profile and the
       # Release configuration. Among other things, this checks that a Rust

@@ -43,9 +43,9 @@ test:
     cargo nextest run --workspace --all-features
     cargo test --workspace --doc --exclude leal-ffi
 
-# Run all tests with many more property-test cases (the default is 256 per test).
-test-deep cases="20000":
-    PROPTEST_CASES={{cases}} cargo nextest run --workspace --all-features
+# Run all tests with many more property-test cases (the default is 256 per test), passing any other arguments to nextest: `just test-deep 100000 --partition slice:1/6`.
+test-deep cases="20000" *args:
+    PROPTEST_CASES={{cases}} cargo nextest run --workspace --all-features --profile deep {{ args }}
 
 # Format all code in place.
 fmt:
