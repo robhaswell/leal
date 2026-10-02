@@ -59,7 +59,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// The cell inspector (mockup 05a), under the grid.
     let inspector = CellInspectorView()
-    private var inspectorHeight: NSLayoutConstraint!
+    /// The inspector's height: none while hidden (required), and its own
+    /// while shown, which gives way before the grid's minimum does.
+    private var inspectorHidden: NSLayoutConstraint!
+    private var inspectorShown: NSLayoutConstraint!
     var isInspectorShown: Bool { !inspector.isHidden }
     /// The inspector's latest read of a value, so tests can wait for it.
     private(set) var inspectorTask: Task<Void, Never>?
@@ -91,6 +94,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         fatalError("not used")
     }
 
+    /// The least height the grid is given: its header and three rows.
+    static let gridMinimumHeight = GridMetrics.headerHeight + 3 * GridMetrics.rowHeight
+
     override func loadView() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 752))
         banners.orientation = .vertical
@@ -106,7 +112,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         noBanners.priority = .defaultLow
         // The find bar and the inspector are hidden until asked for.
         findBarHeight = findBar.heightAnchor.constraint(equalToConstant: 0)
-        inspectorHeight = inspector.heightAnchor.constraint(equalToConstant: 0)
+        inspectorHidden = inspector.heightAnchor.constraint(equalToConstant: 0)
+        inspectorShown = inspector.heightAnchor.constraint(equalToConstant: CellInspectorView.height)
+        inspectorShown.priority = .init(999)
+        // The grid always keeps its header and a few rows, however many
+        // banners and panes show: the window can't be made smaller than
+        // that, and grows if a banner needs the room (phase 1 review,
+        // app-6).
+        let gridMinimum = grid.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.gridMinimumHeight)
         findBar.isHidden = true
         inspector.isHidden = true
         NSLayoutConstraint.activate([
@@ -122,7 +135,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             grid.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             grid.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             grid.bottomAnchor.constraint(equalTo: inspector.topAnchor),
-            inspectorHeight,
+            gridMinimum,
+            inspectorHidden,
             inspector.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             inspector.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             inspector.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
@@ -348,6 +362,36 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             for view in banners.arrangedSubviews { banners.removeArrangedSubview(view); view.removeFromSuperview() }
             for view in order { banners.addArrangedSubview(view) }
         }
+        updateWindowMinimum()
+    }
+
+    // MARK: The window's size (phase 1 review, app-6)
+
+    /// The least content height for what shows now: the find bar, each
+    /// banner (at least `BannerView.minimumHeight`), the grid's header and
+    /// a few rows, the inspector and the status bar.
+    var minimumContentHeight: CGFloat {
+        (isFindBarShown ? FindBarView.height : 0)
+            + CGFloat(banners.arrangedSubviews.count) * BannerView.minimumHeight
+            + Self.gridMinimumHeight
+            + (isInspectorShown ? CellInspectorView.height : 0)
+            + StatusBarView.height
+    }
+
+    /// The window can't be made smaller than `minimumContentHeight`, and
+    /// grows to it when a banner or pane appears. The grid's minimum is a
+    /// required constraint as well, so a banner that wraps onto more lines
+    /// takes its room from the window too.
+    func updateWindowMinimum() {
+        guard let window = view.window else { return }
+        let base = DocumentWindowController.minimumContentSize
+        let minimum = NSSize(width: base.width, height: max(base.height, minimumContentHeight))
+        guard window.contentMinSize != minimum else { return }
+        window.contentMinSize = minimum
+        let current = window.contentRect(forFrameRect: window.frame).size
+        if current.height < minimum.height {
+            window.setContentSize(NSSize(width: current.width, height: minimum.height))
+        }
     }
 
     /// The banner for `key` (`nil`: none), made if needed, unless it was
@@ -556,6 +600,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard findBar.isHidden else { return }
         findBar.isHidden = false
         findBarHeight.constant = FindBarView.height
+        updateWindowMinimum()
         grid.highlighter = find
         if !findBar.field.stringValue.isEmpty {
             search(for: findBar.field.stringValue)
@@ -571,6 +616,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         grid.highlighter = nil
         findBar.isHidden = true
         findBarHeight.constant = 0
+        updateWindowMinimum()
         view.window?.makeFirstResponder(grid.gridView)
     }
 
@@ -761,7 +807,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     func setInspectorShown(_ shown: Bool) {
         guard shown != isInspectorShown else { return }
         inspector.isHidden = !shown
-        inspectorHeight.constant = shown ? CellInspectorView.height : 0
+        // Deactivate before activating, so the two never both hold.
+        (shown ? inspectorHidden : inspectorShown).isActive = false
+        (shown ? inspectorShown : inspectorHidden).isActive = true
+        updateWindowMinimum()
         if shown {
             updateInspector()
             if let cell = grid.activeCell { grid.gridView.scrollToVisible(grid.geometry.cellRect(row: cell.row, column: cell.column)) }
@@ -944,6 +993,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 final class DocumentWindowController: NSWindowController {
     /// The mockups' window: 1200 × 780 points with its title bar.
     static let contentSize = NSSize(width: 1200, height: 752)
+    /// The smallest the window's content may be with no banners or panes;
+    /// more chrome raises the height (`updateWindowMinimum`).
+    static let minimumContentSize = NSSize(width: 480, height: 240)
 
     let content: DocumentViewController
 
@@ -957,7 +1009,7 @@ final class DocumentWindowController: NSWindowController {
         )
         window.contentViewController = content
         window.setContentSize(Self.contentSize)
-        window.contentMinSize = NSSize(width: 480, height: 240)
+        window.contentMinSize = Self.minimumContentSize
         window.initialFirstResponder = content.grid.gridView
         // `.automatic` (the default), so documents open as tabs or windows
         // as the user's "Prefer tabs when opening documents" setting says

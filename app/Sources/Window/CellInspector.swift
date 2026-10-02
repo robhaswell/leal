@@ -62,11 +62,16 @@ final class CellInspectorView: NSView {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
+        // Not required: the pane may be squeezed below its header (more
+        // banners than room) without a constraint conflict (phase 1
+        // review, app-6 and app-7).
+        let headerHeight = header.heightAnchor.constraint(equalToConstant: Self.headerHeight)
+        headerHeight.priority = .init(999)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: topAnchor),
             header.leadingAnchor.constraint(equalTo: leadingAnchor),
             header.trailingAnchor.constraint(equalTo: trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: Self.headerHeight),
+            headerHeight,
             scroll.topAnchor.constraint(equalTo: header.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),

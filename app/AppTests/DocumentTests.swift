@@ -499,6 +499,47 @@ final class DocumentTests: XCTestCase {
 
     // MARK: The window
 
+    /// However small the window, and with the find bar, the inspector and
+    /// banners showing, the grid keeps its header and a few rows (phase 1
+    /// review, app-6).
+    func testTheGridKeepsItsRoomInASmallWindowFullOfChrome() throws {
+        let document = try open(try file("orders.csv", "order_id,customer\nA-1,Sable Optics\nA-2,Loire Provisions\n"))
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let window = try XCTUnwrap(controller.window)
+        let content = controller.content
+        window.setContentSize(window.contentMinSize)
+        content.showFindBar()
+        content.setInspectorShown(true)
+        for key in ["a", "b", "c"] {
+            let banner = BannerView(kind: .info, message: "A banner \(key)", buttonTitle: nil, target: nil, action: nil)
+            content.banners.addArrangedSubview(banner)
+        }
+        content.updateWindowMinimum()
+        let chrome = FindBarView.height + 3 * BannerView.minimumHeight + CellInspectorView.height + StatusBarView.height
+        XCTAssertEqual(window.contentMinSize.height, chrome + DocumentViewController.gridMinimumHeight)
+
+        // The window grew to hold everything.
+        content.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(content.view.frame.width, window.contentRect(forFrameRect: window.frame).width, accuracy: 0.5, "no wider than the window")
+        let height = window.contentRect(forFrameRect: window.frame).height
+        XCTAssertGreaterThanOrEqual(height, window.contentMinSize.height)
+        XCTAssertEqual(content.view.frame.height, height, accuracy: 0.5, "the content fits the window")
+        XCTAssertGreaterThanOrEqual(content.grid.frame.height, DocumentViewController.gridMinimumHeight)
+        XCTAssertEqual(content.inspector.frame.height, CellInspectorView.height)
+        // The content view isn't flipped: the banners are above the grid.
+        XCTAssertGreaterThanOrEqual(content.banners.frame.minY, content.grid.frame.maxY - 0.5, "nothing overlaps the grid")
+
+        // Hiding the inspector gives its room to the grid, and lowers the
+        // minimum.
+        let before = content.grid.frame.height
+        content.setInspectorShown(false)
+        content.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(content.inspector.frame.height, 0)
+        XCTAssertEqual(content.grid.frame.height, before + CellInspectorView.height, accuracy: 0.5)
+        XCTAssertEqual(window.contentMinSize.height, chrome - CellInspectorView.height + DocumentViewController.gridMinimumHeight)
+        document.close()
+    }
+
     /// The whole window draws: rows in the grid, titles in the header.
     func testTheWindowDrawsTheGrid() throws {
         let url = try file("orders.csv", "order_id,customer\nA-100231,Sable Optics\nA-100232,Loire Provisions\n")

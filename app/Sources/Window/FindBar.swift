@@ -75,12 +75,18 @@ final class FindBarView: NSView, NSSearchFieldDelegate {
         stack.setCustomSpacing(16, after: field)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        // The field is 320 points wide, narrower in a narrow window (below
+        // the window's own size, priority 500), but never under 140: the
+        // bar fits the smallest window (phase 1 review, app-6).
+        let width = field.widthAnchor.constraint(equalToConstant: 320)
+        width.priority = .init(490)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor),
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            field.widthAnchor.constraint(equalToConstant: 320),
+            width,
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
         ])
         setAccessibilityRole(.group)
         setAccessibilityLabel(FindText.barLabel)

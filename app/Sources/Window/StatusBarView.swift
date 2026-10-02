@@ -296,6 +296,9 @@ final class BannerView: NSView {
         case warning
     }
 
+    /// A banner's height on one line.
+    static let minimumHeight: CGFloat = 38
+
     private let kind: Kind
     private let label: NSTextField
     /// The banner's button, if it has one.
@@ -372,7 +375,7 @@ final class BannerView: NSView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor),
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            heightAnchor.constraint(greaterThanOrEqualToConstant: 38),
+            heightAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumHeight),
         ])
         setAccessibilityElement(true)
         setAccessibilityRole(.group)

@@ -450,11 +450,19 @@ final class IndexingPillView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        // The grid places the pill by its frame, at its fitting size. The
+        // trailing and bottom edges aren't required, so that the stack
+        // doesn't fight the frame while the pill is hidden at zero size
+        // (phase 1 review, app-7).
+        let trailing = stack.trailingAnchor.constraint(equalTo: trailingAnchor)
+        let bottom = stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        trailing.priority = .init(999)
+        bottom.priority = .init(999)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            trailing,
             stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            bottom,
         ])
     }
 

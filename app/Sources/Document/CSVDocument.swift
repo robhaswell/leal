@@ -126,8 +126,10 @@ final class CSVDocument: NSDocument {
         }
         let target = url ?? model.url
         // Read before the core's snapshot, so a change in between is still
-        // a change by the time Leal saves.
-        let modified = try? target.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        // a change by the time Leal saves. From the file system, not the
+        // URL's cached resource values.
+        let attributes = try? FileManager.default.attributesOfItem(atPath: target.path(percentEncoded: false))
+        let modified = attributes?[.modificationDate] as? Date
         try model.reload(from: target)
         if fileURL != model.url {
             fileURL = model.url
