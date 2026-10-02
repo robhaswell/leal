@@ -138,9 +138,10 @@ final class CellTileCache {
     /// asked for again ahead (a vanished drive would fail every frame).
     /// The draw still reads one it needs, and reports the error then.
     private var failedAhead: Set<Key> = []
-    /// The rows the latest call wanted, which a queued read checks before
+    /// The rows wanted since the last draw (`prepare` starts it again,
+    /// later calls widen it), which a queued read checks before
     /// it starts: one the scroll has left behind is skipped.
-    private let wanted = WantedRows()
+    private let wanted = WantedRange()
     /// The most fields any row read so far has had.
     private(set) var widestRow = 0
     /// How many reads there have been, for tests.
@@ -168,7 +169,7 @@ final class CellTileCache {
     /// into Swift values, and scrolling meets a new tile every few frames.
     /// A tile still missing when it is drawn is read there and then, as
     /// before, so nothing waits for these.
-    func readAhead(rows: Range<Int>, columns: Range<Int>, loadedRows: Int) {
+    func readAhead(rows: Range<Int>, columns: Range<Int>, loadedRows: Int, startsWanted: Bool = false) {
         let rows = rows.clamped(to: 0..<max(0, loadedRows))
         guard makeBackgroundFetch != nil, !rows.isEmpty, !columns.isEmpty else { return }
         // Column blocks past every row read so far have nothing to read.
@@ -178,11 +179,11 @@ final class CellTileCache {
         guard firstColumnBlock <= lastColumnBlock else { return }
         let firstRowBlock = rows.lowerBound / Self.rowsPerTile
         let lastRowBlock = (rows.upperBound - 1) / Self.rowsPerTile
-        // Room for what is on screen and around it (`prepare` asks for a
-        // region and its neighbours), however wide the window.
-        let regionTiles = (min(lastRowBlock - firstRowBlock, 3) + 1) * (lastColumnBlock - firstColumnBlock + 1)
-        capacity = max(capacity, minimumCapacity, 4 * regionTiles + 8)
-        wanted.set(rows: (firstRowBlock - 1)...(lastRowBlock + 1))
+        if startsWanted {
+            wanted.set((firstRowBlock - 1)...(lastRowBlock + 1))
+        } else {
+            wanted.widen((firstRowBlock - 1)...(lastRowBlock + 1))
+        }
         var started = 0
         var rowBlock = firstRowBlock
         // Lazily, block by block: the region may be long, the reads few.
@@ -203,7 +204,7 @@ final class CellTileCache {
                 let block = rowBlock
                 Self.readQueue.async { [weak self] in
                     // The scroll may have moved on while this waited.
-                    guard wanted.contains(rowBlock: block) else {
+                    guard wanted.contains(block) else {
                         Task { @MainActor [weak self] in self?.arrived(key, token: token, .success(nil)) }
                         return
                     }
@@ -236,19 +237,22 @@ final class CellTileCache {
 
     /// Waits for the reads ahead already queued, so that none still holds
     /// a document when Leal quits (`CoreRelease.finish`).
-    nonisolated static func finishReadsAhead() {
-        readQueue.sync {}
+    nonisolated static func finishReadsAhead(timeout: DispatchTime = .distantFuture) {
+        CoreRelease.wait(for: readQueue, timeout: timeout)
     }
 
     /// Holds the reads ahead queued from now on until `resumeReadsAhead`,
-    /// for tests of what happens while one is under way.
+    /// for tests of what happens while one is under way. Resuming more
+    /// than once is harmless, so a test can resume in a `defer` too.
     nonisolated static func suspendReadsAhead() {
-        readQueue.suspend()
+        readQueueHold.hold(readQueue)
     }
 
     nonisolated static func resumeReadsAhead() {
-        readQueue.resume()
+        readQueueHold.release(readQueue)
     }
+
+    private nonisolated static let readQueueHold = QueueHold()
 
     private func arrived(_ key: Key, token: UInt64, _ result: Result<[TileRow]?, any Error>) {
         readsAheadBack += 1
@@ -292,15 +296,27 @@ final class CellTileCache {
     func prepare(rows: Range<Int>, columns: Range<Int>, loadedRows: Int) {
         let rows = rows.clamped(to: 0..<max(0, loadedRows))
         guard !rows.isEmpty, !columns.isEmpty, columns.lowerBound >= 0 else { return }
+        makeRoom(rows: rows, columns: columns)
         for rowBlock in (rows.lowerBound / Self.rowsPerTile)...((rows.upperBound - 1) / Self.rowsPerTile) {
             for columnBlock in (columns.lowerBound / Self.columnsPerTile)...((columns.upperBound - 1) / Self.columnsPerTile) {
                 _ = tile(for: Key(rowBlock: rowBlock, columnBlock: columnBlock), loadedRows: loadedRows)
             }
         }
-        // The tiles next to it, above and below, and either side.
+        // The tiles next to it, above and below, and either side. A draw
+        // starts what is wanted again: a read queued for rows the scroll
+        // has left is skipped.
         let block = Self.rowsPerTile
-        readAhead(rows: max(0, rows.lowerBound - block)..<(rows.upperBound + block), columns: columns, loadedRows: loadedRows)
+        readAhead(rows: max(0, rows.lowerBound - block)..<(rows.upperBound + block), columns: columns, loadedRows: loadedRows, startsWanted: true)
         readAhead(rows: rows, columns: max(0, columns.lowerBound - Self.columnsPerTile)..<(columns.upperBound + Self.columnsPerTile), loadedRows: loadedRows)
+    }
+
+    /// Keeps room for the tiles of a region drawn and those around it, which
+    /// are read ahead (task 2.0a review): four times the region's, however
+    /// wide the window.
+    private func makeRoom(rows: Range<Int>, columns: Range<Int>) {
+        let rowBlocks = min((rows.upperBound - 1) / Self.rowsPerTile - rows.lowerBound / Self.rowsPerTile, 3) + 1
+        let columnBlocks = (columns.upperBound - 1) / Self.columnsPerTile - columns.lowerBound / Self.columnsPerTile + 1
+        capacity = max(capacity, minimumCapacity, 4 * rowBlocks * columnBlocks + 8)
     }
 
     func removeAll() {
@@ -364,18 +380,53 @@ final class CellTileCache {
     }
 }
 
-/// The row blocks the latest read ahead wanted, shared with the queued
-/// reads, which skip a block the scroll has left (task 2.0a review).
-private final class WantedRows: @unchecked Sendable {
+/// What reads or layout ahead are still wanted for (row blocks, rows),
+/// shared with the queued work, which skips what the scroll has left (task
+/// 2.0a review).
+final class WantedRange: @unchecked Sendable {
     // @unchecked: every access holds the lock.
     private let lock = NSLock()
-    private var blocks: ClosedRange<Int> = 0...0
+    private var range: ClosedRange<Int> = 0...0
 
-    func set(rows blocks: ClosedRange<Int>) {
-        lock.withLock { self.blocks = blocks }
+    func set(_ range: ClosedRange<Int>) {
+        lock.withLock { self.range = range }
     }
 
-    func contains(rowBlock: Int) -> Bool {
-        lock.withLock { blocks.contains(rowBlock) }
+    func widen(_ range: ClosedRange<Int>) {
+        lock.withLock {
+            self.range = min(self.range.lowerBound, range.lowerBound)...max(self.range.upperBound, range.upperBound)
+        }
+    }
+
+    func contains(_ value: Int) -> Bool {
+        lock.withLock { range.contains(value) }
+    }
+
+    func overlaps(_ other: ClosedRange<Int>) -> Bool {
+        lock.withLock { range.overlaps(other) }
+    }
+}
+
+/// Suspends a dispatch queue once, and resumes it only if it is suspended:
+/// a queue resumed more often than suspended crashes (tests, task 2.0a).
+final class QueueHold: @unchecked Sendable {
+    // @unchecked: every access holds the lock.
+    private let lock = NSLock()
+    private var held = false
+
+    func hold(_ queue: DispatchQueue) {
+        lock.withLock {
+            guard !held else { return }
+            held = true
+            queue.suspend()
+        }
+    }
+
+    func release(_ queue: DispatchQueue) {
+        lock.withLock {
+            guard held else { return }
+            held = false
+            queue.resume()
+        }
     }
 }

@@ -32,11 +32,22 @@ enum CoreRelease {
     /// snapshots of documents closed just before Leal quits are deleted
     /// (DESIGN §3.1). `sync` lends the queue the caller's quality of
     /// service while it waits.
+    ///
+    /// Each wait gives up after about a second (task 2.0a review): a hung
+    /// release must not stop Leal from quitting.
     static func finish() {
         // A grid's read ahead may hold a closed document until it ends, and
         // then hands it here (`DocumentModel.backgroundTileReader`).
-        CellTileCache.finishReadsAhead()
-        queue.sync {}
+        CellTileCache.finishReadsAhead(timeout: .now() + 1)
+        wait(for: queue, timeout: .now() + 1)
+    }
+
+    /// Waits for what `queue` has queued so far, lending it the caller's
+    /// quality of service, for at most until `timeout`.
+    static func wait(for queue: DispatchQueue, timeout: DispatchTime) {
+        let done = DispatchSemaphore(value: 0)
+        queue.async(qos: .userInitiated, flags: .enforceQoS) { done.signal() }
+        _ = done.wait(timeout: timeout)
     }
 
     /// Holds the object until the queue lets go of it.

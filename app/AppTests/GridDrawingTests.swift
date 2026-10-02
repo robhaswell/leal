@@ -173,6 +173,51 @@ final class GridDrawingTests: XCTestCase {
         }
     }
 
+    /// The gutter, drawn by `GridGutterView`, against its drawing before
+    /// 2.0a: a call per row's number, then its marker. In a narrow gutter
+    /// a seven-digit number reaches under the marker's dot, which must
+    /// still be drawn over it; with the active row and selected rows, light
+    /// and dark, 2× and 1×.
+    func testTheGutterDrawsWhatItDrewBeforeBatching() {
+        let source = MarkedSource()
+        let first = 999_990
+        let rows = first..<1_000_006
+        let width: CGFloat = 44
+        let dirty = CGRect(x: 0, y: CGFloat(rows.lowerBound) * 22, width: width, height: CGFloat(rows.count) * 22)
+        for (appearance, scale) in [(light, 2.0), (dark, 2.0), (light, 1.0)] {
+            let gutter = GridGutterView(frame: CGRect(x: 0, y: 0, width: width, height: CGFloat(source.rowCount) * 22))
+            gutter.appearance = appearance
+            gutter.dataSource = source
+            gutter.activeRow = first + 3
+            gutter.selectedRows = (first + 6)...(first + 8)
+            let drawn = render(width: width, height: dirty.height, scale: scale, appearance: appearance) { context in
+                context.translateBy(x: 0, y: -dirty.minY)
+                gutter.draw(dirty)
+            }
+            let reference = render(width: width, height: dirty.height, scale: scale, appearance: appearance) { context in
+                context.translateBy(x: 0, y: -dirty.minY)
+                let palette = GridPalette.current()
+                context.setFillColor(palette.gutterBackground)
+                context.fill(dirty)
+                context.setFillColor(palette.gridLine)
+                context.fill(CGRect(x: width - 1, y: dirty.minY, width: 1, height: dirty.height))
+                for row in rows {
+                    let rect = CGRect(x: 0, y: CGFloat(row) * 22, width: width - 4, height: 22)
+                    let active = row == first + 3
+                    let accent = active || (first + 6...first + 8).contains(row)
+                    let font = active ? GridFonts.gutterActive : GridFonts.gutter
+                    let color = accent ? palette.accent : palette.secondaryText
+                    let line = CellPainter.makeLine(String(row + 1), font: font, color: color, symbolColor: color)
+                    CellPainter.drawText(line, in: rect, font: font, alignment: .trailing, context: context, ellipsisColor: palette.secondaryText)
+                    if source.rowHasMarker(row) {
+                        CellPainter.drawGutterMarker(rowRect: rect, context: context)
+                    }
+                }
+            }
+            XCTAssertEqual(drawn, reference, "\(appearance.name.rawValue) at \(scale)×")
+        }
+    }
+
     /// `GridView.draw` as it was before 2.0a (main at 5247459).
     private func drawAsBefore(
         source: DrawingSource,
@@ -373,6 +418,7 @@ final class GridDrawingTests: XCTestCase {
         let cache = CellTileCache { _, _ in nil }
         cache.makeBackgroundFetch = { { _, _ in [] } }
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         cache.readAhead(rows: 0..<1_600_000, columns: 0..<40, loadedRows: 2_000_000)
         XCTAssertEqual(cache.readsAheadStarted, CellTileCache.newReadsPerCall)
         for _ in 0..<10 {
@@ -395,19 +441,62 @@ final class GridDrawingTests: XCTestCase {
             }
         }
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
+        cache.readAhead(rows: 0..<64, columns: 0..<1, loadedRows: 1_000_000)
+        // A draw far away starts what is wanted again (and reads its two
+        // neighbours ahead).
+        cache.prepare(rows: 512_000..<512_064, columns: 0..<1, loadedRows: 1_000_000)
+        CellTileCache.resumeReadsAhead()
+        waitUntil("all three are back") { cache.readsAheadBack == 3 }
+        XCTAssertEqual(reads.value, 2, "only the blocks still wanted")
+        XCTAssertNil(cache.cachedCell(row: 0, column: 0, loadedRows: 1_000_000))
+        XCTAssertNotNil(cache.cachedCell(row: 512_064, column: 0, loadedRows: 1_000_000))
+    }
+
+    /// Between draws, what is asked for ahead only widens what is wanted.
+    func testReadsAheadBetweenDrawsAreAllWanted() {
+        let reads = Counter()
+        let cache = CellTileCache { _, _ in nil }
+        cache.makeBackgroundFetch = {
+            { rows, _ in
+                reads.add()
+                return rows.map { _ in TileRow(fieldCount: 1, cells: [.text("x", truncated: false)]) }
+            }
+        }
+        CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         cache.readAhead(rows: 0..<64, columns: 0..<1, loadedRows: 1_000_000)
         cache.readAhead(rows: 512_000..<512_064, columns: 0..<1, loadedRows: 1_000_000)
         CellTileCache.resumeReadsAhead()
         waitUntil("both are back") { cache.readsAheadBack == 2 }
-        XCTAssertEqual(reads.value, 1, "only the block still wanted")
-        XCTAssertNil(cache.cachedCell(row: 0, column: 0, loadedRows: 1_000_000))
-        XCTAssertNotNil(cache.cachedCell(row: 512_000, column: 0, loadedRows: 1_000_000))
+        XCTAssertEqual(reads.value, 2)
+    }
+
+    /// Review nit 7: the cache keeps room for a wide region's tiles, so a
+    /// window of many column blocks doesn't evict what it just read.
+    func testTheCacheGrowsWithTheRegion() {
+        var reads = 0
+        let cache = CellTileCache(capacity: 2) { rows, columns in
+            reads += 1
+            return rows.map { _ in TileRow(fieldCount: 400, cells: columns.map { .text("c\($0)", truncated: false) }) }
+        }
+        cache.makeBackgroundFetch = { { _, _ in nil } }
+        // The first read finds rows 400 fields wide: 13 column blocks.
+        _ = cache.cell(row: 0, column: 0, loadedRows: 100)
+        cache.prepare(rows: 0..<30, columns: 0..<400, loadedRows: 100)
+        let read = reads
+        for column in stride(from: 0, to: 400, by: 32) {
+            _ = cache.cell(row: 0, column: column, loadedRows: 100)
+        }
+        XCTAssertEqual(reads, read, "a tile of the region was dropped and read again")
+        waitUntil("the reads ahead are back") { cache.readsAheadBack == cache.readsAheadStarted }
     }
 
     func testTilesReadAheadBeforeTheCacheIsEmptiedAreDropped() {
         let cache = CellTileCache { rows, columns in Self.tile(rows, columns, "new ") }
         cache.makeBackgroundFetch = { { rows, columns in Self.tile(rows, columns, "old ") } }
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         cache.readAhead(rows: 0..<10, columns: 0..<1, loadedRows: 10)
         cache.removeAll()
         CellTileCache.resumeReadsAhead()
@@ -429,6 +518,7 @@ final class GridDrawingTests: XCTestCase {
             }
         }
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         cache.readAhead(rows: 0..<10, columns: 0..<1, loadedRows: 10)
         cache.removeAll()
         cache.readAhead(rows: 0..<10, columns: 0..<1, loadedRows: 10)
@@ -447,6 +537,7 @@ final class GridDrawingTests: XCTestCase {
         cache.makeBackgroundFetch = { { rows, columns in Self.tile(rows, columns, "ahead ") } }
         XCTAssertEqual(cache.cell(row: 5, column: 0, loadedRows: 1_000), .text("v1 5:0", truncated: false))
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         cache.readAhead(rows: 64..<128, columns: 0..<1, loadedRows: 1_000)
         version = 2
         cache.invalidate(rows: 5..<70)
@@ -560,7 +651,8 @@ final class GridDrawingTests: XCTestCase {
         let gridView = grid.gridView
         try draw(gridView)
         waitUntil("the first lines are made") { gridView.ahead.batchesBack == gridView.ahead.batchesSent }
-        LineReadAhead.queue.suspend()
+        LineReadAhead.suspendForTesting()
+        defer { LineReadAhead.resumeForTesting() }
         scroll(grid, toRow: 10)
         try draw(gridView)
         let sent = gridView.ahead.batchesSent
@@ -568,16 +660,17 @@ final class GridDrawingTests: XCTestCase {
         let key = LineRequest(value: "r\(below)c0", truncated: false, width: 100, number: false).key
         XCTAssertFalse(gridView.lines.contains(key))
         gridView.ahead.reset()
-        LineReadAhead.queue.resume()
+        LineReadAhead.resumeForTesting()
         waitUntil("the batch is back") { gridView.ahead.batchesBack == sent }
         XCTAssertFalse(gridView.lines.contains(key), "a line made before the reset was kept")
         // Without the reset, it would have been.
-        LineReadAhead.queue.suspend()
+        LineReadAhead.suspendForTesting()
+        defer { LineReadAhead.resumeForTesting() }
         scroll(grid, toRow: 40)
         try draw(gridView)
         let later = Int(grid.scrollView.contentView.bounds.maxY / 22) + 2
         let laterKey = LineRequest(value: "r\(later)c0", truncated: false, width: 100, number: false).key
-        LineReadAhead.queue.resume()
+        LineReadAhead.resumeForTesting()
         waitUntil("the next batch is back") { gridView.ahead.batchesBack == gridView.ahead.batchesSent }
         XCTAssertTrue(gridView.lines.contains(laterKey))
     }
@@ -598,11 +691,21 @@ private final class DrawingSource: GridDataSource {
     func cell(row: Int, column: Int) -> GridCell {
         guard row < loadedRowCount else { return .notLoaded }
         if row == 6, column >= 2 { return .missing }
+        // Stacked marks that spill out of their cell, onto the cell below:
+        // the selected one (row 4), a skeleton (row 10), a hatch (row 6,
+        // column 3) and a find mark (row 2, column 3). Each is drawn after
+        // the spilling text, as before batching.
+        let marks = "\u{0335}\u{0327}\u{0322}\u{031B}\u{031B}\u{031E}\u{032B}\u{0317}\u{0317}\u{0349}\u{032E}\u{0348}\u{031D}\u{032E}\u{0316}\u{031C}\u{032D}\u{0332}\u{0339}\u{0319}\u{033C}"
         switch (row, column) {
-        case (3, 0): return .text("Z\u{0335}\u{0327}\u{0322}\u{031B}\u{031B}\u{031E}\u{032B}\u{0317}\u{0317}\u{0349}\u{032E}\u{0348}\u{031D}\u{032E}\u{0316}\u{031C}\u{032D}\u{0332}\u{0339}\u{0319}\u{033C} spills", truncated: false)
+        // (Only the marks' cluster, so the line is one run in one font and
+        // is batched.)
+        case (3, 0), (9, 0), (1, 3), (5, 3): return .text("Z\(marks)", truncated: false)
         case (_, 1): return .text("\(row * 37).5", truncated: false)
         case (_, 3): return .text("SKU-\(60_000 + row) on a long note", truncated: row == 2)
-        case (_, 4): return .text(row % 2 == 0 ? "서울" : "a\tb", truncated: false)
+        // A line of two colours, drawn on its own, only where it doesn't
+        // stand between a spill and what it spills onto.
+        case (7, 4): return .text("a\tb", truncated: false)
+        case (_, 4): return .text("서울", truncated: false)
         default: return .text("Name \(row)", truncated: false)
         }
     }
@@ -610,15 +713,31 @@ private final class DrawingSource: GridDataSource {
     func isHatched(row: Int, column: Int) -> Bool { row == 6 }
 }
 
-/// Find's marks for the drawing test: "SKU" in column 3, the current match
-/// in row 2.
+/// A million rows, every third with a gutter marker, for the gutter test.
+@MainActor
+private final class MarkedSource: GridDataSource {
+    let rowCount = 1_000_010
+    let loadedRowCount = 1_000_010
+    let columnCount = 1
+
+    func headerTitle(column: Int) -> HeaderTitle { HeaderTitle(text: "c", style: .name) }
+    func isNumeric(column: Int) -> Bool { false }
+    func prepare(rows: Range<Int>, columns: Range<Int>) {}
+    func cell(row: Int, column: Int) -> GridCell { .text("x", truncated: false) }
+    func rowHasMarker(_ row: Int) -> Bool { row % 3 == 0 }
+}
+
+/// Find's marks for the drawing test: in column 3, rows 2 (the current
+/// match) and 7.
 @MainActor
 private final class DrawingHighlighter: GridHighlighter {
     func prepareHighlights(rows: Range<Int>, columns: Range<Int>) {}
 
     func highlight(row: Int, column: Int) -> CellHighlight? {
-        guard column == 3, row < 10 else { return nil }
-        return CellHighlight(ranges: [NSRange(location: 0, length: 3)], isCurrent: row == 2)
+        // Only rows 2 and 7: a mark flushes the text before it, and marks
+        // in every row would hide whether the other flushes happen.
+        guard column == 3, row == 2 || row == 7 else { return nil }
+        return CellHighlight(ranges: [NSRange(location: 0, length: 1)], isCurrent: row == 2)
     }
 }
 

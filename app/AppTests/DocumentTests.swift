@@ -124,6 +124,7 @@ final class DocumentTests: XCTestCase {
         XCTAssertFalse(records().isEmpty)
         let back = model.readsAheadBack
         CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
         model.readAhead(rows: 640..<704, columns: 0..<4)
         let calls = model.coreCalls
         document.close()
@@ -438,6 +439,24 @@ final class DocumentTests: XCTestCase {
         XCTAssertEqual(thread.onMain, false)
     }
 
+    /// Task 2.0a re-review, item 2: the reads ahead's hold on a core
+    /// document is let go of off the main thread too, when it is the last.
+    func testTheReadAheadsHandleIsReleasedOffTheMainThread() {
+        let released = expectation(description: "released")
+        let thread = ReleaseThread()
+        var object: ReleaseProbe? = ReleaseProbe { onMain in
+            thread.onMain = onMain
+            released.fulfill()
+        }
+        let handle = ReadAheadHandle<ReleaseProbe>()
+        handle.set(object)
+        object = nil
+        handle.set(nil)
+        CoreRelease.finish()
+        wait(for: [released], timeout: 5)
+        XCTAssertEqual(thread.onMain, false)
+    }
+
     // MARK: Very wide files
 
     /// Column sizing reads at most `sizingFieldLimit` fields, however wide
@@ -493,6 +512,7 @@ final class DocumentTests: XCTestCase {
             XCTAssertNil(model.cachedCell(row: 640, column: 0), "\(change): row 640 isn't read yet")
             let back = model.readsAheadBack
             CellTileCache.suspendReadsAhead()
+            defer { CellTileCache.resumeReadsAhead() }
             model.readAhead(rows: 640..<704, columns: 0..<4)
             switch change {
             case "the header row": model.setHeaderRow(false)

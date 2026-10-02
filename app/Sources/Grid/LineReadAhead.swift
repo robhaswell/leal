@@ -25,9 +25,26 @@ final class LineReadAhead {
     private(set) var linesMade = 0
     private(set) var batchesBack = 0
     private(set) var batchesSent = 0
+    /// The most batches under way at once: past that, a draw lays out
+    /// nothing more until some are back.
+    static let batchesInFlight = 3
+    /// The rows still wanted, which a batch checks before it starts: one
+    /// the scroll has left behind (by a jump) is skipped.
+    private let wanted = WantedRange()
 
     /// Lays out lines for the grid and the gutter, one batch at a time.
     static let queue = DispatchQueue(label: "io.github.robhaswell.leal.line-read-ahead", qos: .userInitiated)
+    private static let hold = QueueHold()
+
+    /// Holds the batches queued from now on, for tests (as
+    /// `CellTileCache.suspendReadsAhead`).
+    static func suspendForTesting() {
+        hold.hold(queue)
+    }
+
+    static func resumeForTesting() {
+        hold.release(queue)
+    }
 
     /// Forgets everything asked for: the values, the columns or the
     /// colours changed.
@@ -49,9 +66,13 @@ final class LineReadAhead {
         lines: TextLineCache,
         caretOffsets: Bool = false
     ) {
-        guard geometry.columnCount > 0,
+        guard geometry.columnCount > 0, batchesSent - batchesBack < Self.batchesInFlight,
               let next = ahead.next(visible: visible, rowHeight: geometry.rowHeight, rows: source.rowCount)
         else { return }
+        // Anything within two screens of the visible rows is still wanted.
+        let screen = Int((visible.height / geometry.rowHeight).rounded(.up))
+        let top = Int(min(CGFloat(source.rowCount), max(0, (visible.minY / geometry.rowHeight).rounded(.down))))
+        wanted.set((top - 2 * screen)...(top + 3 * screen))
         let columns = geometry.columnRange(minX: drawnWidth?.minX ?? visible.minX, maxX: drawnWidth?.maxX ?? visible.maxX)
         guard !columns.isEmpty else { return }
         if requested.count > 4_000 { requested.removeAll() }
@@ -59,6 +80,8 @@ final class LineReadAhead {
         let loaded = min(source.loadedRowCount, source.rowCount)
         let numeric = columns.map { source.isNumeric(column: $0) }
         var work: [LineMaker.Item] = []
+        var firstRow = Int.max
+        var lastRow = Int.min
         for (range, upwards) in next.ranges {
             // Nearest row first, without making an array of the range.
             for step in 0..<range.count where budget > 0 {
@@ -89,6 +112,8 @@ final class LineReadAhead {
                 }
                 requested[row] = columns
                 work += items
+                firstRow = min(firstRow, row)
+                lastRow = max(lastRow, row)
                 budget -= 1
             }
         }
@@ -96,9 +121,12 @@ final class LineReadAhead {
         let maker = LineMaker(palette: palette, caretOffsets: caretOffsets)
         let generation = generation
         let items = work
+        let rows = firstRow...lastRow
+        let wanted = wanted
         batchesSent += 1
         Self.queue.async { [weak self, weak lines] in
-            let made = items.map { (key: $0.request.key, line: maker.make($0)) }
+            // The scroll may have jumped away while this waited.
+            let made = wanted.overlaps(rows) ? items.map { (key: $0.request.key, line: maker.make($0)) } : []
             Task { @MainActor [weak self, weak lines] in
                 guard let self else { return }
                 batchesBack += 1

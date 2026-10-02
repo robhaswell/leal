@@ -91,7 +91,7 @@ final class DocumentModel: GridDataSource {
     /// they look up when they run, not when they are queued: once the
     /// document closes, fails or is replaced, a queued read reads nothing
     /// and holds nothing.
-    private let readAheadHandle = ReadAheadHandle()
+    private let readAheadHandle = ReadAheadHandle<LealFFI.Document>()
     /// Goes up by one each time **Reload** replaces `handle`, so a late
     /// report about the old core document is ignored.
     private var handleNumber = 0
@@ -1496,17 +1496,25 @@ extension Logger {
 
 /// The core document the grid's reads ahead use, shared with the read
 /// queue (task 2.0a review).
-final class ReadAheadHandle: @unchecked Sendable {
-    // @unchecked: every access holds the lock; `LealFFI.Document` is
-    // itself Sendable.
+final class ReadAheadHandle<Object: AnyObject & Sendable>: @unchecked Sendable {
+    // @unchecked: every access holds the lock; the object is itself
+    // Sendable.
     private let lock = NSLock()
-    private var handle: LealFFI.Document?
+    private var handle: Object?
 
-    func set(_ handle: LealFFI.Document?) {
-        lock.withLock { self.handle = handle }
+    /// Holds `handle` in place of the one before, which is let go of off
+    /// the main thread (`CoreRelease`): it may be the last reference to a
+    /// closed document.
+    func set(_ handle: Object?) {
+        var old = lock.withLock {
+            let old = self.handle
+            self.handle = handle
+            return old
+        }
+        CoreRelease.later(&old)
     }
 
-    func get() -> LealFFI.Document? {
+    func get() -> Object? {
         lock.withLock { handle }
     }
 }
