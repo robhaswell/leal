@@ -429,9 +429,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     raises no whole-file review suggestion. (phase 1 review)
   - Decide what happens when an edit makes the output 4 GiB or more,
     which Leal then can't reopen (`TooLarge`). (phase 1 review)
-  - Save As from an incomplete document (a drive disconnected, or the file
-    changed while it was being read) writes only complete rows from the
-    bytes Leal trusts, cut at the last row boundary, with the edits
+  - Save As from an incomplete document (a drive disconnected, the file
+    changed while it was being read, or it was deleted on another
+    computer; ADR-0010) writes only complete rows from the bytes Leal
+    trusts, cut at the last row boundary, with the edits
     applied: never half a row, half a character or an open quote, and no
     marker in the file. It reports how many rows it wrote, for the dialog.
     Tested on the exFAT disk-image case. (ADR-0008 decision 6)
@@ -510,8 +511,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     otherwise Leal offers Save As of what it recovered and names the edits
     it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5)
   - Save As from an incomplete document says plainly that the copy is
-    incomplete ("about N of M rows"); this wires the drive banners' Save
-    As… (`SEAM(2.5)`). (ADR-0008 decision 6)
+    incomplete ("about N of M rows"); this wires the drive and
+    deleted-elsewhere banners' Save As… (`SEAM(2.5)`). (ADR-0008
+    decision 6, ADR-0010)
   - On every save, the interpretation attribute is written with
     `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
     paint or whole-file review would guess differently, when the user

@@ -1,6 +1,6 @@
 # 0010 — Network shares: refinements from the build
 
-- Status: proposed
+- Status: accepted (approved by Rob, 2026-10-02)
 - Date: 2026-10-02
 - Refines: ADR-0009
 
@@ -23,7 +23,7 @@ stand. DESIGN §3.1 already describes the build. Details are in
 
 ## Decision
 
-Option 1, if Rob approves.
+Option 1.
 
 1. **More network errors are retried.** ADR-0009 names six errnos. The
    build also retries EIO, ENOTCONN, ECONNREFUSED, ECONNABORTED, EPIPE,
@@ -60,4 +60,4 @@ Option 1, if Rob approves.
 - DESIGN §3.1 already matches (commit `de6b5ac`).
 - Save As from an incomplete document (ADR-0008 decision 6) also covers
   "deleted on another computer while reading". DESIGN §3.7 and PLAN 2.2 and
-  2.5 are updated to say so once this is accepted.
+  2.5 are updated to say so.

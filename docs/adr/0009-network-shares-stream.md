@@ -3,6 +3,7 @@
 - Status: accepted (decided by Rob, 2026-10-02)
 - Date: 2026-10-02
 - Changes: ADR-0006 (network shares no longer read or copy in full at open)
+- Refined by: ADR-0010
 
 ## Context
 

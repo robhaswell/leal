@@ -525,7 +525,8 @@ The user can edit those cells and try again. Nothing is substituted
 silently.
 
 **Save As from an incomplete document** (ADR-0008 decision 6): a drive or
-share disconnected, or the file changed while it was being read (§3.1).
+share disconnected, the file changed while it was being read, or it was
+deleted on another computer while being read (§3.1, ADR-0010).
 Save As writes only **complete rows** from the bytes Leal trusts, cut at
 the last row boundary, with the user's edits applied. It never writes half
 a row, half a character or an open quote. The dialog says plainly that the
