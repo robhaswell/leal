@@ -163,6 +163,14 @@ final class DocumentFFITests: XCTestCase {
                 OpenErrorText.describe(failure),
                 "Something went wrong inside Leal. Close the file and open it again."
             )
+            // The same words when the failure is held as `any Error`, as
+            // `DocumentModel.failure` holds it (phase 1 review, app-1): never
+            // UniFFI's debug text with the panic message.
+            let held: any Error = failure
+            XCTAssertEqual(
+                OpenErrorText.describe(held),
+                "Something went wrong inside Leal. Close the file and open it again."
+            )
         }
         // The document is marked as the job finishes, on its thread.
         let deadline = Date().addingTimeInterval(10)

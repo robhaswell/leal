@@ -21,11 +21,24 @@ enum OpenErrorText {
     /// The switch over `LealError` is exhaustive, with no `default`, so a new
     /// variant doesn't compile until it has wording here. Otherwise it would
     /// show UniFFI's debug-style description (`LealError.X(...)`).
+    ///
+    /// Whatever the error's static type, the words come from the catalog:
+    /// a `JobFailure` (a background job's end) has its own wording, and an
+    /// error from Foundation has the system's. Anything else is one of
+    /// UniFFI's internal errors, most often a Rust panic in a call, whose
+    /// description is the panic message in English (for logs only, never
+    /// shown; phase 1 review, app-1): it gets the after-a-panic wording.
     static func describe(_ error: any Error) -> String {
+        if let failure = error as? JobFailure {
+            return describe(failure)
+        }
         guard let error = error as? LealError else {
-            // A Rust panic, which UniFFI throws as an internal error whose
-            // description is the panic message.
-            return error.localizedDescription
+            let system = error as NSError
+            if [NSCocoaErrorDomain, NSPOSIXErrorDomain, NSOSStatusErrorDomain].contains(system.domain) {
+                // Such as making the temporary folders: the system's words.
+                return system.localizedDescription
+            }
+            return documentFailed
         }
         return switch error {
         case .NotFound:

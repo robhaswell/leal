@@ -340,7 +340,9 @@ final class DocumentModel: GridDataSource {
         })
     }
 
-    private func jobEnded(_ error: any Error) {
+    /// A background job ended with `error` instead of finishing. Internal
+    /// for tests, which end one with a panic.
+    func jobEnded(_ error: any Error) {
         switch error as? JobFailure {
         case .Panicked?:
             fail(error)
@@ -974,8 +976,14 @@ final class DocumentModel: GridDataSource {
     ///
     /// Throws the open error if the file can't be opened (deleted, moved
     /// out of reach, or its drive away); the document is then unchanged.
-    func reload() throws {
+    ///
+    /// `url` is where to read the file from, if not where the model has
+    /// it: `CSVDocument` passes the URL AppKit reads from. The model then
+    /// lives there. Call it through `CSVDocument.reload`, which keeps
+    /// `NSDocument`'s own idea of the file in step.
+    func reload(from url: URL? = nil) throws {
         guard failure == nil else { return }
+        let url = url ?? self.url
         let current = interpretation
         let chosen = OpenOptions(
             delimiter: current.delimiterSource == .user ? current.delimiter : nil,
@@ -1001,6 +1009,7 @@ final class DocumentModel: GridDataSource {
         tasks.removeAll()
         checkingOriginal?.cancel()
         checkingOriginal = nil
+        self.url = url
         handle = new
         handleNumber = number
         reference.model = self
@@ -1043,11 +1052,13 @@ final class DocumentModel: GridDataSource {
 
     // MARK: Status bar
 
+    /// What the status bar shows. A failed document shows no rows and isn't
+    /// indexing any more (phase 1 review, app-2).
     var status: StatusSummary {
         StatusSummary(
-            rows: max(0, Int(progress.estimatedRows) - headerOffset),
-            columns: fileColumnCount,
-            indexing: !progress.complete,
+            rows: rowCount,
+            columns: failure == nil ? fileColumnCount : 0,
+            indexing: failure == nil && !progress.complete,
             fractionIndexed: progress.bytesTotal > 0 ? Double(progress.bytesScanned) / Double(progress.bytesTotal) : 0,
             delimiter: interpretation.delimiter,
             lineEnding: reviewedLineEnding ?? interpretation.lineEnding,

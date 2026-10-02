@@ -319,6 +319,85 @@ final class DocumentTests: XCTestCase {
         document.close()
     }
 
+    /// A background job's panic reaches the model as a `JobFailure`, held
+    /// as `any Error`. The alert still says what happened in the catalog's
+    /// words, never UniFFI's debug text with the panic's message (phase 1
+    /// review, app-1). The window keeps no stale rows or progress.
+    func testTheAlertAfterAJobPanicIsWorded() async throws {
+        let url = try file("a.csv", "a,b\n1,2\n")
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        var sheets: [NSAlert] = []
+        document.isOnScreen = { _ in true }
+        document.showSheet = { alert, _, _ in sheets.append(alert) }
+        let job = debugPanickingJob(scheduler: environment.scheduler)
+        let ended: any Error
+        do {
+            try await job.finish()
+            return XCTFail("the job should panic")
+        } catch {
+            ended = error
+        }
+        XCTAssertEqual(ended as? JobFailure, .Panicked(message: "deliberate job panic"))
+        model.jobEnded(ended)
+
+        XCTAssertTrue(model.isFailed)
+        let alert = try XCTUnwrap(sheets.first)
+        XCTAssertEqual(sheets.count, 1)
+        XCTAssertEqual(alert.informativeText, "Something went wrong inside Leal. Close the file and open it again.")
+        XCTAssertTrue(alert.messageText.hasPrefix("Leal can’t show “"))
+        XCTAssertEqual(alert.buttons.map(\.title), ["Reopen", "Close"])
+        XCTAssertEqual(model.status.rows, 0)
+        XCTAssertEqual(model.status.columns, 0)
+        XCTAssertFalse(model.status.indexing, "no progress bar for good")
+        document.close()
+    }
+
+    /// A document that fails while its window is out of sight (minimised)
+    /// offers to reopen once the window is back, once (phase 1 review,
+    /// app-2).
+    func testAFailureWhileTheWindowIsOutOfSightIsShownWhenItIsBack() throws {
+        let document = try open(try file("a.csv", "a,b\n1,2\n"))
+        let model = try XCTUnwrap(document.model)
+        let window = try XCTUnwrap(document.windowControllers.first?.window)
+        var onScreen = false
+        var sheets = 0
+        document.isOnScreen = { _ in onScreen }
+        document.showSheet = { _, _, _ in sheets += 1 }
+        _ = model.call { try $0.debugPanic() }
+        XCTAssertTrue(document.isOfferingReopen)
+        XCTAssertEqual(sheets, 0, "nobody would see it")
+
+        onScreen = true
+        NotificationCenter.default.post(name: NSWindow.didDeminiaturizeNotification, object: window)
+        XCTAssertEqual(sheets, 1)
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        XCTAssertEqual(sheets, 1, "shown once")
+        document.close()
+    }
+
+    /// A failed UTF-16 document shows no banner, and its details can't be
+    /// opened from stale diagnostics (phase 1 review, app-2).
+    func testAFailedDocumentKeepsNoBannersOrDetails() async throws {
+        let url = directory.appending(path: "legacy.csv")
+        var data = Data([0xFF, 0xFE])
+        data.append("id\tname\r\n1\tZoë\0\r\n".data(using: .utf16LittleEndian)!)
+        try data.write(to: url)
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        let content = try XCTUnwrap((document.windowControllers.first as? DocumentWindowController)?.content)
+        _ = content.view
+        XCTAssertNotNil(content.readOnlyBanner)
+        let details = NSMenuItem(title: "", action: #selector(DocumentViewController.showDetails(_:)), keyEquivalent: "")
+        XCTAssertTrue(content.validateMenuItem(details), "the NUL is an irregularity")
+        _ = model.call { try $0.debugPanic() }
+        XCTAssertNil(content.readOnlyBanner)
+        XCTAssertTrue(content.banners.arrangedSubviews.isEmpty)
+        XCTAssertFalse(content.validateMenuItem(details))
+        document.close()
+    }
+
     // MARK: Very wide files
 
     /// Column sizing reads at most `sizingFieldLimit` fields, however wide

@@ -45,18 +45,27 @@ final class CSVDocument: NSDocument {
         // `canConcurrentlyReadDocuments` is false, so AppKit reads on the
         // main thread (and tests call this there).
         try MainActor.assumeIsolated {
-            try open(url)
+            if model == nil {
+                try open(url)
+            } else {
+                // A second read, as `revert(toContentsOf:ofType:)` does: the
+                // window keeps its model, which reads the file again, so it
+                // is never left bound to a closed one (phase 1 review,
+                // app-3). SEAM(2.5): Revert to Saved goes through `reload`
+                // too, asking first if there are edits (ADR-0008 decision
+                // 4, proposed).
+                do {
+                    try reload(from: url)
+                } catch {
+                    throw Self.openError(error, url: url)
+                }
+            }
         }
     }
 
     private func open(_ url: URL) throws {
         openStarted = CACurrentMediaTime()
-        // Only the first read has a grid still to draw its first rows.
-        if model == nil, opening == nil {
-            opening = Signposts.opening()
-        }
-        model?.close()
-        model = nil
+        opening = Signposts.opening()
         do {
             let environment = try Self.environment()
             self.environment = environment
@@ -100,10 +109,38 @@ final class CSVDocument: NSDocument {
         )
     }
 
+    /// **Reload** (task 1.9): the file's banner, File ▸ Reload from Disk,
+    /// and a second `read(from:)` all come here. The model reads the file
+    /// again, at `url` if given, and `NSDocument` is told the file Leal now
+    /// shows (its URL and modification date), so its own check before a
+    /// save (phase 2) doesn't take the change the user just accepted for
+    /// one made by another app (phase 1 review, app-3).
+    ///
+    /// Throws the open error if the file can't be opened; the document is
+    /// then unchanged.
+    func reload(from url: URL? = nil) throws {
+        guard let model else { return }
+        if let failure = model.failure {
+            // A failed document is reopened, not reloaded (DESIGN §3.9).
+            throw failure
+        }
+        let target = url ?? model.url
+        // Read before the core's snapshot, so a change in between is still
+        // a change by the time Leal saves.
+        let modified = try? target.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        try model.reload(from: target)
+        if fileURL != model.url {
+            fileURL = model.url
+        }
+        fileModificationDate = modified
+    }
+
     override func makeWindowControllers() {
         guard let model, let environment else { return }
         let controller = DocumentWindowController(model: model, scheduler: environment.scheduler)
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
+        controller.content.onReload = { [weak self] in try self?.reload() }
+        watchWindow(controller.window)
         if let opening {
             self.opening = nil
             controller.content.grid.gridView.onFirstRows = { Signposts.firstRows(opening) }
@@ -165,18 +202,48 @@ final class CSVDocument: NSDocument {
         for case let controller as DocumentWindowController in windowControllers {
             controller.content.documentWillClose()
         }
+        for observer in windowObservers { NotificationCenter.default.removeObserver(observer) }
+        windowObservers.removeAll()
         model?.close()
         super.close()
     }
 
     // MARK: After a failure (DESIGN §3.9)
 
+    /// Whether the user can see `window`, so that a sheet on it is seen: a
+    /// background tab can, a minimised window can't. Tests replace it.
+    var isOnScreen: (NSWindow) -> Bool = { $0.isVisible && !$0.isMiniaturized }
+    /// Shows `alert` as a sheet on `window`, then calls `done` with the
+    /// button chosen. Tests replace it, so that no sheet is shown.
+    var showSheet: (_ alert: NSAlert, _ window: NSWindow, _ done: @escaping @MainActor (NSApplication.ModalResponse) -> Void) -> Void = { alert, window, done in
+        alert.beginSheetModal(for: window) { response in
+            MainActor.assumeIsolated { done(response) }
+        }
+    }
+    /// The window's notifications that bring a waiting failure alert up.
+    private var windowObservers: [any NSObjectProtocol] = []
+
     /// The core panicked: the model has stopped calling it. Say so and
-    /// offer to reopen the file, which makes a new core document.
+    /// offer to reopen the file, which makes a new core document. While the
+    /// window is out of sight (minimised, or not on screen yet), the alert
+    /// waits until it is back (`watchWindow`): a sheet on a hidden window
+    /// would never be seen (phase 1 review, app-2).
     func presentFailure() {
         isOfferingReopen = true
-        guard !failureShown, let window = windowControllers.first?.window, window.isVisible else { return }
+        guard !failureShown, let window = windowControllers.first?.window, isOnScreen(window) else { return }
         failureShown = true
+        showSheet(failureAlert(), window) { [weak self] response in
+            if response == .alertFirstButtonReturn {
+                self?.reopenAfterFailure(display: true) { _ in }
+            } else {
+                self?.close()
+            }
+        }
+    }
+
+    /// The alert after a failure: the file's name, why in words from the
+    /// catalog (never the core's message), Reopen and Close.
+    func failureAlert() -> NSAlert {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = String(
@@ -186,14 +253,26 @@ final class CSVDocument: NSDocument {
         alert.informativeText = OpenErrorText.describe(model?.failure ?? LealError.Internal(message: ""))
         alert.addButton(withTitle: String(localized: "Reopen", comment: "Button: open the file again after a failure"))
         alert.addButton(withTitle: String(localized: "Close", comment: "Button: close the document after a failure"))
-        alert.beginSheetModal(for: window) { [weak self] response in
-            MainActor.assumeIsolated {
-                if response == .alertFirstButtonReturn {
-                    self?.reopenAfterFailure(display: true) { _ in }
-                } else {
-                    self?.close()
+        return alert
+    }
+
+    /// Brings up a waiting failure alert when the window comes back into
+    /// sight: it becomes key, is restored from the Dock, or is uncovered.
+    private func watchWindow(_ window: NSWindow?) {
+        guard let window, windowObservers.isEmpty else { return }
+        let names = [
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didDeminiaturizeNotification,
+            NSWindow.didChangeOcclusionStateNotification,
+        ]
+        for name in names {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.isOfferingReopen else { return }
+                    self.presentFailure()
                 }
             }
+            windowObservers.append(observer)
         }
     }
 

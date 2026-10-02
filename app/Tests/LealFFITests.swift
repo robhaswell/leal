@@ -147,6 +147,12 @@ final class LealFFITests: XCTestCase {
                 error.localizedDescription.contains("deliberate test panic"),
                 "expected the panic message, got \(error.localizedDescription)"
             )
+            // The message is for logs: the words shown come from the catalog
+            // (phase 1 review, app-1).
+            XCTAssertEqual(
+                OpenErrorText.describe(error),
+                "Something went wrong inside Leal. Close the file and open it again."
+            )
         }
 
         let url = try temporaryFile(named: "after-panic.csv", contents: "a,b\n")

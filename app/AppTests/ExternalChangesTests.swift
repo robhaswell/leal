@@ -220,6 +220,62 @@ final class ExternalChangesTests: XCTestCase {
         document.close()
     }
 
+    /// Reload goes through the `NSDocument`, which learns the modification
+    /// date of the file Leal now shows, so phase 2's save check won't take
+    /// the accepted change for another app's. A second `read(from:)`, as
+    /// `revert(toContentsOf:ofType:)` does, reloads the window's own model
+    /// instead of leaving the window bound to a closed one (phase 1 review,
+    /// app-3).
+    func testReloadKeepsTheDocumentInStepAndAReadAgainKeepsTheModel() async throws {
+        let url = try file("people.csv", text(rows: 20, prefix: "old"))
+        let (document, model, content) = try open(url)
+        try save(text(rows: 30, prefix: "new"), to: url)
+        let later = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 3_600).rounded(.down))
+        try FileManager.default.setAttributes([.modificationDate: later], ofItemAtPath: url.path(percentEncoded: false))
+        try await waitUntil("the change is seen") { model.original.state == .changed }
+        try XCTUnwrap(content.driveBanner?.button).performClick(nil)
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("new 0", truncated: false))
+        XCTAssertEqual(try XCTUnwrap(document.fileModificationDate).timeIntervalSince1970, later.timeIntervalSince1970, accuracy: 0.001)
+
+        try save(text(rows: 5, prefix: "newer"), to: url)
+        try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        XCTAssertTrue(document.model === model, "the same model")
+        XCTAssertTrue(content.model === model, "the window still shows it")
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("newer 0", truncated: false))
+        try await waitUntil("indexed again") { model.isIndexComplete }
+        XCTAssertEqual(model.rowCount, 5)
+        XCTAssertEqual(content.grid.gridView.frame.height, max(CGFloat(5) * GridMetrics.rowHeight, content.grid.scrollView.contentSize.height))
+        document.close()
+    }
+
+    /// The lock glyph follows the file: a Reload into UTF-16 adds it, and a
+    /// Reload out of it takes it away (phase 1 review, app-4).
+    func testReloadIntoAndOutOfUTF16MovesTheLock() async throws {
+        let url = try file("legacy.csv", "id\tname\r\n1\tZoë\r\n")
+        let (document, model, content) = try open(url)
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        XCTAssertNil(controller.lock)
+
+        var utf16 = Data([0xFF, 0xFE])
+        utf16.append(try XCTUnwrap("id\tname\r\n1\tZoë\r\n".data(using: .utf16LittleEndian)))
+        try utf16.write(to: url, options: .atomic)
+        try await waitUntil("the change is seen") { model.original.state == .changed }
+        content.reloadFromDisk(nil)
+        XCTAssertTrue(model.isReadOnly)
+        let lock = try XCTUnwrap(controller.lock)
+        XCTAssertTrue(controller.window?.titlebarAccessoryViewControllers.contains(lock) ?? false)
+        XCTAssertNotNil(content.readOnlyBanner)
+
+        try save("id\tname\r\n1\tZoë\r\n", to: url)
+        try await waitUntil("the second change is seen") { model.original.state == .changed }
+        content.reloadFromDisk(nil)
+        XCTAssertFalse(model.isReadOnly)
+        XCTAssertNil(controller.lock)
+        XCTAssertFalse(controller.window?.titlebarAccessoryViewControllers.contains(lock) ?? true)
+        XCTAssertNil(content.readOnlyBanner)
+        document.close()
+    }
+
     func testAReloadThatFailsKeepsTheDocument() async throws {
         let url = try file("people.csv", text(rows: 5, prefix: "old"))
         let (document, model, _) = try open(url)

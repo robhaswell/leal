@@ -23,6 +23,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     let banners = NSStackView()
     /// The document failed (DESIGN §3.9).
     var onFailure: (() -> Void)?
+    /// **Reload**, through the `NSDocument` (`CSVDocument.reload`), so it
+    /// stays in step with the file shown. Without one, the model reloads.
+    var onReload: (() throws -> Void)?
+    /// Whether the file is read-only (UTF-16) changed: the window's lock
+    /// glyph follows it.
+    var onReadOnlyChanged: ((Bool) -> Void)?
+    /// What the lock glyph was last told.
+    private var shownReadOnly: Bool?
 
     /// The file's banner (`FileBanner`), if one shows.
     private(set) var driveBanner: BannerView?
@@ -200,15 +208,24 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             if isFindBarShown { find.restart(from: grid.activeCell) }
             updateInspector()
         case .reloaded:
-            // A new snapshot: every banner may show again. `reloadFromDisk`
-            // puts the selection and scroll position back, then re-runs an
-            // open find and refreshes the inspector. A promised copy keeps
-            // the cells it was made from (`CopyPromise`).
+            // A new snapshot, however the reload came (the banner, the
+            // menu, or a second `read(from:)`): every banner may show
+            // again, and the selection and scroll position stay where they
+            // were, as far as the new file reaches.
+            let cell = grid.activeCell
+            let origin = grid.scrollView.contentView.bounds.origin
             dismissed.removeAll()
             detailsPopover?.close()
             navigation.reset()
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
+            restore(cell: cell, origin: origin)
+            // Task 1.8's tools follow the new snapshot: an open find runs
+            // again from the restored cell, and the inspector shows that
+            // cell's value as it is now. A copy already promised keeps the
+            // cells it was made from (`CopyPromise` holds its own core job).
+            if isFindBarShown { find.restart(from: grid.activeCell) }
+            updateInspector()
         case .failed:
             grid.invalidateContent()
             detailsPopover?.close()
@@ -218,6 +235,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         updateBanners()
         statusBar.show(model.status)
         updateDetails()
+        updateReadOnly()
+    }
+
+    /// Tells the window whether the file is read-only, when that changes:
+    /// a Reload can find a UTF-16 file saved as UTF-8, or the reverse
+    /// (phase 1 review, app-4).
+    func updateReadOnly() {
+        guard shownReadOnly != model.isReadOnly else { return }
+        shownReadOnly = model.isReadOnly
+        onReadOnlyChanged?(model.isReadOnly)
     }
 
     // MARK: Banners
@@ -232,8 +259,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             bannerGeneration = model.generation
         }
         guard !model.isFailed else {
-            for banner in [driveBanner, diagnosticsBanner, delimiterBanner, encodingBanner] { banner?.removeFromSuperview() }
+            for banner in [driveBanner, readOnlyBanner, diagnosticsBanner, delimiterBanner, encodingBanner] { banner?.removeFromSuperview() }
             driveBanner = nil
+            readOnlyBanner = nil
             diagnosticsBanner = nil
             delimiterBanner = nil
             encodingBanner = nil
@@ -370,14 +398,20 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// can't be opened, the window says why and keeps what it shows.
     @objc func reloadFromDisk(_ sender: Any?) {
         scheduler.noteUserInput()
-        let cell = grid.activeCell
-        let origin = grid.scrollView.contentView.bounds.origin
         do {
-            try model.reload()
+            if let onReload {
+                try onReload()
+            } else {
+                try model.reload()
+            }
         } catch {
             showReloadError(error)
-            return
         }
+    }
+
+    /// After a Reload: the active cell and scroll position as they were,
+    /// kept inside the new file.
+    private func restore(cell: CellPosition?, origin: NSPoint) {
         if let cell, model.rowCount > 0, model.columnCount > 0 {
             grid.activeCell = CellPosition(row: min(cell.row, model.rowCount - 1), column: min(cell.column, model.columnCount - 1))
         } else {
@@ -388,12 +422,6 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let maxY = max(0, grid.gridView.frame.height - clip.bounds.height)
         clip.scroll(to: NSPoint(x: min(origin.x, maxX), y: min(origin.y, maxY)))
         grid.scrollView.reflectScrolledClipView(clip)
-        // Task 1.8's tools follow the new snapshot: an open find runs again
-        // from the restored cell, and the inspector shows that cell's value
-        // as it is now. A copy already promised keeps the cells it was made
-        // from (`CopyPromise` holds its own core job).
-        if isFindBarShown { find.restart(from: grid.activeCell) }
-        updateInspector()
     }
 
     /// **Keep Editing**: keep the version Leal opened and hide the banner.
@@ -476,7 +504,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             menuItem.state = encoding == model.interpretation.encoding ? .on : .off
             return !model.isFailed && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
-            return model.diagnostics?.diagnostics.isEmpty == false
+            return !model.isFailed && model.diagnostics?.diagnostics.isEmpty == false
         case #selector(showFind(_:)):
             return !model.isFailed
         case #selector(findNext(_:)), #selector(findPrevious(_:)):
@@ -791,7 +819,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             popover.close()
             return
         }
-        guard model.diagnostics?.diagnostics.isEmpty == false else { return }
+        guard !model.isFailed, model.diagnostics?.diagnostics.isEmpty == false else { return }
         let controller = DiagnosticsDetailsController()
         controller.onNavigate = { [weak self] kind, forward in self?.navigate(kind, forward: forward) }
         details = controller
@@ -931,12 +959,30 @@ final class DocumentWindowController: NSWindowController {
         window.setContentSize(Self.contentSize)
         window.contentMinSize = NSSize(width: 480, height: 240)
         window.initialFirstResponder = content.grid.gridView
-        window.tabbingMode = .preferred
+        // `.automatic` (the default), so documents open as tabs or windows
+        // as the user's "Prefer tabs when opening documents" setting says
+        // (phase 1 review, app-5). Window ▸ Merge All Windows and the tab
+        // bar work either way.
+        window.tabbingMode = .automatic
         super.init(window: window)
         shouldCascadeWindows = true
         window.center()
-        if model.isReadOnly {
-            window.addTitlebarAccessoryViewController(Self.lockAccessory())
+        content.onReadOnlyChanged = { [weak self] readOnly in self?.showLock(readOnly) }
+        content.updateReadOnly()
+    }
+
+    /// The lock glyph by the title, while the file is read-only.
+    private(set) var lock: NSTitlebarAccessoryViewController?
+
+    private func showLock(_ readOnly: Bool) {
+        guard readOnly != (lock != nil), let window else { return }
+        if readOnly {
+            let accessory = Self.lockAccessory()
+            window.addTitlebarAccessoryViewController(accessory)
+            lock = accessory
+        } else if let lock, let index = window.titlebarAccessoryViewControllers.firstIndex(of: lock) {
+            window.removeTitlebarAccessoryViewController(at: index)
+            self.lock = nil
         }
     }
 
