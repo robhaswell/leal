@@ -157,6 +157,49 @@ pub fn performance_cores() -> Option<usize> {
     (status == 0 && size == size_of::<c_int>()).then_some(cores)
 }
 
+/// The open-file limit the app asks for: `OPEN_MAX` from
+/// `<sys/syslimits.h>`, the most macOS lets a process's soft
+/// `RLIMIT_NOFILE` be, and what apps commonly raise it to.
+pub const OPEN_FILES: u64 = 10_240;
+
+/// Raises this process's soft limit on open files (`RLIMIT_NOFILE`) to
+/// [`OPEN_FILES`], or to the hard limit if that is lower, and returns the
+/// soft limit now. It never lowers it.
+///
+/// An app launched from the Finder gets a soft limit of 256. Each open
+/// document holds 3 or 4 descriptors (its temporary record, its watcher's
+/// event queue and the watched file, and the copy on a removable drive),
+/// and AppKit holds its own, so a few dozen documents would run out
+/// (p1-review conc-6): opening would fail, and watching a file would too.
+///
+/// # Errors
+///
+/// The `getrlimit` or `setrlimit` error. The limit is then as it was.
+pub fn raise_open_file_limit() -> std::io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live, writable `rlimit`, the one argument
+    // `getrlimit` writes to.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let wanted = OPEN_FILES.min(limit.rlim_max);
+    if limit.rlim_cur >= wanted {
+        return Ok(limit.rlim_cur);
+    }
+    let raised = libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `raised` is a live `rlimit`, which `setrlimit` only reads.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(wanted)
+}
+
 /// The log, made once. Stored as an address so the `OnceLock` is `Sync`;
 /// `os_log_t` objects are immutable and thread-safe.
 fn log() -> *mut OsLog {
@@ -236,6 +279,45 @@ mod tests {
         // The scheduler falls back to the logical core count when this is None.
         let cores = performance_cores();
         assert!(cores.is_none_or(|n| n >= 1), "{cores:?}");
+    }
+
+    /// p1-review conc-6: the app's open-file limit is raised from the
+    /// Finder's 256. It is never lowered.
+    #[test]
+    fn the_open_file_limit_is_raised() {
+        let before = open_file_limit();
+        let now = raise_open_file_limit().unwrap();
+        let limit = open_file_limit();
+        assert_eq!(limit.rlim_cur, now);
+        assert!(now >= before.rlim_cur, "{now} < {}", before.rlim_cur);
+        assert!(now >= OPEN_FILES.min(limit.rlim_max), "{now}");
+        // Lowered to the Finder's limit (as a shell may have it already),
+        // it is raised again.
+        if limit.rlim_max >= OPEN_FILES {
+            let finder = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: limit.rlim_max,
+            };
+            // SAFETY: `finder` is a live `rlimit`, which `setrlimit` only
+            // reads.
+            let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const finder) };
+            assert_eq!(set, 0);
+            assert_eq!(open_file_limit().rlim_cur, 256);
+            assert_eq!(raise_open_file_limit().unwrap(), OPEN_FILES);
+            assert_eq!(open_file_limit().rlim_cur, OPEN_FILES);
+        }
+    }
+
+    fn open_file_limit() -> libc::rlimit {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a live, writable `rlimit`, the one argument
+        // `getrlimit` writes to.
+        let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        assert_eq!(got, 0);
+        limit
     }
 
     #[test]

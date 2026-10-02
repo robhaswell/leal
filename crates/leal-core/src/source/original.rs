@@ -67,7 +67,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,8 @@ struct Shared {
     /// `None` if the kernel wouldn't make a queue: then nothing is watched,
     /// and only [`Original::check`] notices changes.
     queue: Option<Kqueue>,
+    /// Why there is no queue, for [`Original::watch`] to say.
+    no_queue: Option<io::Error>,
     /// The state, held while the file is looked at (system calls that can
     /// block on a slow volume).
     inner: Mutex<Inner>,
@@ -157,6 +159,9 @@ struct Shared {
     /// held only to copy it, so [`Original::status`] never waits for a look
     /// (the main thread calls it, through `Document::can_save`).
     published: Mutex<OriginalStatus>,
+    /// Set by the watching thread as it ends, for [`Original`]'s `drop`.
+    stopped: Mutex<bool>,
+    stopping: Condvar,
 }
 
 struct Inner {
@@ -232,11 +237,22 @@ impl Original {
     /// `opened`. It looks at the file once straight away: if the path
     /// already leads to another file, or the file has changed since it was
     /// opened, it is `Changed` from the start.
+    ///
+    /// If the kernel won't make an event queue (for example, the process
+    /// is out of file descriptors), nothing is watched, [`check`](Self::check)
+    /// still works, and [`watch`](Self::watch) says why.
     #[must_use]
     pub fn new(path: &Path, opened: FileIdentity) -> Self {
-        let queue = Kqueue::new()
-            .and_then(|queue| queue.add_user(STOP).map(|()| queue))
-            .ok();
+        let queue = Kqueue::new().and_then(|queue| queue.add_user(STOP).map(|()| queue));
+        Self::with_queue(path, opened, queue)
+    }
+
+    /// [`new`](Self::new), with the event queue made (or not) already.
+    fn with_queue(path: &Path, opened: FileIdentity, queue: io::Result<Kqueue>) -> Self {
+        let (queue, no_queue) = match queue {
+            Ok(queue) => (Some(queue), None),
+            Err(error) => (None, Some(error)),
+        };
         let mut inner = Inner {
             path: path.to_owned(),
             pending: None,
@@ -252,8 +268,11 @@ impl Original {
             shared: Arc::new(Shared {
                 opened,
                 queue,
+                no_queue,
                 inner: Mutex::new(inner),
                 published,
+                stopped: Mutex::new(false),
+                stopping: Condvar::new(),
             }),
             thread: Mutex::new(None),
         }
@@ -293,19 +312,39 @@ impl Original {
             return Ok(());
         }
         if self.shared.queue.is_none() {
-            return Err(io::Error::other("no event queue to watch the file with"));
+            let why = self.shared.no_queue.as_ref().map_or_else(
+                || io::Error::other("no event queue to watch the file with"),
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("couldn't make an event queue to watch the file with: {error}"),
+                    )
+                },
+            );
+            return Err(why);
         }
         let shared = Arc::clone(&self.shared);
         *thread = Some(
             std::thread::Builder::new()
                 .name("leal-watch".to_owned())
-                .spawn(move || shared.run(&on_change))?,
+                .spawn(move || {
+                    // Tells `drop` the thread is ending, however it ends.
+                    let _stopped = Stopped(&shared);
+                    shared.run(&on_change);
+                })?,
         );
         Ok(())
     }
 }
 
 impl Original {
+    /// An `Original` whose event queue couldn't be made, failing with
+    /// `error` (tests only).
+    #[cfg(test)]
+    pub(super) fn without_queue(path: &Path, opened: FileIdentity, error: io::Error) -> Self {
+        Self::with_queue(path, opened, Err(error))
+    }
+
     /// Holds the lock a look at the file holds, as a look blocked on a
     /// slow volume would (tests only).
     #[cfg(test)]
@@ -331,18 +370,66 @@ impl Original {
 }
 
 impl Drop for Original {
+    /// Tells the watching thread to stop, and waits for it, but only for
+    /// `STOP_WAIT` (50 ms). Waiting on the queue, it wakes at once; but after an
+    /// event it looks at the file (`fstat`, `stat`, `open` and `F_GETPATH`
+    /// on the file's volume) and calls `on_change`, and on a hung network
+    /// volume a look can block for tens of seconds. The app drops a
+    /// document on the main thread (p1-review conc-4), so it doesn't wait
+    /// that long: the thread is left to stop by itself. It owns what it
+    /// uses (the shared state, its queue and `on_change`), and stops as
+    /// soon as the look returns and it sees the stop.
     fn drop(&mut self) {
         let thread = self
             .thread
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let (Some(thread), Some(queue)) = (thread, &self.shared.queue)
-            && queue.trigger(STOP).is_ok()
-        {
-            // It wakes at once: it only ever waits on the queue.
+        let (Some(thread), Some(queue)) = (thread, &self.shared.queue) else {
+            return;
+        };
+        if queue.trigger(STOP).is_err() {
+            // The queue failed, so the thread has stopped or will at its
+            // next wait.
+            return;
+        }
+        let stopped = self
+            .shared
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (stopped, _) = self
+            .shared
+            .stopping
+            .wait_timeout_while(stopped, STOP_WAIT, |stopped| !*stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        if *stopped {
+            // It has as good as returned: this takes a moment at most.
+            drop(stopped);
             let _ = thread.join();
         }
+        // Otherwise dropping the handle detaches the thread.
+    }
+}
+
+/// How long dropping an [`Original`] waits for its watching thread to stop
+/// before leaving it to stop by itself. Long enough for a thread waiting on
+/// its queue, which stops at once, so in the usual case the thread and its
+/// descriptors are gone when `drop` returns; short enough not to be seen.
+const STOP_WAIT: Duration = Duration::from_millis(50);
+
+/// Marks the watching thread stopped when dropped: as it returns, or if
+/// `on_change` panics.
+struct Stopped<'a>(&'a Shared);
+
+impl Drop for Stopped<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        self.0.stopping.notify_all();
     }
 }
 

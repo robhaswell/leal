@@ -1105,9 +1105,14 @@ impl Document {
     /// document works without them, and
     /// [`check_original`](Self::check_original) still notices changes.
     pub fn watch_original(&self, on_change: OriginalCallback) -> std::io::Result<()> {
-        let source = Arc::clone(&self.source);
+        // Weak: dropping the document mustn't wait for the watching thread
+        // (it may be in a slow look at the file), and the thread mustn't
+        // keep the file's clone or copy alive once the document is gone.
+        let source = Arc::downgrade(&self.source);
         self.original.watch(move |status| {
-            if status.written {
+            if status.written
+                && let Some(source) = source.upgrade()
+            {
                 source.note_original_written();
             }
             on_change(status);

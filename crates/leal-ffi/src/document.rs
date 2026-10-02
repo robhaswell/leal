@@ -49,11 +49,19 @@ impl Scheduler {
     /// one, with each thread's QoS set and `os_signpost` intervals for
     /// every job.
     ///
+    /// The app makes its one scheduler as it starts, so this also raises
+    /// the process's open-file limit from the Finder's 256
+    /// (`platform::raise_open_file_limit`):
+    /// each open document holds a few descriptors.
+    ///
     /// # Errors
     ///
     /// [`LealError::Internal`] if the threads can't be started.
     #[uniffi::constructor]
     pub fn new() -> Result<Arc<Self>, LealError> {
+        // If it can't be raised, opening many documents fails later with
+        // "too many open files", and watching says so.
+        let _ = crate::platform::raise_open_file_limit();
         let config = SchedulerConfig {
             platform: Arc::new(MacPlatform),
             ..SchedulerConfig::default()

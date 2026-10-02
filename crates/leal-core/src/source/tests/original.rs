@@ -6,7 +6,7 @@ use super::*;
 use std::fs::OpenOptions as FsOpenOptions;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt as _;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 /// How long a test waits for the watcher to notice something.
@@ -323,6 +323,60 @@ fn watching_twice_is_harmless() {
     original.watch(|_| {}).unwrap();
     write_in_place(&path, b"z");
     wait_for(&reports, "the write", state(OriginalState::Changed));
+}
+
+/// The watching thread may be busy after an event: looking at the file
+/// (which can block on a hung network volume) or in `on_change`. Dropping
+/// the `Original`, which the app does on the main thread, doesn't wait for
+/// it (p1-review conc-4); the thread stops by itself once it is done.
+#[test]
+fn dropping_doesnt_wait_for_a_busy_watching_thread() {
+    let dir = TempDir::new("original");
+    let path = dir.file("a.csv", b"a,b\n");
+    let original = Original::new(&path, identity(&path));
+    let (busy_tx, busy) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    original
+        .watch(move |_| {
+            let _ = busy_tx.send(());
+            // Busy, as a look blocked on a hung volume would be.
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        })
+        .unwrap();
+    write_in_place(&path, b"z");
+    busy.recv_timeout(NOTICE).unwrap();
+    let start = Instant::now();
+    drop(original);
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(1), "dropping waited {took:?}");
+    release.send(()).unwrap();
+}
+
+/// When the kernel won't make an event queue (as when the process is out
+/// of descriptors, p1-review conc-6), watching fails and says why, rather
+/// than leaving the document unwatched without a word.
+#[test]
+fn watching_without_an_event_queue_says_why() {
+    let dir = TempDir::new("original");
+    let path = dir.file("a.csv", b"a,b\n");
+    let original = Original::without_queue(
+        &path,
+        identity(&path),
+        io::Error::from_raw_os_error(libc::EMFILE),
+    );
+    let error = original.watch(|_| {}).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("event queue") && message.contains("Too many open files"),
+        "{message}"
+    );
+    // A look still works.
+    write_in_place(&path, b"z");
+    assert_eq!(original.check().state, OriginalState::Changed);
 }
 
 // ---------------------------------------------------------------------------
