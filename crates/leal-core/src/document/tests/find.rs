@@ -854,7 +854,7 @@ fn removable_copy(
     let scheduler = scheduler_with(Arc::clone(gate));
     let source = Source::open_simulating_removable(path, &dir.temp(), chunk_len).unwrap();
     let (document, _) = Document::from_source(source, &scheduler, options(5), None).unwrap();
-    let source = Arc::clone(&document.source);
+    let source = document.source();
     let job = document.copy_cells(1..usize::MAX, 0..3);
     assert_eq!(job.control().wait_timeout(Duration::from_millis(50)), None);
     (document, source, job)

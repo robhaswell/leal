@@ -14,7 +14,7 @@ use crate::diagnostics::Mark;
 use crate::edit::{
     COLUMN_LIMIT, CellChange, Command, Edit, EditError, Lineage, Overlay, Replay, RowEdits,
 };
-use crate::index::{RowIndex, Status};
+use crate::index::Status;
 use crate::rows::{ParsedRow, RowParser};
 use crate::source::{ReadError, Storage};
 
@@ -188,7 +188,7 @@ impl Document {
     pub fn can_edit(&self, row: usize, column: usize) -> Result<(), EditError> {
         let reading = self.current();
         let overlay = reading.edits.overlay();
-        let work = self.work(&reading, &overlay, row)?;
+        let work = Self::work(&reading, &overlay, row)?;
         check_column(&work, row, column)?;
         if let Some(quote) = open_quote(&work)
             && column > quote
@@ -249,10 +249,10 @@ impl Document {
     /// has, if it ever does.
     #[must_use]
     pub fn edit_conflicts(&self) -> Vec<(usize, usize)> {
-        if !self.head_is_stale() {
+        let reading = self.current();
+        if !reading.head_is_stale() {
             return Vec::new();
         }
-        let reading = self.current();
         let overlay = reading.edits.overlay();
         let mut cells = Vec::new();
         for (row, edits) in overlay.all() {
@@ -260,7 +260,7 @@ impl Document {
                 continue;
             };
             let same = matches!(
-                self.row_bytes(&reading, row),
+                Self::row_bytes(&reading, row),
                 Ok(Some(RowBytes { bytes, .. })) if hash_of(&bytes) == hash
             );
             if !same {
@@ -293,7 +293,7 @@ impl Document {
         for target in targets {
             let Target { row, column, .. } = *target;
             if let Entry::Vacant(entry) = rows.entry(row) {
-                entry.insert(self.work(&reading, &overlay, row)?);
+                entry.insert(Self::work(&reading, &overlay, row)?);
             }
             let Some(work) = rows.get_mut(&row) else {
                 continue;
@@ -367,21 +367,19 @@ impl Document {
 
     /// Row `row`, read for a change.
     fn work<'b>(
-        &'b self,
         reading: &'b Reading,
         overlay: &Overlay,
         row: usize,
     ) -> Result<Work<'b>, EditError> {
         // As `Reading::rows_from` decides it.
-        let from_head = !self.head_is_stale() && reading.index.row_count() < reading.head_rows;
-        let Some(RowBytes { bytes, base, index }) = self
-            .row_bytes(reading, row)
-            .map_err(|error| EditError::Read { row, error })?
+        let from_head = !reading.head_is_stale() && reading.index.row_count() < reading.head_rows;
+        let Some(RowBytes { bytes, base, index }) =
+            Self::row_bytes(reading, row).map_err(|error| EditError::Read { row, error })?
         else {
-            return Err(self.missing_row(&reading.index, row));
+            return Err(missing_row(reading, row));
         };
         let Some(parsed) = reading.parser.parse_row_in(index, row, &bytes, base) else {
-            return Err(self.missing_row(&reading.index, row));
+            return Err(missing_row(reading, row));
         };
         let previous = overlay.row_arc(row).cloned();
         let cells = previous
@@ -504,28 +502,26 @@ fn row_edits(
     Some(RowEdits::new(fields, work.cells, flagged, head_hash))
 }
 
-impl Document {
-    /// Why row `row` can't be edited: it isn't there (the index is
-    /// complete without it); it can't be read, because the file changed
-    /// while it was read or was deleted on its share, so the row will never
-    /// come; or it hasn't been read yet (the index hasn't reached it, or
-    /// stopped before it: its drive may come back).
-    fn missing_row(&self, index: &RowIndex, row: usize) -> EditError {
-        if index.status() == Status::Complete {
-            EditError::NoSuchRow { row }
-        } else if self.source.changed_on_disk() {
-            EditError::Read {
-                row,
-                error: ReadError::changed_on_disk(),
-            }
-        } else if self.source.storage() == Storage::Deleted {
-            EditError::Read {
-                row,
-                error: ReadError::already_deleted(),
-            }
-        } else {
-            EditError::NotReadYet { row }
+/// Why row `row` can't be edited: it isn't there (the index is complete
+/// without it); it can't be read, because the file changed while it was
+/// read or was deleted on its share, so the row will never come; or it
+/// hasn't been read yet (the index hasn't reached it, or stopped before it:
+/// its drive may come back).
+fn missing_row(reading: &Reading, row: usize) -> EditError {
+    if reading.index.status() == Status::Complete {
+        EditError::NoSuchRow { row }
+    } else if reading.source.changed_on_disk() {
+        EditError::Read {
+            row,
+            error: ReadError::changed_on_disk(),
         }
+    } else if reading.source.storage() == Storage::Deleted {
+        EditError::Read {
+            row,
+            error: ReadError::already_deleted(),
+        }
+    } else {
+        EditError::NotReadYet { row }
     }
 }
 

@@ -151,7 +151,7 @@ impl Document {
     ) -> Result<Option<String>, ReadError> {
         let reading = self.current();
         let edits = reading.edits.overlay();
-        let stale = self.head_is_stale();
+        let stale = reading.head_is_stale();
         let (index, available) = reading.rows_from(&reading.index, stale);
         let settled = matches!(
             index_ended(&reading.index, reading.index_job.control()),
@@ -166,7 +166,7 @@ impl Document {
             append_rows(
                 &reading,
                 index,
-                (&self.source, &self.head, stale),
+                (&reading.source, &reading.head, stale),
                 &edits,
                 rows.start..end,
                 rows.start,
@@ -206,7 +206,7 @@ impl Document {
         } else {
             0
         };
-        let rest = usize::try_from(self.source.len())
+        let rest = usize::try_from(reading.source.len())
             .unwrap_or(usize::MAX)
             .saturating_sub(scanned);
         let unknown = match rows.end.saturating_sub(indexed.max(rows.start)) {
@@ -250,8 +250,8 @@ impl Document {
         let reading = self.current();
         // The edits when the copy is made: later ones don't change it.
         let edits = reading.edits.overlay();
-        let source = Arc::clone(&self.source);
-        let head = Arc::clone(&self.head);
+        let source = Arc::clone(&reading.source);
+        let head = Arc::clone(&reading.head);
         let scheduler = self.scheduler.clone();
         // Kept between the job's turns.
         let mut out = String::new();

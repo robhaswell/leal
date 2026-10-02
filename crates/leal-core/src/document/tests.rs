@@ -1871,18 +1871,21 @@ fn after_a_change_while_reading_no_reader_uses_the_stale_first_64_kb() {
     .unwrap();
     let gate = Gate::closed();
     let scheduler = scheduler_with(Arc::clone(&gate));
-    let (mut document, screen) =
-        Document::from_source(source, &scheduler, options(30), None).unwrap();
+    let (document, screen) = Document::from_source(source, &scheduler, options(30), None).unwrap();
     // The first 64 KB as an older version of the file had them: the same
     // size, but row 1's name is different and row 2 has no NUL.
-    let mut old = document.head.to_vec();
-    let replace = |old: &mut Vec<u8>, from: &[u8], to: &[u8]| {
-        let at = old.windows(from.len()).position(|w| w == from).unwrap();
-        old[at..at + from.len()].copy_from_slice(to);
-    };
-    replace(&mut old, b"1,nm1q,x", b"1,OLDO,x");
-    replace(&mut old, b"2,n\0m2q,x", b"2,nXm2q,x");
-    document.head = Arc::from(old);
+    {
+        let mut slot = document.reading.write().unwrap();
+        let reading = Arc::get_mut(&mut slot).expect("only the document holds the reading");
+        let mut old = reading.head.to_vec();
+        let replace = |old: &mut Vec<u8>, from: &[u8], to: &[u8]| {
+            let at = old.windows(from.len()).position(|w| w == from).unwrap();
+            old[at..at + from.len()].copy_from_slice(to);
+        };
+        replace(&mut old, b"1,nm1q,x", b"1,OLDO,x");
+        replace(&mut old, b"2,n\0m2q,x", b"2,nXm2q,x");
+        reading.head = Arc::from(old);
+    }
     // Until the change is found, the kept bytes are trusted.
     assert_eq!(
         text(&document.rows(1..2, 100).unwrap()),

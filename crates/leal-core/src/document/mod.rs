@@ -347,12 +347,7 @@ impl From<ChoiceError> for DocumentError {
 /// rows, and the jobs that fill it. Dropping it cancels its jobs; the
 /// file's clone or copy is deleted once they have stopped.
 pub struct Document {
-    source: Arc<Source>,
     scheduler: Scheduler,
-    /// The first 64 KB, read once at first paint and kept: re-reading the
-    /// file with other choices starts from them, and rows in them can be
-    /// read even if a removable drive vanishes before they were copied.
-    head: Arc<[u8]>,
     progress: Option<ProgressCallback>,
     /// The next reading's generation.
     generations: AtomicU64,
@@ -364,7 +359,11 @@ pub struct Document {
     /// Counts kind searches (`next_with_kind`): a search stops when a
     /// newer one starts.
     searches: AtomicU64,
-    reading: RwLock<Arc<Reading>>,
+    /// The current reading. Shared with the watching thread
+    /// ([`watch_original`](Self::watch_original)), which notes what it sees
+    /// on the reading's source, whichever reading is current then: a save
+    /// replaces the source (task 2.2).
+    reading: Arc<RwLock<Arc<Reading>>>,
     /// The user's file, watched for changes made elsewhere (task 1.9).
     original: Original,
 }
@@ -372,6 +371,14 @@ pub struct Document {
 /// One reading of the file: a detection, and the index and jobs built
 /// from it. [`Document::reinterpret`] replaces it.
 struct Reading {
+    /// The file's bytes: the snapshot taken when it was opened, or when
+    /// Leal last saved it (task 2.2).
+    source: Arc<Source>,
+    /// The first 64 KB of `source`, read once at first paint and kept:
+    /// re-reading the file with other choices starts from them, and rows in
+    /// them can be read even if a removable drive vanishes before they were
+    /// copied.
+    head: Arc<[u8]>,
     generation: u64,
     /// The user's choices it was read with, so it can be read again the
     /// same way ([`Document::check_original`] after a drive comes back).
@@ -423,6 +430,7 @@ static NO_REPORT: LazyLock<Arc<Report>> = LazyLock::new(Arc::default);
 /// What the jobs of every reading of a document share.
 struct Context<'a> {
     source: &'a Arc<Source>,
+    head: &'a Arc<[u8]>,
     scheduler: &'a Scheduler,
     progress: Option<&'a ProgressCallback>,
 }
@@ -497,6 +505,7 @@ impl Document {
         drop(first_paint);
         let context = Context {
             source: &source,
+            head: &head,
             scheduler,
             progress: progress.as_ref(),
         };
@@ -507,13 +516,11 @@ impl Document {
         let original = Original::new(source.path(), *source.identity());
         let document = Document {
             scheduler: scheduler.clone(),
-            head,
             progress,
             generations: AtomicU64::new(1),
             writer: Mutex::new(()),
             searches: AtomicU64::new(0),
-            reading: RwLock::new(Arc::new(reading)),
-            source,
+            reading: Arc::new(RwLock::new(Arc::new(reading))),
             original,
         };
         Ok((document, screen))
@@ -550,10 +557,10 @@ impl Document {
     ) -> Result<FirstScreen, DocumentError> {
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let first_paint = self.scheduler.interval(Interval::FirstPaint);
-        let paint = read_first_paint(&self.source, &self.head, choices)?;
-        // Checked after detection, so a change noticed meanwhile counts.
-        self.refuse_once_stale()?;
         let old = self.current();
+        let paint = read_first_paint(&old.source, &old.head, choices)?;
+        // Checked after detection, so a change noticed meanwhile counts.
+        old.refuse_once_stale()?;
         let edits = edits_after(&old, &paint.detection)?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let options = OpenOptions {
@@ -562,8 +569,8 @@ impl Document {
             max_chars,
         };
         let screen = first_screen(
-            &self.head,
-            self.source.len(),
+            &old.head,
+            old.source.len(),
             generation,
             &paint,
             options,
@@ -574,7 +581,8 @@ impl Document {
         // at a time, so the new index waits for the old one to stop.
         old.cancel();
         let context = Context {
-            source: &self.source,
+            source: &old.source,
+            head: &old.head,
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
@@ -590,31 +598,22 @@ impl Document {
     fn restart(&self) -> Result<u64, DocumentError> {
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let old = self.current();
-        let paint = read_first_paint(&self.source, &self.head, old.choices)?;
-        self.refuse_once_stale()?;
+        let paint = read_first_paint(&old.source, &old.head, old.choices)?;
+        old.refuse_once_stale()?;
         // The same choices on the same bytes split the file the same way,
         // so the edits carry on (ADR-0008 decision 4).
         let edits = edits_after(&old, &paint.detection)?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         old.cancel();
         let context = Context {
-            source: &self.source,
+            source: &old.source,
+            head: &old.head,
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
         let reading = start_jobs(&context, generation, paint, old.choices, edits);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reading);
         Ok(generation)
-    }
-
-    /// [`reinterpret`](Self::reinterpret)'s and `restart`'s refusal once
-    /// the first 64 KB kept in memory can't be trusted.
-    fn refuse_once_stale(&self) -> Result<(), DocumentError> {
-        if self.head_is_stale() {
-            Err(DocumentError::Read(ReadError::changed_on_disk()))
-        } else {
-            Ok(())
-        }
     }
 
     /// Rows `rows` (as many of them as can be read now), each as its
@@ -681,7 +680,7 @@ impl Document {
     #[must_use]
     pub fn column_count(&self) -> usize {
         let reading = self.current();
-        self.rows_index(&reading).0.field_count_mode().unwrap_or(0)
+        Self::rows_index(&reading).0.field_count_mode().unwrap_or(0)
     }
 
     /// Which columns hold numbers, from the first `sample` rows after the
@@ -714,25 +713,24 @@ impl Document {
         rows: Range<usize>,
         each: impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
-        self.read_rows_of(&self.current(), rows, each)
+        Self::read_rows_of(&self.current(), rows, each)
     }
 
     /// [`read_rows`](Self::read_rows), in a given reading.
     fn read_rows_of<T>(
-        &self,
         reading: &Reading,
         rows: Range<usize>,
         mut each: impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
         // One look, so the rows and their bytes agree on whether the first
         // 64 KB can be trusted.
-        let stale = self.head_is_stale();
+        let stale = reading.head_is_stale();
         let (index, available) = reading.rows_from(&reading.index, stale);
         let rows = rows.start..rows.end.min(available);
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok(Vec::new());
         };
-        let bytes = self.bytes_of(extent.clone(), stale)?;
+        let bytes = reading.bytes_of(extent.clone(), stale)?;
         let base = extent.start;
         // The cache is locked only to find (or parse) the rows, never while
         // `each` runs: `each` may decode whole values, megabytes long for
@@ -771,36 +769,21 @@ impl Document {
     /// read ([`changed_on_disk`](Self::changed_on_disk)), only the index's.
     #[must_use]
     pub fn row_count(&self) -> usize {
-        self.rows_index(&self.current()).1
+        Self::rows_index(&self.current()).1
     }
 
     /// The index rows are read from, and how many rows it has
     /// ([`Reading::rows_from`] the reading's index).
-    fn rows_index<'r>(&self, reading: &'r Reading) -> (&'r RowIndex, usize) {
-        reading.rows_from(&reading.index, self.head_is_stale())
-    }
-
-    /// The bytes of `extent` ([`bytes_in`]), with the first 64 KB trusted
-    /// unless `head_stale`.
-    fn bytes_of(&self, extent: Range<usize>, head_stale: bool) -> Result<Cow<'_, [u8]>, ReadError> {
-        Ok(bytes_in(&self.source, &self.head, extent, head_stale)?.0)
-    }
-
-    /// Whether the first 64 KB kept in memory may be a different version
-    /// from the rest (task 1.9). The file changed while it was read without
-    /// a snapshot: first paint read the 64 KB before the copy began, and a
-    /// change that kept the size and modification time could have come in
-    /// between, so from then on rows come only from the index pass's copy,
-    /// whose every chunk was checked before it was kept.
-    fn head_is_stale(&self) -> bool {
-        self.source.changed_on_disk()
+    fn rows_index(reading: &Reading) -> (&RowIndex, usize) {
+        reading.rows_from(&reading.index, reading.head_is_stale())
     }
 
     /// The row count to size the scrollbar with while indexing (DESIGN
     /// §3.10 rule 5): exact once indexing is complete.
     #[must_use]
     pub fn estimated_row_count(&self) -> usize {
-        estimated_rows(&self.current(), &self.head, self.source.len())
+        let reading = self.current();
+        estimated_rows(&reading, &reading.head, reading.source.len())
     }
 
     /// Where indexing has got to.
@@ -810,10 +793,10 @@ impl Document {
         let index = &reading.index;
         IndexProgress {
             generation: reading.generation,
-            rows: self.rows_index(&reading).1,
-            estimated_rows: estimated_rows(&reading, &self.head, self.source.len()),
+            rows: Self::rows_index(&reading).1,
+            estimated_rows: estimated_rows(&reading, &reading.head, reading.source.len()),
             bytes_scanned: u64::try_from(index.bytes_scanned()).unwrap_or(u64::MAX),
-            bytes_total: self.source.len(),
+            bytes_total: reading.source.len(),
             complete: index.status() == Status::Complete,
         }
     }
@@ -843,10 +826,11 @@ impl Document {
         self.current().review_job.clone()
     }
 
-    /// The file's bytes.
+    /// The file's bytes: the snapshot the current reading reads, which a
+    /// save replaces with one of the file it wrote (task 2.2).
     #[must_use]
-    pub fn source(&self) -> &Source {
-        &self.source
+    pub fn source(&self) -> Arc<Source> {
+        Arc::clone(&self.current().source)
     }
 
     /// Where the file's bytes are held ([`Source::storage`]): for a file on
@@ -854,7 +838,7 @@ impl Document {
     /// [`Storage::Copy`] when the index pass has copied it.
     #[must_use]
     pub fn storage(&self) -> Storage {
-        self.source.storage()
+        self.current().source.storage()
     }
 
     /// What the index pass has found wrong with the file so far
@@ -890,7 +874,7 @@ impl Document {
         let overlay = reading.edits.overlay();
         if let Some(edits) = overlay.row(row) {
             let (marked, mode) = diagnostics.marked_rows_and_mode();
-            let len = self.edited_len(&reading, row, edits);
+            let len = Self::edited_len(&reading, row, edits);
             return row < marked && edited_flags(len, edits, mode).marked;
         }
         diagnostics.row_has_diagnostic(row)
@@ -915,7 +899,7 @@ impl Document {
             let next = diagnostics.next_row_with_diagnostic(at);
             let end = next.map_or(marked, |row| row + 1).min(marked);
             if let Some((row, _)) = overlay.rows_in(at..end).find(|&(row, edits)| {
-                edited_flags(self.edited_len(&reading, row, edits), edits, mode).marked
+                edited_flags(Self::edited_len(&reading, row, edits), edits, mode).marked
             }) {
                 return Some(row);
             }
@@ -947,7 +931,7 @@ impl Document {
                     .rows_in(start..at.min(marked))
                     .rev()
                     .find(|&(row, edits)| {
-                        edited_flags(self.edited_len(&reading, row, edits), edits, mode).marked
+                        edited_flags(Self::edited_len(&reading, row, edits), edits, mode).marked
                     })
             {
                 return Some(row);
@@ -977,7 +961,7 @@ impl Document {
         if !overlay.is_empty() {
             let (marked, mode) = diagnostics.marked_rows_and_mode();
             for (row, edits) in overlay.rows_in(rows.start..rows.end.min(marked)) {
-                let len = self.edited_len(&reading, row, edits);
+                let len = Self::edited_len(&reading, row, edits);
                 flags[row - rows.start] = edited_flags(len, edits, mode);
             }
         }
@@ -1057,7 +1041,7 @@ impl Document {
         let (marked, mode) = diagnostics.marked_rows_and_mode();
         let has = |row: usize, edits: &RowEdits| match kind {
             DiagnosticKind::RaggedRows => {
-                mode.is_some_and(|mode| self.edited_len(&reading, row, edits) != mode)
+                mode.is_some_and(|mode| Self::edited_len(&reading, row, edits) != mode)
             }
             other => edits.kinds().contains(Kinds::of(other)),
         };
@@ -1079,7 +1063,7 @@ impl Document {
                     .find(|&(row, edits)| has(row, edits))
             };
             if let Some((row, _)) = edited {
-                return self.place(&reading, kind, row);
+                return Self::place(&reading, kind, row);
             }
             let Some(place) = found else {
                 return Ok(None);
@@ -1136,19 +1120,19 @@ impl Document {
 
         // 1. The report's locations.
         if settled && let Some(row) = listed_row(report, kind, start, direction) {
-            return self.place(reading, kind, row);
+            return Self::place(reading, kind, row);
         }
 
         // 2. The bytes.
         let encoding = reading.detection.encoding;
         if direction == Direction::Forward
-            && let Some(bytes) = self.source.as_slice()
+            && let Some(bytes) = reading.source.as_slice()
             && let Some(extent) = reading.index.row_extent(start)
         {
             match next_hit(kind, encoding, bytes, extent.start, bytes.len(), &stopped) {
                 Hit::At(offset) => match reading.index.row_at_offset(offset) {
                     Some(row) if diagnostics.row_is(row, Mark::Flagged) => {
-                        return self.place(reading, kind, row);
+                        return Self::place(reading, kind, row);
                     }
                     // Past the rows indexed so far: none before it.
                     None => return Ok(None),
@@ -1181,8 +1165,8 @@ impl Document {
                 return Ok(None);
             };
             for row in rows {
-                if alone || self.row_has(reading, kind, row)? {
-                    return self.place(reading, kind, row);
+                if alone || Self::row_has(reading, kind, row)? {
+                    return Self::place(reading, kind, row);
                 }
             }
             // `rows_where` looks before `at` going backward.
@@ -1193,11 +1177,10 @@ impl Document {
     /// The bytes of row `row`, line ending included, from whichever index
     /// holds it ([`rows_index`](Self::rows_index)), without the row cache.
     fn row_bytes<'r>(
-        &self,
         reading: &'r Reading,
         row: usize,
-    ) -> Result<Option<RowBytes<'_, 'r>>, ReadError> {
-        let stale = self.head_is_stale();
+    ) -> Result<Option<RowBytes<'r, 'r>>, ReadError> {
+        let stale = reading.head_is_stale();
         let (index, available) = reading.rows_from(&reading.index, stale);
         if row >= available {
             return Ok(None);
@@ -1205,7 +1188,7 @@ impl Document {
         let Some(extent) = index.row_extent(row) else {
             return Ok(None);
         };
-        let bytes = self.bytes_of(extent.clone(), stale)?;
+        let bytes = reading.bytes_of(extent.clone(), stale)?;
         Ok(Some(RowBytes {
             bytes,
             base: extent.start,
@@ -1214,13 +1197,8 @@ impl Document {
     }
 
     /// Whether row `row` has an occurrence of the field-level `kind`.
-    fn row_has(
-        &self,
-        reading: &Reading,
-        kind: DiagnosticKind,
-        row: usize,
-    ) -> Result<bool, ReadError> {
-        let Some(RowBytes { bytes, base, index }) = self.row_bytes(reading, row)? else {
+    fn row_has(reading: &Reading, kind: DiagnosticKind, row: usize) -> Result<bool, ReadError> {
+        let Some(RowBytes { bytes, base, index }) = Self::row_bytes(reading, row)? else {
             return Ok(false);
         };
         let encoding = reading.detection.encoding;
@@ -1241,13 +1219,12 @@ impl Document {
     /// first extra one (a long row); otherwise the first cell with the
     /// kind. An edited row is looked at as it reads now.
     fn place(
-        &self,
         reading: &Reading,
         kind: DiagnosticKind,
         row: usize,
     ) -> Result<Option<Place>, ReadError> {
         let overlay = reading.edits.overlay();
-        let column = match self.row_bytes(reading, row)? {
+        let column = match Self::row_bytes(reading, row)? {
             Some(RowBytes { bytes, base, index }) => reading
                 .parser
                 .parse_row_in(index, row, &bytes, base)
@@ -1279,7 +1256,8 @@ impl Document {
     /// asks first (phase 2, from [`OriginalStatus::diverged`]).
     #[must_use]
     pub fn can_save(&self) -> bool {
-        self.source.can_save() && self.original.status().state != OriginalState::Unavailable
+        self.current().source.can_save()
+            && self.original.status().state != OriginalState::Unavailable
     }
 
     /// The user's file as last seen (task 1.9): unchanged, changed,
@@ -1306,13 +1284,21 @@ impl Document {
         // Weak: dropping the document mustn't wait for the watching thread
         // (it may be in a slow look at the file), and the thread mustn't
         // keep the file's clone or copy alive once the document is gone.
-        let source = Arc::downgrade(&self.source);
+        // The current reading's source, whichever reading that is then: a
+        // save replaces it (task 2.2).
+        let reading = Arc::downgrade(&self.reading);
         // The thread gets its quality of service from the platform, as the
         // scheduler's own threads do (`ThreadClass::Watcher`).
         let platform = self.scheduler.platform();
         let started = move || platform.thread_started(ThreadClass::Watcher);
         self.original.watch_on(started, move |status| {
-            if let Some(source) = source.upgrade() {
+            if let Some(reading) = reading.upgrade() {
+                let source = Arc::clone(
+                    &reading
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .source,
+                );
                 source.note_original_path(&status.path);
                 if changes_what_is_read(&source, status) {
                     source.note_original_written();
@@ -1338,11 +1324,12 @@ impl Document {
     /// call it off the main thread.
     pub fn check_original(&self) -> OriginalStatus {
         // It looks at the file: never on the main thread for a share.
-        self.source.note_share_use();
+        let source = self.source();
+        source.note_share_use();
         let status = self.original.check();
-        self.source.note_original_path(&status.path);
-        if changes_what_is_read(&self.source, &status) {
-            self.source.note_original_written();
+        source.note_original_path(&status.path);
+        if changes_what_is_read(&source, &status) {
+            source.note_original_written();
         }
         let back = matches!(
             status.state,
@@ -1350,8 +1337,8 @@ impl Document {
         );
         if back
             && !status.diverged
-            && self.source.storage() == Storage::Disconnected
-            && self.source.reconnect(&status.path)
+            && source.storage() == Storage::Disconnected
+            && source.reconnect(&status.path)
         {
             // Detection already succeeded with these choices on these
             // bytes, so this can't fail; if it did, the source stays
@@ -1365,7 +1352,7 @@ impl Document {
     /// ([`Source::changed_on_disk`]): the rows held may mix two versions.
     #[must_use]
     pub fn changed_on_disk(&self) -> bool {
-        self.source.changed_on_disk()
+        self.current().source.changed_on_disk()
     }
 
     /// The current reading. A clone of the `Arc`, so the lock is held only
@@ -1385,9 +1372,9 @@ impl Drop for Document {
         // own, as the source's file is (task 2.0 review): closing a file on
         // a share that has stopped answering can block, and the app may let
         // go of a document anywhere.
-        if self.source.is_on_network_share() {
-            self.original
-                .close_on_own_thread(self.source.share_close_hook());
+        let source = self.source();
+        if source.is_on_network_share() {
+            self.original.close_on_own_thread(source.share_close_hook());
         }
     }
 }
@@ -1395,13 +1382,39 @@ impl Drop for Document {
 impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Document")
-            .field("source", &self.source)
+            .field("source", &self.current().source)
             .field("progress", &self.progress())
             .finish_non_exhaustive()
     }
 }
 
 impl Reading {
+    /// Whether the first 64 KB kept in memory may be a different version
+    /// from the rest (task 1.9). The file changed while it was read without
+    /// a snapshot: first paint read the 64 KB before the copy began, and a
+    /// change that kept the size and modification time could have come in
+    /// between, so from then on rows come only from the index pass's copy,
+    /// whose every chunk was checked before it was kept.
+    fn head_is_stale(&self) -> bool {
+        self.source.changed_on_disk()
+    }
+
+    /// [`Document::reinterpret`]'s and `restart`'s refusal once the first
+    /// 64 KB kept in memory can't be trusted.
+    fn refuse_once_stale(&self) -> Result<(), DocumentError> {
+        if self.head_is_stale() {
+            Err(DocumentError::Read(ReadError::changed_on_disk()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The bytes of `extent` ([`bytes_in`]), with the first 64 KB trusted
+    /// unless `head_stale`.
+    fn bytes_of(&self, extent: Range<usize>, head_stale: bool) -> Result<Cow<'_, [u8]>, ReadError> {
+        Ok(bytes_in(&self.source, &self.head, extent, head_stale)?.0)
+    }
+
     /// The index rows are read from, and how many rows it has: `index`
     /// (the reading's own, or a copy job's) or the first 64 KB's, whichever
     /// covers more of the file's first rows (both cover a prefix), except
@@ -1573,6 +1586,8 @@ fn start_jobs(
     );
     let review_job = start_checks(context, &index_job, &detection);
     Reading {
+        source: Arc::clone(context.source),
+        head: Arc::clone(context.head),
         generation,
         choices,
         detection,
@@ -1758,11 +1773,11 @@ impl Document {
     /// of the row now, so no row is read. Once they are stale, the row is
     /// read from the trusted copy (it may not be there: then the kept
     /// count).
-    fn edited_len(&self, reading: &Reading, row: usize, edits: &RowEdits) -> usize {
-        if !self.head_is_stale() {
+    fn edited_len(reading: &Reading, row: usize, edits: &RowEdits) -> usize {
+        if !reading.head_is_stale() {
             return edits.len();
         }
-        self.read_rows_of(reading, row..row + 1, |view| view.len())
+        Self::read_rows_of(reading, row..row + 1, |view| view.len())
             .ok()
             .and_then(|lens| lens.first().copied())
             .unwrap_or_else(|| edits.len())

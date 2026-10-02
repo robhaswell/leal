@@ -282,9 +282,9 @@ impl Document {
         // A search starts from the edits as they are when it starts.
         let synced = reading.edits.version();
         let state = Arc::new(SearchState {
+            source: Arc::clone(&reading.source),
+            head: Arc::clone(&reading.head),
             reading,
-            source: Arc::clone(&self.source),
-            head: Arc::clone(&self.head),
             matcher,
             first_row,
             found: Mutex::new(Found {

@@ -170,6 +170,9 @@ pub struct Source {
     /// The size of [`stream`](Self::stream)'s chunks:
     /// [`STREAM_CHUNK_BYTES`], except in tests.
     chunk_len: usize,
+    /// Where this snapshot's temporary folders went: a save takes the
+    /// snapshot of the file it wrote there too (task 2.2).
+    folders: TempFolders,
 }
 
 /// Where a [`Source`]'s bytes are held.
@@ -593,6 +596,7 @@ impl Source {
             attributes,
             identity,
             chunk_len: options.chunk_len.max(1),
+            folders: temp.clone(),
         })
     }
 
@@ -992,6 +996,12 @@ impl Source {
     #[must_use]
     pub fn identity(&self) -> &FileIdentity {
         &self.identity
+    }
+
+    /// The temporary folders the snapshot was made in.
+    #[must_use]
+    pub fn temp_folders(&self) -> &TempFolders {
+        &self.folders
     }
 
     /// The clone on the removable drive, while there is one.
