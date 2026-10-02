@@ -472,9 +472,16 @@ impl Diagnostics {
     ) {
         let done = report.is_complete();
         let report = Arc::new(report);
-        let mut shared = self.shared.write().unwrap_or_else(PoisonError::into_inner);
-        shared.report = report;
-        shared.marks.extend(codes, wide, mode, done);
+        // Any copy the marks need to grow (or shrink, once done) is made
+        // under the read lock, so the write lock is held only for the swap
+        // (`growth`, phase 1 review app-10). The old lists are dropped
+        // after it is released.
+        let room = self.read().marks.room(codes.len(), wide.len(), done);
+        let _old = {
+            let mut shared = self.shared.write().unwrap_or_else(PoisonError::into_inner);
+            shared.report = report;
+            shared.marks.extend(room, codes, wide, mode, done)
+        };
     }
 
     /// How many bytes the row marks hold room for, for tests.

@@ -65,25 +65,55 @@ pub(crate) struct RowMarks {
     mode: Option<usize>,
 }
 
+/// Copies of a [`RowMarks`]' lists with the room the next rows need, made
+/// before the write lock is taken ([`RowMarks::room`]); or the old lists
+/// [`RowMarks::extend`] gives back.
+#[derive(Debug, Default)]
+pub(crate) struct MarksRoom {
+    codes: Option<Vec<u8>>,
+    wide: Option<Vec<(u32, u32)>>,
+}
+
 impl RowMarks {
+    /// The copies the lists need to take `codes` more codes and `wide`
+    /// more wide rows ([`growth::room`](crate::growth::room)), made by the
+    /// caller under the read lock, before it takes the write lock for
+    /// [`extend`](Self::extend).
+    pub(crate) fn room(&self, codes: usize, wide: usize, done: bool) -> MarksRoom {
+        MarksRoom {
+            codes: crate::growth::room(&self.codes, self.codes.capacity(), codes, done),
+            wide: crate::growth::room(&self.wide, self.wide.capacity(), wide, done),
+        }
+    }
+
     /// Adds the next rows' codes and wide rows (emptying both), and the
-    /// mode as of the last of them. `done` if those are the file's last
-    /// rows: the lists then give back the room they grew into, as the row
-    /// index's offsets do, since no more rows will come.
+    /// mode as of the last of them, into `room` made beforehand
+    /// ([`room`](Self::room); an empty one grows the lists in place).
+    /// `done` if those are the file's last rows: the lists then give back
+    /// the room they grew into, as the row index's offsets do, since no
+    /// more rows will come. Returns the old lists, for the caller to drop
+    /// once it has released its lock.
     pub(crate) fn extend(
         &mut self,
+        room: MarksRoom,
         codes: &mut Vec<u8>,
         wide: &mut Vec<(u32, u32)>,
         mode: Option<usize>,
         done: bool,
-    ) {
+    ) -> MarksRoom {
+        let old = MarksRoom {
+            codes: crate::growth::swap_in(&mut self.codes, room.codes),
+            wide: crate::growth::swap_in(&mut self.wide, room.wide),
+        };
         self.codes.append(codes);
         self.wide.append(wide);
         self.mode = mode;
         if done {
+            // Only if an exact copy couldn't go in: a no-op otherwise.
             self.codes.shrink_to_fit();
             self.wide.shrink_to_fit();
         }
+        old
     }
 
     /// How many bytes the lists hold room for, for tests.

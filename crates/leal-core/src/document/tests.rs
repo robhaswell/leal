@@ -62,6 +62,8 @@ struct Gate {
     closed: Mutex<bool>,
     opened: Condvar,
     intervals: Mutex<Vec<(Interval, u64, bool)>>,
+    /// The threads set up through it, with their names.
+    threads: Mutex<Vec<(ThreadClass, Option<String>)>>,
 }
 
 impl Gate {
@@ -83,6 +85,8 @@ impl Gate {
 
 impl Platform for Gate {
     fn thread_started(&self, class: ThreadClass) {
+        let name = std::thread::current().name().map(str::to_owned);
+        self.threads.lock().unwrap().push((class, name));
         if class == ThreadClass::Index {
             let mut closed = self.closed.lock().unwrap();
             while *closed {
@@ -1548,6 +1552,39 @@ fn watch(document: &Document) -> mpsc::Receiver<OriginalStatus> {
         }))
         .unwrap();
     receive
+}
+
+/// The file watcher's thread is set up through the scheduler's platform,
+/// which gives it its quality of service (phase 1 review, app-10): at the
+/// default one, the main thread waited on it.
+#[test]
+fn the_watcher_thread_is_set_up_by_the_platform() {
+    let dir = Dir::new("watcher-qos");
+    let path = dir.file("a.csv", b"a,b\n1,2\n");
+    let gate = Arc::new(Gate::default());
+    let scheduler = scheduler_with(Arc::clone(&gate));
+    let (document, _) = Document::open(
+        &path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        &scheduler,
+        options(10),
+        None,
+    )
+    .unwrap();
+    let _reports = watch(&document);
+    let deadline = std::time::Instant::now() + LONG;
+    loop {
+        let threads = gate.threads.lock().unwrap().clone();
+        if threads.contains(&(ThreadClass::Watcher, Some("leal-watch".to_owned()))) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no watcher thread set up: {threads:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 #[test]

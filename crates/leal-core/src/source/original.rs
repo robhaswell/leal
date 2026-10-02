@@ -307,6 +307,21 @@ impl Original {
     /// If the kernel wouldn't make an event queue, or the thread couldn't
     /// be started.
     pub fn watch(&self, on_change: impl Fn(&OriginalStatus) + Send + 'static) -> io::Result<()> {
+        self.watch_on(|| {}, on_change)
+    }
+
+    /// [`watch`](Self::watch), calling `started` first on the new thread:
+    /// the document sets its quality of service there, through the
+    /// scheduler's platform.
+    ///
+    /// # Errors
+    ///
+    /// As for [`watch`](Self::watch).
+    pub fn watch_on(
+        &self,
+        started: impl FnOnce() + Send + 'static,
+        on_change: impl Fn(&OriginalStatus) + Send + 'static,
+    ) -> io::Result<()> {
         let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
         if thread.is_some() {
             return Ok(());
@@ -330,6 +345,7 @@ impl Original {
                 .spawn(move || {
                     // Tells `drop` the thread is ending, however it ends.
                     let _stopped = Stopped(&shared);
+                    started();
                     shared.run(&on_change);
                 })?,
         );

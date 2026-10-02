@@ -107,7 +107,7 @@ pub struct MacPlatform;
 impl Platform for MacPlatform {
     fn thread_started(&self, class: ThreadClass) {
         let qos = match class {
-            ThreadClass::Index => QOS_CLASS_USER_INITIATED,
+            ThreadClass::Index | ThreadClass::Watcher => QOS_CLASS_USER_INITIATED,
             ThreadClass::Background => QOS_CLASS_UTILITY,
         };
         set_thread_qos(qos);

@@ -110,6 +110,14 @@ pub enum ThreadClass {
     Index,
     /// A background pool thread (P2 and P3): utility.
     Background,
+    /// A document's file watcher ([`Document::watch_original`]): user
+    /// initiated, as the index. The window reads what it publishes, under
+    /// a lock it holds while it looks at the file, so at the default
+    /// quality of service the main thread waited on a lower one (phase 1
+    /// review, app-10).
+    ///
+    /// [`Document::watch_original`]: crate::document::Document::watch_original
+    Watcher,
 }
 
 /// What an interval of work was, for Instruments.
@@ -402,6 +410,13 @@ impl Scheduler {
         let task = run_job(Arc::clone(&self.shared), state, work);
         after.on_finish(move || scheduler.start(priority, task));
         handle
+    }
+
+    /// The platform the scheduler was made with, for threads the core
+    /// starts outside the scheduler (the file watcher), to set them up as
+    /// it does its own ([`Platform::thread_started`]).
+    pub(crate) fn platform(&self) -> Arc<dyn Platform> {
+        Arc::clone(&self.shared.platform)
     }
 
     /// An interval that isn't a job, such as first paint: it begins now and

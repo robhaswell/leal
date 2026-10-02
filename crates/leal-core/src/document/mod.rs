@@ -79,7 +79,9 @@ use crate::index::{
 use crate::rows::{
     DEFAULT_CACHE_ROWS, FieldSpan, NUMBER_MAX_CHARS, NumericColumns, ParsedRow, RowCache, RowParser,
 };
-use crate::schedule::{Interval, IntervalGuard, Job, JobError, JobHandle, Priority, Scheduler};
+use crate::schedule::{
+    Interval, IntervalGuard, Job, JobError, JobHandle, Priority, Scheduler, ThreadClass,
+};
 use crate::source::{
     OpenError, Original, OriginalState, OriginalStatus, ReadError, ReadErrorKind, Source, Storage,
     TempFolders, VolumeInfo,
@@ -1129,7 +1131,11 @@ impl Document {
         // (it may be in a slow look at the file), and the thread mustn't
         // keep the file's clone or copy alive once the document is gone.
         let source = Arc::downgrade(&self.source);
-        self.original.watch(move |status| {
+        // The thread gets its quality of service from the platform, as the
+        // scheduler's own threads do (`ThreadClass::Watcher`).
+        let platform = self.scheduler.platform();
+        let started = move || platform.thread_started(ThreadClass::Watcher);
+        self.original.watch_on(started, move |status| {
             if status.written
                 && let Some(source) = source.upgrade()
             {

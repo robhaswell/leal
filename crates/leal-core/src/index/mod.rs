@@ -679,9 +679,25 @@ impl RowIndex {
     /// Publishes one chunk's rows: `new_starts` (then emptied) and how far
     /// the scan got. `done` marks the index complete. Then wakes whoever
     /// was waiting for that ([`when_past`](Self::when_past)).
+    ///
+    /// When the offsets need more room (or, once `done`, give back what
+    /// they grew into), the bigger (or exact) copy is made first, under
+    /// the read lock, so the write lock is held only for the swap and the
+    /// new offsets ([`growth`](crate::growth), phase 1 review app-10).
     fn publish(&self, new_starts: &mut Vec<u32>, scan: &scan::Summary, done: bool) -> Progress {
-        let (progress, waiting) = {
+        let room = {
+            let state = self.read();
+            crate::growth::room(
+                &state.starts,
+                state.starts.capacity(),
+                new_starts.len(),
+                done,
+            )
+        };
+        let (progress, waiting, _old) = {
             let mut state = self.write();
+            // Dropped after the lock is released.
+            let old = crate::growth::swap_in(&mut state.starts, room);
             let before = state.starts.len();
             state.starts.extend_from_slice(new_starts);
             new_starts.clear();
@@ -690,6 +706,7 @@ impl RowIndex {
             if done {
                 state.unterminated_quote = scan.unterminated_quote;
                 state.status = Status::Complete;
+                // Only if the exact copy couldn't go in: a no-op otherwise.
                 state.starts.shrink_to_fit();
             }
             let progress = Progress {
@@ -706,7 +723,7 @@ impl RowIndex {
             } else {
                 Waiting::default()
             };
-            (progress, waiting)
+            (progress, waiting, old)
         };
         waiting.wake();
         progress

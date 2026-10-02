@@ -10,6 +10,7 @@ pub mod diagnostics;
 pub mod dialect;
 pub mod document;
 pub mod find;
+mod growth;
 pub mod index;
 pub mod rows;
 pub mod schedule;
