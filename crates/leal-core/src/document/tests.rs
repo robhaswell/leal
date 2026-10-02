@@ -996,6 +996,18 @@ fn cells_reads_a_window_of_columns_with_each_rows_field_count() {
             .iter()
             .all(|r| r.cells.is_empty())
     );
+    // A window starting past a short row's last field (the grid reading
+    // the next block of columns ahead, task 2.0a) gives none of its cells,
+    // and its field count.
+    let short = document.cells(2..3, 3..5, 100).unwrap();
+    assert_eq!(short[0].field_count, 2);
+    assert!(short[0].cells.is_empty());
+    let wide = document.cells(1..5, 32..64, 100).unwrap();
+    assert_eq!(
+        wide.iter().map(|r| r.field_count).collect::<Vec<_>>(),
+        [4, 2, 4, 6]
+    );
+    assert!(wide.iter().all(|r| r.cells.is_empty()));
     // Cells are cut to `max_chars` as for `rows`.
     let cut = document.cells(0..1, 0..1, 0).unwrap();
     assert_eq!(cut[0].cells[0].text, "");

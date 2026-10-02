@@ -609,6 +609,39 @@ final class DocumentTests: XCTestCase {
     }
 
     /// The whole window draws: rows in the grid, titles in the header.
+    /// Task 2.0a re-review, item 1: drawing a file of more than 32 columns
+    /// reads the next block of columns ahead (32 to 63), which a short or
+    /// blank row ends before. The core used to panic on that read, which
+    /// failed the document before any scrolling.
+    func testReadingColumnsPastAShortRowAheadDoesntFailTheDocument() async throws {
+        let header = (0..<40).map { "c\($0)" }.joined(separator: ",")
+        var text = header + "\n"
+        for row in 0..<200 {
+            switch row {
+            case 3: text += "short,row\n"
+            case 7: text += "\n"
+            default: text += (0..<40).map { "r\(row)c\($0)" }.joined(separator: ",") + "\n"
+            }
+        }
+        let document = try open(try file("wide.csv", text))
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let view = try XCTUnwrap(controller.window?.contentView)
+        view.layoutSubtreeIfNeeded()
+        let back = model.readsAheadBack
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        try await waitUntil("the reads ahead are back") { model.readsAheadBack > back && model.readsAheadBack == model.readsAheadStarted }
+        XCTAssertFalse(model.isFailed)
+        // The file's row 3 is the short one; the grid's rows are the file's
+        // less the header row, if one was found.
+        let offset = model.interpretation.header ? 0 : 1
+        XCTAssertEqual(model.cachedCell(row: 3 + offset, column: 35), .missing)
+        XCTAssertEqual(model.cell(row: 4 + offset, column: 35), .text("r4c35", truncated: false))
+        document.close()
+    }
+
     func testTheWindowDrawsTheGrid() throws {
         let url = try file("orders.csv", "order_id,customer\nA-100231,Sable Optics\nA-100232,Loire Provisions\n")
         let document = try open(url)

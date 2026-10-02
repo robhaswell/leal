@@ -620,10 +620,11 @@ impl Document {
     ) -> Result<Vec<RowCells>, ReadError> {
         self.read_rows(rows, |parser, bytes, base, row| {
             let fields = row.fields();
+            // A short row may end before the window starts.
+            let count = fields.len();
+            let start = columns.start.min(count);
             let window = fields
-                .get(
-                    columns.start.min(fields.len())..columns.end.clamp(columns.start, fields.len()),
-                )
+                .get(start..columns.end.clamp(start, count))
                 .unwrap_or_default();
             RowCells {
                 field_count: fields.len(),

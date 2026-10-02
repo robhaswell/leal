@@ -853,6 +853,7 @@ final class DocumentModel: GridDataSource {
     /// How many of the grid's reads ahead have come back, kept or dropped,
     /// for tests.
     var readsAheadBack: Int { tiles.readsAheadBack }
+    var readsAheadStarted: Int { tiles.readsAheadStarted }
 
     // MARK: Columns
 
