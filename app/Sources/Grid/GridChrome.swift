@@ -175,7 +175,14 @@ final class GridGutterView: NSView {
     /// A Shift-click on a row number: the selected rows run to it.
     var onExtend: ((_ row: Int) -> Void)?
 
-    private var numbers: [Int: TextLine] = [:]
+    /// Row numbers, by row: unlike cells' values each is drawn once in a
+    /// while, so they are kept like the cells' lines (task 2.0a: emptying a
+    /// dictionary of 2,000 lines at once cost a frame).
+    private let numbers = LineCache<Int>(capacity: 1_000)
+    /// Lays out the numbers of rows about to scroll into view (task 2.0a).
+    private let ahead = NumberReadAhead()
+    /// The numbers' text, drawn together (task 2.0a).
+    private let glyphs = GlyphBatch()
     /// Selected rows' numbers, in the accent colour.
     private var selectedNumbers: [Int: TextLine] = [:]
     /// How many times it has drawn, for the scroll benchmark.
@@ -202,6 +209,7 @@ final class GridGutterView: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         numbers.removeAll()
+        ahead.reset()
         selectedNumbers.removeAll()
         activeNumber = nil
         needsDisplay = true
@@ -220,7 +228,6 @@ final class GridGutterView: NSView {
         let first = max(0, Int((dirtyRect.minY / rowHeight).rounded(.down)))
         let end = min(loaded, Int((dirtyRect.maxY / rowHeight).rounded(.up)))
         guard first < end else { return }
-        if numbers.count > 2_000 { numbers.removeAll() }
         for row in first..<end {
             let rect = CGRect(x: 0, y: CGFloat(row) * rowHeight, width: bounds.width - 4, height: rowHeight)
             let isActive = row == activeRow
@@ -240,17 +247,25 @@ final class GridGutterView: NSView {
                     selectedNumbers[row] = made
                     return made
                 }()
-            } else if let cached = numbers[row] {
-                line = cached
             } else {
-                line = CellPainter.makeLine(String(row + 1), font: font, color: palette.secondaryText, symbolColor: palette.secondaryText)
-                numbers[row] = line
+                line = numbers.line(for: row) {
+                    CellPainter.makeLine(String(row + 1), font: font, color: palette.secondaryText, symbolColor: palette.secondaryText)
+                }
             }
-            CellPainter.drawText(line, in: rect, font: font, alignment: .trailing, context: context, ellipsisColor: palette.secondaryText)
+            CellPainter.addText(line, in: rect, font: font, alignment: .trailing, to: glyphs, context: context, ellipsisColor: palette.secondaryText)
             if source.rowHasMarker(row) {
                 CellPainter.drawGutterMarker(rowRect: rect, context: context)
             }
         }
+        glyphs.draw(in: context)
+        ahead.update(
+            visible: visibleRect,
+            rowHeight: rowHeight,
+            loaded: loaded,
+            font: GridFonts.gutter,
+            color: palette.secondaryText,
+            numbers: numbers
+        )
     }
 
     override func mouseDown(with event: NSEvent) {

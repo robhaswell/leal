@@ -311,6 +311,7 @@ final class DocumentModel: GridDataSource {
             complete: false
         )
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
+        tiles.makeBackgroundFetch = { [weak self] in self?.backgroundTileReader() }
         applyFirstScreen(screen)
         original = call({ try $0.original() }) ?? original
         isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? false
@@ -760,6 +761,14 @@ final class DocumentModel: GridDataSource {
         }
     }
 
+    func cachedCell(row: Int, column: Int) -> GridCell? {
+        tiles.cachedCell(row: row, column: column, loadedRows: loadedRowCount)
+    }
+
+    func readAhead(rows: Range<Int>, columns: Range<Int>) {
+        tiles.readAhead(rows: rows, columns: columns, loadedRows: loadedRowCount)
+    }
+
     func prepare(rows: Range<Int>, columns: Range<Int>) {
         tiles.prepare(rows: rows, columns: columns, loadedRows: loadedRowCount)
         if tiles.widestRow > columnCount, !columnUpdateScheduled {
@@ -788,6 +797,27 @@ final class DocumentModel: GridDataSource {
         }) else { return nil }
         return read.map { row in
             TileRow(fieldCount: Int(row.fieldCount), cells: row.cells.map { .text($0.text, truncated: $0.truncated) })
+        }
+    }
+
+    /// `readTile` for the grid's reads ahead, off the main thread (task
+    /// 2.0a), from the document as it is now. A failed read gives `nil`:
+    /// the grid then reads the tile itself when it draws it, through
+    /// `call`, which reports the error.
+    private func backgroundTileReader() -> CellTileCache.BackgroundFetch? {
+        guard let handle = backgroundHandle() else { return nil }
+        let offset = headerOffset
+        return { rows, columns in
+            let read = try? handle.cells(
+                rowStart: UInt64(rows.lowerBound + offset),
+                rowCount: UInt32(rows.count),
+                columnStart: UInt32(columns.lowerBound),
+                columnCount: UInt32(columns.count),
+                maxChars: GridMetrics.maxCellCharacters
+            )
+            return read?.map { row in
+                TileRow(fieldCount: Int(row.fieldCount), cells: row.cells.map { .text($0.text, truncated: $0.truncated) })
+            }
         }
     }
 

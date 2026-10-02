@@ -27,10 +27,33 @@ struct GridPalette {
     let skeleton: CGColor
     let headerBackground: CGColor
     let gutterBackground: CGColor
+    /// Find's marks (mockup 04a): behind a match, behind the current one,
+    /// and the current one's outline.
+    let findMark: CGColor
+    let findCurrentMark: CGColor
+    let findCurrentOutline: CGColor
+    /// The lines of a missing cell's hatching.
+    let hatch: CGColor
 
-    /// The palette for the current drawing appearance.
+    /// The palette for the current drawing appearance. Made once for each
+    /// appearance, and again when the system's colours change (the accent
+    /// colour, for one): every view draws with it on every frame of a
+    /// scroll (task 2.0a).
     @MainActor
     static func current() -> GridPalette {
+        let appearance = NSAppearance.currentDrawing().name
+        if let cached = PaletteCache.palette, PaletteCache.appearance == appearance {
+            return cached
+        }
+        PaletteCache.observe()
+        let palette = make()
+        PaletteCache.appearance = appearance
+        PaletteCache.palette = palette
+        return palette
+    }
+
+    @MainActor
+    private static func make() -> GridPalette {
         let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let backgrounds = NSColor.alternatingContentBackgroundColors.map(\.cgColor)
         let base = backgrounds.first ?? NSColor.controlBackgroundColor.cgColor
@@ -48,8 +71,31 @@ struct GridPalette {
             activeFill: NSColor.controlAccentColor.withAlphaComponent(dark ? 0.28 : 0.12).cgColor,
             skeleton: NSColor.labelColor.withAlphaComponent(dark ? 0.12 : 0.08).cgColor,
             headerBackground: dark ? CGColor(gray: 0.15, alpha: 1) : CGColor(gray: 0.985, alpha: 1),
-            gutterBackground: dark ? CGColor(gray: 0.13, alpha: 1) : CGColor(gray: 0.96, alpha: 1)
+            gutterBackground: dark ? CGColor(gray: 0.13, alpha: 1) : CGColor(gray: 0.96, alpha: 1),
+            findMark: NSColor.systemYellow.withAlphaComponent(dark ? 0.32 : 0.38).cgColor,
+            findCurrentMark: NSColor.systemYellow.withAlphaComponent(dark ? 0.55 : 0.6).cgColor,
+            findCurrentOutline: NSColor.systemOrange.cgColor,
+            hatch: NSColor.labelColor.withAlphaComponent(dark ? 0.16 : 0.12).cgColor
         )
+    }
+
+    /// The palette last made, and for which appearance.
+    @MainActor
+    private enum PaletteCache {
+        static var appearance: NSAppearance.Name?
+        static var palette: GridPalette?
+        private static var observer: NSObjectProtocol?
+
+        static func observe() {
+            guard observer == nil else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: NSColor.systemColorsDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { palette = nil }
+            }
+        }
     }
 
     /// `top` (which may be translucent) drawn over the opaque `bottom`.
@@ -72,18 +118,199 @@ struct GridPalette {
 /// A laid-out line of text, kept between frames (ADR-0001: creating a Core
 /// Text line for each newly exposed cell was the largest item in the
 /// spike's profile).
-final class TextLine {
+final class TextLine: @unchecked Sendable {
+    // @unchecked: a line is made and filled in on one thread, and only then
+    // handed to the main thread (`LineReadAhead`), which alone uses it from
+    // then on. `CTLine` itself is immutable and thread-safe.
     let line: CTLine
     let width: CGFloat
     /// The line cut with an ellipsis to fit `fittedWidth`, once needed.
     var fitted: CTLine?
     var fittedWidth: CGFloat = -1
+    /// `fitted`'s glyphs and width.
+    var fittedRuns: [GlyphRun]?
+    var fittedLineWidth: CGFloat = 0
+
+    /// The line's glyphs, as `CTLineDraw` draws them (`nil` if it has a
+    /// run they can't stand for), taken with the line: where it is laid
+    /// out ahead, off the main thread, so are they.
+    let runs: [GlyphRun]?
+
+    /// The caret's offset before each UTF-16 unit of the line's text, as
+    /// `CTLineGetOffsetForStringIndex` gives it, found in one pass (task
+    /// 2.0a: asking for each end of each find mark took a tenth of the main
+    /// thread's time while a search's matches showed). `nan` where Core
+    /// Text has no caret of its own (inside a cluster); the last is the
+    /// end of the text.
+    private lazy var caretOffsets: [CGFloat] = {
+        let length = CTLineGetStringRange(line).length
+        var offsets = [CGFloat](repeating: .nan, count: length + 1)
+        CTLineEnumerateCaretOffsets(line) { offset, index, leadingEdge, _ in
+            // The leading edge of a unit is the caret before it, as
+            // `CTLineGetOffsetForStringIndex` reports it (its primary
+            // offset); the first edge seen is kept.
+            guard leadingEdge, index >= 0, index < length, offsets[index].isNaN else { return }
+            offsets[index] = offset
+        }
+        offsets[length] = CTLineGetOffsetForStringIndex(line, length, nil)
+        return offsets
+    }()
+
+    /// The offset of the caret before UTF-16 unit `index` of the line's text.
+    func offset(at index: Int) -> CGFloat {
+        if index >= 0, index < caretOffsets.count, !caretOffsets[index].isNaN { return caretOffsets[index] }
+        return CTLineGetOffsetForStringIndex(line, index, nil)
+    }
 
     init(_ line: CTLine) {
         self.line = line
         width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        runs = GlyphRun.runs(of: line)
+    }
+
+    /// Cuts the line with `ellipsis` to fit `available` points.
+    func fit(_ available: CGFloat, ellipsis: CTLine) {
+        fitted = CTLineCreateTruncatedLine(line, Double(available), .end, ellipsis)
+        fittedWidth = available
+        fittedRuns = nil
+        fittedLineWidth = fitted.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) } ?? 0
     }
 }
+
+/// One run of a laid-out line: its glyphs, where they go (relative to the
+/// line's origin, as Core Text placed them), and in which font and colour.
+/// The grid hands many cells' runs to the context at once, one call per
+/// font and colour (`GlyphBatch`), instead of one `CTLineDraw` per cell.
+struct GlyphRun {
+    let font: CTFont
+    let color: CGColor
+    let glyphs: [CGGlyph]
+    let positions: [CGPoint]
+
+    /// The runs of `line`, or `nil` if any run is drawn with more than
+    /// glyphs at positions (a text matrix of its own), which only
+    /// `CTLineDraw` reproduces.
+    static func runs(of line: CTLine) -> [GlyphRun]? {
+        let runs = CTLineGetGlyphRuns(line) as? [CTRun] ?? []
+        var result: [GlyphRun] = []
+        result.reserveCapacity(runs.count)
+        for run in runs {
+            let count = CTRunGetGlyphCount(run)
+            guard count > 0 else { continue }
+            guard !CTRunGetStatus(run).contains(.hasNonIdentityMatrix) else { return nil }
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            // Core Text puts the run's font (a fallback font, if it took
+            // one) in its attributes; the colour is the line's.
+            guard let fontValue = attributes[kCTFontAttributeName] as AnyObject?,
+                  CFGetTypeID(fontValue) == CTFontGetTypeID()
+            else { return nil }
+            let font = fontValue as! CTFont
+            let colorValue = attributes[kCTForegroundColorAttributeName] as AnyObject?
+            // Core Text draws a run without a colour in black.
+            let color = colorValue.flatMap { CFGetTypeID($0) == CGColor.typeID ? ($0 as! CGColor) : nil }
+                ?? CGColor(gray: 0, alpha: 1)
+            var glyphs = [CGGlyph](repeating: 0, count: count)
+            var positions = [CGPoint](repeating: .zero, count: count)
+            CTRunGetGlyphs(run, CFRange(location: 0, length: count), &glyphs)
+            CTRunGetPositions(run, CFRange(location: 0, length: count), &positions)
+            result.append(GlyphRun(font: font, color: color, glyphs: glyphs, positions: positions))
+        }
+        return result
+    }
+}
+
+/// Glyphs gathered from many cells, drawn with one call per font and
+/// colour (task 2.0a). In a scroll view AppKit records the grid's drawing
+/// and replays all of what is in view on every frame; one call for a strip
+/// of cells instead of one per cell leaves it far less to replay. What is
+/// drawn is the same: the glyphs `CTLineDraw` would draw, at the same
+/// places.
+@MainActor
+final class GlyphBatch {
+    private struct Group {
+        let font: CTFont
+        let color: CGColor
+        var glyphs: [CGGlyph] = []
+        var positions: [CGPoint] = []
+
+        mutating func append(_ run: GlyphRun, x: CGFloat, baseline: CGFloat) {
+            glyphs.append(contentsOf: run.glyphs)
+            // The context's text matrix flips y (see `draw`), as
+            // `CellPainter.drawText`'s does for `CTLineDraw`.
+            positions.reserveCapacity(positions.count + run.positions.count)
+            for position in run.positions {
+                positions.append(CGPoint(x: x + position.x, y: position.y - baseline))
+            }
+        }
+
+        func holds(font: CTFont, color: CGColor) -> Bool {
+            (self.font === font || CFEqual(self.font, font)) && (self.color === color || self.color == color)
+        }
+    }
+
+    private var groups: [Group] = []
+    private var last = 0
+
+    /// Adds `runs` with the line's origin at `x` on the baseline `baseline`
+    /// (in a flipped context's coordinates), if they are all in one font
+    /// and colour; `false` if they aren't. The glyphs of different cells
+    /// never overlap, so drawing them together changes no pixel; but a
+    /// line's own runs (a value with symbols, or a fallback font) may
+    /// touch, so those are drawn in their own order, by `CTLineDraw`.
+    func add(_ runs: [GlyphRun], x: CGFloat, baseline: CGFloat) -> Bool {
+        guard let first = runs.first else { return true }
+        for run in runs.dropFirst() where !(run.font === first.font && (run.color === first.color || run.color == first.color)) {
+            return false
+        }
+        let index = groupIndex(font: first.font, color: first.color)
+        for run in runs {
+            groups[index].append(run, x: x, baseline: baseline)
+        }
+        return true
+    }
+
+    private func groupIndex(font: CTFont, color: CGColor) -> Int {
+        if last < groups.count, groups[last].font === font, groups[last].color === color { return last }
+        // The same objects, almost always (the palette and fonts are made
+        // once); comparing fonts by value is far slower.
+        if let index = groups.firstIndex(where: { $0.font === font && $0.color === color })
+            ?? groups.firstIndex(where: { $0.holds(font: font, color: color) })
+        {
+            last = index
+            return index
+        }
+        groups.append(Group(font: font, color: color))
+        last = groups.count - 1
+        return last
+    }
+
+    /// Draws what was added, and empties the batch (keeping its storage).
+    func draw(in context: CGContext) {
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        for index in groups.indices where !groups[index].glyphs.isEmpty {
+            context.setFillColor(groups[index].color)
+            CTFontDrawGlyphs(groups[index].font, groups[index].glyphs, groups[index].positions, groups[index].glyphs.count, context)
+            groups[index].glyphs.removeAll(keepingCapacity: true)
+            groups[index].positions.removeAll(keepingCapacity: true)
+        }
+        // Few distinct fonts and colours are ever drawn; don't keep the
+        // groups of an old palette or a fallback font for ever.
+        if groups.count > 16 {
+            groups.removeAll()
+            last = 0
+        }
+    }
+}
+
+/// What a cell's line is keyed by: the text it shows, whether it is cut
+/// short, and the font.
+struct CellLineKey: Hashable, Sendable {
+    let text: String
+    let truncated: Bool
+    let number: Bool
+}
+
+typealias TextLineCache = LineCache<CellLineKey>
 
 /// Laid-out lines for cells, keyed by what they show: the text, whether it
 /// is cut short, and the font. Cells with the same value (a column of
@@ -94,14 +321,10 @@ final class TextLine {
 /// and when the current one is full, the older is dropped whole. So the
 /// lines in use stay, and trimming costs nothing per frame. Lines carry
 /// their colours, so the cache is cleared when the appearance changes.
+///
+/// The gutter keeps its row numbers in one too, keyed by row.
 @MainActor
-final class TextLineCache {
-    struct Key: Hashable {
-        let text: String
-        let truncated: Bool
-        let number: Bool
-    }
-
+final class LineCache<Key: Hashable & Sendable> {
     private var current: [Key: TextLine] = [:]
     private var previous: [Key: TextLine] = [:]
     private let generation: Int
@@ -129,6 +352,15 @@ final class TextLineCache {
         return line
     }
 
+    func contains(_ key: Key) -> Bool {
+        current[key] != nil || previous[key] != nil
+    }
+
+    /// Keeps `line` for `key`, unless there already is one.
+    func insert(_ line: TextLine, for key: Key) {
+        _ = self.line(for: key) { line }
+    }
+
     func removeAll() {
         current.removeAll()
         previous.removeAll()
@@ -149,6 +381,26 @@ final class TextLineCache {
 /// cheap to draw as short ones.
 func charactersThatFit(width: CGFloat) -> Int {
     max(8, Int((width / 3).rounded(.up)))
+}
+
+/// Which line a text cell is drawn with, in a column `width` points wide:
+/// only what the column could show is laid out (`charactersThatFit`).
+struct LineRequest: Sendable {
+    /// The line cache's key for it.
+    let key: CellLineKey
+    /// The part of the value laid out.
+    let shown: String
+    /// Whether the line ends with an ellipsis of its own: the core gave
+    /// only the value's start, and all of that is shown.
+    let ellipsis: Bool
+
+    init(value: String, truncated: Bool, width: CGFloat, number: Bool) {
+        let fits = charactersThatFit(width: width)
+        let cut = value.utf8.count > fits && value.count > fits
+        shown = cut ? String(value.prefix(fits)) : value
+        key = CellLineKey(text: shown, truncated: truncated || cut, number: number)
+        ellipsis = truncated && !cut
+    }
 }
 
 /// How a cell's text is laid out.
@@ -172,7 +424,17 @@ enum CellPainter {
         color: CGColor,
         symbolColor: CGColor
     ) -> TextLine {
-        let attributes = attributes(font: font, color: color)
+        makeLine(text, symbols: symbols, attributes: attributes(font: font, color: color), symbolColor: symbolColor)
+    }
+
+    /// `makeLine` with its font and colour as Core Text attributes: on any
+    /// thread (`LineReadAhead`).
+    nonisolated static func makeLine(
+        _ text: String,
+        symbols: [NSRange],
+        attributes: CFDictionary,
+        symbolColor: CGColor
+    ) -> TextLine {
         guard !symbols.isEmpty else {
             // Almost every cell: no symbols, so no mutable string.
             let attributed = CFAttributedStringCreate(nil, text as CFString, attributes)
@@ -185,7 +447,7 @@ enum CellPainter {
         return TextLine(CTLineCreateWithAttributedString(attributed))
     }
 
-    private static let colorKey = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
+    private nonisolated static let colorKey = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
     /// Attribute dictionaries by font and colour, made once rather than for
     /// every line.
     private static var attributeCache: [AttributesKey: CFDictionary] = [:]
@@ -195,7 +457,7 @@ enum CellPainter {
         let color: CGColor
     }
 
-    private static func attributes(font: NSFont, color: CGColor) -> CFDictionary {
+    static func attributes(font: NSFont, color: CGColor) -> CFDictionary {
         let key = AttributesKey(font: font, color: color)
         if let cached = attributeCache[key] { return cached }
         if attributeCache.count > 64 { attributeCache.removeAll() }
@@ -213,20 +475,37 @@ enum CellPainter {
         palette: GridPalette,
         color: CGColor? = nil
     ) -> TextLine {
-        let (text, symbols) = CellText.display(value)
-        return makeLine(
-            truncated ? text + "…" : text,
-            symbols: symbols,
-            font: font,
-            color: color ?? palette.text,
-            symbolColor: palette.secondaryText
-        )
+        makeCellLine(value, truncated: truncated, attributes: attributes(font: font, color: color ?? palette.text), symbolColor: palette.secondaryText)
     }
 
-    /// The alternating row shading (ADR-0002 question 1) across `rect`.
-    static func drawRowBackground(row: Int, in rect: CGRect, palette: GridPalette, context: CGContext) {
-        context.setFillColor(palette.rowBackgrounds[row % palette.rowBackgrounds.count])
-        context.fill(rect)
+    /// `makeCellLine` on any thread.
+    nonisolated static func makeCellLine(_ value: String, truncated: Bool, attributes: CFDictionary, symbolColor: CGColor) -> TextLine {
+        let (text, symbols) = CellText.display(value)
+        return makeLine(truncated ? text + "…" : text, symbols: symbols, attributes: attributes, symbolColor: symbolColor)
+    }
+
+    /// The alternating row shading (ADR-0002 question 1) of `rows`, from
+    /// `minX` across `width`: one fill per colour (task 2.0a), since AppKit
+    /// replays every drawing call in view on every scroll step. `scratch`
+    /// is storage kept between draws.
+    static func drawRowBackgrounds(
+        rows: Range<Int>,
+        minX: CGFloat,
+        width: CGFloat,
+        rowHeight: CGFloat,
+        palette: GridPalette,
+        context: CGContext,
+        scratch: inout [CGRect]
+    ) {
+        let colors = palette.rowBackgrounds
+        for (index, color) in colors.enumerated() {
+            scratch.removeAll(keepingCapacity: true)
+            for row in rows where row % colors.count == index {
+                scratch.append(CGRect(x: minX, y: CGFloat(row) * rowHeight, width: width, height: rowHeight))
+            }
+            context.setFillColor(color)
+            context.fill(scratch)
+        }
     }
 
     /// One line of text in a cell: padded, vertically centred, cut with an
@@ -239,19 +518,58 @@ enum CellPainter {
         context: CGContext,
         ellipsisColor: CGColor
     ) {
+        guard let (drawn, x, baseline) = placeText(line, in: rect, font: font, alignment: alignment, ellipsisColor: ellipsisColor) else { return }
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(x: x, y: baseline)
+        CTLineDraw(drawn, context)
+    }
+
+    /// Adds a cell's text to `batch`, to be drawn with other cells' (task
+    /// 2.0a): placed and cut exactly as `drawText` places and cuts it. A
+    /// line whose runs the batch can't stand for is drawn on its own.
+    static func addText(
+        _ line: TextLine,
+        in rect: CGRect,
+        font: NSFont,
+        alignment: CellAlignment,
+        to batch: GlyphBatch,
+        context: CGContext,
+        ellipsisColor: CGColor
+    ) {
+        guard let (drawn, x, baseline) = placeText(line, in: rect, font: font, alignment: alignment, ellipsisColor: ellipsisColor) else { return }
+        let runs: [GlyphRun]?
+        if drawn === line.line {
+            runs = line.runs
+        } else {
+            if line.fittedRuns == nil { line.fittedRuns = GlyphRun.runs(of: drawn) }
+            runs = line.fittedRuns
+        }
+        if let runs, batch.add(runs, x: x, baseline: baseline) { return }
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(x: x, y: baseline)
+        CTLineDraw(drawn, context)
+    }
+
+    /// Where a line goes in a cell: the line to draw (cut with an ellipsis
+    /// if it doesn't fit), its origin's x and its baseline.
+    private static func placeText(
+        _ line: TextLine,
+        in rect: CGRect,
+        font: NSFont,
+        alignment: CellAlignment,
+        ellipsisColor: CGColor
+    ) -> (CTLine, CGFloat, CGFloat)? {
         let available = rect.width - 2 * GridMetrics.cellPadding
-        guard available > 2, line.width > 0 else { return }
+        guard available > 2, line.width > 0 else { return nil }
         var drawn = line.line
         var width = line.width
         if width > available {
             if line.fittedWidth != available {
-                let ellipsis = makeLine("…", font: font, color: ellipsisColor, symbolColor: ellipsisColor)
-                line.fitted = CTLineCreateTruncatedLine(line.line, Double(available), .end, ellipsis.line)
-                line.fittedWidth = available
+                line.fit(available, ellipsis: makeLine("…", font: font, color: ellipsisColor, symbolColor: ellipsisColor).line)
             }
-            guard let fitted = line.fitted else { return }
+            guard let fitted = line.fitted else { return nil }
             drawn = fitted
-            width = CGFloat(CTLineGetTypographicBounds(fitted, nil, nil, nil))
+            width = line.fittedLineWidth
         }
         let x = switch alignment {
         case .leading: rect.minX + GridMetrics.cellPadding
@@ -260,9 +578,7 @@ enum CellPainter {
         let ascent = font.ascender
         let descent = -font.descender
         let baseline = (rect.minY + (rect.height - (ascent + descent)) / 2 + ascent).rounded()
-        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-        context.textPosition = CGPoint(x: x, y: baseline)
-        CTLineDraw(drawn, context)
+        return (drawn, x, baseline)
     }
 
     /// A skeleton cell (mockup 02b): a rounded bar whose length varies from
@@ -308,6 +624,7 @@ enum CellPainter {
         in rect: CGRect,
         alignment: CellAlignment,
         current: Bool,
+        palette: GridPalette,
         context: CGContext
     ) {
         let available = rect.width - 2 * GridMetrics.cellPadding
@@ -317,14 +634,13 @@ enum CellPainter {
         case .leading: rect.minX + GridMetrics.cellPadding
         case .trailing: rect.maxX - GridMetrics.cellPadding - width
         }
-        let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let fill = NSColor.systemYellow.withAlphaComponent(dark ? (current ? 0.55 : 0.32) : (current ? 0.6 : 0.38)).cgColor
+        let fill = current ? palette.findCurrentMark : palette.findMark
         context.saveGState()
         // A long value is cut with an ellipsis where the column ends.
         context.clip(to: CGRect(x: x - 2, y: rect.minY, width: width + 4, height: rect.height))
         for range in ranges {
-            let start = CTLineGetOffsetForStringIndex(line.line, range.location, nil)
-            let end = CTLineGetOffsetForStringIndex(line.line, range.location + range.length, nil)
+            let start = line.offset(at: range.location)
+            let end = line.offset(at: range.location + range.length)
             guard end > start else { continue }
             let mark = CGRect(x: x + start - 1, y: rect.minY + 3, width: end - start + 2, height: rect.height - 6)
             let path = CGPath(roundedRect: mark, cornerWidth: 3, cornerHeight: 3, transform: nil)
@@ -332,7 +648,7 @@ enum CellPainter {
             context.addPath(path)
             context.fillPath()
             if current {
-                context.setStrokeColor(NSColor.systemOrange.cgColor)
+                context.setStrokeColor(palette.findCurrentOutline)
                 context.setLineWidth(1.5)
                 context.addPath(CGPath(roundedRect: mark.insetBy(dx: 0.75, dy: 0.75), cornerWidth: 3, cornerHeight: 3, transform: nil))
                 context.strokePath()
@@ -347,14 +663,30 @@ enum CellPainter {
         context.fill(CGRect(x: x - 1, y: minY, width: 1, height: maxY - minY))
     }
 
+    /// The lines at the right edges `xs`, in one fill (task 2.0a).
+    static func drawColumnSeparators(
+        atX xs: some Sequence<CGFloat>,
+        minY: CGFloat,
+        maxY: CGFloat,
+        palette: GridPalette,
+        context: CGContext,
+        scratch: inout [CGRect]
+    ) {
+        scratch.removeAll(keepingCapacity: true)
+        for x in xs {
+            scratch.append(CGRect(x: x - 1, y: minY, width: 1, height: maxY - minY))
+        }
+        context.setFillColor(palette.gridLine)
+        context.fill(scratch)
+    }
+
     /// A short ragged row's missing cell (ADR-0002 question 5, mockup 03a):
     /// thin diagonal lines. Only ragged rows have these, so the colour is
     /// resolved here rather than in the palette every frame.
-    static func drawHatch(in rect: CGRect, context: CGContext) {
-        let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    static func drawHatch(in rect: CGRect, palette: GridPalette, context: CGContext) {
         context.saveGState()
         context.clip(to: rect.insetBy(dx: 0, dy: 1))
-        context.setStrokeColor(NSColor.labelColor.withAlphaComponent(dark ? 0.16 : 0.12).cgColor)
+        context.setStrokeColor(palette.hatch)
         context.setLineWidth(1)
         let spacing: CGFloat = 6
         var x = rect.minX - rect.height

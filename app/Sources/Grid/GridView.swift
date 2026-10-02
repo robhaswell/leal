@@ -56,7 +56,13 @@ final class GridView: NSView, NSMenuItemValidation {
     /// Any key or click: the user is interacting (DESIGN §3.10 rule 3).
     var onUserInput: (() -> Void)?
 
-    let lines = TextLineCache()
+    let lines = TextLineCache(capacity: 2_500)
+    /// Lays out the text of rows about to scroll into view (task 2.0a).
+    let ahead = LineReadAhead()
+    /// The cells' text, drawn together (task 2.0a).
+    private let glyphs = GlyphBatch()
+    /// Rectangles filled together, kept between draws.
+    private var rects: [CGRect] = []
     /// Cells drawn so far, for the scroll benchmark.
     private(set) var cellsDrawn = 0
     /// How many times, and how many points, it has drawn.
@@ -83,12 +89,14 @@ final class GridView: NSView, NSMenuItemValidation {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         lines.removeAll()
+        ahead.reset()
         needsDisplay = true
     }
 
     /// Forget every laid-out line: the values or the column styles changed.
     func invalidateContent() {
         lines.removeAll()
+        ahead.reset()
         needsDisplay = true
     }
 
@@ -107,15 +115,15 @@ final class GridView: NSView, NSMenuItemValidation {
             maxY: dirtyRect.maxY,
             rows: Int((bounds.height / geometry.rowHeight).rounded(.up))
         )
-        for row in shaded {
-            let y = CGFloat(row) * geometry.rowHeight
-            CellPainter.drawRowBackground(
-                row: row,
-                in: CGRect(x: dirtyRect.minX, y: y, width: dirtyRect.width, height: geometry.rowHeight),
-                palette: palette,
-                context: context
-            )
-        }
+        CellPainter.drawRowBackgrounds(
+            rows: shaded,
+            minX: dirtyRect.minX,
+            width: dirtyRect.width,
+            rowHeight: geometry.rowHeight,
+            palette: palette,
+            context: context,
+            scratch: &rects
+        )
         guard let source else { return }
         let rows = geometry.rowRange(minY: dirtyRect.minY, maxY: dirtyRect.maxY, rows: rowCount)
         let columns = geometry.columnRange(minX: dirtyRect.minX, maxX: dirtyRect.maxX)
@@ -129,15 +137,14 @@ final class GridView: NSView, NSMenuItemValidation {
                 onFirstRows = nil
             }
         }
-        for column in columns {
-            CellPainter.drawColumnSeparator(
-                atX: geometry.offsets[column + 1],
-                minY: dirtyRect.minY,
-                maxY: dirtyRect.maxY,
-                palette: palette,
-                context: context
-            )
-        }
+        CellPainter.drawColumnSeparators(
+            atX: columns.lazy.map { self.geometry.offsets[$0 + 1] },
+            minY: dirtyRect.minY,
+            maxY: dirtyRect.maxY,
+            palette: palette,
+            context: context,
+            scratch: &rects
+        )
         if let active = activeCell, active.row < rowCount, active.column < geometry.columnCount,
            !isCurrentMatchShown(active)
         {
@@ -146,6 +153,7 @@ final class GridView: NSView, NSMenuItemValidation {
                 CellPainter.drawActiveCellRing(in: rect, palette: palette, context: context)
             }
         }
+        ahead.update(visible: visibleRect, geometry: geometry, source: source, palette: palette, lines: lines)
     }
 
     /// The selection's cells, as one rectangle, if the grid has them.
@@ -194,36 +202,34 @@ final class GridView: NSView, NSMenuItemValidation {
                     guard !value.isEmpty || truncated else { continue }
                     let number = alignment == .trailing
                     let font = number ? GridFonts.number : GridFonts.cell
-                    // Only what the column could show is laid out.
-                    let fits = charactersThatFit(width: rect.width)
-                    let cut = value.utf8.count > fits && value.count > fits
-                    let shown = cut ? String(value.prefix(fits)) : value
-                    let key = TextLineCache.Key(text: shown, truncated: truncated || cut, number: number)
-                    let line = lines.line(for: key) {
-                        CellPainter.makeCellLine(shown, truncated: truncated && !cut, font: font, palette: palette)
+                    let request = LineRequest(value: value, truncated: truncated, width: rect.width, number: number)
+                    let line = lines.line(for: request.key) {
+                        CellPainter.makeCellLine(request.shown, truncated: request.ellipsis, font: font, palette: palette)
                     }
                     if let highlight, !highlight.ranges.isEmpty {
                         CellPainter.drawFindHighlights(
                             line,
-                            ranges: CellText.displayRanges(highlight.ranges, in: shown),
+                            ranges: CellText.displayRanges(highlight.ranges, in: request.shown),
                             in: rect,
                             alignment: alignment,
                             current: highlight.isCurrent,
+                            palette: palette,
                             context: context
                         )
                     }
-                    CellPainter.drawText(line, in: rect, font: font, alignment: alignment, context: context, ellipsisColor: palette.text)
+                    CellPainter.addText(line, in: rect, font: font, alignment: alignment, to: glyphs, context: context, ellipsisColor: palette.text)
                     cellsDrawn += 1
                 case .notLoaded:
                     CellPainter.drawSkeleton(row: row, column: column, in: rect, alignment: alignment, palette: palette, context: context)
                 case .missing:
                     // A short ragged row's missing cells (ADR-0002 question 5).
                     if source.isHatched(row: row, column: column) {
-                        CellPainter.drawHatch(in: rect, context: context)
+                        CellPainter.drawHatch(in: rect, palette: palette, context: context)
                     }
                 }
             }
         }
+        glyphs.draw(in: context)
     }
 
     // MARK: Input
