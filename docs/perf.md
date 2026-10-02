@@ -49,16 +49,18 @@ content layer on every scroll step (1.6a, docs/tasks/1.10.md). Normal
 scrolling ran at about 2.4 GHz (2.24–2.44 GHz). PLAN task 2.0a, "Scrolling
 headroom", takes this on.
 
-**After 2.0a it passes on this Mac** (`just perf`, 2 October 2026,
-unlocked, a loaded machine:
+**After 2.0a it passes on this Mac, provisionally** (`just perf`, 2
+October 2026, unlocked, a loaded machine:
 [`perf-runs/2026-10-02-m5pro-unlocked-2.0a.md`](perf-runs/2026-10-02-m5pro-unlocked-2.0a.md)):
 p50 1.4–1.6 ms and p99 2.2–2.6 ms in all six reference-file runs, 5.2–6.0 M
 instructions a frame against 13.0–18.5 M, 0–2 late frames a run, and a
 lower footprint peak. The main thread ran at 2.6–3.1 GHz, higher than in
-Rob's run, so the margin at 2.4 GHz is thinner (about 3 ms at p99 if CPU
-time scaled with the clock alone). Text layout and core reads now happen
+Rob's run, and `main` measured in the same session was 1.25–1.5× faster
+than in Rob's run; scaled the same way, the p99 would be 3.1–3.9 ms. So p50
+most likely passes and p99 is unproven until an unloaded run. Text layout and core reads now happen
 ahead of the scroll, off the main thread; what is left is mostly AppKit's
-rebuild of the visible layers, which ADR-0011 (proposed) would remove.
+rebuild of the visible layers, which ADR-0011 (accepted, conditional on
+tests and an on-screen check) removes in a follow-up task.
 docs/tasks/2.0a.md has the breakdown.
 
 The late frames are few (2–6 in a run of about 7,550, against 7–59 on the

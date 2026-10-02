@@ -1,54 +1,49 @@
 # 0011 — Grid drawing: strips of rows that scrolling moves
 
-- Status: proposed
+- Status: accepted (Rob, 2026-10-02), conditional on tests and an on-screen
+  check
 - Date: 2026-10-02
-- Refines: ADR-0001 (option B: how the cells reach the screen)
+- Refines: ADR-0001 (its option B: how the cells reach the screen)
 
 ## In one minute
 
-**Question for Rob: should the grid draw its cells and row numbers into
-strips of rows that scrolling moves, instead of letting AppKit redraw the
-visible grid on every scroll step?**
+**Decision: the grid and the gutter draw into strips of rows that scrolling
+moves, instead of letting AppKit rebuild the visible grid on every scroll
+step. Grids wider than 4,096 pt keep today's drawing.** It lands only once
+the prototype has tests and has been checked on screen, as a follow-up
+task; task 2.0a lands without it.
 
-- Task 2.0a brought scrolling within the 3× rule without changing the
-  drawing design: on the M5 Pro, main-thread work per frame is now p50
-  1.4–1.6 ms and p99 2.2–2.6 ms on the reference file (`just perf`,
-  docs/tasks/2.0a.md), against 2.8 ms.
-- That margin depends on the clock. The run's main thread was at
-  2.6–3.1 GHz; Rob's run was at 2.2–2.4 GHz, where the p99 would be about
-  3 ms (an estimate). On a base M1 Air the beta check could fail.
+- Task 2.0a cut Leal's own work per scroll frame (text layout and core
+  reads moved off the main thread, batched drawing): 5.2–6.0 M instructions
+  a frame against 13.0–18.5 M. Its `just perf` run gave p99 2.2–2.6 ms on
+  a loaded Mac with a fast clock; in Rob's conditions that would be about
+  3.1–3.9 ms, over the 3× rule's 2.8 ms. The rule's p99 is unproven.
 - About half of what is left in each frame is AppKit rebuilding the
   visible grid's and gutter's layers from their recorded drawing. A
   prototype that draws into strips instead (branch `task/2.0a-strips`)
-  takes the reference file to **p50 0.93–0.98 ms and p99 1.68–1.90 ms**:
-  about 1.5× more headroom.
-- Costs: 10–30 MB more footprint while scrolling, wide grids need to keep
-  today's drawing, and phase 2's in-cell editor must sit above the strips.
-- **Recommendation: accept, with wide grids (more than 4,096 pt) keeping
-  today's drawing.** If Rob prefers to wait, the 3× rule passes today on
-  this Mac, and the decision can be taken with the base M1 Air's numbers
-  in the beta.
+  takes the reference file to p50 0.93–0.98 ms and p99 1.68–1.90 ms on
+  this Mac, against 1.59–1.63 / 2.35–2.58 ms for 2.0a in the same runs:
+  **1.24–1.54× better at p99**.
+- Costs and risks: 10–30 MB more footprint while scrolling, wide grids keep
+  today's drawing (where 2.0a's p99 is already over 2.8 ms at 200 columns),
+  phase 2's in-cell editor must sit above the strips, and the risks below.
 
 ## Context
 
-ADR-0001 chose a custom grid (option B): an `NSScrollView` whose document
-view draws only the cells AppKit asks for. Task 1.6a found the catch:
-AppKit backs a view in a scroll view with a layer the size of the visible
-rectangle, and on every scroll step rebuilds it from the view's recorded
-drawing (a display list), though only a strip of it is new. It also
-redraws the whole visible view about every 1.25 s while scrolling (2.0a).
-The gutter, a second scrolled view, pays the same.
+ADR-0001 chose a custom grid: an `NSScrollView` whose document view draws
+only the cells AppKit asks for. Task 1.6a found the catch: AppKit backs a
+view in a scroll view with a layer the size of the visible rectangle, and
+on every scroll step rebuilds it from the view's recorded drawing (a
+display list), though only a strip of it is new. It also redraws the whole
+visible view about every 1.25 s while scrolling (2.0a). The gutter, a
+second scrolled view, pays the same.
 
 1.10 tried tiles of 512 × 256 pt that scrolling moves, and rejected them:
 a frame in which a row of tiles came into view drew all of them at once
-(ten times the late frames), and they added about 180 MB of footprint. 1.10
-noted that tiles small enough that one row of them costs no more than a
-strip would need to keep their per-tile overhead low, and left it to an
-ADR.
+(ten times the late frames), and they added about 180 MB of footprint.
 
-2.0a moved Leal's own per-frame work off the main thread (text layout and
-core reads ahead of the scroll, batched drawing). What remains in a frame
-is mostly AppKit's:
+2.0a moved Leal's own per-frame work off the main thread. What remains in a
+frame is mostly AppKit's:
 
 | Main thread, average frame (Time Profiler, 2.0a) | Time |
 |---|---:|
@@ -60,10 +55,12 @@ is mostly AppKit's:
 
 ## Options
 
-**A. Keep AppKit's drawing (2.0a as landed).** Passes the 3× rule on this
-Mac's run, with a thin margin at a low clock. No new code.
+**Keep AppKit's drawing (2.0a as landed).** No new code. Per-frame work is
+about 5 M instructions, half of it AppKit's rebuild; p99 is about 2.4 ms
+on this Mac at 2.6–3.1 GHz and an estimated 3.1–3.9 ms in Rob's
+conditions.
 
-**B. Strips of rows (the prototype).**
+**Strips of rows (the prototype).**
 
 - The grid's cells are drawn into strips four rows (88 pt) tall and as wide
   as the grid, each a `CALayer` with its own backing store, drawn
@@ -79,17 +76,17 @@ Mac's run, with a thin margin at a low clock. No new code.
 - The gutter's numbers are drawn the same way, in a view over its clip
   view.
 - `GridView` and the gutter stay where they are, for events, scrolling and
-  `cacheDisplay` (snapshots and tests draw them as today). Their own layers
-  are left empty (`wantsUpdateLayer`), so AppKit records and replays
-  nothing, and its requests to redraw the strip a scroll exposes are
-  ignored.
-- What is drawn comes from the same code (`GridView.drawContent`), so it is
+  `cacheDisplay`. Their own layers are left empty (`wantsUpdateLayer`), so
+  AppKit records and replays nothing, and its requests to redraw the strip
+  a scroll exposes are ignored.
+- What is drawn comes from the same code (`GridView`'s drawing), so it is
   the same drawing; only where it lands changes.
 
-Measured against A, same binary, alternating runs, the full scroll
-benchmark (vertical flings, horizontal, vertical at the far right):
+Measured against 2.0a, same binary, alternating runs, the full scroll
+benchmark (vertical flings, horizontal, vertical at the far right), this
+Mac:
 
-| | A | B |
+| | 2.0a | Strips |
 |---|---|---|
 | Reference file: CPU a frame p50 / p99 | 1.59–1.63 / 2.35–2.58 ms | 0.93–0.98 / 1.68–1.90 ms |
 | … instructions p50 / p99 | 5.4–5.5 / 8.5–9.0 M | 2.2 / 5.9–6.5 M |
@@ -100,37 +97,66 @@ benchmark (vertical flings, horizontal, vertical at the far right):
 
 On the 200-column file a grid wider than 4,096 pt is cut into columns of
 tiles, and a column of them coming into view during a horizontal fling
-draws at once, the 1.10 problem turned sideways; tiles of 256 or 1,117 pt
-were no better. Hence B's rule below for wide grids.
+draws at once (the 1.10 problem turned sideways); tiles of 256 or 1,117 pt
+were no better. Hence the 4,096 pt line.
 
-**C. ADR-0001's fallback (`NSTableView` with self-drawing rows).** Row views
+**ADR-0001's fallback, an `NSTableView` with self-drawing rows.** Row views
 move like strips, but NSTableView makes them for every row in view and
 redraws each row's newly exposed strip on a horizontal scroll; ADR-0001
-measured it at about twice B's main-thread time on wide files. Not
-re-measured; it would lose more than it gains here.
+measured it at about twice the custom grid's main-thread time on wide
+files. Not re-measured.
 
 ## Decision
 
-Proposed: **B for grids up to 4,096 pt wide, A for wider ones.** The grid
-switches when its width crosses the line (a column resized, more columns
-read). The reference file and most CSVs are well under it (12 columns are
-about 1,300 pt); a wide file keeps 2.0a's drawing, which on this Mac gives
-p50 1.6 ms and p99 2.9 ms at 200 columns (the rule judges only the
-reference file).
+Accepted by Rob on 2 October 2026, conditional: **strips for grids up to
+4,096 pt wide, today's drawing for wider ones**, switching when the width
+crosses the line (a column resized, more columns read). The follow-up task
+lands it only once the prototype has tests and an on-screen check. Wide
+files keep 2.0a's drawing, where p99 is 2.9 ms at 200 columns on this Mac
+(the 3× rule judges only the reference file, but wide files are already
+over its number).
+
+## Risks to settle in the follow-up task
+
+From the 2.0a review:
+
+- **Stale or misplaced strips during a fling**: a strip shown before its
+  drawing is in, or at the wrong place for a frame (positions are set
+  relative to the visible rectangle on every scroll). Check on screen, at
+  120 Hz, with fast flings and with the scroller.
+- **The in-cell editor** (2.5) and the invalid-bytes callout must sit above
+  the strips' view and follow the scroll, IME included (marked text, the
+  candidate window's position).
+- **Selection and find redraw cost**: a selection or find change redraws
+  whole strips (four rows across the grid), not just the cells.
+- **Resize and display-scale changes**: a window resize, a column resize,
+  and moving the window between a 1× and a 2× display must redraw or
+  rescale every strip.
+- **Memory at 4,096 pt on Retina**: a strip is 4,096 × 88 pt, about 5.8 MB
+  at 2×; with the visible strips, the margin and spares that is about
+  80–90 MB, and double that if the layers are extended range (EDR). The
+  line may need to be lower, or strips narrower than the grid.
+- **Tests and screenshots draw through `cacheDisplay`**, which bypasses the
+  strips: they would no longer see what is on screen. The follow-up needs
+  a test that renders the strips themselves and compares them with
+  `cacheDisplay`.
+- **VoiceOver frames** (4.2) come from the grid's geometry, which doesn't
+  move; check they still line up with what is drawn.
+- **Render-server CPU**: more layers (about a dozen strips) for
+  WindowServer to composite; measure its CPU and late frames, not only
+  Leal's main thread.
 
 ## Consequences
 
-- PLAN: a task to land B, with tests that strips draw what `cacheDisplay`
-  draws (the strip transforms are the main risk), the switch for wide
-  grids, footprint checked in `just perf` against Rob's run, and the
-  in-cell editor's place.
-- Phase 2 (2.5, in-cell editing): the editor and the invalid-bytes callout
-  must be placed above the strips' view, not inside the document view.
-- Phase 4 (4.2, accessibility): unaffected; elements come from geometry.
-- DESIGN §2's grid description gains a sentence on strips.
+- PLAN: a follow-up task (the coordinator adds it) to land strips with the
+  tests and the on-screen check above, the 4,096 pt switch, footprint
+  checked in `just perf` against Rob's run, and the in-cell editor's place.
+- Phase 2 (2.5, in-cell editing): the editor and the callout are placed
+  above the strips' view, not inside the document view.
+- DESIGN §2's grid description gains a sentence on strips when it lands.
 - The prototype is one commit on branch `task/2.0a-strips`, behind
-  `-LealStrips YES`, with its tuning options (`-LealStripRows`,
-  `-LealStripTileWidth`, `-LealStripSpares`, `-LealStripAhead`). It is not
-  for landing as is: it has no tests, keeps column tiles for wide grids
-  instead of switching, and hasn't been checked on screen against the
-  current drawing beyond the benchmark.
+  `-LealStrips YES`, with tuning options (`-LealStripRows`,
+  `-LealStripTileWidth`, `-LealStripSpares`, `-LealStripAhead`). It has no
+  tests, keeps column tiles for wide grids instead of switching, predates
+  the 2.0a review's fixes, and hasn't been checked on screen beyond the
+  benchmark.
