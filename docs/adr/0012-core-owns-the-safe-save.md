@@ -58,5 +58,18 @@ change the oracle.
 
 - DESIGN §3.7's safe-save paragraph is rewritten (the proposed wording is
   in `docs/tasks/2.2.md`, "Proposed DESIGN wording").
-- PLAN 2.5 overrides NSDocument's save to start the core's save job.
+- PLAN 2.5 overrides NSDocument's save to start the core's save job, and
+  for "nothing changes for the user" to hold it must also:
+  - wrap the job in an `NSFileCoordinator` write with `.forReplacing`
+    (the document as file presenter), serialised with
+    `performAsynchronousFileAccess`, so other apps, iCloud Drive and File
+    Provider folders get coordinated notice and NSDocument doesn't react
+    to its own save;
+  - set `fileModificationDate` from the save's outcome, so NSDocument's
+    own "changed by another application" check doesn't fire;
+  - always pass an item-replacement folder on the file's volume, with a
+    defined fallback where AppKit can't make one (shares, FAT).
+- The main thread never waits for a save (DESIGN §3.9): the save holds
+  the document's lock only to take a snapshot of the edits and to swap in
+  the result, and edits made during the save carry over.
 - Product code from task 2.2 lands once this is accepted.
