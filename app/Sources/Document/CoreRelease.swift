@@ -33,6 +33,9 @@ enum CoreRelease {
     /// (DESIGN §3.1). `sync` lends the queue the caller's quality of
     /// service while it waits.
     static func finish() {
+        // A grid's read ahead may hold a closed document until it ends, and
+        // then hands it here (`DocumentModel.backgroundTileReader`).
+        CellTileCache.finishReadsAhead()
         queue.sync {}
     }
 

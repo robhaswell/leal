@@ -105,40 +105,69 @@ final class CellTileCache {
         var lastUse: UInt64
     }
 
-    /// Reads rows and columns off the main thread; `nil` if they can't be
-    /// read. Made for each read (`makeBackgroundFetch`), so it reads from
-    /// the document as it is when the read is asked for.
-    typealias BackgroundFetch = @Sendable (_ rows: Range<Int>, _ columns: Range<Int>) -> [TileRow]?
+    /// Reads rows and columns off the main thread. Made for each read
+    /// (`makeBackgroundFetch`), from the document as it is when the read is
+    /// asked for. It throws what the core threw; `nil` means it had nothing
+    /// to read from (the document closed).
+    typealias BackgroundFetch = @Sendable (_ rows: Range<Int>, _ columns: Range<Int>) throws -> [TileRow]?
 
-    private let capacity: Int
+    /// The most tiles a call to `readAhead` starts reading, and the most
+    /// being read at once: a jump across the file (a scroller drag, Go to
+    /// Row) asks for a region only a screen or two tall, but nothing here
+    /// relies on that.
+    nonisolated static let newReadsPerCall = 4
+    nonisolated static let readsInFlight = 8
+
+    private let minimumCapacity: Int
+    private var capacity: Int
     private let fetch: Fetch
     /// Gives a reader for tiles read ahead of the scroll (task 2.0a), or
     /// `nil` if none can be read now.
     var makeBackgroundFetch: (() -> BackgroundFetch?)?
+    /// A read ahead failed: the document decides what the error means, as
+    /// for any core call (`DocumentModel.report`).
+    var onReadAheadError: ((any Error) -> Void)?
     private var tiles: [Key: Tile] = [:]
     private var clock: UInt64 = 0
-    /// Tiles being read ahead.
-    private var reading: Set<Key> = []
-    /// Bumped by `removeAll`: a tile read ahead before it is dropped.
-    private var generation = 0
+    /// Tiles being read ahead, each with the token of its read: an answer
+    /// that comes back with another token is for a read the cache has
+    /// since dropped (`removeAll`, `invalidate`), and is thrown away.
+    private var reading: [Key: UInt64] = [:]
+    private var nextToken: UInt64 = 0
+    /// Tiles whose read ahead failed since the cache was last emptied: not
+    /// asked for again ahead (a vanished drive would fail every frame).
+    /// The draw still reads one it needs, and reports the error then.
+    private var failedAhead: Set<Key> = []
+    /// The rows the latest call wanted, which a queued read checks before
+    /// it starts: one the scroll has left behind is skipped.
+    private let wanted = WantedRows()
     /// The most fields any row read so far has had.
     private(set) var widestRow = 0
     /// How many reads there have been, for tests.
     private(set) var fetchCount = 0
-    /// How many tiles were read ahead, for tests.
+    /// How many tiles were read ahead, and how many reads ahead were
+    /// started, for tests.
     private(set) var readAheadCount = 0
+    private(set) var readsAheadStarted = 0
+    /// How many reads ahead have come back, kept or not, for tests.
+    private(set) var readsAheadBack = 0
+    /// How many reads ahead are under way.
+    var readsAheadUnderWay: Int { reading.count }
 
     init(capacity: Int = 24, fetch: @escaping Fetch) {
-        self.capacity = max(1, capacity)
+        minimumCapacity = max(1, capacity)
+        self.capacity = minimumCapacity
         self.fetch = fetch
     }
 
-    /// Reads ahead, off the main thread, every tile of a region that isn't
-    /// read or being read yet (task 2.0a). A tile read from the core costs
-    /// about a millisecond on the main thread, most of it turning the
-    /// core's reply into Swift values, and scrolling meets a new tile every
-    /// few frames. A tile still missing when it is drawn is read there and
-    /// then, as before, so nothing waits for these.
+    /// Reads ahead, off the main thread, the tiles of a region that aren't
+    /// read or being read yet (task 2.0a): at most `newReadsPerCall` new
+    /// ones, nearest the region's start first, and never more than
+    /// `readsInFlight` at once. A tile read from the core costs about a
+    /// millisecond on the main thread, most of it turning the core's reply
+    /// into Swift values, and scrolling meets a new tile every few frames.
+    /// A tile still missing when it is drawn is read there and then, as
+    /// before, so nothing waits for these.
     func readAhead(rows: Range<Int>, columns: Range<Int>, loadedRows: Int) {
         let rows = rows.clamped(to: 0..<max(0, loadedRows))
         guard makeBackgroundFetch != nil, !rows.isEmpty, !columns.isEmpty else { return }
@@ -147,23 +176,42 @@ final class CellTileCache {
         let firstColumnBlock = max(0, columns.lowerBound) / Self.columnsPerTile
         let lastColumnBlock = min(columnBlocks - 1, (columns.upperBound - 1) / Self.columnsPerTile)
         guard firstColumnBlock <= lastColumnBlock else { return }
-        for rowBlock in (rows.lowerBound / Self.rowsPerTile)...((rows.upperBound - 1) / Self.rowsPerTile) {
-            for columnBlock in firstColumnBlock...lastColumnBlock {
+        let firstRowBlock = rows.lowerBound / Self.rowsPerTile
+        let lastRowBlock = (rows.upperBound - 1) / Self.rowsPerTile
+        // Room for what is on screen and around it (`prepare` asks for a
+        // region and its neighbours), however wide the window.
+        let regionTiles = (min(lastRowBlock - firstRowBlock, 3) + 1) * (lastColumnBlock - firstColumnBlock + 1)
+        capacity = max(capacity, minimumCapacity, 4 * regionTiles + 8)
+        wanted.set(rows: (firstRowBlock - 1)...(lastRowBlock + 1))
+        var started = 0
+        var rowBlock = firstRowBlock
+        // Lazily, block by block: the region may be long, the reads few.
+        while rowBlock <= lastRowBlock, started < Self.newReadsPerCall, reading.count < Self.readsInFlight {
+            for columnBlock in firstColumnBlock...lastColumnBlock
+                where started < Self.newReadsPerCall && reading.count < Self.readsInFlight
+            {
                 let key = Key(rowBlock: rowBlock, columnBlock: columnBlock)
-                guard tiles[key] == nil, !reading.contains(key), let read = makeBackgroundFetch?() else { continue }
-                reading.insert(key)
-                let start = rowBlock * Self.rowsPerTile
-                let columnStart = columnBlock * Self.columnsPerTile
-                let tileRows = start..<(start + Self.rowsPerTile)
-                let tileColumns = columnStart..<(columnStart + Self.columnsPerTile)
-                let generation = generation
+                guard tiles[key] == nil, reading[key] == nil, !failedAhead.contains(key), let read = makeBackgroundFetch?() else { continue }
+                nextToken += 1
+                let token = nextToken
+                reading[key] = token
+                started += 1
+                readsAheadStarted += 1
+                let tileRows = (rowBlock * Self.rowsPerTile)..<((rowBlock + 1) * Self.rowsPerTile)
+                let tileColumns = (columnBlock * Self.columnsPerTile)..<((columnBlock + 1) * Self.columnsPerTile)
+                let wanted = wanted
+                let block = rowBlock
                 Self.readQueue.async { [weak self] in
-                    let result = read(tileRows, tileColumns)
-                    Task { @MainActor [weak self] in
-                        self?.arrived(key, result, generation: generation)
+                    // The scroll may have moved on while this waited.
+                    guard wanted.contains(rowBlock: block) else {
+                        Task { @MainActor [weak self] in self?.arrived(key, token: token, .success(nil)) }
+                        return
                     }
+                    let result = Result { try read(tileRows, tileColumns) }
+                    Task { @MainActor [weak self] in self?.arrived(key, token: token, result) }
                 }
             }
+            rowBlock += 1
         }
     }
 
@@ -180,20 +228,50 @@ final class CellTileCache {
         return cellIndex < tileRow.cells.count ? tileRow.cells[cellIndex] : .missing
     }
 
-    private static let readQueue = DispatchQueue(label: "io.github.robhaswell.leal.read-ahead", qos: .userInitiated)
+    /// The reads ahead, one at a time, for every document: each holds the
+    /// core's row cache while it reads (the grid's own reads on the main
+    /// thread wait for it), and reads only bytes already in memory or in
+    /// the file's copy, never a share (task 2.0), so none can stall.
+    private nonisolated static let readQueue = DispatchQueue(label: "io.github.robhaswell.leal.read-ahead", qos: .userInitiated)
 
-    private func arrived(_ key: Key, _ rows: [TileRow]?, generation: Int) {
-        reading.remove(key)
-        // A failed read is left for the draw to read again, which reports
-        // the error as any core call does.
-        guard generation == self.generation, let rows, tiles[key] == nil else { return }
-        clock += 1
-        readAheadCount += 1
-        tiles[key] = Tile(rows: rows, requested: Self.rowsPerTile, failed: false, lastUse: clock)
-        for row in rows where row.fieldCount > widestRow {
-            widestRow = row.fieldCount
+    /// Waits for the reads ahead already queued, so that none still holds
+    /// a document when Leal quits (`CoreRelease.finish`).
+    nonisolated static func finishReadsAhead() {
+        readQueue.sync {}
+    }
+
+    /// Holds the reads ahead queued from now on until `resumeReadsAhead`,
+    /// for tests of what happens while one is under way.
+    nonisolated static func suspendReadsAhead() {
+        readQueue.suspend()
+    }
+
+    nonisolated static func resumeReadsAhead() {
+        readQueue.resume()
+    }
+
+    private func arrived(_ key: Key, token: UInt64, _ result: Result<[TileRow]?, any Error>) {
+        readsAheadBack += 1
+        // A read the cache dropped since (or one whose key was asked for
+        // again) leaves the newer read alone.
+        guard reading[key] == token else { return }
+        reading[key] = nil
+        switch result {
+        case let .success(rows?):
+            guard tiles[key] == nil else { return }
+            clock += 1
+            readAheadCount += 1
+            tiles[key] = Tile(rows: rows, requested: Self.rowsPerTile, failed: false, lastUse: clock)
+            for row in rows where row.fieldCount > widestRow {
+                widestRow = row.fieldCount
+            }
+            evictIfNeeded()
+        case .success(nil):
+            break
+        case let .failure(error):
+            failedAhead.insert(key)
+            onReadAheadError?(error)
         }
-        evictIfNeeded()
     }
 
     /// The cell at `row`, `column`. `loadedRows` is how many rows can be
@@ -228,8 +306,25 @@ final class CellTileCache {
     func removeAll() {
         tiles.removeAll()
         reading.removeAll()
-        generation += 1
+        failedAhead.removeAll()
         widestRow = 0
+    }
+
+    /// Forgets the tiles holding `rows`, and any read of them under way,
+    /// whose answer is then thrown away: their cells changed (an edit,
+    /// `DocumentModel.cellsChanged`). They are read again when drawn.
+    /// Rows inserted or deleted move every row after them: use
+    /// `removeAll` for those.
+    func invalidate(rows: Range<Int>) {
+        guard !rows.isEmpty else { return }
+        let blocks = (rows.lowerBound / Self.rowsPerTile)...((rows.upperBound - 1) / Self.rowsPerTile)
+        for key in Array(tiles.keys) where blocks.contains(key.rowBlock) {
+            tiles[key] = nil
+        }
+        for key in Array(reading.keys) where blocks.contains(key.rowBlock) {
+            reading[key] = nil
+        }
+        failedAhead = failedAhead.filter { !blocks.contains($0.rowBlock) }
     }
 
     private func tile(for key: Key, loadedRows: Int) -> Tile? {
@@ -266,5 +361,21 @@ final class CellTileCache {
         for (key, _) in oldest {
             tiles.removeValue(forKey: key)
         }
+    }
+}
+
+/// The row blocks the latest read ahead wanted, shared with the queued
+/// reads, which skip a block the scroll has left (task 2.0a review).
+private final class WantedRows: @unchecked Sendable {
+    // @unchecked: every access holds the lock.
+    private let lock = NSLock()
+    private var blocks: ClosedRange<Int> = 0...0
+
+    func set(rows blocks: ClosedRange<Int>) {
+        lock.withLock { self.blocks = blocks }
+    }
+
+    func contains(rowBlock: Int) -> Bool {
+        lock.withLock { blocks.contains(rowBlock) }
     }
 }

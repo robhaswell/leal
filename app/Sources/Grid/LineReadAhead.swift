@@ -20,9 +20,13 @@ final class LineReadAhead {
     /// Bumped by `reset`: lines laid out before it are dropped.
     private var generation = 0
     private var ahead = ScrollAhead()
-    /// How many lines it has laid out, for tests.
+    /// How many lines it has laid out and kept, and how many batches came
+    /// back (kept or dropped), for tests.
     private(set) var linesMade = 0
+    private(set) var batchesBack = 0
+    private(set) var batchesSent = 0
 
+    /// Lays out lines for the grid and the gutter, one batch at a time.
     static let queue = DispatchQueue(label: "io.github.robhaswell.leal.line-read-ahead", qos: .userInitiated)
 
     /// Forgets everything asked for: the values, the columns or the
@@ -33,27 +37,35 @@ final class LineReadAhead {
         ahead.reset()
     }
 
-    /// After a draw: lays out the rows ahead of `visible` (`ScrollAhead`).
+    /// After a draw: lays out the rows ahead of `visible` (`ScrollAhead`),
+    /// in the columns `drawnWidth` spans (those in view if `nil`). With
+    /// `caretOffsets`, also the find marks' offsets (the find bar is open).
     func update(
         visible: CGRect,
+        drawnWidth: (minX: CGFloat, maxX: CGFloat)? = nil,
         geometry: GridLayout,
         source: any GridDataSource,
         palette: GridPalette,
-        lines: TextLineCache
+        lines: TextLineCache,
+        caretOffsets: Bool = false
     ) {
         guard geometry.columnCount > 0,
-              let (ranges, rowBudget) = ahead.next(visible: visible, rowHeight: geometry.rowHeight, rows: source.rowCount)
+              let next = ahead.next(visible: visible, rowHeight: geometry.rowHeight, rows: source.rowCount)
         else { return }
-        let columns = geometry.columnRange(minX: visible.minX, maxX: visible.maxX)
+        let columns = geometry.columnRange(minX: drawnWidth?.minX ?? visible.minX, maxX: drawnWidth?.maxX ?? visible.maxX)
         guard !columns.isEmpty else { return }
         if requested.count > 4_000 { requested.removeAll() }
-        var budget = rowBudget
+        var budget = next.budget
         let loaded = min(source.loadedRowCount, source.rowCount)
         let numeric = columns.map { source.isNumeric(column: $0) }
         var work: [LineMaker.Item] = []
-        for (range, upwards) in ranges {
-            let rows: [Int] = upwards ? range.reversed() : Array(range)
-            for row in rows where row < loaded && budget > 0 {
+        for (range, upwards) in next.ranges {
+            // Nearest row first, without making an array of the range.
+            for step in 0..<range.count where budget > 0 {
+                let row = upwards ? range.upperBound - 1 - step : range.lowerBound + step
+                guard row < loaded else {
+                    if upwards { continue } else { break }
+                }
                 if let done = requested[row], done.lowerBound <= columns.lowerBound, done.upperBound >= columns.upperBound { continue }
                 var items: [LineMaker.Item] = []
                 var ready = true
@@ -81,15 +93,19 @@ final class LineReadAhead {
             }
         }
         guard !work.isEmpty else { return }
-        let maker = LineMaker(palette: palette)
+        let maker = LineMaker(palette: palette, caretOffsets: caretOffsets)
         let generation = generation
         let items = work
+        batchesSent += 1
         Self.queue.async { [weak self, weak lines] in
             let made = items.map { (key: $0.request.key, line: maker.make($0)) }
             Task { @MainActor [weak self, weak lines] in
-                guard let self, let lines, generation == self.generation else { return }
+                guard let self else { return }
+                batchesBack += 1
+                // Made for values, columns or colours since forgotten.
+                guard let lines, generation == self.generation else { return }
                 for item in made {
-                    lines.insert(item.line, for: item.key)
+                    lines.insert(TextLine(item.line), for: item.key)
                 }
                 linesMade += made.count
             }
@@ -99,9 +115,11 @@ final class LineReadAhead {
 
 /// Which rows are about to scroll into view: past the visible area in the
 /// direction it moved since the last call, a screen or four frames' travel
-/// ahead, whichever is further; both ways, half a screen, if it moved only
-/// sideways. At most a screen, or twice a frame's travel, is taken at a
-/// time (`budget`, in rows), so a fling's first frame doesn't take it all.
+/// ahead, whichever is further, but never more than two screens. After a
+/// move of more than two screens (a scroller drag, a click in its track, a
+/// jump to a find match or to a row) there is no direction to follow: half
+/// a screen each way, as when it moved only sideways. At most a screen of
+/// rows is taken at a time (`budget`).
 struct ScrollAhead {
     private var lastVisible: CGRect?
 
@@ -113,15 +131,20 @@ struct ScrollAhead {
     /// upwards (nearest row first), and how many to take; `nil` if
     /// `visible` hasn't changed since the last call.
     mutating func next(visible: CGRect, rowHeight: CGFloat, rows: Int) -> (ranges: [(rows: Range<Int>, upwards: Bool)], budget: Int)? {
-        guard visible != lastVisible, visible.height > 0, rowHeight > 0, rows > 0 else { return nil }
-        let dy = lastVisible.map { visible.minY - $0.minY } ?? 0
+        // (A view outside a window, drawn for a snapshot, may have no
+        // finite visible rectangle.)
+        guard visible != lastVisible, visible.height > 0, rowHeight > 0, rows > 0,
+              visible.minY.isFinite, visible.maxY.isFinite, visible.height < 1_000_000
+        else { return nil }
+        var dy = lastVisible.map { visible.minY - $0.minY } ?? 0
         lastVisible = visible
+        if abs(dy) > 2 * visible.height { dy = 0 }
         func rowRange(_ minY: CGFloat, _ maxY: CGFloat) -> Range<Int> {
-            let first = max(0, Int((minY / rowHeight).rounded(.down)))
-            let last = min(rows, Int((maxY / rowHeight).rounded(.up)))
+            let first = Int(min(CGFloat(rows), max(0, (minY / rowHeight).rounded(.down))))
+            let last = Int(min(CGFloat(rows), max(0, (maxY / rowHeight).rounded(.up))))
             return first < last ? first..<last : 0..<0
         }
-        let reach = max(visible.height, 4 * abs(dy))
+        let reach = min(2 * visible.height, max(visible.height, 4 * abs(dy)))
         let ranges: [(rows: Range<Int>, upwards: Bool)] = if dy > 0 {
             [(rowRange(visible.maxY, visible.maxY + reach), false)]
         } else if dy < 0 {
@@ -132,8 +155,7 @@ struct ScrollAhead {
                 (rowRange(visible.minY - visible.height / 2, visible.minY), true),
             ]
         }
-        let budget = max(Int((visible.height / rowHeight).rounded(.up)), 2 * Int((abs(dy) / rowHeight).rounded(.up)) + 2)
-        return (ranges, budget)
+        return (ranges, Int((visible.height / rowHeight).rounded(.up)))
     }
 }
 
@@ -144,23 +166,28 @@ final class NumberReadAhead {
     private var requested: Set<Int> = []
     private var generation = 0
     private var ahead = ScrollAhead()
+    private var maker: NumberMaker?
+    /// How many numbers it has asked for, for tests.
+    private(set) var numbersAsked = 0
 
     func reset() {
         requested.removeAll()
         generation += 1
         ahead.reset()
+        maker = nil
     }
 
     /// After a draw: lays out the numbers of the rows ahead of `visible`
     /// that `numbers` hasn't got, in `font` and `color`, for rows up to
     /// `loaded`.
     func update(visible: CGRect, rowHeight: CGFloat, loaded: Int, font: NSFont, color: CGColor, numbers: LineCache<Int>) {
-        guard let (ranges, rowBudget) = ahead.next(visible: visible, rowHeight: rowHeight, rows: loaded) else { return }
+        guard let next = ahead.next(visible: visible, rowHeight: rowHeight, rows: loaded) else { return }
         if requested.count > 4_000 { requested.removeAll() }
-        var budget = rowBudget
+        var budget = next.budget
         var rows: [Int] = []
-        for (range, upwards) in ranges {
-            for row in upwards ? Array(range.reversed()) : Array(range) where budget > 0 {
+        for (range, upwards) in next.ranges {
+            for step in 0..<range.count where budget > 0 {
+                let row = upwards ? range.upperBound - 1 - step : range.lowerBound + step
                 guard !requested.contains(row), !numbers.contains(row) else { continue }
                 requested.insert(row)
                 rows.append(row)
@@ -168,7 +195,11 @@ final class NumberReadAhead {
             }
         }
         guard !rows.isEmpty else { return }
-        let maker = NumberMaker(attributes: CellPainter.attributes(font: font, color: color), color: color)
+        numbersAsked += rows.count
+        if maker?.font !== font || maker?.color != color {
+            maker = NumberMaker(font: font, attributes: CellPainter.attributes(font: font, color: color), color: color)
+        }
+        guard let maker else { return }
         let generation = generation
         let wanted = rows
         LineReadAhead.queue.async { [weak self, weak numbers] in
@@ -176,7 +207,7 @@ final class NumberReadAhead {
             Task { @MainActor [weak self, weak numbers] in
                 guard let self, let numbers, generation == self.generation else { return }
                 for item in made {
-                    numbers.insert(item.line, for: item.row)
+                    numbers.insert(TextLine(item.line), for: item.row)
                 }
             }
         }
@@ -186,10 +217,11 @@ final class NumberReadAhead {
 /// Lays out row numbers on any thread, as the gutter does.
 private struct NumberMaker: @unchecked Sendable {
     // @unchecked: as `LineMaker`.
+    let font: NSFont
     let attributes: CFDictionary
     let color: CGColor
 
-    func make(_ row: Int) -> TextLine {
+    func make(_ row: Int) -> LaidOutLine {
         CellPainter.makeLine(String(row + 1), symbols: [], attributes: attributes, symbolColor: color)
     }
 }
@@ -209,26 +241,27 @@ struct LineMaker: @unchecked Sendable {
     private let cell: CFDictionary
     private let number: CFDictionary
     private let symbolColor: CGColor
+    private let caretOffsets: Bool
 
     @MainActor
-    init(palette: GridPalette) {
+    init(palette: GridPalette, caretOffsets: Bool = false) {
         cell = CellPainter.attributes(font: GridFonts.cell, color: palette.text)
         number = CellPainter.attributes(font: GridFonts.number, color: palette.text)
         symbolColor = palette.secondaryText
+        self.caretOffsets = caretOffsets
     }
 
-    func make(_ item: Item) -> TextLine {
+    func make(_ item: Item) -> LaidOutLine {
         let attributes = item.request.key.number ? number : cell
         let line = CellPainter.makeCellLine(item.request.shown, truncated: item.request.ellipsis, attributes: attributes, symbolColor: symbolColor)
-        // Its glyphs' offsets, for find's marks.
-        _ = line.offset(at: 0)
         // Cut to the column with an ellipsis, as `CellPainter.drawText`
         // does: in the cell's font and the text colour.
+        var fitted: LaidOutLine.Fitted?
         if item.available > 2, line.width > item.available {
-            let ellipsis = CellPainter.makeLine("…", symbols: [], attributes: attributes, symbolColor: symbolColor)
-            line.fit(item.available, ellipsis: ellipsis.line)
-            line.fittedRuns = line.fitted.flatMap(GlyphRun.runs(of:))
+            let ellipsis = CellPainter.makeLine("…", symbols: [], attributes: attributes, symbolColor: symbolColor).line
+            fitted = LaidOutLine.fit(line.line, item.available, ellipsis: ellipsis)
         }
-        return line
+        // The find marks' offsets, only while the find bar is open.
+        return line.adding(fitted: fitted, caretOffsets: caretOffsets ? LaidOutLine.caretOffsets(of: line.line) ?? [] : nil)
     }
 }

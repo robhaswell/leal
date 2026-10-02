@@ -153,7 +153,7 @@ final class GridView: NSView, NSMenuItemValidation {
                 CellPainter.drawActiveCellRing(in: rect, palette: palette, context: context)
             }
         }
-        ahead.update(visible: visibleRect, geometry: geometry, source: source, palette: palette, lines: lines)
+        ahead.update(visible: visibleRect, geometry: geometry, source: source, palette: palette, lines: lines, caretOffsets: highlighter != nil)
     }
 
     /// The selection's cells, as one rectangle, if the grid has them.
@@ -191,9 +191,11 @@ final class GridView: NSView, NSMenuItemValidation {
                 if selection?.contains(row: row, column: column) == true,
                    !(highlight?.isCurrent == true && highlight?.ranges.isEmpty == false)
                 {
+                    glyphs.draw(in: context)
                     CellPainter.drawActiveCellFill(in: rect, palette: palette, context: context)
                 }
                 guard row < loaded else {
+                    glyphs.draw(in: context)
                     CellPainter.drawSkeleton(row: row, column: column, in: rect, alignment: alignment, palette: palette, context: context)
                     continue
                 }
@@ -207,6 +209,7 @@ final class GridView: NSView, NSMenuItemValidation {
                         CellPainter.makeCellLine(request.shown, truncated: request.ellipsis, font: font, palette: palette)
                     }
                     if let highlight, !highlight.ranges.isEmpty {
+                        glyphs.draw(in: context)
                         CellPainter.drawFindHighlights(
                             line,
                             ranges: CellText.displayRanges(highlight.ranges, in: request.shown),
@@ -220,10 +223,12 @@ final class GridView: NSView, NSMenuItemValidation {
                     CellPainter.addText(line, in: rect, font: font, alignment: alignment, to: glyphs, context: context, ellipsisColor: palette.text)
                     cellsDrawn += 1
                 case .notLoaded:
+                    glyphs.draw(in: context)
                     CellPainter.drawSkeleton(row: row, column: column, in: rect, alignment: alignment, palette: palette, context: context)
                 case .missing:
                     // A short ragged row's missing cells (ADR-0002 question 5).
                     if source.isHatched(row: row, column: column) {
+                        glyphs.draw(in: context)
                         CellPainter.drawHatch(in: rect, palette: palette, context: context)
                     }
                 }

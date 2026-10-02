@@ -181,6 +181,8 @@ final class GridGutterView: NSView {
     private let numbers = LineCache<Int>(capacity: 1_000)
     /// Lays out the numbers of rows about to scroll into view (task 2.0a).
     private let ahead = NumberReadAhead()
+    /// How many numbers it has asked for ahead, for tests.
+    var numbersAskedAhead: Int { ahead.numbersAsked }
     /// The numbers' text, drawn together (task 2.0a).
     private let glyphs = GlyphBatch()
     /// Selected rows' numbers, in the accent colour.
@@ -254,6 +256,7 @@ final class GridGutterView: NSView {
             }
             CellPainter.addText(line, in: rect, font: font, alignment: .trailing, to: glyphs, context: context, ellipsisColor: palette.secondaryText)
             if source.rowHasMarker(row) {
+                glyphs.draw(in: context)
                 CellPainter.drawGutterMarker(rowRect: rect, context: context)
             }
         }

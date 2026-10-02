@@ -84,7 +84,14 @@ final class DocumentModel: GridDataSource {
     /// Where the file is: where it was opened from, or where it was moved
     /// to since (task 1.9).
     private(set) var url: URL
-    private var handle: LealFFI.Document?
+    private var handle: LealFFI.Document? {
+        didSet { readAheadHandle.set(failure == nil ? handle : nil) }
+    }
+    /// The core document for the grid's reads ahead (task 2.0a), which
+    /// they look up when they run, not when they are queued: once the
+    /// document closes, fails or is replaced, a queued read reads nothing
+    /// and holds nothing.
+    private let readAheadHandle = ReadAheadHandle()
     /// Goes up by one each time **Reload** replaces `handle`, so a late
     /// report about the old core document is ignored.
     private var handleNumber = 0
@@ -294,6 +301,7 @@ final class DocumentModel: GridDataSource {
     private init(url: URL, handle: LealFFI.Document, environment: DocumentEnvironment) throws {
         self.url = url
         self.handle = handle
+        readAheadHandle.set(handle)
         self.environment = environment
         original = OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
         let screen = try handle.firstScreen()
@@ -312,6 +320,7 @@ final class DocumentModel: GridDataSource {
         )
         tiles = CellTileCache { [weak self] rows, columns in self?.readTile(rows: rows, columns: columns) }
         tiles.makeBackgroundFetch = { [weak self] in self?.backgroundTileReader() }
+        tiles.onReadAheadError = { [weak self] error in self?.report(error) }
         applyFirstScreen(screen)
         original = call({ try $0.original() }) ?? original
         isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? false
@@ -378,22 +387,28 @@ final class DocumentModel: GridDataSource {
         coreCalls += 1
         do {
             return try body(handle)
-        } catch let error as LealError {
-            switch error {
-            case .DocumentFailed:
-                fail(error)
-            case .DriveDisconnected, .ChangedOnDisk, .DeletedElsewhere:
-                // A read found the drive gone, the file changed, or the file
-                // on its share deleted: show it (task 1.7, ADR-0009). Not
-                // now, though: this may be inside a draw.
-                queueDriveCheck()
-            default:
-                Logger.document.error("Core call failed for \(self.url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
-            }
-            return nil
         } catch {
-            fail(error)
+            report(error)
             return nil
+        }
+    }
+
+    /// What a core call's error means: a `DocumentFailed` error, or anything
+    /// that isn't a `LealError` (a panic UniFFI caught), fails the
+    /// document; a vanished drive or a changed or deleted file is shown;
+    /// anything else is logged. For `call`, and for calls made off the main
+    /// actor that hand their errors back (the grid's reads ahead).
+    func report(_ error: any Error) {
+        switch error as? LealError {
+        case .DocumentFailed?, nil:
+            fail(error)
+        case .DriveDisconnected?, .ChangedOnDisk?, .DeletedElsewhere?:
+            // A read found the drive gone, the file changed, or the file on
+            // its share deleted: show it (task 1.7, ADR-0009). Not now,
+            // though: this may be inside a draw.
+            queueDriveCheck()
+        case .some:
+            Logger.document.error("Core call failed for \(self.url.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -413,6 +428,7 @@ final class DocumentModel: GridDataSource {
         guard failure == nil else { return }
         Logger.document.error("Document failed: \(String(describing: error), privacy: .public)")
         failure = error
+        readAheadHandle.set(nil)
         setInteracting(false)
         for task in tasks { task.cancel() }
         tasks.removeAll()
@@ -801,25 +817,42 @@ final class DocumentModel: GridDataSource {
     }
 
     /// `readTile` for the grid's reads ahead, off the main thread (task
-    /// 2.0a), from the document as it is now. A failed read gives `nil`:
-    /// the grid then reads the tile itself when it draws it, through
-    /// `call`, which reports the error.
+    /// 2.0a), with the header offset of now. It reads from the core
+    /// document of when it runs (`readAheadHandle`): none once the document
+    /// has closed or failed. An error comes back to `report` through the
+    /// tile cache. A read that ends holding the last reference to a closed
+    /// document lets go of it through `CoreRelease`, as `close` would have.
     private func backgroundTileReader() -> CellTileCache.BackgroundFetch? {
-        guard let handle = backgroundHandle() else { return nil }
+        guard backgroundHandle() != nil else { return nil }
         let offset = headerOffset
+        let current = readAheadHandle
         return { rows, columns in
-            let read = try? handle.cells(
+            var handle = current.get()
+            defer { CoreRelease.later(&handle) }
+            return try handle?.cells(
                 rowStart: UInt64(rows.lowerBound + offset),
                 rowCount: UInt32(rows.count),
                 columnStart: UInt32(columns.lowerBound),
                 columnCount: UInt32(columns.count),
                 maxChars: GridMetrics.maxCellCharacters
-            )
-            return read?.map { row in
+            ).map { row in
                 TileRow(fieldCount: Int(row.fieldCount), cells: row.cells.map { .text($0.text, truncated: $0.truncated) })
             }
         }
     }
+
+    /// SEAM(2.5): the values of `rows` (grid rows) changed: an edit, an
+    /// undo or a redo. The tiles holding them are read again when drawn,
+    /// and a read of them already under way is thrown away when it comes
+    /// back (`CellTileCache.invalidate`). See docs/tasks/2.0a.md, "For
+    /// editing", for what else an edit must refresh.
+    func cellsChanged(rows: Range<Int>) {
+        tiles.invalidate(rows: rows)
+    }
+
+    /// How many of the grid's reads ahead have come back, kept or dropped,
+    /// for tests.
+    var readsAheadBack: Int { tiles.readsAheadBack }
 
     // MARK: Columns
 
@@ -1458,4 +1491,21 @@ final class ModelReference: Sendable {
 extension Logger {
     /// Documents.
     static let document = Logger(subsystem: "io.github.robhaswell.leal", category: "document")
+}
+
+/// The core document the grid's reads ahead use, shared with the read
+/// queue (task 2.0a review).
+final class ReadAheadHandle: @unchecked Sendable {
+    // @unchecked: every access holds the lock; `LealFFI.Document` is
+    // itself Sendable.
+    private let lock = NSLock()
+    private var handle: LealFFI.Document?
+
+    func set(_ handle: LealFFI.Document?) {
+        lock.withLock { self.handle = handle }
+    }
+
+    func get() -> LealFFI.Document? {
+        lock.withLock { handle }
+    }
 }

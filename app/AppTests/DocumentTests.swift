@@ -113,6 +113,27 @@ final class DocumentTests: XCTestCase {
         XCTAssertEqual(model.coreCalls, calls, "no calls after closing")
     }
 
+    /// Task 2.0a review, item 4: a grid's read ahead queued when its
+    /// document closes doesn't keep the core's document (and the file's
+    /// clone) alive until it runs, and reads nothing when it does.
+    func testAReadAheadQueuedWhenTheDocumentClosesDoesntKeepIt() async throws {
+        let (url, _) = try bigFile("closing.csv", bytes: 200_000)
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertFalse(records().isEmpty)
+        let back = model.readsAheadBack
+        CellTileCache.suspendReadsAhead()
+        model.readAhead(rows: 640..<704, columns: 0..<4)
+        let calls = model.coreCalls
+        document.close()
+        try await waitUntil("the clone is removed, with the read still queued") { records().isEmpty }
+        CellTileCache.resumeReadsAhead()
+        try await waitUntil("the read is back") { model.readsAheadBack > back }
+        XCTAssertEqual(model.coreCalls, calls, "no calls after closing")
+        XCTAssertNil(model.cachedCell(row: 640, column: 0))
+    }
+
     func testAFileThatCantBeOpenedIsWorded() throws {
         let url = directory.appending(path: "missing.csv")
         XCTAssertThrowsError(try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")) { error in
@@ -457,6 +478,34 @@ final class DocumentTests: XCTestCase {
     }
 
     // MARK: The header row (ADR-0002 question 13)
+
+    /// Task 2.0a review, item 6c: a grid's read ahead still under way when
+    /// the file is read another way (the Header row, Treat As, Reload) is
+    /// thrown away when it comes back, and the rows are read again the new
+    /// way.
+    func testAReadAheadUnderWayWhenTheFileIsReadAgainIsDropped() async throws {
+        let (url, _) = try bigFile("ahead.csv", bytes: 300_000)
+        let document = try open(url)
+        let model = try XCTUnwrap(document.model)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        XCTAssertTrue(model.interpretation.header)
+        for change in ["the header row", "Treat As", "Reload"] {
+            XCTAssertNil(model.cachedCell(row: 640, column: 0), "\(change): row 640 isn't read yet")
+            let back = model.readsAheadBack
+            CellTileCache.suspendReadsAhead()
+            model.readAhead(rows: 640..<704, columns: 0..<4)
+            switch change {
+            case "the header row": model.setHeaderRow(false)
+            case "Treat As": model.treatAs(.semicolon)
+            default: try model.reload()
+            }
+            CellTileCache.resumeReadsAhead()
+            try await waitUntil("\(change): the read is back") { model.readsAheadBack > back }
+            try await waitUntil("\(change): indexed again") { model.isIndexComplete && model.loadedRowCount > 704 }
+            XCTAssertNil(model.cachedCell(row: 640, column: 0), "\(change): the read of the old reading was kept")
+        }
+        document.close()
+    }
 
     func testTheHeaderRowToggleReadsTheFileAgain() async throws {
         let url = try file("readings.csv", "2025-03-01T00:00:00Z,S-01,18.2\n2025-03-01T00:10:00Z,S-02,18.3\n2025-03-01T00:20:00Z,S-03,18.1\n")

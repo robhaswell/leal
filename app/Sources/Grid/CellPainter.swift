@@ -84,17 +84,25 @@ struct GridPalette {
     private enum PaletteCache {
         static var appearance: NSAppearance.Name?
         static var palette: GridPalette?
-        private static var observer: NSObjectProtocol?
+        private static var observers: [NSObjectProtocol] = []
 
+        /// The system's colours change with the accent colour and the
+        /// highlight colour, and with Increase Contrast, which is an
+        /// accessibility display option.
         static func observe() {
-            guard observer == nil else { return }
-            observer = NotificationCenter.default.addObserver(
-                forName: NSColor.systemColorsDidChangeNotification,
-                object: nil,
-                queue: .main
-            ) { _ in
+            guard observers.isEmpty else { return }
+            let forget: @Sendable (Notification) -> Void = { _ in
                 MainActor.assumeIsolated { palette = nil }
             }
+            observers = [
+                NotificationCenter.default.addObserver(forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main, using: forget),
+                NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+                    object: nil,
+                    queue: .main,
+                    using: forget
+                ),
+            ]
         }
     }
 
@@ -115,34 +123,78 @@ struct GridPalette {
     }
 }
 
-/// A laid-out line of text, kept between frames (ADR-0001: creating a Core
-/// Text line for each newly exposed cell was the largest item in the
-/// spike's profile).
-final class TextLine: @unchecked Sendable {
-    // @unchecked: a line is made and filled in on one thread, and only then
-    // handed to the main thread (`LineReadAhead`), which alone uses it from
-    // then on. `CTLine` itself is immutable and thread-safe.
+/// A line laid out by Core Text, with what drawing it needs, made on any
+/// thread and never changed after (task 2.0a): the main thread keeps it in
+/// a `TextLine`. Lines laid out ahead of the scroll (`LineReadAhead`) are
+/// made off the main thread and handed over as this.
+struct LaidOutLine: @unchecked Sendable {
+    // @unchecked: every stored property is a `let` of an immutable value;
+    // Core Text's lines and fonts and Core Graphics' colours are immutable
+    // and documented as safe to use from any thread, but not marked
+    // Sendable.
+    /// A cut of the line to a column's width, with an ellipsis.
+    struct Fitted {
+        /// The width it was cut to.
+        let available: CGFloat
+        let line: CTLine?
+        let width: CGFloat
+        let runs: [GlyphRun]?
+    }
+
     let line: CTLine
     let width: CGFloat
-    /// The line cut with an ellipsis to fit `fittedWidth`, once needed.
-    var fitted: CTLine?
-    var fittedWidth: CGFloat = -1
-    /// `fitted`'s glyphs and width.
-    var fittedRuns: [GlyphRun]?
-    var fittedLineWidth: CGFloat = 0
-
     /// The line's glyphs, as `CTLineDraw` draws them (`nil` if it has a
-    /// run they can't stand for), taken with the line: where it is laid
-    /// out ahead, off the main thread, so are they.
+    /// run they can't stand for).
     let runs: [GlyphRun]?
+    let fitted: Fitted?
+    /// `TextLine.offset(at:)`'s table, if it was asked for.
+    let caretOffsets: [CGFloat]?
 
-    /// The caret's offset before each UTF-16 unit of the line's text, as
+    init(_ line: CTLine) {
+        self.line = line
+        width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        runs = GlyphRun.runs(of: line)
+        fitted = nil
+        caretOffsets = nil
+    }
+
+    private init(_ other: LaidOutLine, fitted: Fitted?, caretOffsets: [CGFloat]?) {
+        line = other.line
+        width = other.width
+        runs = other.runs
+        self.fitted = fitted
+        self.caretOffsets = caretOffsets
+    }
+
+    /// This line with its cut to a column and its caret offsets.
+    func adding(fitted: Fitted?, caretOffsets: [CGFloat]?) -> LaidOutLine {
+        LaidOutLine(self, fitted: fitted, caretOffsets: caretOffsets)
+    }
+
+    /// `line` cut with `ellipsis` to fit `available` points, as
+    /// `CTLineCreateTruncatedLine` cuts it.
+    static func fit(_ line: CTLine, _ available: CGFloat, ellipsis: CTLine) -> Fitted {
+        let fitted = CTLineCreateTruncatedLine(line, Double(available), .end, ellipsis)
+        return Fitted(
+            available: available,
+            line: fitted,
+            width: fitted.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) } ?? 0,
+            runs: fitted.flatMap(GlyphRun.runs(of:))
+        )
+    }
+
+    /// The caret's offset before each UTF-16 unit of `line`'s text, as
     /// `CTLineGetOffsetForStringIndex` gives it, found in one pass (task
     /// 2.0a: asking for each end of each find mark took a tenth of the main
     /// thread's time while a search's matches showed). `nan` where Core
     /// Text has no caret of its own (inside a cluster); the last is the
     /// end of the text.
-    private lazy var caretOffsets: [CGFloat] = {
+    static func caretOffsets(of line: CTLine) -> [CGFloat]? {
+        // Right-to-left text, alone or mixed with left-to-right, has carets
+        // whose primary offsets this pass doesn't reproduce: each is asked
+        // for on its own.
+        let runs = CTLineGetGlyphRuns(line) as? [CTRun] ?? []
+        guard !runs.contains(where: { CTRunGetStatus($0).contains(.rightToLeft) }) else { return nil }
         let length = CTLineGetStringRange(line).length
         var offsets = [CGFloat](repeating: .nan, count: length + 1)
         CTLineEnumerateCaretOffsets(line) { offset, index, leadingEdge, _ in
@@ -154,26 +206,49 @@ final class TextLine: @unchecked Sendable {
         }
         offsets[length] = CTLineGetOffsetForStringIndex(line, length, nil)
         return offsets
-    }()
+    }
+}
+
+/// A laid-out line of text, kept between frames (ADR-0001: creating a Core
+/// Text line for each newly exposed cell was the largest item in the
+/// spike's profile). Only the main thread uses one.
+final class TextLine {
+    let line: CTLine
+    let width: CGFloat
+    /// The line's glyphs, as `CTLineDraw` draws them (`nil` if it has a
+    /// run they can't stand for).
+    let runs: [GlyphRun]?
+    /// The line cut with an ellipsis to fit a column, once needed.
+    private(set) var fitted: LaidOutLine.Fitted?
+    private var caretOffsets: [CGFloat]?
+    private var caretOffsetsMade = false
+
+    init(_ laidOut: LaidOutLine) {
+        line = laidOut.line
+        width = laidOut.width
+        runs = laidOut.runs
+        fitted = laidOut.fitted
+        caretOffsets = laidOut.caretOffsets
+        caretOffsetsMade = laidOut.caretOffsets != nil
+    }
+
+    convenience init(_ line: CTLine) {
+        self.init(LaidOutLine(line))
+    }
 
     /// The offset of the caret before UTF-16 unit `index` of the line's text.
     func offset(at index: Int) -> CGFloat {
-        if index >= 0, index < caretOffsets.count, !caretOffsets[index].isNaN { return caretOffsets[index] }
+        if !caretOffsetsMade {
+            caretOffsets = LaidOutLine.caretOffsets(of: line)
+            caretOffsetsMade = true
+        }
+        if let offsets = caretOffsets, index >= 0, index < offsets.count, !offsets[index].isNaN { return offsets[index] }
         return CTLineGetOffsetForStringIndex(line, index, nil)
-    }
-
-    init(_ line: CTLine) {
-        self.line = line
-        width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
-        runs = GlyphRun.runs(of: line)
     }
 
     /// Cuts the line with `ellipsis` to fit `available` points.
     func fit(_ available: CGFloat, ellipsis: CTLine) {
-        fitted = CTLineCreateTruncatedLine(line, Double(available), .end, ellipsis)
-        fittedWidth = available
-        fittedRuns = nil
-        fittedLineWidth = fitted.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) } ?? 0
+        fitted = LaidOutLine.fit(line, available, ellipsis: ellipsis)
     }
 }
 
@@ -181,7 +256,8 @@ final class TextLine: @unchecked Sendable {
 /// line's origin, as Core Text placed them), and in which font and colour.
 /// The grid hands many cells' runs to the context at once, one call per
 /// font and colour (`GlyphBatch`), instead of one `CTLineDraw` per cell.
-struct GlyphRun {
+struct GlyphRun: @unchecked Sendable {
+    // @unchecked: as `LaidOutLine`.
     let font: CTFont
     let color: CGColor
     let glyphs: [CGGlyph]
@@ -205,6 +281,8 @@ struct GlyphRun {
                   CFGetTypeID(fontValue) == CTFontGetTypeID()
             else { return nil }
             let font = fontValue as! CTFont
+            // Colour glyphs (emoji) are drawn by `CTLineDraw` its own way.
+            guard !CTFontGetSymbolicTraits(font).contains(.traitColorGlyphs) else { return nil }
             let colorValue = attributes[kCTForegroundColorAttributeName] as AnyObject?
             // Core Text draws a run without a colour in black.
             let color = colorValue.flatMap { CFGetTypeID($0) == CGColor.typeID ? ($0 as! CGColor) : nil }
@@ -221,10 +299,10 @@ struct GlyphRun {
 
 /// Glyphs gathered from many cells, drawn with one call per font and
 /// colour (task 2.0a). In a scroll view AppKit records the grid's drawing
-/// and replays all of what is in view on every frame; one call for a strip
+/// and replays all of what is in view on every frame; one call for a run
 /// of cells instead of one per cell leaves it far less to replay. What is
 /// drawn is the same: the glyphs `CTLineDraw` would draw, at the same
-/// places.
+/// places, in the same order relative to everything else (`draw`).
 @MainActor
 final class GlyphBatch {
     private struct Group {
@@ -250,6 +328,7 @@ final class GlyphBatch {
 
     private var groups: [Group] = []
     private var last = 0
+    private var pending = false
 
     /// Adds `runs` with the line's origin at `x` on the baseline `baseline`
     /// (in a flipped context's coordinates), if they are all in one font
@@ -266,6 +345,7 @@ final class GlyphBatch {
         for run in runs {
             groups[index].append(run, x: x, baseline: baseline)
         }
+        pending = true
         return true
     }
 
@@ -285,7 +365,13 @@ final class GlyphBatch {
     }
 
     /// Draws what was added, and empties the batch (keeping its storage).
+    /// The grid draws it before anything else a cell draws (a fill, a
+    /// find mark, a skeleton, a hatch, a line drawn on its own), so that
+    /// everything is drawn in the order it was before batching: text ink
+    /// that spills out of its cell still lies under what comes after it.
     func draw(in context: CGContext) {
+        guard pending else { return }
+        pending = false
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         for index in groups.indices where !groups[index].glyphs.isEmpty {
             context.setFillColor(groups[index].color)
@@ -424,7 +510,7 @@ enum CellPainter {
         color: CGColor,
         symbolColor: CGColor
     ) -> TextLine {
-        makeLine(text, symbols: symbols, attributes: attributes(font: font, color: color), symbolColor: symbolColor)
+        TextLine(makeLine(text, symbols: symbols, attributes: attributes(font: font, color: color), symbolColor: symbolColor))
     }
 
     /// `makeLine` with its font and colour as Core Text attributes: on any
@@ -434,17 +520,17 @@ enum CellPainter {
         symbols: [NSRange],
         attributes: CFDictionary,
         symbolColor: CGColor
-    ) -> TextLine {
+    ) -> LaidOutLine {
         guard !symbols.isEmpty else {
             // Almost every cell: no symbols, so no mutable string.
             let attributed = CFAttributedStringCreate(nil, text as CFString, attributes)
-            return TextLine(CTLineCreateWithAttributedString(attributed!))
+            return LaidOutLine(CTLineCreateWithAttributedString(attributed!))
         }
         let attributed = NSMutableAttributedString(string: text, attributes: attributes as? [NSAttributedString.Key: Any])
         for range in symbols {
             attributed.addAttribute(colorKey, value: symbolColor, range: range)
         }
-        return TextLine(CTLineCreateWithAttributedString(attributed))
+        return LaidOutLine(CTLineCreateWithAttributedString(attributed))
     }
 
     private nonisolated static let colorKey = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
@@ -475,11 +561,11 @@ enum CellPainter {
         palette: GridPalette,
         color: CGColor? = nil
     ) -> TextLine {
-        makeCellLine(value, truncated: truncated, attributes: attributes(font: font, color: color ?? palette.text), symbolColor: palette.secondaryText)
+        TextLine(makeCellLine(value, truncated: truncated, attributes: attributes(font: font, color: color ?? palette.text), symbolColor: palette.secondaryText))
     }
 
     /// `makeCellLine` on any thread.
-    nonisolated static func makeCellLine(_ value: String, truncated: Bool, attributes: CFDictionary, symbolColor: CGColor) -> TextLine {
+    nonisolated static func makeCellLine(_ value: String, truncated: Bool, attributes: CFDictionary, symbolColor: CGColor) -> LaidOutLine {
         let (text, symbols) = CellText.display(value)
         return makeLine(truncated ? text + "…" : text, symbols: symbols, attributes: attributes, symbolColor: symbolColor)
     }
@@ -537,14 +623,10 @@ enum CellPainter {
         ellipsisColor: CGColor
     ) {
         guard let (drawn, x, baseline) = placeText(line, in: rect, font: font, alignment: alignment, ellipsisColor: ellipsisColor) else { return }
-        let runs: [GlyphRun]?
-        if drawn === line.line {
-            runs = line.runs
-        } else {
-            if line.fittedRuns == nil { line.fittedRuns = GlyphRun.runs(of: drawn) }
-            runs = line.fittedRuns
-        }
+        let runs = drawn === line.line ? line.runs : line.fitted?.runs
         if let runs, batch.add(runs, x: x, baseline: baseline) { return }
+        // Drawn now, after the text before it, as it always was.
+        batch.draw(in: context)
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         context.textPosition = CGPoint(x: x, y: baseline)
         CTLineDraw(drawn, context)
@@ -564,12 +646,12 @@ enum CellPainter {
         var drawn = line.line
         var width = line.width
         if width > available {
-            if line.fittedWidth != available {
+            if line.fitted?.available != available {
                 line.fit(available, ellipsis: makeLine("…", font: font, color: ellipsisColor, symbolColor: ellipsisColor).line)
             }
-            guard let fitted = line.fitted else { return nil }
-            drawn = fitted
-            width = line.fittedLineWidth
+            guard let fitted = line.fitted, let fittedLine = fitted.line else { return nil }
+            drawn = fittedLine
+            width = fitted.width
         }
         let x = switch alignment {
         case .leading: rect.minX + GridMetrics.cellPadding
@@ -672,11 +754,20 @@ enum CellPainter {
         context: CGContext,
         scratch: inout [CGRect]
     ) {
-        scratch.removeAll(keepingCapacity: true)
-        for x in xs {
-            scratch.append(CGRect(x: x - 1, y: minY, width: 1, height: maxY - minY))
-        }
         context.setFillColor(palette.gridLine)
+        scratch.removeAll(keepingCapacity: true)
+        var last: CGFloat?
+        for x in xs {
+            // Two columns' lines in one place (a column of no width) are
+            // filled one over the other, as separate calls draw them: one
+            // fill of overlapping rectangles would cover them once.
+            if let last, x - 1 < last {
+                context.fill(scratch)
+                scratch.removeAll(keepingCapacity: true)
+            }
+            scratch.append(CGRect(x: x - 1, y: minY, width: 1, height: maxY - minY))
+            last = x
+        }
         context.fill(scratch)
     }
 
