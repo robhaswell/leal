@@ -114,6 +114,9 @@ keyboard navigation and accessibility are Leal's own code rather than
 
 ### 3.1 Source: getting bytes without copying them
 
+> Proposed, see ADR-0008 §1 (Leal's own save), §6 (Save As from an
+> incomplete document) and §9 (the check before saving, and SMB shares).
+
 On open, the core never reads the whole file into its heap.
 
 1. **Clone** the file with `clonefile(2)` into a temporary folder **on the
@@ -138,10 +141,12 @@ below instead. An EXDEV error means "clone elsewhere", not "no cloning":
 Clones are deleted when the document closes. Leftover clones from a crash are
 removed at launch, from every folder Leal recorded.
 
-The original file is watched with a dispatch source (kqueue). If it changes or
-is deleted, the window shows a banner with **Reload** and **Keep editing**.
-Saving checks the original's identity (inode, size, mtime) against what was
-opened, and asks before overwriting a file changed elsewhere.
+The original file is watched with kqueue, on one small thread per open
+document in leal-core (1.9). If it changes, the window shows a banner with
+**Reload** and **Keep Editing**; if it is deleted or moved to the Trash,
+the banner has **Save As…** and **Keep Editing**, since there is nothing to
+reload. Saving checks the original's identity (inode, size, mtime) against
+what was opened, and asks before overwriting a file changed elsewhere.
 
 **Removable drives (ADR-0006).** A clone on a removable drive can vanish if
 the drive is unplugged, and touching mapped pages then crashes the process.
@@ -159,10 +164,11 @@ blocks Save until the drive returns, and offers Save As.
 > ADR-0004 §11 (the `com.apple.TextEncoding` attribute) and ADR-0005 (§1,
 > §4, §5). The ADRs take precedence over this section.
 
-Detected from the first 64 KB plus samples from the middle and end of the file:
+Detected from the first 64 KB, then checked against the whole file in the
+background (1.2):
 
 - **Delimiter:** `,` `;` `\t` `|`, chosen by the most consistent field count
-  across sampled rows.
+  across rows.
 - **Quote character:** `"`. Other quote characters are out of scope for v1.
 - **Line endings:** LF, CRLF or CR, and whether they are mixed.
 - **BOM:** UTF-8, UTF-16 LE/BE.
@@ -201,9 +207,10 @@ open, Leal honours the attribute if the file still parses sensibly with it.
 Other apps still guess for themselves.
 
 For first paint, the dialect is decided from the **first 64 KB only**. The
-middle and end samples are checked afterwards in the background. If they
-disagree, Leal does not re-lay out the grid under the user; it shows a
-suggestion instead ("This file looks semicolon-separated — Switch").
+whole file is checked afterwards in the background (samples can't know
+whether they start inside a quoted field). If it disagrees, Leal does not
+re-lay out the grid under the user; it shows a suggestion instead ("This
+file looks semicolon-separated — Switch").
 
 The encoding at first paint is chosen in this order (ADR-0005 decision 4):
 the BOM, then the `com.apple.TextEncoding` attribute, then the encoding rule
@@ -279,6 +286,10 @@ field says so before the change is committed.
 
 ### 3.6 Edits
 
+> Proposed, see ADR-0008 §1 (rebasing after a save), §2 (every reader sees
+> edits), §3 (editing starts from the full value), §4 (re-reading with
+> unsaved edits) and §5 (recovering edits after an internal error).
+
 > Reverting by value, including cells with invalid bytes: ADR-0004 §9.
 > Editing hatched cells: ADR-0005 §2.
 
@@ -303,6 +314,10 @@ blank line edited in column *c* becomes a row of *c* + 1 fields. Edits past
 an unterminated quote are still rejected (ADR-0004 §8).
 
 ### 3.7 Saving
+
+> Proposed, see ADR-0008 §1 (after a save), §6 (Save As from an incomplete
+> document), §7 (Save As UTF-8), §8 (attributes written on save) and §9
+> (the check before writing).
 
 > Edge cases (quoting new fields, end-of-file line endings, ragged rows and
 > blank lines, empty rows, BOM-like starts, unterminated quotes, the reopen
@@ -361,6 +376,9 @@ of physical row numbers to show, in order.
 
 ### 3.9 Threading and the FFI boundary
 
+> Proposed, see ADR-0008 §5 (a failed document's unsaved edits are
+> recovered, not lost).
+
 - A document is an `Arc`-shared object. Reads for visible cells are synchronous
   and must take under 1 ms. They are safe to call on the main thread.
 - Indexing, filtering, sorting and saving are long jobs. They run on
@@ -387,9 +405,9 @@ lower-priority work must never delay higher-priority work.
 | Priority | Work | When | QoS |
 |---|---|---|---|
 | **P0** | Clone, map, detect dialect and encoding from the first 64 KB, parse the first screen of rows, paint | Immediately, before anything else starts | User-interactive |
-| **P1** | Row index (§3.3); parsing rows as the user scrolls | Straight after P0 | User-initiated |
-| **P2** | Diagnostics details, dialect check on later samples, whole-file encoding check, refined column widths, number detection for alignment | Alongside or after P1 | Utility |
-| **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, lowered to background during scrolling |
+| **P1** | Row index (§3.3) and diagnostics (§3.5), in one pass (1.5); parsing rows as the user scrolls | Straight after P0 | User-initiated |
+| **P2** | Whole-file dialect and encoding check (§3.2), refined column widths, number detection for alignment | Alongside or after P1 | Utility |
+| **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, paused while the user scrolls or edits (rule 3) |
 
 Rules:
 
@@ -471,6 +489,9 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |
 
 ### 4.3 Documents
+
+> Proposed, see ADR-0008 §4 (Revert to Saved goes through Reload) and §10
+> (no Versions browser in v1, since autosave-in-place is off).
 
 - `NSDocument`-based: Open Recent, window tabs, Save, Save As, Revert, dirty
   indicator, Versions where supported.

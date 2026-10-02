@@ -346,6 +346,25 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     unterminated quote are still rejected (ADR-0004 decision 8). The save
     oracle (`Document::apply`) and the edit strategy, which today reject or
     never generate such edits, change to match. (ADR-0005 decision 2)
+  - Every core reader goes through the edit overlay: cell values, find
+    (it matches edited values and stops matching the ones they replaced;
+    an edit recounts or invalidates the per-row running match counts, and
+    the raw-byte prefilter doesn't skip edited rows), `CopyPromise` (it
+    snapshots the overlay when the copy is made), the diagnostics marks
+    and Previous/Next (an edited cell is checked on its new value), and
+    column widths and number detection. Tests edit a cell, then find,
+    copy and step to it. (ADR-0008 decision 2, pending)
+  - Edits are tied to how the file was split into cells, so the core
+    refuses a new delimiter or encoding while there are unsaved edits. The
+    header-row choice can still change, and a drive-reconnect `restart`
+    keeps the edits, because the file's identity is verified unchanged.
+    (ADR-0008 decision 4, pending)
+  - The edit commands (logical coordinates, old and new values) can be
+    replayed into a freshly opened document, which reports any command
+    that no longer applies, so a failed document's edits can be recovered.
+    (ADR-0008 decision 5, pending)
+  - Decide whether header-row cells (file row 0, not a grid row) can be
+    edited; an ADR if it changes DESIGN. (phase 1 review)
 - [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
   - Replays the testkit's `EditCase` edits on the real document with
     `existing_hint` passed through, and requires the same bytes, splices,
@@ -362,10 +381,35 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     reach that column, then the value, at the end of the row before its
     line ending, and nothing else in the file changes; the replay covers
     it. (ADR-0005 decision 2)
+  - The save runs as a Rust-owned job with a handle whose `cancel()` sets
+    a flag the writer checks between chunks (ADR-0005 decision 6, DESIGN
+    §3.9). A cancelled save leaves the original untouched and removes
+    what it wrote; a test cancels one part-way.
+  - A criterion benchmark saves the reference file after one edit,
+    against DESIGN §1's "Save after one edit < 500 ms", and is added to
+    `bench-compare`'s budgets.
+  - The reopen property also requires that reopening the saved file
+    raises no whole-file review suggestion. (phase 1 review)
+  - Decide what happens when an edit makes the output 4 GiB or more,
+    which Leal then can't reopen (`TooLarge`). (phase 1 review)
+  - Save As from an incomplete document (a drive disconnected, or the file
+    changed while it was being read) writes only complete rows from the
+    bytes Leal trusts, cut at the last row boundary, with the edits
+    applied: never half a row, half a character or an open quote, and no
+    marker in the file. It reports how many rows it wrote, for the dialog.
+    Tested on the exFAT disk-image case. (ADR-0008 decision 6, pending)
 - [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
   - Covers every single-byte encoding Leal supports. (ADR-0005 decision 5)
   - The UTF-16 banner's Save As UTF-8 button works (mockup 06a).
+  - Save As UTF-8 keeps line endings, quoting and delimiters in meaning;
+    writes a UTF-8 BOM only if the original had a BOM; sets
+    `com.apple.TextEncoding` to UTF-8 and rewrites the interpretation
+    attribute for the new bytes. Text that can't be converted (an unpaired
+    surrogate or odd final byte in UTF-16, an unmapped byte in a
+    single-byte encoding) makes it refuse and name the cells; nothing is
+    substituted. The UTF-16 generator gains unpaired surrogates and odd
+    final bytes to cover it. (ADR-0008 decision 7, pending)
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
     and the product, with a unit test and edit-strategy coverage; this
@@ -395,6 +439,59 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     writing**, whatever the watcher last said: a network share's watcher
     sees only this Mac's changes, and a change can land between the last
     event and the save. (1.9 review)
+  - Leal's own save is not an outside change. After a successful save the
+    document is rebased onto the file just written: a new snapshot (clone,
+    or copy on removable drives), re-indexed; the watcher gets the new
+    identity and treats the event from Leal's own replace as expected;
+    `diverged` is cleared; edits and undo carry on. A hosted test saves
+    twice in a row and sees no banner and no prompt. (ADR-0008 decision 1,
+    pending)
+  - The inspector, find highlights, copy and the diagnostics marks show
+    edited values (2.1's overlay); a hosted test edits a cell, then finds,
+    copies and steps to it. (ADR-0008 decision 2, pending)
+  - The in-cell editor and the inspector start from the core's full
+    display value, never the grid's shortened text or its ↵ ⇥ ␀ symbols.
+    A value longer than the inspector's 64,000 characters is loaded in
+    full before it can be edited. A test commits an untouched long value
+    and an untouched multiline value and gets no edit. (ADR-0008 decision
+    3, pending)
+  - Reload and Revert to Saved ask before discarding unsaved edits, and
+    Revert goes through the model's Reload, never NSDocument's default
+    `read(from:)`. Treat As and Reopen with Encoding are disabled while
+    there are unsaved edits ("Save or revert your changes first"); the
+    Header row toggle stays available; a drive coming back keeps the
+    edits. Each has a test. (ADR-0008 decision 4, pending)
+  - If a document fails (DESIGN §3.9) with unsaved edits, the alert offers
+    **Recover changes**: Leal opens the file afresh and replays the undo
+    history's commands. If the file is unchanged the window carries on;
+    otherwise Leal offers Save As of what it recovered and names the edits
+    it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5,
+    pending)
+  - Save As from an incomplete document says plainly that the copy is
+    incomplete ("about N of M rows"); this wires the drive banners' Save
+    As… (`SEAM(2.5)`). (ADR-0008 decision 6, pending)
+  - On every save, the interpretation attribute is written with
+    `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
+    paint or whole-file review would guess differently, when the user
+    chose the delimiter or header, or when the choice came from the
+    attribute; otherwise any old attribute is removed. The same rule for
+    `com.apple.TextEncoding`, against both the first-64 KB and the
+    whole-file guess. A hosted test checks that after Save the attributes
+    are the new values, not ones NSDocument copied from the old file.
+    (ADR-0008 decision 8, pending)
+  - The check before writing opens the file afresh and reads its identity
+    with `fstat`, so network file systems revalidate; tested on a share if
+    one is available. (ADR-0008 decision 9, pending)
+  - Revert to Saved only, with no Versions browser: autosave-in-place
+    stays off and `preservesVersions` stays false. (ADR-0008 decision 10,
+    pending)
+  - The user sees one prompt about a file changed elsewhere, never both
+    Leal's and NSDocument's own. Decide what Save does for a deleted file
+    (`can_save()` is true today). (phase 1 review)
+  - Swift wraps the save's await in `withTaskCancellationHandler`, which
+    calls the job's `cancel()` (2.2; ADR-0005 decision 6).
+  - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
+    to `just perf` and recorded in docs/perf.md.
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
@@ -427,6 +524,19 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
 
 - [ ] **4.1 Performance and memory audit** against every budget in DESIGN §1;
   published comparison with Tad.
+  - Follow-ups the phase 1 notes deferred here (phase 1 review):
+    - UTF-16 fields with many `""` take one `memchr` per quote (1.4).
+    - One watcher thread per open document: measure with many documents
+      open, and share one kqueue if it matters (1.9).
+    - The row index's offsets in fixed-size blocks, if the 0.3 ms copy
+      when the index grows matters (1.3).
+    - Tighten `bench-compare`'s 20% regression and 10% noise thresholds
+      once CI has a few weeks of history (1.2b).
+    - A more compact store for find matches than 12 bytes per matching
+      row (120 MB on the 1 GB file), unless Rob accepts it (1.10).
+    - An age limit for the records of volumes that never come back (1.1).
+    - A home folder on an external drive puts the scratch copy there too,
+      so it isn't internal (1.1a, 1.3a).
 - [ ] **4.2 Accessibility** — VoiceOver, keyboard access, contrast (§4.4).
   - The grid draws its own cells, so it implements the `NSAccessibility`
     table protocols itself (ADR-0001, "Accessibility"): row and cell
