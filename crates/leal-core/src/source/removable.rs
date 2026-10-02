@@ -371,11 +371,39 @@ struct External {
     /// The file's `(st_dev, st_ino)`, to tell whether the path still leads
     /// to it.
     id: (u64, u64),
-    /// For a clone: its folder, held so that dropping it deletes the clone,
-    /// the folder and the record. `None` for the user's own file, whose
-    /// size and modification time at open are in `watched` instead.
+    /// Which file `file` and `path` are: the clone or the user's file. Ask
+    /// this, not `folder`, which outlives reading the clone.
+    reads: Reads,
+    /// Leal's clone's folder, if one was made: held so that dropping it
+    /// deletes the clone, the folder and the record. It stays after a
+    /// reconnect falls back to the user's file (`reads` says so), so a
+    /// clone that is only missing for now is still cleaned up. `None` for a
+    /// drive that can't clone, and for a share.
     folder: Option<TempFolder>,
-    watched: Option<FileIdentity>,
+}
+
+/// Which file an [`External`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// Leal's clone on the drive: a snapshot, which can't change.
+    Clone,
+    /// The user's file itself, which can: checked after every read against
+    /// what it was at open (its device as mounted now, after a reconnect).
+    Original(FileIdentity),
+}
+
+impl External {
+    /// What the user's file was at open, if this is the user's file.
+    fn original(&self) -> Option<FileIdentity> {
+        match self.reads {
+            Reads::Original(identity) => Some(identity),
+            Reads::Clone => None,
+        }
+    }
+
+    fn reads_clone(&self) -> bool {
+        self.reads == Reads::Clone
+    }
 }
 
 /// What a failed read of the drive means, from its error alone.
@@ -495,8 +523,8 @@ impl Removable {
                     file: Arc::new(file),
                     path,
                     id: (metadata.dev(), metadata.ino()),
+                    reads: Reads::Clone,
                     folder: Some(clone),
-                    watched: None,
                 }
             }
             Origin::Original {
@@ -507,13 +535,13 @@ impl Removable {
                 file: Arc::new(file),
                 path,
                 id: (identity.device, identity.inode),
+                reads: Reads::Original(identity),
                 folder: None,
-                watched: Some(identity),
             },
         };
         // A clone's size is the snapshot's. The user's file is read only up
         // to the size it had at open.
-        let len = match &external.watched {
+        let len = match external.original() {
             Some(identity) => identity.len,
             None => external
                 .file
@@ -625,8 +653,9 @@ impl Removable {
         }
     }
 
-    /// Whether the user's file changed while it was being copied (only
-    /// possible without a clone).
+    /// Whether the user's file changed while it was being copied: only
+    /// possible while the user's file itself is read, without a clone or
+    /// after a drive came back without it (`reconnect`).
     pub(super) fn changed_on_disk(&self) -> bool {
         self.changed.load(Ordering::Acquire)
     }
@@ -656,11 +685,7 @@ impl Removable {
         if self.is_complete() {
             return;
         }
-        let reads_the_original = self
-            .lock_external()
-            .as_ref()
-            .is_some_and(|external| external.watched.is_some());
-        if reads_the_original {
+        if self.reads_the_original() {
             self.changed.store(true, Ordering::Release);
         }
     }
@@ -670,7 +695,7 @@ impl Removable {
     /// (`confirm_deletion`). A clone's path is Leal's own, and stays.
     pub(super) fn note_original_path(&self, path: &Path) {
         if let Some(external) = self.lock_external().as_mut()
-            && external.watched.is_some()
+            && !external.reads_clone()
             && external.path != path
         {
             external.path = path.to_owned();
@@ -683,8 +708,10 @@ impl Removable {
     /// was opened. Returns whether the source is reading again.
     ///
     /// It reopens, in order:
-    /// 1. **The clone on the drive**, if it survived the disconnection and
-    ///    is the same file (inode and size). It is a snapshot, so it serves
+    /// 1. **The clone on the drive**, if it was what was read (not since an
+    ///    earlier reconnect fell back to the user's file), survived the
+    ///    disconnection and is the same file (inode and size). It is a
+    ///    snapshot, so it serves
     ///    the rest of the bytes as they were when the file was opened.
     /// 2. **The user's file**, if its inode, size and modification time are
     ///    still the ones it had when opened (its device number changes with
@@ -722,7 +749,9 @@ impl Removable {
         let Some(external) = external.as_mut() else {
             return false;
         };
-        let reopened = if external.folder.is_some()
+        // Once it has fallen back to the user's file, it stays with it:
+        // `path` and `id` are the user's file's from then on.
+        let reopened = if external.reads_clone()
             && let Ok(clone) = File::open(&external.path)
             && let Ok(now) = clone.metadata()
             && now.ino() == external.id.1
@@ -740,7 +769,7 @@ impl Removable {
             external.file = Arc::new(file);
             external.path = original.to_owned();
             external.id = (now.dev(), now.ino());
-            external.watched = Some(FileIdentity {
+            external.reads = Reads::Original(FileIdentity {
                 device: now.dev(),
                 ..*opened
             });
@@ -792,19 +821,20 @@ impl Removable {
 
     /// TEST HOOK: Leal's clone on the drive is lost while the drive is
     /// away: it is deleted, so `reconnect` can't reopen it and falls back
-    /// to the user's file. Returns whether there was a clone to lose.
+    /// to the user's file. Returns whether there was a clone to lose. Only
+    /// ever Leal's clone is deleted, at its folder's own path, never
+    /// `External::path`, which is the user's file after a fallback.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn simulate_clone_lost(&self) -> bool {
         let external = self.lock_external();
         let Some(External {
-            path,
-            folder: Some(_),
+            folder: Some(folder),
             ..
         }) = external.as_ref()
         else {
             return false;
         };
-        fs::remove_file(path).is_ok()
+        fs::remove_file(folder.file_path()).is_ok()
     }
 
     /// TEST HOOK: the simulated share's close callback, if any.
@@ -951,7 +981,7 @@ impl Removable {
     fn reads_the_original(&self) -> bool {
         self.lock_external()
             .as_ref()
-            .is_some_and(|external| external.watched.is_some())
+            .is_some_and(|external| !external.reads_clone())
     }
 
     /// The copy's chunk at `offset` must agree with first paint's bytes,
@@ -1180,7 +1210,7 @@ impl Removable {
             let Some(external) = external.as_ref() else {
                 return self.disconnect(error);
             };
-            (external.path.clone(), external.watched)
+            (external.path.clone(), external.original())
         };
         match fs::metadata(&path) {
             Ok(now) => {
@@ -1352,7 +1382,7 @@ impl Removable {
         let external = self.lock_external();
         let Some(External {
             file,
-            watched: Some(watched),
+            reads: Reads::Original(watched),
             ..
         }) = external.as_ref()
         else {
@@ -1423,10 +1453,24 @@ impl Removable {
         if external.file.metadata().is_err() {
             return true;
         }
-        external.folder.is_some()
+        // Asked of what is read, not of whether a clone was made: after a
+        // reconnect without the clone, `path` is the user's file.
+        external.reads_clone()
             && fs::metadata(&external.path).map_or(true, |metadata| {
                 (metadata.dev(), metadata.ino()) != external.id
             })
+    }
+
+    /// TEST: what an `EIO` from the drive's file would be classed as now,
+    /// for a reader that doesn't wait. A disconnection is recorded, as for
+    /// a real read.
+    #[cfg(test)]
+    pub(super) fn classify_eio_now(&self) -> ReadError {
+        self.failed_with(
+            io::Error::from_raw_os_error(libc::EIO),
+            Failure::Ambiguous,
+            Wait::Never,
+        )
     }
 
     /// The clone on the drive, or the user's file, while there is one.

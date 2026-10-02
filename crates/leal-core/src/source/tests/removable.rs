@@ -940,45 +940,131 @@ fn change_in_place(path: &Path, at: usize, keep_time: bool) {
 /// kept whatever they were read from, so the rest of the first 64 KB is
 /// checked against them: a same-size change there, with its modification
 /// time put back, passes the `fstat` check but stops the copy.
+///
+/// With 4 KB chunks; with 5,000-byte chunks, one of which crosses the end
+/// of the 64 KB (the change is in its part inside them); and with the
+/// app's 1 MB chunks and the drive gone before the first one, so the one
+/// chunk holding all of the 64 KB is read from the user's file.
 #[test]
 fn a_drive_back_without_its_clone_checks_the_copy_against_first_paint() {
     let dir = TempDir::new("reconnect-lost-clone");
-    let chunk = 4096;
     let head = 64 * 1024;
-    let bytes = contents(200 * 1024);
-    let path = dir.file("usb.csv", &bytes);
+    // (chunk, disconnected at, changed at, file size)
+    let cases = [
+        (4096, 16 * 1024, 40 * 1024 + 7, 200 * 1024),
+        (5000, 16 * 1024, 65_100, 200 * 1024),
+        (1024 * 1024, 0, 40 * 1024 + 7, 2_500_000),
+    ];
+    for (chunk, disconnect_at, changed_at, len) in cases {
+        let case = format!("{chunk}-byte chunks");
+        let bytes = contents(len);
+        let path = dir.file(&format!("usb-{chunk}.csv"), &bytes);
+        let source = Source::open_simulating_fault(
+            &path,
+            &dir.temp_folders(),
+            chunk,
+            Some(SimulatedFault::Disconnect { at: disconnect_at }),
+        )
+        .unwrap();
+        assert_eq!(&*source.read_head(head).unwrap(), &bytes[..head], "{case}");
+        let streamed = stream_all(&source);
+        assert_eq!(kind(streamed.result), ReadErrorKind::Disconnected, "{case}");
+        let copied = disconnect_at / chunk * chunk;
+        assert_eq!(streamed.chunks, expected_chunks(copied, chunk), "{case}");
+
+        assert!(
+            source.simulate_clone_lost(),
+            "{case}: first paint read a clone"
+        );
+        change_in_place(&path, changed_at, true);
+        source.simulate_drive_back();
+        assert!(source.reconnect(&path), "{case}: the file looks unchanged");
+        assert!(source.can_save(), "{case}");
+
+        let streamed = stream_all(&source);
+        assert_eq!(
+            kind(streamed.result),
+            ReadErrorKind::ChangedOnDisk,
+            "{case}"
+        );
+        let before_change = changed_at / chunk * chunk;
+        assert_eq!(
+            streamed.chunks,
+            expected_chunks(before_change, chunk),
+            "{case}: the changed chunk isn't delivered"
+        );
+        assert_eq!(streamed.bytes, &bytes[..before_change], "{case}");
+        assert!(source.changed_on_disk(), "{case}");
+        assert!(!source.can_save(), "{case}");
+        assert_eq!(source.as_slice(), None, "{case}: never mapped");
+        assert_eq!(source.kept_head_len(), 0, "{case}: let go once they differ");
+    }
+}
+
+/// Opens `bytes` as `name` on a simulated drive that can clone, reads first
+/// paint, and copies until the drive goes at 16 KB; then loses the clone,
+/// brings the drive back and reconnects, which falls back to the user's
+/// file.
+fn fallen_back_to_the_users_file(dir: &TempDir, name: &str, bytes: &[u8]) -> (Source, PathBuf) {
+    let path = dir.file(name, bytes);
     let source = Source::open_simulating_fault(
         &path,
         &dir.temp_folders(),
-        chunk,
+        4096,
         Some(SimulatedFault::Disconnect { at: 16 * 1024 }),
     )
     .unwrap();
-    assert_eq!(&*source.read_head(head).unwrap(), &bytes[..head]);
-    let streamed = stream_all(&source);
-    assert_eq!(kind(streamed.result), ReadErrorKind::Disconnected);
-    assert_eq!(streamed.chunks, expected_chunks(16 * 1024, chunk));
-
-    assert!(source.simulate_clone_lost(), "first paint read a clone");
-    let changed_at = 40 * 1024 + 7;
-    change_in_place(&path, changed_at, true);
-    source.simulate_drive_back();
-    assert!(source.reconnect(&path), "the user's file looks unchanged");
-    assert!(source.can_save());
-
-    let streamed = stream_all(&source);
-    assert_eq!(kind(streamed.result), ReadErrorKind::ChangedOnDisk);
-    let before_change = changed_at / chunk * chunk;
+    source.read_head(64 * 1024).unwrap();
     assert_eq!(
-        streamed.chunks,
-        expected_chunks(before_change, chunk),
-        "the changed chunk isn't delivered"
+        kind(stream_all(&source).result),
+        ReadErrorKind::Disconnected
     );
-    assert_eq!(streamed.bytes, &bytes[..before_change]);
-    assert!(source.changed_on_disk());
-    assert!(!source.can_save());
-    assert_eq!(source.as_slice(), None, "never mapped");
-    assert_eq!(source.kept_head_len(), 0, "let go once they differ");
+    assert!(source.simulate_clone_lost());
+    source.simulate_drive_back();
+    assert!(source.reconnect(&path));
+    assert_eq!(
+        source.external_clone(),
+        Some(path.clone()),
+        "the user's file"
+    );
+    (source, path)
+}
+
+/// The hook deletes only Leal's clone, by its own path: once a reconnect
+/// has fallen back to the user's file, there is nothing left to lose, and
+/// the user's file is left alone (2.1a review).
+#[test]
+fn losing_the_clone_again_leaves_the_users_file_alone() {
+    let dir = TempDir::new("lose-clone-twice");
+    let bytes = contents(200 * 1024);
+    let (source, path) = fallen_back_to_the_users_file(&dir, "usb.csv", &bytes);
+    assert!(!source.simulate_clone_lost(), "nothing left to lose");
+    assert!(!source.simulate_clone_lost(), "still nothing");
+    assert_eq!(fs::read(&path).unwrap(), bytes, "the user's file is there");
+    let streamed = stream_all(&source);
+    streamed.result.unwrap();
+    assert_eq!(streamed.bytes, bytes);
+}
+
+/// After a reconnect without the clone, the drive's file is the user's,
+/// which may simply have been renamed: an `EIO` then is a read error (such
+/// as a bad block), not a vanished drive. Only a clone's path is looked at
+/// (`drive_vanished`, from 1.9; fixed in the 2.1a review). While the clone
+/// is read, a clone gone from its path with an `EIO` is a vanished drive.
+#[test]
+fn after_falling_back_a_renamed_file_and_an_eio_is_not_a_disconnection() {
+    let dir = TempDir::new("fallback-eio");
+    let bytes = contents(200 * 1024);
+    let (source, path) = fallen_back_to_the_users_file(&dir, "usb.csv", &bytes);
+    fs::rename(&path, dir.0.join("renamed.csv")).unwrap();
+    assert_eq!(source.classify_eio_now(), Some(ReadErrorKind::Other));
+    assert_eq!(source.storage(), Storage::Reading);
+
+    let path = dir.file("cloned.csv", &bytes);
+    let source = open_removable(&path, &dir.temp_folders(), 4096);
+    assert!(source.simulate_clone_lost());
+    assert_eq!(source.classify_eio_now(), Some(ReadErrorKind::Disconnected));
+    assert_eq!(source.storage(), Storage::Disconnected);
 }
 
 /// The clone a drive comes back with is a snapshot: first paint's bytes,

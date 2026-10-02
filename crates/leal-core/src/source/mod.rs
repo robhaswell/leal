@@ -659,8 +659,10 @@ impl Source {
     /// isn't, in an app ([`forbid_share_use_on_main_thread`]). Nothing can
     /// cancel it: no open can be cancelled. On a removable drive or a
     /// share, the bytes are kept until the copy's first chunks are checked
-    /// against them (`ChangedOnDisk` if they differ): without a clone, and
-    /// with one too, in case the drive comes back without it.
+    /// against them (`ChangedOnDisk` if they differ). That matters when the
+    /// user's file itself is read: on a share (which is never cloned), on a
+    /// drive that can't clone, and on one that comes back without its
+    /// clone.
     ///
     /// # Errors
     ///
@@ -1008,6 +1010,16 @@ impl Source {
         match &self.bytes {
             Bytes::Removable(removable) => removable.kept_head_len(),
             Bytes::Mapped(_) | Bytes::Owned(_) => 0,
+        }
+    }
+
+    /// What an `EIO` from a removable drive's file would be classed as now
+    /// (`None` for other sources).
+    #[cfg(test)]
+    fn classify_eio_now(&self) -> Option<ReadErrorKind> {
+        match &self.bytes {
+            Bytes::Removable(removable) => Some(removable.classify_eio_now().kind()),
+            Bytes::Mapped(_) | Bytes::Owned(_) => None,
         }
     }
 
