@@ -147,6 +147,9 @@ final class StatusBarView: NSView {
         badge.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.22).cgColor
     }
 
+    /// Whether the indexing progress bar shows, for tests.
+    var isShowingProgress: Bool { !progress.isHidden }
+
     /// The left side's text, segments joined by " · ", for tests.
     var text: String { shown.map(\.text).joined(separator: "  ·  ") }
 

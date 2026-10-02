@@ -427,7 +427,7 @@ final class ExternalChangesTests: XCTestCase {
         let url = try file("failing.csv", text(rows: 200_000, prefix: "name"))
         let (document, model, content) = try open(url)
         content.grid.move(.lastRow)
-        model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index)
+        model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index, reading: model.readingID)
 
         XCTAssertTrue(model.readStopped)
         XCTAssertTrue(model.isIndexComplete, "no more rows will come")
@@ -448,6 +448,58 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertEqual(model.rowCount, 200_000)
         XCTAssertFalse(StatusText.segments(model.status).contains("Partly read"))
         document.close()
+    }
+
+    /// A read error reported for a reading that is gone (the file was
+    /// read again, or reloaded, meanwhile) doesn't mark the new reading
+    /// "Partly read" (phase 1 review follow-up).
+    func testAStaleReadErrorIsIgnored() async throws {
+        let url = try file("people.csv", text(rows: 2_000, prefix: "name"))
+        let (document, model, content) = try open(url)
+        try await waitUntil("indexed") { model.isIndexComplete }
+        let first = model.readingID
+        content.treatAs(.semicolon)
+        XCTAssertNotEqual(model.readingID, first)
+        model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index, reading: first)
+        XCTAssertFalse(model.readStopped)
+        XCTAssertNil(content.driveBanner)
+
+        let second = model.readingID
+        try save(text(rows: 3_000, prefix: "new"), to: url)
+        try await waitUntil("the change is seen") { model.original.state == .changed }
+        content.reloadFromDisk(nil)
+        XCTAssertNotEqual(model.readingID, second)
+        model.jobEnded(JobFailure.Failed(message: "Input/output error"), job: .index, reading: second)
+        model.jobEnded(JobFailure.DriveDisconnected, job: .index, reading: second)
+        XCTAssertFalse(model.readStopped)
+        XCTAssertFalse(model.indexStopped)
+        XCTAssertNil(content.driveBanner)
+        try await waitUntil("indexed again") { model.isIndexComplete }
+        XCTAssertEqual(model.rowCount, 3_000)
+        document.close()
+    }
+
+    /// An index that ends because the drive went, or the file changed
+    /// while it was read, leaves no "Indexing…" and frozen progress bar:
+    /// the window shows the rows read, with no skeletons past them, and
+    /// the banner says why (phase 1 review follow-up).
+    func testAnIndexStoppedByTheDriveShowsNoProgress() async throws {
+        for fault in [SimulatedFault.change(at: 16_384), .disconnect(at: 100_000)] {
+            simulateDrive(fault)
+            let url = try file("usb-\(UUID().uuidString).csv", text(rows: 20_000, prefix: "name"))
+            let (document, model, content) = try open(url)
+            try await waitUntil("\(fault): the index stopped") { model.indexStopped }
+            XCTAssertTrue(model.isIndexComplete)
+            XCTAssertFalse(model.status.indexing, "\(fault)")
+            XCTAssertFalse(StatusText.counts(model.status).hasPrefix("Indexing"), "\(fault)")
+            XCTAssertFalse(content.statusBar.isShowingProgress, "\(fault)")
+            XCTAssertEqual(model.rowCount, model.loadedRowCount, "\(fault): no skeleton rows")
+            XCTAssertLessThan(model.rowCount, 20_000)
+            XCTAssertNotNil(content.driveBanner, "\(fault): the banner says why")
+            XCTAssertFalse(model.readStopped, "\(fault): not a read error")
+            DocumentModel.openForTesting = nil
+            document.close()
+        }
     }
 
     // MARK: The banner choice and the status bar's words

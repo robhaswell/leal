@@ -339,7 +339,7 @@ final class DocumentTests: XCTestCase {
             ended = error
         }
         XCTAssertEqual(ended as? JobFailure, .Panicked(message: "deliberate job panic"))
-        model.jobEnded(ended, job: .review)
+        model.jobEnded(ended, job: .review, reading: model.readingID)
 
         XCTAssertTrue(model.isFailed)
         let alert = try XCTUnwrap(sheets.first)
