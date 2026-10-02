@@ -163,12 +163,17 @@ final class RemovableDriveTests: XCTestCase {
     /// A drive detached while Leal is still copying the file: the document
     /// shows the rows it had read, the disconnected banner and status note,
     /// Save is off, and nothing crashes, including closing it. The image is
-    /// compressed (bzip2), so reading it is slow enough that the copy is
-    /// still going when the drive goes.
+    /// compressed (bzip2), so reading it is slow enough (about 50 MB/s)
+    /// that the copy is still going when the drive goes.
     func testADriveDetachedMidCopyShowsDisconnected() async throws {
-        let rows = 1_500_000
+        let rows = 2_000_000
         let image = try await attach(fs: "ExFAT", format: "UDBZ", size: nil, file: "drive.csv", contents: csv(rows: rows))
         let url = image.root.appending(path: "drive.csv")
+        // The drive is pulled as soon as the helper gets to it, which takes
+        // at least 0.4 s: first paint (one 64 KB read) is long done by then,
+        // and the copy (about 90 MB) far from it, even in a Release build.
+        let pulled = Date()
+        try image.requestPull()
         let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
         document.makeWindowControllers()
         let model = try XCTUnwrap(document.model)
@@ -177,9 +182,7 @@ final class RemovableDriveTests: XCTestCase {
         XCTAssertEqual(model.storage, .reading, "streamed from the drive at first paint")
         XCTAssertEqual(model.cell(row: 0, column: 0), .text("0", truncated: false))
 
-        // At once: the copy of a file this size takes a second or more.
-        let pulled = Date()
-        try await image.pull()
+        try await image.waitUntilPulled()
         let took = Date().timeIntervalSince(pulled)
         try await waitUntil("disconnected (detaching took \(took) s)") { model.storage == .disconnected || model.storage == .copy }
         XCTAssertEqual(model.storage, .disconnected, "the copy finished before the drive went (detaching took \(took) s)")
@@ -282,14 +285,18 @@ struct HelperDiskImage {
         return false
     }
 
-    /// Pulls the drive out while Leal has the file open, as when a drive is
-    /// unplugged: the helper runs `hdiutil detach -force` on it. The test
+    /// Asks the helper to pull the drive out, as when a drive is unplugged
+    /// with a file on it open: it runs `hdiutil detach -force` on it. The test
     /// host could do it itself, but in the sandbox that takes about 10 s
     /// while a file on the volume is open (0.3 s outside), by which time
     /// the copy has finished. Throws with the helper's report if the image
     /// is still attached afterwards.
-    func pull() async throws {
+    func requestPull() throws {
         try Data().write(to: folder.appending(path: "detach"))
+    }
+
+    /// Waits until the helper has pulled the drive (`requestPull`).
+    func waitUntilPulled() async throws {
         let detached = folder.appending(path: "detached")
         let deadline = Date().addingTimeInterval(60)
         while !FileManager.default.fileExists(atPath: detached.path(percentEncoded: false)) {

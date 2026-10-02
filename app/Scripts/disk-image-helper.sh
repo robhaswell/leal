@@ -130,7 +130,7 @@ serve() {
 # Pulls the drive of the request in folder $1 out, as if unplugged.
 pull() {
     local folder="$1" device result
-    device="$(devices_of "$folder/volume.dmg")"
+    device="$(cut -d ' ' -f 2 < "$folder/ready")"
     result="$(/usr/bin/hdiutil detach "$device" -force 2>&1)"
     printf '%s\n' "$result" > "$folder/detached.tmp"
     mv "$folder/detached.tmp" "$folder/detached"
@@ -185,7 +185,7 @@ watch() {
                 [ -e "$done_file" ] && grep -qxF "$(dirname "$done_file")/volume.dmg" "$attached" && finish "$(dirname "$done_file")"
             done
         fi
-        sleep 0.2
+        sleep 0.05
     done
 }
 
