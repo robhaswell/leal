@@ -923,3 +923,126 @@ fn changes_to_the_file_without_a_clone_are_reported_and_block_save() {
 
     assert_eq!(entries(temp.scratch()).len(), 0, "every source was dropped");
 }
+
+/// Writes `b"XX"` into the user's file at `at`, in place, and puts its
+/// modification time back if `keep_time`: a same-size change.
+fn change_in_place(path: &Path, at: usize, keep_time: bool) {
+    let modified = fs::metadata(path).unwrap().modified().unwrap();
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, b"XX", u64::try_from(at).unwrap()).unwrap();
+    if keep_time {
+        file.set_modified(modified).unwrap();
+    }
+}
+
+/// Task 2.1a: a drive that comes back without Leal's clone is read from the
+/// user's file, though first paint read the clone. First paint's bytes are
+/// kept whatever they were read from, so the rest of the first 64 KB is
+/// checked against them: a same-size change there, with its modification
+/// time put back, passes the `fstat` check but stops the copy.
+#[test]
+fn a_drive_back_without_its_clone_checks_the_copy_against_first_paint() {
+    let dir = TempDir::new("reconnect-lost-clone");
+    let chunk = 4096;
+    let head = 64 * 1024;
+    let bytes = contents(200 * 1024);
+    let path = dir.file("usb.csv", &bytes);
+    let source = Source::open_simulating_fault(
+        &path,
+        &dir.temp_folders(),
+        chunk,
+        Some(SimulatedFault::Disconnect { at: 16 * 1024 }),
+    )
+    .unwrap();
+    assert_eq!(&*source.read_head(head).unwrap(), &bytes[..head]);
+    let streamed = stream_all(&source);
+    assert_eq!(kind(streamed.result), ReadErrorKind::Disconnected);
+    assert_eq!(streamed.chunks, expected_chunks(16 * 1024, chunk));
+
+    assert!(source.simulate_clone_lost(), "first paint read a clone");
+    let changed_at = 40 * 1024 + 7;
+    change_in_place(&path, changed_at, true);
+    source.simulate_drive_back();
+    assert!(source.reconnect(&path), "the user's file looks unchanged");
+    assert!(source.can_save());
+
+    let streamed = stream_all(&source);
+    assert_eq!(kind(streamed.result), ReadErrorKind::ChangedOnDisk);
+    let before_change = changed_at / chunk * chunk;
+    assert_eq!(
+        streamed.chunks,
+        expected_chunks(before_change, chunk),
+        "the changed chunk isn't delivered"
+    );
+    assert_eq!(streamed.bytes, &bytes[..before_change]);
+    assert!(source.changed_on_disk());
+    assert!(!source.can_save());
+    assert_eq!(source.as_slice(), None, "never mapped");
+    assert_eq!(source.kept_head_len(), 0, "let go once they differ");
+}
+
+/// The clone a drive comes back with is a snapshot: first paint's bytes,
+/// kept although they were read from it, agree with it, and a change to the
+/// user's file meanwhile doesn't matter.
+#[test]
+fn a_drive_back_with_its_clone_completes_the_copy() {
+    let dir = TempDir::new("reconnect-kept-clone");
+    let chunk = 4096;
+    let head = 64 * 1024;
+    let bytes = contents(200 * 1024);
+    let path = dir.file("usb.csv", &bytes);
+    let source = Source::open_simulating_fault(
+        &path,
+        &dir.temp_folders(),
+        chunk,
+        Some(SimulatedFault::Disconnect { at: 16 * 1024 }),
+    )
+    .unwrap();
+    assert_eq!(&*source.read_head(head).unwrap(), &bytes[..head]);
+    assert_eq!(source.kept_head_len(), head, "kept, though from a clone");
+    assert_eq!(
+        kind(stream_all(&source).result),
+        ReadErrorKind::Disconnected
+    );
+    assert_eq!(source.kept_head_len(), head, "not all checked yet");
+
+    change_in_place(&path, 40 * 1024, false);
+    source.simulate_drive_back();
+    assert!(source.reconnect(&path));
+    let streamed = stream_all(&source);
+    streamed.result.unwrap();
+    assert_eq!(streamed.bytes, bytes);
+    assert!(!source.changed_on_disk());
+    assert_eq!(source.as_slice(), Some(bytes.as_slice()));
+    assert_eq!(source.kept_head_len(), 0, "let go once checked");
+}
+
+/// First paint's bytes kept from a clone cost at most 64 KB, and only
+/// until the copy is past them.
+#[test]
+fn first_paints_bytes_from_a_clone_are_let_go_once_copied() {
+    let dir = TempDir::new("clone-head-kept");
+    let bytes = contents(200 * 1024);
+    let path = dir.file("usb.csv", &bytes);
+    let source = open_removable(&path, &dir.temp_folders(), 4096);
+    assert!(source.external_clone().is_some_and(|clone| clone != path));
+    source.read_head(64 * 1024).unwrap();
+    assert_eq!(source.kept_head_len(), 64 * 1024);
+    let mut kept = Vec::new();
+    let streamed = stream_with(&source, &AtomicBool::new(false), |_, source| {
+        kept.push(source.kept_head_len());
+    });
+    streamed.result.unwrap();
+    assert_eq!(streamed.bytes, bytes);
+    // Kept while the copy is in the first 64 KB (16 chunks), then let go.
+    assert!(kept[..15].iter().all(|&len| len == 64 * 1024), "{kept:?}");
+    assert!(kept[15..].iter().all(|&len| len == 0), "{kept:?}");
+
+    // A file shorter than 64 KB: all of it, until its one chunk is copied.
+    let small = dir.file("small.csv", &bytes[..1000]);
+    let source = open_removable(&small, &dir.temp_folders(), 4096);
+    assert_eq!(&*source.read_head(64 * 1024).unwrap(), &bytes[..1000]);
+    assert_eq!(source.kept_head_len(), 1000);
+    stream_all(&source).result.unwrap();
+    assert_eq!(source.kept_head_len(), 0);
+}

@@ -481,13 +481,14 @@ check-no-test-exports app="build/DerivedData/Build/Products/Release/Leal.app":
     # symbols, and `strings` UniFFI's metadata names, in either spelling
     # (`debug_panic`, `debugPanic`). Every test-only export starts `debug_`;
     # the test hooks are `open_simulating_*`, `SimulatedFault`,
-    # `simulate_drive_back`, and for network shares (task 2.0)
+    # `simulate_drive_back`, `simulate_clone_lost` (task 2.1a), and for
+    # network shares (task 2.0)
     # `SimulatedShare`, `SimulatedShareFailure`, `simulated_share_reads`,
     # `simulated_share_release`, `simulated_head_reads`,
     # `share_reads_on_main_thread`, `debug_share_release`, and the private
     # `simulate_share_read`, `simulate_share_hold`, `simulated_away`,
     # `SimulatedState` and `sleep_strictly`.
-    pattern='debug_?(panic|watch|open_?document|simulate|share)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share)|set_?fault|share_?reads_?on_?main|sleep_?strictly'
+    pattern='debug_?(panic|watch|open_?document|simulate|share)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share|clone)|set_?fault|share_?reads_?on_?main|sleep_?strictly'
     for binary in "{{ app }}/Contents/Frameworks/LealFFI.framework/LealFFI" "{{ app }}/Contents/MacOS/Leal"; do
         if nm "$binary" | grep -Ei "$pattern" || strings "$binary" | grep -Ei "$pattern"; then
             echo "error: $binary has test-only exports or test hooks" >&2

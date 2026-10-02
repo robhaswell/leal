@@ -657,9 +657,10 @@ impl Source {
     /// error is retried for up to [`NETWORK_RETRY_WINDOW`], so **on a share
     /// it must be called off the main thread**. A debug build panics if it
     /// isn't, in an app ([`forbid_share_use_on_main_thread`]). Nothing can
-    /// cancel it: no open can be cancelled. Without a clone, the bytes are
-    /// kept until the copy's first chunks are checked against them
-    /// (`ChangedOnDisk` if they differ).
+    /// cancel it: no open can be cancelled. On a removable drive or a
+    /// share, the bytes are kept until the copy's first chunks are checked
+    /// against them (`ChangedOnDisk` if they differ): without a clone, and
+    /// with one too, in case the drive comes back without it.
     ///
     /// # Errors
     ///
@@ -937,6 +938,22 @@ impl Source {
         }
     }
 
+    /// TEST HOOK, not for product code: Leal's clone of a file on a
+    /// removable drive is lost (deleted) while the drive is away, so
+    /// [`reconnect`](Self::reconnect) falls back to the user's file (task
+    /// 2.1a). Returns whether there was a clone to lose: `false` for a
+    /// drive that can't clone, a network share, a complete copy, and every
+    /// other source.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn simulate_clone_lost(&self) -> bool {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.simulate_clone_lost(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
     fn len_usize(&self) -> usize {
         match &self.bytes {
             Bytes::Mapped(map) => map.len(),
@@ -981,6 +998,16 @@ impl Source {
         match &self.bytes {
             Bytes::Removable(removable) => removable.external_clone(),
             Bytes::Mapped(_) | Bytes::Owned(_) => None,
+        }
+    }
+
+    /// How many of first paint's bytes a file on a removable drive keeps
+    /// for its copy to check.
+    #[cfg(test)]
+    fn kept_head_len(&self) -> usize {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.kept_head_len(),
+            Bytes::Mapped(_) | Bytes::Owned(_) => 0,
         }
     }
 

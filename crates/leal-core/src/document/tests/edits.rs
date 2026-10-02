@@ -835,6 +835,58 @@ fn edits_on_rows_the_copy_never_reached_are_named() {
     assert_eq!(row_text(&document, 2)[1], "early");
 }
 
+/// Task 2.1a: a drive that comes back without Leal's clone is read from the
+/// user's file, though first paint read the clone. A same-size change to a
+/// row of the first 64 KB, with its modification time put back, stops the
+/// copy (`ChangedOnDisk`) rather than being read unnoticed, and an edit
+/// made to that row from first paint's bytes is named as a conflict.
+#[test]
+fn a_drive_back_without_its_clone_catches_a_change_to_an_edited_head_row() {
+    let dir = Dir::new("edit-reconnect-lost-clone");
+    let bytes = sample(300 * 1024);
+    // A record of the first 64 KB that the copy hasn't reached when the
+    // drive goes, at 16 KB. Record `i` is row `i + 1`, after the header.
+    let (i, at) = (0..)
+        .find_map(|i| {
+            let start = format!("\n{i},caf\u{e9} {i},");
+            let at = memchr::memmem::find(&bytes, start.as_bytes())? + 1;
+            (at > 40 * 1024).then_some((i, at))
+        })
+        .unwrap();
+    let row = i + 1;
+    let document = open_with_fault(&dir, &bytes, SimulatedFault::Disconnect { at: 16 * 1024 });
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    assert_eq!(row_text(&document, row)[0], i.to_string());
+    set(&document, 2, 1, "copied");
+    set(&document, row, 1, "edited from first paint");
+
+    assert!(document.source().simulate_clone_lost(), "read from a clone");
+    // "café" becomes "CAFé": the same length, in place, its time put back.
+    let path = dir.0.join("usb.csv");
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let name = u64::try_from(at + i.to_string().len() + 1).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, b"CAF", name).unwrap();
+    file.set_modified(modified).unwrap();
+    drop(file);
+
+    document.source().simulate_drive_back();
+    assert_eq!(document.check_original().state, OriginalState::Unchanged);
+    assert_eq!(document.generation(), 1, "reconnected to the user's file");
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::ChangedOnDisk)))
+    );
+    assert!(document.changed_on_disk());
+    assert!(!document.can_save());
+    assert_eq!(document.edit_conflicts(), [(row, 1)]);
+    assert_eq!(document.edited_cells(), 2, "kept");
+    assert_eq!(row_text(&document, 2)[1], "copied");
+}
+
 /// T1: a chunk searched before an edit and added after it is recounted:
 /// `found.synced` drops back to the chunk's version.
 #[test]

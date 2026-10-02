@@ -309,10 +309,12 @@ pub(super) struct Removable {
     /// Set when a read of a network share found the file deleted
     /// elsewhere (`ENOENT` or `ESTALE`, and nothing at its path).
     deleted: AtomicBool,
-    /// First paint's bytes, when they were read from the user's file itself
-    /// (no clone): the copy's first chunks must be the same bytes, or the
-    /// file changed in between (a change the size and modification time can
-    /// miss). Dropped once they have been compared.
+    /// First paint's bytes (at most 64 KB), whatever they were read from:
+    /// the copy's first chunks must be the same bytes, or the file changed
+    /// in between (a change the size and modification time can miss). Read
+    /// from a clone they always agree, unless the drive comes back without
+    /// it and the rest is read from the user's file (`reconnect`, task
+    /// 2.1a). Dropped once they have been compared.
     head: Mutex<Option<Vec<u8>>>,
     /// The file is on a network share: its rules (ADR-0009). `None` for a
     /// removable drive.
@@ -687,7 +689,9 @@ impl Removable {
     /// 2. **The user's file**, if its inode, size and modification time are
     ///    still the ones it had when opened (its device number changes with
     ///    each mount, so isn't compared). From then on it is read as on a
-    ///    drive that can't clone: checked after every read.
+    ///    drive that can't clone: checked after every read, and what is
+    ///    left to copy of the first 64 KB against first paint's bytes, read
+    ///    from the clone (task 2.1a).
     ///
     /// Nothing is reopened after the file changed while it was read, or
     /// was deleted on its share, and nothing is needed once the copy is
@@ -786,6 +790,23 @@ impl Removable {
         }
     }
 
+    /// TEST HOOK: Leal's clone on the drive is lost while the drive is
+    /// away: it is deleted, so `reconnect` can't reopen it and falls back
+    /// to the user's file. Returns whether there was a clone to lose.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn simulate_clone_lost(&self) -> bool {
+        let external = self.lock_external();
+        let Some(External {
+            path,
+            folder: Some(_),
+            ..
+        }) = external.as_ref()
+        else {
+            return false;
+        };
+        fs::remove_file(path).is_ok()
+    }
+
     /// TEST HOOK: the simulated share's close callback, if any.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn share_close_hook(&self) -> Option<fn()> {
@@ -854,9 +875,10 @@ impl Removable {
     /// the share, which `read_range` never does: it may block for as long
     /// as the share takes to answer, and it retries network errors (for at
     /// most [`NETWORK_RETRY_WINDOW`]), so it must not be on the main thread
-    /// (ADR-0009). Read from the user's file itself (no clone), the bytes
-    /// are kept until the copy has the same ones, to check that the file
-    /// didn't change in between.
+    /// (ADR-0009). The bytes are kept until the copy has the same ones, to
+    /// check that the file didn't change in between: read from the user's
+    /// file itself (no clone), or from a clone that may be lost before the
+    /// copy is (`reconnect`).
     pub(super) fn read_head(&self, len: usize) -> Result<Cow<'_, [u8]>, ReadError> {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(simulated) = self.simulated() {
@@ -916,7 +938,10 @@ impl Removable {
         let never = AtomicBool::new(false);
         // Without a clone, bytes read after a change are never returned.
         self.read_origin(&external, &mut bytes, range.start, wait, &never)?;
-        if reader == Reader::Head && range.start == 0 && self.reads_the_original() {
+        // Kept whatever they were read from, the clone included: a drive
+        // that comes back without its clone is read from the user's file,
+        // and the copy's chunks are checked against these (task 2.1a).
+        if reader == Reader::Head && range.start == 0 {
             *self.head.lock().unwrap_or_else(PoisonError::into_inner) = Some(bytes.clone());
         }
         Ok(Cow::Owned(bytes))
@@ -932,8 +957,9 @@ impl Removable {
     /// The copy's chunk at `offset` must agree with first paint's bytes,
     /// where it overlaps them; otherwise the user's file changed between
     /// first paint and the copy, which a same-size change with its time
-    /// kept can hide from `fstat`. The bytes are let go once the copy is
-    /// past them.
+    /// kept can hide from `fstat`. That needs the user's file to be read
+    /// (no clone, or a drive back without its clone); a clone's chunks
+    /// always agree. The bytes are let go once the copy is past them.
     fn check_against_head(&self, chunk: &[u8], offset: usize) -> Result<(), ReadError> {
         let mut head = self.head.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(bytes) = head.as_ref() else {
@@ -1409,6 +1435,16 @@ impl Removable {
         self.lock_external()
             .as_ref()
             .map(|external| external.path.clone())
+    }
+
+    /// How many of first paint's bytes are kept for the copy to check.
+    #[cfg(test)]
+    pub(super) fn kept_head_len(&self) -> usize {
+        self.head
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, Vec::len)
     }
 
     /// Lets go of the clone on the drive as a crash would.
