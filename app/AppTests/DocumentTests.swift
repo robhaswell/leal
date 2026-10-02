@@ -398,6 +398,25 @@ final class DocumentTests: XCTestCase {
         document.close()
     }
 
+    // MARK: Releasing the core (phase 1 review, app-10)
+
+    /// What `CoreRelease` hands over is released off the main thread, so a
+    /// core document's teardown (its watcher thread's end, its snapshot's
+    /// deletion) never makes the main thread wait.
+    func testCoreObjectsAreReleasedOffTheMainThread() {
+        let released = expectation(description: "released")
+        let thread = ReleaseThread()
+        var object: ReleaseProbe? = ReleaseProbe { onMain in
+            thread.onMain = onMain
+            released.fulfill()
+        }
+        CoreRelease.later(&object)
+        XCTAssertNil(object)
+        CoreRelease.finish()
+        wait(for: [released], timeout: 5)
+        XCTAssertEqual(thread.onMain, false)
+    }
+
     // MARK: Very wide files
 
     /// Column sizing reads at most `sizingFieldLimit` fields, however wide
@@ -566,4 +585,24 @@ final class DocumentTests: XCTestCase {
         XCTAssertGreaterThan(dark, 20, "the first cell has text")
         document.close()
     }
+}
+
+/// Calls back from its `deinit` with whether it ran on the main thread.
+private final class ReleaseProbe: Sendable {
+    let onDeinit: @Sendable (Bool) -> Void
+
+    init(_ onDeinit: @escaping @Sendable (Bool) -> Void) {
+        self.onDeinit = onDeinit
+    }
+
+    deinit {
+        onDeinit(Thread.isMainThread)
+    }
+}
+
+/// Where a `ReleaseProbe` was released.
+private final class ReleaseThread: @unchecked Sendable {
+    // @unchecked: written once on the release queue before the expectation
+    // is fulfilled, and read after waiting for it.
+    var onMain: Bool?
 }

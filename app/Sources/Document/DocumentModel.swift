@@ -54,6 +54,10 @@ final class DocumentModel: GridDataSource {
     /// row cache caps fields: a file of 20,000 columns is sized from 5 rows,
     /// not 1,000 (20M cells).
     nonisolated static let sizingFieldLimit = 100_000
+    /// The most fields one core call of the refined sizing reads: about a
+    /// screenful, so the reading's row cache is never held for long by a
+    /// utility thread while the grid waits for it (phase 1 review, app-10).
+    nonisolated static let sizingBatchFields = 5_000
 
     /// Called after first paint inside `init`, on the core's document. Only
     /// tests set it, to make the document fail while it opens.
@@ -237,14 +241,15 @@ final class DocumentModel: GridDataSource {
 
     /// Stops everything: the Swift tasks are cancelled, which cancels the
     /// jobs they wait for, and the core's document is released, which
-    /// cancels the rest and deletes the file's clone (DESIGN §3.1).
+    /// cancels the rest and deletes the file's clone (DESIGN §3.1). The
+    /// release happens off the main thread (`CoreRelease`, app-10).
     func close() {
         setInteracting(false)
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
         stopObserving()
-        handle = nil
+        CoreRelease.later(&handle)
         onChange = nil
         onMoved = nil
     }
@@ -721,19 +726,33 @@ final class DocumentModel: GridDataSource {
         let number = numberMeasurer
         let header = headerMeasurer
         let titles = interpretation.header ? headerTitles : []
+        let batch = UInt32(max(1, Self.sizingBatchFields / columns))
         let task = Task.detached(priority: .utility) { [weak self] in
-            // Off the main thread: two reads from the core (each well under
-            // a millisecond a hundred rows) and the measuring. Only each
-            // column's widest text is kept.
+            // Off the main thread: reads from the core (each well under a
+            // millisecond a hundred rows) and the measuring. Only each
+            // column's widest text is kept. The rows come in batches of at
+            // most `sizingBatchFields` fields: the core holds the reading's
+            // row cache while it reads, and the grid's reads on the main
+            // thread wait for it, so each hold is kept short (phase 1
+            // review, app-10).
             let result: Result<RefinedColumns, any Error>
             do {
-                let rows = try handle.cells(
-                    rowStart: first,
-                    rowCount: rowCount,
-                    columnStart: 0,
-                    columnCount: UInt32(columns),
-                    maxChars: GridMetrics.maxCellCharacters
-                )
+                var rows: [RowCells] = []
+                var next = first
+                while next < first + UInt64(rowCount), !Task.isCancelled {
+                    let count = UInt32(min(UInt64(batch), first + UInt64(rowCount) - next))
+                    let read = try handle.cells(
+                        rowStart: next,
+                        rowCount: count,
+                        columnStart: 0,
+                        columnCount: UInt32(columns),
+                        maxChars: GridMetrics.maxCellCharacters
+                    )
+                    rows += read
+                    // Fewer rows than asked for: the index has no more yet.
+                    if read.count < Int(count) { break }
+                    next += UInt64(count)
+                }
                 let numeric = try handle.numericColumns(sample: rowCount)
                 let widest = ColumnSizer.widest(
                     columns: columns,
@@ -1040,6 +1059,8 @@ final class DocumentModel: GridDataSource {
         checkingOriginal?.cancel()
         checkingOriginal = nil
         self.url = url
+        // The old core document goes off the main thread (app-10).
+        CoreRelease.later(&handle)
         handle = new
         handleNumber = number
         reference.model = self

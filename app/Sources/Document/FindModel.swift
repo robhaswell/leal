@@ -115,7 +115,9 @@ final class FindModel: GridHighlighter {
         for task in tasks { task.cancel() }
         tasks.removeAll()
         search?.cancel()
-        search = nil
+        // Off the main thread: it may hold the last reference to a core
+        // document (phase 1 review, app-10; `CoreRelease`).
+        CoreRelease.later(&search)
         progress = nil
         pendingStep = nil
         current = nil

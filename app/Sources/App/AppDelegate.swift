@@ -45,6 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Documents closed just before quitting release their snapshots off
+    /// the main thread (`CoreRelease`): let that finish first.
+    func applicationWillTerminate(_ notification: Notification) {
+        CoreRelease.finish()
+    }
+
     /// Leal is a viewer: launching it doesn't make an empty document.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         false
