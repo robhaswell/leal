@@ -229,6 +229,37 @@ fn spreads_and_verdicts() {
 }
 
 #[test]
+fn the_idle_budget_waits_for_rob_when_only_the_footprint_passes() {
+    let footprint = Spread::of(&[10.9, 11.7]);
+    let rss = Spread::of(&[65.0, 68.5]);
+    // Today's numbers: not a pass until Rob picks the reading
+    // (docs/perf.md, "Decisions for Rob").
+    assert_eq!(
+        Verdict::idle(footprint, rss, 30.0),
+        Verdict::PendingFootprint
+    );
+    assert!(
+        Verdict::PendingFootprint
+            .label()
+            .starts_with("pending Rob: fail on resident size")
+    );
+    // Both readings agree: no decision needed.
+    assert_eq!(
+        Verdict::idle(footprint, Spread::of(&[20.0]), 30.0),
+        Verdict::Pass
+    );
+    assert_eq!(
+        Verdict::idle(Spread::of(&[31.0]), Spread::of(&[70.0]), 30.0),
+        Verdict::Fail
+    );
+    assert_eq!(
+        Verdict::idle(Spread::of(&[20.0, 25.0, 40.0]), rss, 30.0),
+        Verdict::Mixed
+    );
+    assert_eq!(Verdict::idle(None, None, 30.0), Verdict::Untested);
+}
+
+#[test]
 fn scroll_runs_are_read_and_judged() {
     let json: serde_json::Value = serde_json::from_str(
         r#"{"scroll":{"frames":6150,"late":3,"p99":8.3,"cpuP50":4.1,"cpuP99":6.4,"busyOver120Hz":2,"instructionsMean":17.9,"mainThreadGHz":2.0},

@@ -301,6 +301,11 @@ pub enum Verdict {
     /// Inside the budget where it was measured, but only part of it was:
     /// the heap settled after opening, with no scroll runs for its peak.
     SettledOnly,
+    /// The idle budget passes on the physical footprint but not on the
+    /// resident size DESIGN §1 names. Which one counts is Rob's decision
+    /// (docs/perf.md, "Decisions for Rob"), so it is neither a pass nor a
+    /// fail until then.
+    PendingFootprint,
 }
 
 impl Verdict {
@@ -324,6 +329,26 @@ impl Verdict {
             Verdict::Fail => "fail",
             Verdict::Untested => "untested",
             Verdict::SettledOnly => "pass (settled only; peak untested)",
+            Verdict::PendingFootprint => {
+                "pending Rob: fail on resident size (RSS), as DESIGN §1 words it; pass on the proposed footprint reading"
+            }
+        }
+    }
+
+    /// The idle-memory budget's verdict ("< 30 MB resident"), from the
+    /// physical footprint and the resident size (RSS). The footprint is
+    /// never above RSS, so RSS passing passes either reading and the
+    /// footprint failing fails either. In between, the verdict waits for
+    /// Rob's decision on which reading the budget means.
+    #[must_use]
+    pub fn idle(footprint: Option<Spread>, rss: Option<Spread>, budget: f64) -> Verdict {
+        match (
+            Verdict::below(footprint, budget),
+            Verdict::below(rss, budget),
+        ) {
+            (_, Verdict::Pass) => Verdict::Pass,
+            (Verdict::Pass, _) => Verdict::PendingFootprint,
+            (footprint, _) => footprint,
         }
     }
 }

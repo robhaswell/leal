@@ -26,14 +26,14 @@ Measured 1 October 2026, commit `2de0aee` (task/1.10), 3 runs of each.
 | Budget (DESIGN §1) | Measured on this Mac | How | Verdict |
 |---|---|---|---|
 | Launch to empty window < 300 ms | 110 ms (92–195) | process start to the end of `applicationDidFinishLaunching` ("Launched" signpost). Leal opens no empty window | pass |
-| Open to first rows < 150 ms | 95 ms (94–99) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), the reference file, the app launched with it | pass |
+| Open to first rows < 150 ms | 95 ms (94–99) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), the reference file, the app launched with it (the cold open, which `just perf` judges; whether the budget means it is pending Rob) | pass |
 | … opened in a running app | 36 ms (31–41, 15 opens) | the same signpost, closing the file and opening it again | pass |
 | Full index < 500 ms | 120 ms (119–131) | the core's "Index" signpost in the app, the reference file, with diagnostics | pass |
 | Scrolling: no dropped frames at 120 Hz | 7, 23 and 51 late of about 7,530 (0.09–0.68%) | the scroll benchmark's flings on the reference file after indexing | **fail** |
 | … including while background work runs | 48, 59 and 48 late of about 7,500 (0.64–0.79%) | the same from the first rows, while the index and review run, with a search for `SKU-` (every row) running and highlighted throughout | **fail** |
 | … stress: background work not pausing | 2, 3 and 3 late of about 7,555 (0.03–0.04%) | the 1 GB variant from the first rows: index, review and search all running at full speed | **fail** (see caveats: this one ran at 4.25 GHz) |
 | Leal's own heap, reference file < 40 MB | 28 MB after opening; peaks while scrolling 39–42 MB, and 44–50 MB with the search running | `heap -s` (every malloc zone) once the review finished; the scroll benchmark's highest `malloc_zone_statistics` | **fail** (settled: pass) |
-| Idle app, no document < 30 MB resident | 10.9 MB footprint (RSS 65–68 MB) | `heap -s`'s physical footprint, 5 s after launch | pass |
+| Idle app, no document < 30 MB resident | 10.9 MB footprint (RSS 65–68 MB) | `heap -s`'s physical footprint, 5 s after launch | **pending Rob**: fail on resident size (RSS), as DESIGN §1 words it; pass on the proposed footprint reading |
 
 Also measured:
 
@@ -119,18 +119,38 @@ app takes 36 ms.
 
 ## Decisions for Rob
 
-The 1.10 review's recommendations. **These are proposals**: nothing here
-changes until Rob decides.
+Recommendations from 1.10, its review and the phase 1 review. **These
+are proposals**: nothing here changes until Rob decides. The phase 1
+gate's full list of decisions is docs/reports/phase-1-decisions.md.
 
 - **Idle memory:** measure the physical footprint, which Activity
   Monitor's Memory column shows (10.9 MB), not RSS (65–68 MB). No AppKit
   app is under 30 MB of RSS, because RSS counts the shared system
-  libraries every app maps.
+  libraries every app maps. Until Rob decides, `just perf` and the table
+  above mark the idle row "pending Rob", not "pass".
 - **Heap:** count every malloc zone minus the per-window AppKit baseline
   (the heap with a two-row file open, about 21 MB here). Count Leal's own
   long-lived data, search results included. Leave out AppKit's brief
   drawing peaks while scrolling. On today's numbers that is about 7 MB
   settled, plus 12 MB while a search for every row is held.
+- **Open to first rows: cold or warm.** The cold open (the app launched
+  with the file) takes 95 ms here; opening in a running app takes 36 ms.
+  On a base M1 Air, at the 2–3× the 1.3 notes expect, that is roughly
+  190–285 ms cold (over the 150 ms budget) and 72–108 ms warm (under).
+  Most of the cold open is AppKit's first window ("Where the cold open
+  goes"). Proposal: judge the open in a running app against 150 ms, and
+  judge the cold open as part of launching: launch with a file to its
+  first rows against 450 ms, the launch and open budgets together
+  (263 ms here). `just perf` judges the cold open until Rob decides.
+- **Launch to empty window.** Leal opens no empty window, so this is
+  measured to the end of `applicationDidFinishLaunching` (110 ms here).
+  Proposal: keep that reading.
+- **Search memory.** A running search holds 12 bytes per matching row:
+  12 MB on the reference file when every row matches, 120 MB on the 1 GB
+  file. Proposal: accept it for v1 (it is inside the reference file's
+  heap budget once the window's baseline is left out), and leave a more
+  compact store (a bitmap of rows, `u32` counts) to 4.1's audit, which
+  PLAN now lists.
 - **Scrolling:** the failures here are probably mostly the locked screen
   (an efficiency core at about 1.8 GHz), but that isn't proven. It needs
   Rob's unlocked run and, if one is available, a base M1 Air.

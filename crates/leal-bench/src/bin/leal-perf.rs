@@ -424,7 +424,7 @@ fn rows(
                     ", so it is over 30 MB for any AppKit app"
                 }
             ),
-            verdict: Verdict::below(idle, 30.0),
+            verdict: Verdict::idle(idle, idle_rss, 30.0),
         },
     ]
 }
