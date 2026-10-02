@@ -276,6 +276,12 @@ Shares have more rules (ADR-0009):
   so the whole-file review (§3.2) doesn't run. Rows are read from that
   copy on the main thread, so a home share that stops answering can stall
   the window. Save still works.
+- **A drive changed while it was away.** When a drive comes back, Leal
+  compares the file's inode, size and modification time. A change of the
+  same size, with its modification time put back, made while the drive was
+  away to bytes Leal had already copied, goes unnoticed (2.1a). Catching
+  it would mean reading the copied part again on every reconnect. Bytes
+  not yet copied, and the first 64 KB, are checked.
 - **Revert to Saved** is AppKit's second read of the file, on the main
   thread. Nothing saves in phase 1, so it can't be reached yet; task 2.5
   sends it through Reload.

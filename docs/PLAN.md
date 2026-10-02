@@ -419,7 +419,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (ADR-0008 decision 5)
   - Decide whether header-row cells (file row 0, not a grid row) can be
     edited; an ADR if it changes DESIGN. (phase 1 review)
-- [ ] **2.1a Drive reconnect head check** (a 1.9 follow-up; 2.1 notes,
+- [x] **2.1a Drive reconnect head check** (a 1.9 follow-up; 2.1 notes,
   "Edits on rows of the first 64 KB that turn out stale").
   - When a drive reconnects after its clone was lost
     (`Removable::reconnect` falling back to the user's own file), the copy
