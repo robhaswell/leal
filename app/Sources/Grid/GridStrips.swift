@@ -18,8 +18,9 @@ import QuartzCore
 /// or a strip's height ahead of the scroll, `ahead` a frame.
 ///
 /// A horizontal scroll draws nothing: the strips are as wide as the view.
-/// That is why grids wider than `GridContainerView.stripMaximumWidth` keep
-/// AppKit's drawing (ADR-0011).
+/// So their drawing and memory grow with the grid's width, where AppKit's
+/// grow with the visible width; that is why grids much wider than the
+/// visible area (`GridContainerView.stripLine`) keep AppKit's drawing.
 ///
 /// Strips are placed relative to the visible rectangle, not the view's
 /// origin: a grid of 40M rows is 880M points tall, past where Core
@@ -35,6 +36,12 @@ final class GridStrips: NSObject, CALayerDelegate {
     /// Strips kept, with their backing stores, for the next to come into
     /// view, so a fling doesn't allocate one a frame.
     static let spares = 2
+
+    /// How many times every strip was asked to redraw (`invalidateAll`),
+    /// and how many times for a new width or scale: for the scroll
+    /// benchmark.
+    private(set) var wholeRedraws = 0
+    private(set) var resizes = 0
     /// The grid's strips are as wide as the grid rounded up to this, so a
     /// live window resize of a grid narrower than the window redraws them
     /// only every so often, not on every step.
@@ -102,6 +109,7 @@ final class GridStrips: NSObject, CALayerDelegate {
         let scale = view.backingScale
         if width != stripWidth || scale != self.scale {
             // Every strip is drawn again, at its new width or scale.
+            resizes += 1
             stripWidth = width
             self.scale = scale
             for strip in strips.values {
@@ -201,6 +209,7 @@ final class GridStrips: NSObject, CALayerDelegate {
     /// Redraws every strip.
     func invalidateAll() {
         invalidations += 1
+        wholeRedraws += 1
         for strip in strips.values { strip.setNeedsDisplay() }
     }
 

@@ -18,9 +18,9 @@ import XCTest
 final class GridStripsTests: XCTestCase {
     private let light = NSAppearance(named: .aqua)!
     private let dark = NSAppearance(named: .darkAqua)!
-    /// Wider than the window, so the grid scrolls sideways; a column of no
-    /// width.
-    private static let widths: [CGFloat] = [110, 90, 0, 120, 80, 140, 160, 200]
+    /// Wider than the window, so the grid scrolls sideways (but less than
+    /// 1.4 times as wide, so it has strips); a column of no width.
+    private static let widths: [CGFloat] = [110, 90, 0, 120, 80, 140, 120, 140]
     /// The visible area: 18 rows under the header.
     private static let size = NSSize(width: 640, height: GridMetrics.headerHeight + 18 * 22)
 
@@ -49,7 +49,8 @@ final class GridStripsTests: XCTestCase {
         grid.dataSource = source
         grid.setColumnWidths(widths)
         grid.layoutSubtreeIfNeeded()
-        XCTAssertEqual(grid.strips != nil, strips && grid.gridView.frame.width <= GridContainerView.stripMaximumWidth)
+        let line = GridContainerView.stripLine(visibleWidth: grid.scrollView.contentView.bounds.width, returning: false)
+        XCTAssertEqual(grid.strips != nil, strips && grid.gridView.frame.width <= line)
         XCTAssertEqual(grid.gutterStrips != nil, strips)
         return grid
     }
@@ -389,55 +390,107 @@ final class GridStripsTests: XCTestCase {
     // MARK: Resizing
 
     /// A column resized, by a step at a time as a drag does: every strip is
-    /// drawn again at the new widths. Past 4,096 pt the grid keeps AppKit's
-    /// drawing, and goes back to strips only below 3,840 pt.
+    /// drawn again at the new widths. Past 1.5 times the visible width the
+    /// grid keeps AppKit's drawing, and goes back to strips only below 1.4
+    /// times it.
     func testAColumnResizeRedrawsTheStripsAndWideGridsKeepAppKitsDrawing() {
         let source = StripSource(rows: 1_000)
         let (grid, plain) = makePair(source)
         scroll(grid, plain, to: NSPoint(x: 50, y: 22 * 30))
-        for width in [150, 151, 40, 0, 300] as [CGFloat] {
+        for width in [150, 151, 40, 0, 120] as [CGFloat] {
             grid.setWidth(width, ofColumn: 1)
             plain.setWidth(width, ofColumn: 1)
             assertSameGrid(grid, plain, "column 1 at \(width) pt")
         }
-        let rest = Self.widths.reduce(0, +) - Self.widths[7]
-        func setLast(_ total: CGFloat) {
-            for each in [grid, plain] { each.setWidth(total - rest - 300 + Self.widths[1], ofColumn: 7) }
+        let visible = grid.scrollView.contentView.bounds.width
+        let line = (1.5 * visible).rounded(.down)
+        let back = (1.4 * visible).rounded(.down)
+        XCTAssertEqual(GridContainerView.stripLine(visibleWidth: visible, returning: false), 1.5 * visible)
+        // (Column 1 is 120 pt now.)
+        let rest = Self.widths.reduce(0, +) - Self.widths[7] - Self.widths[1] + 120
+        func setTotal(_ total: CGFloat) {
+            for each in [grid, plain] { each.setWidth(total - rest, ofColumn: 7) }
+            XCTAssertEqual(grid.gridView.frame.width, total)
         }
-        // (Column 1 is 300 pt now.)
-        setLast(4_096)
-        XCTAssertNotNil(grid.strips, "4,096 pt: strips")
-        assertSameGrid(grid, plain, "4,096 pt")
-        setLast(4_097)
-        XCTAssertNil(grid.strips, "4,097 pt: AppKit's drawing")
+        setTotal(line)
+        XCTAssertNotNil(grid.strips, "\(line) pt: strips")
+        assertSameGrid(grid, plain, "at the line")
+        setTotal(line + 1)
+        XCTAssertNil(grid.strips, "\(line + 1) pt: AppKit's drawing")
         XCTAssertNil(grid.gridView.strips)
         XCTAssertFalse(grid.gridView.wantsUpdateLayer)
         XCTAssertNotNil(grid.gutterStrips, "the gutter keeps its strips")
-        assertSameGrid(grid, plain, "4,097 pt")
-        for total in [4_000, 3_900, 3_841, 4_200] as [CGFloat] {
-            setLast(total)
+        assertSameGrid(grid, plain, "past the line")
+        for total in [line, line - 20, back + 1, line + 100] {
+            setTotal(total)
             XCTAssertNil(grid.strips, "\(total) pt: still AppKit's drawing")
         }
-        setLast(3_840)
-        XCTAssertNotNil(grid.strips, "3,840 pt: strips again")
+        setTotal(back)
+        XCTAssertNotNil(grid.strips, "\(back) pt: strips again")
         XCTAssertTrue(grid.gridView.wantsUpdateLayer)
-        assertSameGrid(grid, plain, "3,840 pt")
-        setLast(4_000)
-        XCTAssertNotNil(grid.strips, "4,000 pt: still strips")
-        assertSameGrid(grid, plain, "4,000 pt")
+        assertSameGrid(grid, plain, "back below the line")
+        setTotal(line - 1)
+        XCTAssertNotNil(grid.strips, "\(line - 1) pt: still strips")
+        assertSameGrid(grid, plain, "near the line")
     }
 
-    /// A grid opened wider than 4,096 pt starts with AppKit's drawing; one
-    /// between 3,840 and 4,096 pt starts with strips.
+    /// Resizing the window moves the line: a grid that is too wide for
+    /// strips in a narrow window has them in a wide one.
+    func testAWindowResizeCanCrossTheLine() throws {
+        let source = StripSource(rows: 1_000, columns: 4)
+        let widths: [CGFloat] = [250, 250, 250, 250]
+        let (grid, plain) = makePair(source, widths: widths)
+        let gutter = grid.window!.contentLayoutRect.width - grid.scrollView.contentView.bounds.width
+        var hadStrips = grid.strips != nil
+        var modes: Set<Bool> = []
+        // Visible widths of 747, 687, 647, 687 and 727 pt: strips while
+        // 1,000 pt is within 1.5 times it, or once AppKit draws it, 1.4.
+        for visible in [747, 687, 647, 687, 727] as [CGFloat] {
+            for each in [grid, plain] {
+                each.window?.setContentSize(NSSize(width: visible + gutter, height: Self.size.height))
+                each.layoutSubtreeIfNeeded()
+            }
+            XCTAssertEqual(grid.scrollView.contentView.bounds.width, visible)
+            let expected = 1_000 <= (hadStrips ? 1.5 : 1.4) * visible
+            XCTAssertEqual(grid.strips != nil, expected, "visible width \(visible) pt")
+            assertSameGrid(grid, plain, "visible width \(visible) pt")
+            hadStrips = grid.strips != nil
+            modes.insert(hadStrips)
+        }
+        XCTAssertEqual(modes, [true, false], "both drawings were used")
+    }
+
+    /// In a very wide window the line is 4,096 pt (ADR-0011's), and a grid
+    /// goes back to strips below 3,840 pt.
+    func testStripsAreNeverWiderThan4096Points() {
+        let source = StripSource(rows: 200, columns: 32)
+        let size = NSSize(width: 3_200, height: 300)
+        // 376 + 31 × 120 = 4,096 pt.
+        let grid = makeGrid(source, strips: true, widths: [376] + Array(repeating: 120, count: 31), size: size)
+        XCTAssertGreaterThan(1.4 * grid.scrollView.contentView.bounds.width, 4_096)
+        XCTAssertEqual(grid.gridView.frame.width, 4_096)
+        XCTAssertNotNil(grid.strips, "4,096 pt: strips")
+        grid.setWidth(376.5, ofColumn: 0)
+        XCTAssertNil(grid.strips, "past 4,096 pt: AppKit's drawing")
+        grid.setWidth(121, ofColumn: 0)
+        XCTAssertNil(grid.strips, "3,841 pt: still AppKit's drawing")
+        grid.setWidth(120, ofColumn: 0)
+        XCTAssertNotNil(grid.strips, "3,840 pt: strips again")
+    }
+
+    /// A grid opened past the line starts with AppKit's drawing; one between
+    /// the hysteresis and the line starts with strips.
     func testTheFirstWidthDecidesByTheLineItself() {
-        let source = StripSource(rows: 100, columns: 40)
-        let wide = makeGrid(source, strips: true, widths: Array(repeating: 103, count: 40))
-        XCTAssertNil(wide.strips)
-        let near = makeGrid(source, strips: true, widths: Array(repeating: 100, count: 40))
-        XCTAssertNotNil(near.strips)
-        let plain = makeGrid(source, strips: false, widths: Array(repeating: 100, count: 40))
-        scroll(near, plain, to: NSPoint(x: 3_400, y: 22 * 50))
-        assertSameGrid(near, plain, "4,000 pt")
+        let source = StripSource(rows: 100, columns: 9)
+        let probe = makeGrid(source, strips: true, widths: Array(repeating: 10, count: 9))
+        let line = GridContainerView.stripLine(visibleWidth: probe.scrollView.contentView.bounds.width, returning: false)
+        let wide = makeGrid(source, strips: true, widths: Array(repeating: (line + 9) / 9, count: 9))
+        XCTAssertNil(wide.strips, "just past the line")
+        let near = makeGrid(source, strips: true, widths: Array(repeating: (line - 9) / 9, count: 9))
+        XCTAssertNotNil(near.strips, "just within it, past the hysteresis")
+        let plain = makeGrid(source, strips: false, widths: Array(repeating: (line - 9) / 9, count: 9))
+        scroll(near, plain, to: NSPoint(x: 200, y: 22 * 50))
+        assertSameGrid(near, plain, "just within the line")
     }
 
     /// The window resized a step at a time, as a live resize does: taller,

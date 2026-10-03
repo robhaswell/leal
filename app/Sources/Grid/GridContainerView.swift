@@ -22,9 +22,13 @@ final class GridContainerView: NSView {
     /// in-cell editor's place (task 2.5).
     let overlay = GridOverlayView()
 
-    /// The strips the cells are drawn into (ADR-0011), while the grid is no
-    /// wider than `stripMaximumWidth`; `nil` while AppKit draws them.
+    /// The strips the cells are drawn into (ADR-0011), while the grid is
+    /// narrow enough (`stripLine`); `nil` while AppKit draws them.
     private(set) var strips: GridStrips?
+    /// Whether the drawing has been chosen once with the grid laid out:
+    /// the first choice is made at the line itself, later ones with the
+    /// hysteresis.
+    private var drawingChosen = false
     /// The strips the gutter's numbers are drawn into. The gutter is never
     /// wide, so it always has them (unless `allowsStrips` is off).
     private(set) var gutterStrips: GridStrips?
@@ -33,13 +37,32 @@ final class GridContainerView: NSView {
     /// bench builds) and for tests' reference drawing.
     let allowsStrips: Bool
 
-    /// Grids wider than this keep AppKit's drawing (ADR-0011): a strip is
-    /// as wide as the grid, and wider strips cost too much memory.
+    /// Grids wider than this many times the visible area keep AppKit's
+    /// drawing (task 2.0b, refining ADR-0011's 4,096 pt line). A strip is
+    /// as wide as the grid, so its drawing and its memory grow with the
+    /// grid's width, AppKit's with the visible width; past about 1.5 times
+    /// the visible width strips draw more a frame than AppKit does (the
+    /// slowest frames, after the scroll jumps a screen, draw every strip in
+    /// view), and add more memory (docs/tasks/2.0b.md, "Where strips pay").
+    static let stripMaximumRatio: CGFloat = 1.5
+    /// And never wider than this (ADR-0011's line): a very wide window
+    /// would otherwise make very wide strips.
     static let stripMaximumWidth: CGFloat = 4_096
-    /// A grid that went past `stripMaximumWidth` goes back to strips only
-    /// once it is this narrow, so a column dragged back and forth across
-    /// the line doesn't switch the drawing on every step.
+    /// A grid that went past the line goes back to strips only once it is
+    /// this narrow (times the visible width, and in points), so a column
+    /// dragged, or a window resized, back and forth across the line doesn't
+    /// switch the drawing on every step.
+    static let stripReturnRatio: CGFloat = 1.4
     static let stripReturnWidth: CGFloat = 3_840
+
+    /// The widest the grid may be and draw into strips, with the visible
+    /// area `visibleWidth` wide: the line, or with `returning` (it is drawn
+    /// by AppKit now) the line less the hysteresis.
+    static func stripLine(visibleWidth: CGFloat, returning: Bool) -> CGFloat {
+        returning
+            ? min(stripReturnWidth, stripReturnRatio * visibleWidth)
+            : min(stripMaximumWidth, stripMaximumRatio * visibleWidth)
+    }
 
     /// Strips unless a bench build was asked for AppKit's drawing.
     static var stripsByDefault: Bool {
@@ -310,18 +333,28 @@ final class GridContainerView: NSView {
             changed = true
         }
         if changed {
-            updateDrawing()
             placeStrips()
         }
     }
 
     // MARK: Strips (ADR-0011)
 
-    /// Strips for a grid up to `stripMaximumWidth` wide, AppKit's drawing
-    /// for a wider one, switching back below `stripReturnWidth`.
+    /// Strips for a grid no wider than the line (`stripLine`: 1.5 times
+    /// the visible width, at most 4,096 pt), AppKit's drawing for a wider
+    /// one, switching back only below the line less the hysteresis. Until
+    /// the grid is laid out, strips.
     private func updateDrawing() {
         let width = gridView.frame.width
-        let wanted = allowsStrips && width <= (strips == nil ? Self.stripReturnWidth : Self.stripMaximumWidth)
+        let visible = scrollView.contentView.bounds.width
+        let wanted: Bool
+        if !allowsStrips {
+            wanted = false
+        } else if visible < 1 {
+            wanted = drawingChosen ? strips != nil : true
+        } else {
+            wanted = width <= Self.stripLine(visibleWidth: visible, returning: drawingChosen && strips == nil)
+            drawingChosen = true
+        }
         guard wanted != (strips != nil) else { return }
         if wanted {
             let strips = GridStrips(content: gridView, widthStep: GridStrips.gridWidthStep)
@@ -329,7 +362,6 @@ final class GridContainerView: NSView {
             scrollView.addSubview(strips.view, positioned: .below, relativeTo: overlay)
             self.strips = strips
             gridView.strips = strips
-            placeStrips()
         } else {
             gridView.strips = nil
             strips?.view.removeFromSuperview()
@@ -354,6 +386,8 @@ final class GridContainerView: NSView {
     /// part; the overlay follows the scroll too. Called on every scroll.
     private func placeStrips() {
         let clip = scrollView.contentView
+        // The grid's or the visible area's width may have crossed the line.
+        updateDrawing()
         keepStripsUnderScrollers()
         if let strips {
             if strips.view.frame != clip.frame { strips.view.frame = clip.frame }
