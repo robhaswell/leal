@@ -355,7 +355,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     SMB share if one is available.
   - Done before 2.1, because it changes the source layer 2.x builds on.
 
-- [ ] **2.0a Scrolling headroom** (DESIGN §1, the 3× rule). Rob's unlocked
+- [x] **2.0a Scrolling headroom** (DESIGN §1, the 3× rule). Rob's unlocked
   `just perf` run fails the 3× rule: main-thread work per scroll frame is
   p50 2.7–3.6 ms and p99 5.8–7.0 ms on the M5 Pro (docs/perf.md).
   - It doesn't block 2.1: phase 2 goes ahead alongside it (phase 1
@@ -376,7 +376,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Measured with `just perf`; the results go in docs/perf.md. A change to
     the grid's drawing design needs an ADR (ADR-0001).
 
-- [ ] **2.0b Grid strips** (ADR-0011). Draw the grid and gutter into strips
+- [x] **2.0b Grid strips** (ADR-0011). Draw the grid and gutter into strips
   of rows that scrolling moves, on top of 2.0a; grids wider than 4,096 pt
   keep 2.0a's drawing, with hysteresis around the switch.
   - Start from `task/2.0a-strips` (`ca904cd`, the prototype), rebased onto
@@ -469,7 +469,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     missing again is refused (`ValueChanged`). Either undo it to `""`
     (keeping the delimiters) or add a change that truncates the row back.
     The rebase keeps the lineage (`EditStore::with_lineage`). (2.1 notes)
-- [ ] **2.3 Encoding on save** — encode edits in the file's encoding;
+- [x] **2.3 Encoding on save** — encode edits in the file's encoding;
   unencodable-character guard and Save As UTF-8.
   - Covers every single-byte encoding Leal supports. (ADR-0005 decision 5)
   - The UTF-16 banner's Save As UTF-8 button works (mockup 06a).
@@ -487,6 +487,21 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - `SaveError::EncodingNotSupported` becomes F5's `Unencodable`, and the
       save property's `TODO(2.3)` branch goes.
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
+  Split into parts of about a day (CLAUDE.md, token budget):
+  - [ ] **2.4d Design.** A short design in `docs/tasks/2.4.md` covering
+    everything below (piece list and row ids, `RowMap`, column map and
+    per-row applied flags, cell identities, the base epoch, Find, the
+    writer and the rebase), so the parts fit. An ADR if it changes DESIGN.
+  - [ ] **2.4a Rows.** Insert and delete rows in the core: the piece list,
+    stable row ids, the `RowMap` seam in every row walk, Find remapping,
+    undo and redo. Not saved yet.
+  - [ ] **2.4b Columns.** Insert and delete columns: the column map, per-row
+    applied flags, cell identities for undo, per-column quoting in the
+    oracle and the product (ADR-0004 decision 2). Not saved yet.
+  - [ ] **2.4c Saving them.** The writer walks the piece list, the splices
+    for inserted and deleted rows and columns, the rebase, the carry-over,
+    and 2.2's oracle replay extended to every edit kind (F6).
+  The bullets below are the acceptance criteria across the parts.
   - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
     and the product, with a unit test and edit-strategy coverage; this
     removes `TODO(ADR-0004 #2)` in `crates/leal-testkit/src/save.rs`. A

@@ -1,7 +1,7 @@
 # 0011 — Grid drawing: strips of rows that scrolling moves
 
-- Status: accepted (Rob, 2026-10-02), conditional on tests and an on-screen
-  check
+- Status: accepted (Rob, 2026-10-02); its conditions were met in task 2.0b
+  (tests, Rob's on-screen check and unlocked perf run, 2026-10-03)
 - Date: 2026-10-02
 - Refines: ADR-0001 (its option B: how the cells reach the screen)
 
