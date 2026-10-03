@@ -16,7 +16,7 @@
 //! The census takes one pass over the document's rows, each through its
 //! `RowView` ([`ColumnQuoting::add`]), with the file's every-field check
 //! (ADR-0004 decision 1) in the same pass ([`ColumnQuoting::add_file_row`]):
-//! `Document::column_quoting` makes it.
+//! [`ColumnQuoting::census`] makes it (in `document`, which reads the rows).
 
 use crate::document::RowView;
 

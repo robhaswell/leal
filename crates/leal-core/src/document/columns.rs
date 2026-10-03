@@ -177,25 +177,25 @@ impl Document {
     }
 }
 
-impl Document {
+impl ColumnQuoting {
     /// The census for per-column quoting of new fields (ADR-0005 decision
     /// 3, ADR-0014 decision 4), for the writer (task 2.4c): one pass over
     /// the file's rows, each as `overlay` lays it out, a batch at a time.
     /// Every row counts for whether the file quotes every field; the rows
     /// still in the document count for their columns now.
     #[cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
-    pub(super) fn column_quoting(
+    pub(in crate::document) fn census(
         reading: &Reading,
         overlay: &Overlay,
     ) -> Result<ColumnQuoting, ReadError> {
         const BATCH: usize = 4096;
         let mut census = ColumnQuoting::new();
         let map = overlay.map();
-        let rows = Self::rows_index(reading).1;
+        let rows = Document::rows_index(reading).1;
         let mut start = 0;
         while start < rows {
             let batch = start..rows.min(start + BATCH);
-            Self::read_physical(reading, overlay, batch.clone(), &mut |view| {
+            Document::read_physical(reading, overlay, batch.clone(), &mut |view| {
                 census.add_file_row(&view);
                 let live = view
                     .id()

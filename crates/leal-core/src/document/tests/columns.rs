@@ -349,7 +349,7 @@ fn quoting_census_judges_each_column_now() {
     let census = |document: &Document| {
         let reading = document.current();
         let overlay = reading.edits.overlay();
-        Document::column_quoting(&reading, &overlay).unwrap()
+        crate::save::ColumnQuoting::census(&reading, &overlay).unwrap()
     };
     let now = census(&document);
     assert!(!now.every_field());
