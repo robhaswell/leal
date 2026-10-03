@@ -557,9 +557,13 @@ check-no-test-exports app="build/DerivedData/Build/Products/Release/Leal.app":
     # `SimulatedShare`, `SimulatedShareFailure`, `simulated_share_reads`,
     # `simulated_share_release`, `simulated_head_reads`,
     # `share_reads_on_main_thread`, `debug_share_release`, and the private
-    # `simulate_share_read`, `simulate_share_hold`, `simulated_away`,
-    # `SimulatedState` and `sleep_strictly`.
-    pattern='debug_?(panic|watch|open_?document|simulate|share)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share|clone)|set_?fault|share_?reads_?on_?main|sleep_?strictly'
+    # `simulate_share_read`, `simulated_away`, `SimulatedState` and
+    # `sleep_strictly`; and the copy held part-way, for the tests that pull
+    # a real drive mid-copy: `open_holding_copy`,
+    # `debug_open_document_holding_copy`, `release_held_copy`,
+    # `debug_release_held_copy`, and the private `hold_copy_at`,
+    # `wait_while_copy_held` and `HeldCopy`.
+    pattern='debug_?(panic|watch|open_?document|simulate|share)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share|clone)|set_?fault|share_?reads_?on_?main|sleep_?strictly|hold(ing)?_?copy|held_?copy|copy_?held'
     for binary in "{{ app }}/Contents/Frameworks/LealFFI.framework/LealFFI" "{{ app }}/Contents/MacOS/Leal"; do
         if nm "$binary" | grep -Ei "$pattern" || strings "$binary" | grep -Ei "$pattern"; then
             echo "error: $binary has test-only exports or test hooks" >&2

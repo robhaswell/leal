@@ -353,6 +353,81 @@ fn cancelling_before_the_first_chunk_delivers_nothing() {
     assert_eq!(source.storage(), Storage::Reading);
 }
 
+/// The test hook that holds a drive's copy part-way (`open_holding_copy`,
+/// for the app's tests that pull a real drive mid-copy): the copy stops
+/// before the hold until it is released, cancelling stops it there, and
+/// reads that aren't the copy's (first paint's, `read_range`) aren't held.
+#[test]
+fn a_held_copy_waits_until_released_or_cancelled() {
+    let dir = TempDir::new("removable-hold");
+    let bytes = contents(50_000);
+    let path = dir.file("a.csv", &bytes);
+    let source = Source::open_with_options(
+        &path,
+        &dir.temp_folders(),
+        VolumeInfo::default(),
+        Options {
+            volume: VolumeCheck::Removable,
+            chunk_len: 10_000,
+            hold_at: Some(25_000),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(&*source.read_head(64 * 1024).unwrap(), &bytes[..]);
+    assert_eq!(&*source.read_range(0..40_000).unwrap(), &bytes[..40_000]);
+
+    // One pass while held: it waits, then `cancel` stops it there.
+    let delivered = AtomicU64::new(0);
+    let wait_for_two_chunks = || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while delivered.load(Ordering::Relaxed) < 2 {
+            assert!(Instant::now() < deadline, "the copy didn't get to the hold");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            delivered.load(Ordering::Relaxed),
+            2,
+            "held at the third chunk"
+        );
+    };
+    let cancel = AtomicBool::new(false);
+    let count =
+        |n: usize, _: &Source| delivered.store(u64::try_from(n).unwrap() + 1, Ordering::Relaxed);
+    std::thread::scope(|scope| {
+        let streaming = scope.spawn(|| stream_with(&source, &cancel, count));
+        wait_for_two_chunks();
+        cancel.store(true, Ordering::Relaxed);
+        let cancelled = streaming.join().unwrap();
+        assert_eq!(kind(cancelled.result), ReadErrorKind::Cancelled);
+        assert_eq!(cancelled.chunks, expected_chunks(20_000, 10_000));
+    });
+    assert_eq!(source.storage(), Storage::Reading);
+
+    // Another pass waits there too, and completes once released.
+    delivered.store(0, Ordering::Relaxed);
+    let go_on = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let streaming = scope.spawn(|| stream_with(&source, &go_on, count));
+        wait_for_two_chunks();
+        assert_eq!(source.storage(), Storage::Reading);
+        source.release_held_copy();
+        let streamed = streaming.join().unwrap();
+        streamed.result.unwrap();
+        assert_eq!(streamed.bytes, bytes);
+    });
+    assert_eq!(source.storage(), Storage::Copy);
+
+    // On a volume that isn't removable, `open_holding_copy` opens the file
+    // as usual: nothing is copied, so nothing is held.
+    let internal =
+        Source::open_holding_copy(&path, &dir.temp_folders(), VolumeInfo::default(), 0).unwrap();
+    assert_eq!(internal.storage(), Storage::Clone);
+    internal.release_held_copy();
+    assert_eq!(internal.as_slice(), Some(bytes.as_slice()));
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup
 

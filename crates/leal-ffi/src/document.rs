@@ -1402,6 +1402,12 @@ impl Document {
     pub fn debug_share_release(&self) {
         self.document.source().simulated_share_release();
     }
+
+    /// For a document from [`debug_open_document_holding_copy`]: the copy's
+    /// reads held at `hold_at` go on.
+    pub fn debug_release_held_copy(&self) {
+        self.document.source().release_held_copy();
+    }
 }
 
 /// Reads of a simulated network share that fail, for the app's tests
@@ -1476,6 +1482,40 @@ pub fn debug_open_document_simulating_share(
     let source =
         Source::open_simulating_share(Path::new(path), &temp, to_usize(chunk_bytes), share)
             .map_err(|error| LealError::from_open(path, &error))?;
+    debug_document_from(path, source, scheduler, options, observer)
+}
+
+/// [`open_document`], the real thing, except that if the file is on a
+/// removable drive (or a network share) the copy's reads past `hold_at`
+/// wait for [`Document::debug_release_held_copy`], or for the document to
+/// be closed. So the app's tests can pull a real drive (a disk image) while
+/// the copy is certainly part-way through, however long the pull takes,
+/// then let the copy go on and find the drive gone (`test-exports`). See
+/// `leal_core::source::Source::open_holding_copy`.
+///
+/// # Errors
+///
+/// As for [`open_document`].
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+pub fn debug_open_document_holding_copy(
+    path: &str,
+    volume: VolumeInfo,
+    temp: TempLocations,
+    scheduler: &Scheduler,
+    options: OpenOptions,
+    observer: Option<Arc<dyn ProgressObserver>>,
+    hold_at: u64,
+) -> Result<Arc<Document>, LealError> {
+    let temp = TempFolders::from(temp);
+    let hold_at = usize::try_from(hold_at).unwrap_or(usize::MAX);
+    let source = leal_core::source::Source::open_holding_copy(
+        Path::new(path),
+        &temp,
+        volume.into(),
+        hold_at,
+    )
+    .map_err(|error| LealError::from_open(path, &error))?;
     debug_document_from(path, source, scheduler, options, observer)
 }
 

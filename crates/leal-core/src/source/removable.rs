@@ -162,9 +162,6 @@ impl ShareRules {
                 reads: AtomicUsize::new(0),
                 failed: AtomicUsize::new(0),
                 head_reads: AtomicUsize::new(0),
-                hold_at: share.hold_at,
-                released: Mutex::new(share.hold_at.is_none()),
-                release: Condvar::new(),
                 on_close: share.on_close,
             }),
         }
@@ -197,7 +194,8 @@ pub struct SimulatedShare {
     /// [`Source::simulated_share_release`](super::Source::simulated_share_release)
     /// or until the pass is cancelled, so a test can look at a document
     /// part-way through its copy without racing it. First paint's read isn't
-    /// held.
+    /// held. The same hold as
+    /// [`Source::open_holding_copy`](super::Source::open_holding_copy)'s.
     pub hold_at: Option<usize>,
     /// Called on each thread that closes one of the share's files (the
     /// source's, and the document's watcher's), once it has closed it, so a
@@ -255,12 +253,24 @@ struct SimulatedState {
     failed: AtomicUsize,
     /// How many first paint reads there have been (not tries).
     head_reads: AtomicUsize,
-    /// See [`SimulatedShare::hold_at`].
-    hold_at: Option<usize>,
+    on_close: Option<fn()>,
+}
+
+/// TEST HOOK: the copy held part-way, so a test can do something to the
+/// drive or share (pull it, delete the file) while the copy is certainly
+/// not finished, without racing it ([`Source::open_holding_copy`], and a
+/// [`SimulatedShare`]'s `hold_at`). Reads of the copy that reach past `at`
+/// wait until [`Removable::release_held_copy`] or until the pass is
+/// cancelled. First paint's read, and `read_range`, aren't held.
+///
+/// [`Source::open_holding_copy`]: super::Source::open_holding_copy
+#[cfg(any(test, feature = "test-hooks"))]
+struct HeldCopy {
+    /// The byte reads of the copy may reach before they wait.
+    at: usize,
     /// Whether held reads may go on.
     released: Mutex<bool>,
     release: Condvar,
-    on_close: Option<fn()>,
 }
 
 /// What is read from the removable drive.
@@ -330,6 +340,10 @@ pub(super) struct Removable {
     /// `simulate_drive_back` clears it.
     #[cfg(any(test, feature = "test-hooks"))]
     fault: Mutex<Option<SimulatedFault>>,
+    /// TEST HOOK: where the copy waits, if anywhere, until the test lets
+    /// it go on.
+    #[cfg(any(test, feature = "test-hooks"))]
+    held_copy: Option<HeldCopy>,
 }
 
 /// TEST HOOK, not for product code: what to pretend happens to a file on a
@@ -590,6 +604,8 @@ impl Removable {
             chunk_len: chunk_len.max(1),
             #[cfg(any(test, feature = "test-hooks"))]
             fault: Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            held_copy: None,
         })
     }
 
@@ -610,6 +626,17 @@ impl Removable {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn set_fault(&mut self, fault: Option<SimulatedFault>) {
         *self.fault.get_mut().unwrap_or_else(PoisonError::into_inner) = fault;
+    }
+
+    /// TEST HOOK: reads of the copy that reach past byte `at` wait until
+    /// [`release_held_copy`](Self::release_held_copy) (`None`: never held).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn hold_copy_at(&mut self, at: Option<usize>) {
+        self.held_copy = at.map(|at| HeldCopy {
+            at,
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        });
     }
 
     /// TEST HOOK: the simulated fault's error, if a read of the drive up to
@@ -849,15 +876,13 @@ impl Removable {
         self.share.as_ref()?.simulated.as_ref()
     }
 
-    /// TEST HOOK: reads of the simulated share held at its `hold_at` go on.
+    /// TEST HOOK: reads of the copy held at its hold (`hold_copy_at`) go
+    /// on, and no later read is held.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn simulated_share_release(&self) {
-        if let Some(simulated) = self.simulated() {
-            *simulated
-                .released
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = true;
-            simulated.release.notify_all();
+    pub(super) fn release_held_copy(&self) {
+        if let Some(held) = &self.held_copy {
+            *held.released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            held.release.notify_all();
         }
     }
 
@@ -1085,7 +1110,7 @@ impl Removable {
             )));
         };
         #[cfg(any(test, feature = "test-hooks"))]
-        self.simulate_share_hold(offset + chunk.len(), cancel)?;
+        self.wait_while_copy_held(offset + chunk.len(), cancel)?;
         self.read_origin(&external, chunk, offset, Wait::Allowed, cancel)?;
         self.check_against_head(chunk, offset)?;
         self.copy
@@ -1267,26 +1292,23 @@ impl Removable {
         share_used_on_main_thread();
     }
 
-    /// TEST HOOK: reads of the copy reaching `end` wait while the simulated
-    /// share holds them, unless `cancel` is set meanwhile (looked at every
-    /// `PAUSE_SLICE`).
+    /// TEST HOOK: a read of the copy reaching `end` waits while the copy is
+    /// held there (`hold_copy_at`), unless `cancel` is set meanwhile
+    /// (looked at every `PAUSE_SLICE`).
     #[cfg(any(test, feature = "test-hooks"))]
-    fn simulate_share_hold(&self, end: usize, cancel: &AtomicBool) -> Result<(), ReadError> {
-        let Some(simulated) = self.simulated() else {
+    fn wait_while_copy_held(&self, end: usize, cancel: &AtomicBool) -> Result<(), ReadError> {
+        let Some(held) = &self.held_copy else {
             return Ok(());
         };
-        if simulated.hold_at.is_none_or(|at| end <= at) {
+        if end <= held.at {
             return Ok(());
         }
-        let mut released = simulated
-            .released
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut released = held.released.lock().unwrap_or_else(PoisonError::into_inner);
         while !*released {
             if cancel.load(Ordering::Relaxed) {
                 return Err(ReadError::cancelled());
             }
-            released = simulated
+            released = held
                 .release
                 .wait_timeout(released, PAUSE_SLICE)
                 .unwrap_or_else(PoisonError::into_inner)

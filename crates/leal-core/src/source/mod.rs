@@ -306,6 +306,10 @@ struct Options {
     /// can't clone, as real ones can't.
     #[cfg(any(test, feature = "test-hooks"))]
     share: Option<SimulatedShare>,
+    /// Where a removable drive's copy waits until the test lets it go on
+    /// (tests only): `Source::open_holding_copy`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    hold_at: Option<usize>,
     /// Pretend Leal's temporary folder is on a network volume (tests only).
     #[cfg(test)]
     copy_on_network: bool,
@@ -321,6 +325,8 @@ impl Default for Options {
             fault: None,
             #[cfg(any(test, feature = "test-hooks"))]
             share: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            hold_at: None,
             #[cfg(test)]
             copy_on_network: false,
         }
@@ -514,6 +520,39 @@ impl Source {
         )
     }
 
+    /// TEST HOOK, not for product code: [`open_on`](Self::open_on), the
+    /// real thing (the volume is looked at as for any file), except that if
+    /// the file is on a removable drive or a network share, the copy's
+    /// reads that reach past byte `hold_at` wait until
+    /// [`release_held_copy`](Self::release_held_copy), or until the pass is
+    /// cancelled (closing the document cancels it). So a test can pull a
+    /// real drive while the copy is certainly part-way through, however
+    /// long the pull takes, and only then let the copy go on and find the
+    /// drive gone. First paint's read isn't held. The app's tests use it
+    /// (through leal-ffi's `test-exports`) with real disk images.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn open_holding_copy(
+        path: &Path,
+        temp: &TempFolders,
+        volume: VolumeInfo,
+        hold_at: usize,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_options(
+            path,
+            temp,
+            volume,
+            Options {
+                hold_at: Some(hold_at),
+                ..Options::default()
+            },
+        )
+    }
+
     /// [`open_on`](Self::open_on), with options so tests can reach the copy
     /// fallback with small files, choose the stream's chunk size, and
     /// pretend a volume is internal, removable or a network share.
@@ -544,7 +583,11 @@ impl Source {
             )]
             let mut removable = Removable::new(path, origin, &copy, options.chunk_len, share)?;
             #[cfg(any(test, feature = "test-hooks"))]
-            removable.set_fault(options.fault);
+            {
+                removable.set_fault(options.fault);
+                let share_hold = options.share.and_then(|share| share.hold_at);
+                removable.hold_copy_at(options.hold_at.or(share_hold));
+            }
             #[cfg(test)]
             if options.copy_on_network {
                 removable.set_copy_on_network();
@@ -895,12 +938,23 @@ impl Source {
 
     /// TEST HOOK, not for product code: for a source from
     /// [`open_simulating_share`](Self::open_simulating_share) with a
-    /// `hold_at`, the held reads go on.
+    /// `hold_at`, the held reads go on. The same as
+    /// [`release_held_copy`](Self::release_held_copy).
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn simulated_share_release(&self) {
+        self.release_held_copy();
+    }
+
+    /// TEST HOOK, not for product code: for a source from
+    /// [`open_holding_copy`](Self::open_holding_copy) (or a simulated share
+    /// with a `hold_at`), the copy's held reads go on, and no later one is
+    /// held. Does nothing for any other source.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn release_held_copy(&self) {
         if let Bytes::Removable(removable) = &self.bytes {
-            removable.simulated_share_release();
+            removable.release_held_copy();
         }
     }
 

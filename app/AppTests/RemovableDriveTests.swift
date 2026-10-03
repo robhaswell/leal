@@ -9,7 +9,8 @@ import XCTest
 /// images (phase 1 review, cons-12): a file on an ejectable volume is read
 /// from the drive while it is copied to this Mac, then worked from the copy;
 /// and a drive detached part-way through shows the disconnected banner
-/// without a crash.
+/// without a crash (the copy held part-way by the core's test hook until the
+/// drive has gone, so the test doesn't race it).
 ///
 /// The sandbox stops the test host attaching images: `hdiutil create` and
 /// `hdiutil attach` fail with "Device not configured" in it. The Leal
@@ -43,6 +44,8 @@ final class RemovableDriveTests: XCTestCase {
 
     override func tearDown() async throws {
         if let savedEnvironment { CSVDocument.environment = savedEnvironment }
+        DocumentModel.openForTesting = nil
+        // Closing a document whose copy is still held cancels the copy.
         for document in NSDocumentController.shared.documents {
             document.close()
         }
@@ -161,20 +164,36 @@ final class RemovableDriveTests: XCTestCase {
 
     // MARK: Pulled out part-way
 
-    /// A drive detached while Leal is still copying the file: the document
+    /// A drive pulled out while Leal is still copying the file: the document
     /// shows the rows it had read, the disconnected banner and status note,
-    /// Save is off, and nothing crashes, including closing it. The image is
-    /// compressed (bzip2), so reading it is slow enough (about 50 MB/s)
-    /// that the copy is still going when the drive goes.
+    /// Save is off, and nothing crashes, including closing it.
+    ///
+    /// The file is opened the real way (its volume looked at, read from the
+    /// drive, copied to this Mac), except that the core's test hook holds
+    /// the copy at `holdAt` (`debugOpenDocumentHoldingCopy`). The drive is
+    /// pulled while it is held, and only once it has gone does the copy go
+    /// on, and find it gone. So the copy is certainly part-way through when
+    /// the drive goes, however long `hdiutil detach -force` takes: the test
+    /// used to count on the pull beating a slow (compressed) image's copy,
+    /// and failed when a detach took 1.7 s.
     func testADriveDetachedMidCopyShowsDisconnected() async throws {
-        let rows = 2_000_000
-        let image = try await attach(fs: "ExFAT", format: "UDBZ", size: nil, file: "drive.csv", contents: csv(rows: rows))
+        let rows = 400_000
+        let image = try await attach(fs: "ExFAT", format: "UDRW", size: "64m", file: "drive.csv", contents: csv(rows: rows))
         let url = image.root.appending(path: "drive.csv")
-        // The drive is pulled as soon as the helper gets to it, which takes
-        // at least 0.4 s: first paint (one 64 KB read) is long done by then,
-        // and the copy (about 90 MB) far from it, even in a Release build.
-        let pulled = Date()
-        try image.requestPull()
+        // 4 MiB of about 18 MB, past first paint's 64 KB: four of the copy's
+        // 1 MiB chunks, then it waits.
+        let holdAt: UInt64 = 4 << 20
+        DocumentModel.openForTesting = { path, environment, options, observer in
+            try debugOpenDocumentHoldingCopy(
+                path: path,
+                volume: TemporaryFolders.volume(for: URL(filePath: path)),
+                temp: environment.temp,
+                scheduler: environment.scheduler,
+                options: options,
+                observer: observer,
+                holdAt: holdAt
+            )
+        }
         let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
         document.makeWindowControllers()
         let model = try XCTUnwrap(document.model)
@@ -182,13 +201,24 @@ final class RemovableDriveTests: XCTestCase {
         _ = content.view
         XCTAssertEqual(model.storage, .reading, "streamed from the drive at first paint")
         XCTAssertEqual(model.cell(row: 0, column: 0), .text("0", truncated: false))
+        // Copied and indexed up to the hold (about 93,000 rows), and no
+        // further: the copy is waiting.
+        try await waitUntil("copied to the hold") { model.loadedRowCount > 50_000 }
+        XCTAssertEqual(model.storage, .reading)
+        XCTAssertFalse(model.isIndexComplete)
 
+        // Pulled out (the helper's `hdiutil detach -force`), then the copy
+        // goes on.
+        let pulled = Date()
+        try image.requestPull()
         try await image.waitUntilPulled()
         let took = Date().timeIntervalSince(pulled)
+        model.backgroundHandle()?.debugReleaseHeldCopy()
         try await waitUntil("disconnected (detaching took \(took) s)") { model.storage == .disconnected || model.storage == .copy }
-        XCTAssertEqual(model.storage, .disconnected, "the copy finished before the drive went (detaching took \(took) s)")
+        XCTAssertEqual(model.storage, .disconnected, "the copy finished, though the drive went first (detaching took \(took) s)")
         XCTAssertFalse(model.isFailed)
         XCTAssertFalse(document.canSave)
+        try await waitUntil("its banner") { content.driveBanner != nil }
         XCTAssertEqual(content.driveBanner?.message, DiagnosticsText.disconnected)
         XCTAssertTrue(StatusText.segments(model.status).contains("Drive disconnected"))
         XCTAssertLessThan(model.loadedRowCount, rows, "not all of it was read")
@@ -301,9 +331,11 @@ struct HelperDiskImage {
     /// Asks the helper to pull the drive out, as when a drive is unplugged
     /// with a file on it open: it runs `hdiutil detach -force` on it. The test
     /// host could do it itself, but in the sandbox that takes about 10 s
-    /// while a file on the volume is open (0.3 s outside), by which time
-    /// the copy has finished. Throws with the helper's report if the image
-    /// is still attached afterwards.
+    /// while a file on the volume is open (0.3 s outside). How long it
+    /// takes varies, so a test that needs the copy part-way through when
+    /// the drive goes holds the copy (`debugOpenDocumentHoldingCopy`)
+    /// rather than racing it. `waitUntilPulled` throws with the helper's
+    /// report if the image is still attached afterwards.
     func requestPull() throws {
         try Data().write(to: folder.appending(path: "detach"))
     }
