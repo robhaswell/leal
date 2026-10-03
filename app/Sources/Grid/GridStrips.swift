@@ -235,7 +235,7 @@ final class GridStrips: NSObject, CALayerDelegate {
         }
     }
 
-    private func flushDeferred() {
+    func flushDeferred() {
         deferredScheduled = false
         let parts = deferred
         deferred = []
@@ -248,7 +248,17 @@ final class GridStrips: NSObject, CALayerDelegate {
     func invalidateAll() {
         invalidations += 1
         wholeRedraws += 1
-        for strip in strips.values { strip.setNeedsDisplay() }
+        for (index, strip) in strips {
+            if index == drawing {
+                // As in `invalidate`: asked while this strip is being drawn
+                // (`GridView.noteSpill` forgetting the spills), which Core
+                // Animation drops: all of it is asked again afterwards.
+                deferred.append((index, rect(ofStrip: index)))
+                scheduleDeferred()
+                continue
+            }
+            strip.setNeedsDisplay()
+        }
     }
 
     /// The window moved to a display of another scale, or the strips' view

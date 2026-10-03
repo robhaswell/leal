@@ -218,6 +218,9 @@ final class GridView: StripContentView, NSMenuItemValidation {
     /// strip its ink reaches redraws that part of the strip (the next
     /// frame). Without strips, AppKit's drawing is as it was.
     private var spills: [Int: InkSpill] = [:]
+    /// More spills than this are forgotten, and everything is drawn again
+    /// (lowered in tests).
+    var spillRecordLimit = 10_000
     /// The most rows any ink in `spills` reaches: how far from a strip to
     /// look.
     private var farthestSpill = 0
@@ -269,7 +272,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
         let old = spills[row] ?? InkSpill()
         let new = whole ? spill : old.union(spill)
         guard new != old else { return }
-        if spills.count > 10_000 {
+        if spills.count > spillRecordLimit {
             // Rows already drawn lose their record: draw everything again,
             // which learns the spills that matter in view.
             forgetSpills()

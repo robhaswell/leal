@@ -83,7 +83,10 @@ final class GridStripsTests: XCTestCase {
             // can ask for ink it spills past its edge (or past what was
             // drawn of it) to be drawn, in the next frame
             // (`GridView.spills`; `GridStrips.invalidate`). (A grid view's
-            // own snapshot waits for that itself.)
+            // own snapshot waits for that itself.) The strips' snapshot
+            // (`drawSnapshot`) flushes what was deferred, but without a
+            // turn of the run loop here a later check (an edit back to
+            // spilling) differs.
             RunLoop.main.run(until: Date().addingTimeInterval(0.005))
             view.cacheDisplay(in: rect, to: rep)
         }
@@ -262,7 +265,7 @@ final class GridStripsTests: XCTestCase {
     /// drawn at once. Going to plain is cleared in the same pass as the
     /// edit (one frame, not a later one); going to spilling is learnt when
     /// the row is drawn, and shows a frame later (`GridView.spills`).
-    func testAnEditFromSpillingToPlainAndBack() {
+    func testAnEditFromSpillingToPlainAndBack() throws {
         for row in [11, 12] {
             let source = StripSource(rows: 60)
             source.spillingRow = row
@@ -272,11 +275,47 @@ final class GridStripsTests: XCTestCase {
             // be redrawn without them within the one frame.
             source.spillingRow = -1
             for each in [grid, plain] { each.cellsChanged(rows: row..<(row + 1)) }
+            // Before any draw (a snapshot draws again until nothing is
+            // left to draw, which would hide a neighbour missed here): the
+            // strip next door is already to be drawn. (Strips are
+            // `GridStrips.rows` rows: row 11 ends strip 2, and its ink
+            // reaches strip 3; row 12's reaches only rows below it.)
+            let strips = try XCTUnwrap(grid.strips)
+            if row == 11 {
+                XCTAssertEqual(strips.strip(at: 3)?.needsDisplay(), true, "row \(row): the strip next door is to be drawn at once")
+            }
             assertSame(snapshot(grid, laterFrame: false), reference(plain), "row \(row), spilling to plain, in one frame")
             // And back: plain to spilling.
             source.spillingRow = row
             for each in [grid, plain] { each.cellsChanged(rows: row..<(row + 1)) }
             assertSameGrid(grid, plain, "row \(row), plain to spilling")
+        }
+    }
+
+    /// Forgetting the spills (too many are recorded) while a strip is being
+    /// drawn asks for every strip to be drawn again, which Core Animation
+    /// drops for the strip being drawn: it is asked again afterwards.
+    func testForgettingSpillsWhileDrawingRedrawsTheStripBeingDrawn() throws {
+        let source = StripSource(rows: 60)
+        let grid = makeGrid(source, strips: true)
+        let strips = try XCTUnwrap(grid.strips)
+        // Every strip learns spills as it is drawn, and forgets them all
+        // again as soon as it has learnt more than this.
+        grid.gridView.spillRecordLimit = 0
+        let before = strips.wholeRedraws
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 1280, height: 2000, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        // One pass: each strip needing it is drawn once.
+        strips.view.root.render(in: context)
+        // (Left low, every draw would forget them again, and ask again.)
+        grid.gridView.spillRecordLimit = 10_000
+        XCTAssertGreaterThan(strips.wholeRedraws, before, "the spills were forgotten while drawing")
+        // The next frame.
+        strips.flushDeferred()
+        for index in strips.placedIndexes {
+            XCTAssertEqual(strips.strip(at: index)?.needsDisplay(), true, "strip \(index), which asked for all to be drawn again or was asked, is to be drawn")
         }
     }
 
