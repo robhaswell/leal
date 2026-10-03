@@ -57,7 +57,7 @@ fn an_edit_gives_a_command_that_undoes_and_redoes() {
                 old_value: Some("Marlow".into()),
                 new_value: Some("Marlowe".into()),
             }],
-            rows: None,
+            structural: None,
         }
     );
     assert!(document.has_unsaved_edits().unwrap());
@@ -197,7 +197,7 @@ fn replay_recovers_the_edits_and_names_those_that_no_longer_apply() {
                 old_value: Some("not what it holds".into()),
                 new_value: Some("x".into()),
             }],
-            rows: None,
+            structural: None,
         },
     ];
     let fresh = open(&dir, &scheduler, "fresh.csv");
@@ -238,7 +238,7 @@ fn rows_inserted_and_deleted_undo_redo_and_replay() {
         .unwrap()
         .unwrap();
     assert!(insert.changes.is_empty());
-    let rows = insert.rows.clone().unwrap();
+    let rows = insert.structural.clone().unwrap();
     assert!(rows.inserts());
     assert_eq!((rows.first_row(), rows.row_count()), (1, 1));
     assert_eq!(document.row_count().unwrap(), 5);
@@ -249,7 +249,7 @@ fn rows_inserted_and_deleted_undo_redo_and_replay() {
     assert_eq!(name(&document, 1), ["0", "Vale"]);
 
     let delete = document.delete_rows(2, 2).unwrap().unwrap();
-    assert!(!delete.rows.clone().unwrap().inserts());
+    assert!(!delete.structural.clone().unwrap().inserts());
     assert_eq!(document.row_count().unwrap(), 3);
     assert_eq!(name(&document, 2), ["3", "open\nquote\n"]);
     assert!(document.has_unsaved_edits().unwrap());

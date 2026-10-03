@@ -158,13 +158,23 @@ impl<'a> RowView<'a> {
     ///
     /// [`COLUMN_LIMIT`]: crate::edit::COLUMN_LIMIT
     pub(crate) fn filled(&self) -> Vec<(usize, ViewCell<'a>)> {
-        let own = (0..self.own.len()).filter_map(|column| Some((column, self.own(column)?)));
-        let Some(edits) = self.edits else {
-            return own.collect();
+        let mut cells: Vec<(usize, ViewCell<'a>)> = match self.own {
+            Own::Parsed(row) => row
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(column, field)| (column, ViewCell::Field(field)))
+                .collect(),
+            Own::New(values) => values
+                .iter()
+                .enumerate()
+                .map(|(column, value)| (column, ViewCell::New(value)))
+                .collect(),
         };
-        let mut cells: Vec<(usize, ViewCell<'a>)> = own
-            .filter(|&(column, _)| edits.get(column).is_none())
-            .collect();
+        let Some(edits) = self.edits else {
+            return cells;
+        };
+        cells.retain(|&(column, _)| edits.get(column).is_none());
         cells.extend(
             edits
                 .cells()
@@ -227,6 +237,14 @@ impl<'a> RowView<'a> {
 
     /// The first cell with an occurrence of the field-level `kind`.
     pub(crate) fn first_with(&self, kind: DiagnosticKind) -> Option<usize> {
+        if let Some(row) = self.plain() {
+            // A row of the file with no edits: its fields, in order, with
+            // nothing to collect first.
+            return row
+                .fields()
+                .iter()
+                .position(|field| self.cell_has(kind, ViewCell::Field(field)));
+        }
         self.filled()
             .into_iter()
             .find(|&(_, cell)| self.cell_has(kind, cell))

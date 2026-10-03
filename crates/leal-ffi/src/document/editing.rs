@@ -22,8 +22,8 @@
 //!
 //! **Rows** (task 2.4a). [`Document::insert_rows`] and
 //! [`Document::delete_rows`] give commands too, undone and redone the same
-//! way: their [`EditCommand::rows`] holds the rows, which the app keeps
-//! but can't look into beyond [`RowEdit`]'s summary. They need the whole
+//! way: their [`EditCommand::structural`] holds the rows, which the app
+//! keeps but can't look into beyond [`StructuralEdit`]'s summary. They need the whole
 //! file read, and no save running ([`Document::can_change_rows`]).
 //!
 //! Rows are logical rows: as the document has them now, after any rows
@@ -75,20 +75,22 @@ pub struct EditCommand {
     /// The cells it changes, in order: one for an edit, several for a
     /// batch (all or nothing). Empty for a row insert or delete.
     pub changes: Vec<ValueChange>,
-    /// The rows it inserts or deletes, for a row insert or delete.
-    pub rows: Option<Arc<RowEdit>>,
+    /// The rows it inserts or deletes, for a row insert or delete (and,
+    /// from task 2.4b, the column for a column insert or delete).
+    pub structural: Option<Arc<StructuralEdit>>,
 }
 
-/// A row insert or delete, inside an [`EditCommand`]: opaque to the app,
-/// which keeps it for undo and redo, but for where the rows are. See
+/// A row insert or delete (task 2.4a; columns are task 2.4b's), inside an
+/// [`EditCommand`]: opaque to the app, which keeps it for undo and redo,
+/// but for where the rows are. See
 /// `leal_core::edit::Edit::InsertRows`.
 #[derive(Debug, PartialEq, Eq, uniffi::Object)]
-pub struct RowEdit {
+pub struct StructuralEdit {
     edit: Edit,
 }
 
 #[uniffi::export]
-impl RowEdit {
+impl StructuralEdit {
     /// Whether it inserts rows (its undo deletes them), rather than
     /// deleting them.
     #[must_use]
@@ -187,16 +189,16 @@ pub struct ReplayReport {
 
 impl From<Command> for EditCommand {
     fn from(command: Command) -> Self {
-        let (changes, rows) = match command.edit {
+        let (changes, structural) = match command.edit {
             Edit::SetCell(change) => (vec![change], None),
             Edit::SetCells(changes) => (changes, None),
             edit @ (Edit::InsertRows { .. } | Edit::DeleteRows { .. }) => {
-                (Vec::new(), Some(Arc::new(RowEdit { edit })))
+                (Vec::new(), Some(Arc::new(StructuralEdit { edit })))
             }
         };
         EditCommand {
             lineage: command.lineage.get(),
-            rows,
+            structural,
             changes: changes
                 .into_iter()
                 .map(|change| ValueChange {
@@ -212,10 +214,10 @@ impl From<Command> for EditCommand {
 
 impl From<EditCommand> for Command {
     fn from(command: EditCommand) -> Self {
-        if let Some(rows) = command.rows {
+        if let Some(structural) = command.structural {
             return Command {
                 lineage: Lineage::from_raw(command.lineage),
-                edit: rows.edit.clone(),
+                edit: structural.edit.clone(),
             };
         }
         let mut changes: Vec<CellChange> = command
