@@ -261,6 +261,9 @@ pub enum InterpretationNote {
     },
     /// Leal's interpretation attribute couldn't be read.
     InterpretationUnreadable,
+    /// Leal's interpretation attribute has an encoding Leal doesn't read
+    /// from a tag; the rest of it is kept.
+    InterpretationEncodingIgnored,
     /// The file changed since Leal saved its interpretation attribute, and
     /// the remembered delimiter no longer fits it.
     InterpretationNotSensible {
@@ -282,6 +285,7 @@ impl From<detect::Note> for InterpretationNote {
                 encoding: encoding.into(),
             },
             Core::InterpretationUnreadable => Self::InterpretationUnreadable,
+            Core::InterpretationEncodingIgnored => Self::InterpretationEncodingIgnored,
             Core::InterpretationNotSensible { delimiter } => Self::InterpretationNotSensible {
                 delimiter: delimiter.into(),
             },

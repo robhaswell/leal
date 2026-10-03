@@ -418,6 +418,198 @@ fn an_unreadable_interpretation_is_ignored_with_a_note() {
     assert_eq!(d.notes, [Note::InterpretationUnreadable]);
 }
 
+/// A malformed `encoding=` costs only the encoding: the remembered
+/// delimiter, header and fingerprint are kept, a note says the encoding was
+/// ignored, and the encoding falls back to ADR-0004 decision 11.
+#[test]
+fn a_malformed_own_encoding_keeps_the_rest_of_the_interpretation() {
+    // Clearly semicolon-separated, saved as a one-column comma file with no
+    // header. The remembered comma only holds while the fingerprint matches.
+    let bytes = b"product;price;qty\nApple;1,20;3\nPear;0,95;12\nPlum;2,05;7\n\xAA\n";
+    let fingerprint = Fingerprint::of(bytes);
+    let value = format!(
+        "v=1;delimiter=comma;header=no;file={}-{:016x};encoding=greek",
+        fingerprint.length, fingerprint.head_hash
+    );
+    for bad in ["greek", "", "utf-16le", "Windows-1253"] {
+        let value = value.replace("greek", bad);
+        // With no tag: the guess decides the encoding.
+        let d = with_interpretation(bytes, value.as_bytes());
+        assert_eq!(
+            (d.delimiter, d.delimiter_source, d.header, d.header_source),
+            (
+                Delimiter::Comma,
+                DialectSource::Attribute,
+                false,
+                DialectSource::Attribute
+            ),
+            "{bad}"
+        );
+        assert_eq!(d.notes, [Note::InterpretationEncodingIgnored], "{bad}");
+        assert_eq!(d.encoding_source, EncodingSource::Guess, "{bad}");
+        assert!(!d.own_encoding_tag, "{bad}");
+
+        // With a tag that decodes: the tag is honoured as for any file.
+        let hints = Hints {
+            text_encoding: Some(&attr(Encoding::MacRoman)),
+            interpretation: Some(value.as_bytes()),
+        };
+        let d = detect(bytes, hints, Choices::default()).unwrap();
+        assert_eq!(
+            (d.encoding, d.encoding_source, d.own_encoding_tag),
+            (Encoding::MacRoman, EncodingSource::Attribute, false),
+            "{bad}"
+        );
+        assert_eq!(d.delimiter, Delimiter::Comma, "{bad}");
+        assert_eq!(d.notes, [Note::InterpretationEncodingIgnored], "{bad}");
+
+        // With a tag that doesn't decode (0xAA in Windows-1253): no own
+        // mark to hold it, so it is ignored with its usual note.
+        let hints = Hints {
+            text_encoding: Some(&attr(Encoding::Windows1253)),
+            interpretation: Some(value.as_bytes()),
+        };
+        let d = detect(bytes, hints, Choices::default()).unwrap();
+        assert_ne!(d.encoding, Encoding::Windows1253, "{bad}");
+        assert_eq!(d.encoding_source, EncodingSource::Guess, "{bad}");
+        assert_eq!(
+            d.notes,
+            [
+                Note::TextEncodingDoesNotDecode {
+                    encoding: Encoding::Windows1253
+                },
+                Note::InterpretationEncodingIgnored
+            ],
+            "{bad}"
+        );
+    }
+}
+
+// ---- Leal's own encoding tag: precedence (ADR-0013 decision 2) --------------
+
+/// "a,\xAAb" (0xAA is unassigned in Windows-1253) and the interpretation
+/// attribute Leal would have written for it in Windows-1253.
+fn own_tag_file() -> (Vec<u8>, Interpretation) {
+    let bytes = b"id,name\n1,\xAAb\n".to_vec();
+    let mark = Interpretation {
+        file: Some(Fingerprint::of(&bytes)),
+        encoding: Some(Encoding::Windows1253),
+        ..Interpretation::default()
+    };
+    (bytes, mark)
+}
+
+fn detect_own(bytes: &[u8], mark: &Interpretation, tag: Encoding, choices: Choices) -> Detection {
+    let (tag, mark) = (attr(tag), mark.to_attribute_value());
+    let hints = Hints {
+        text_encoding: Some(&tag),
+        interpretation: Some(mark.as_bytes()),
+    };
+    detect(bytes, hints, choices).unwrap()
+}
+
+/// Control: the mark holds the tag over the unassigned byte.
+#[test]
+fn an_own_mark_holds_its_tag_over_an_unassigned_byte() {
+    let (bytes, mark) = own_tag_file();
+    let d = detect_own(&bytes, &mark, Encoding::Windows1253, Choices::default());
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::Windows1253, EncodingSource::Attribute, true)
+    );
+    assert_eq!(d.notes, []);
+}
+
+#[test]
+fn a_utf16_bom_beats_an_own_mark() {
+    let mut bytes = b"\xFF\xFE".to_vec();
+    for unit in "a,b\n1,2\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mark = Interpretation {
+        file: Some(Fingerprint::of(&bytes)),
+        encoding: Some(Encoding::Windows1253),
+        ..Interpretation::default()
+    };
+    let d = detect_own(&bytes, &mark, Encoding::Windows1253, Choices::default());
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::Utf16Le, EncodingSource::Bom, false)
+    );
+}
+
+#[test]
+fn the_users_encoding_beats_an_own_mark() {
+    let (bytes, mark) = own_tag_file();
+    let choices = Choices {
+        encoding: Some(Encoding::MacRoman),
+        ..Choices::default()
+    };
+    let d = detect_own(&bytes, &mark, Encoding::Windows1253, choices);
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::MacRoman, EncodingSource::User, false)
+    );
+}
+
+/// The mark vouches only for the tag naming its own encoding. Where the
+/// tag names another, the normal rule applies to it (ADR-0004 decision 11).
+#[test]
+fn an_own_mark_for_another_encoding_than_the_tag_changes_nothing() {
+    let (bytes, mark) = own_tag_file();
+    // The tag names MacRoman, which assigns every byte: honoured, but not
+    // as Leal's own.
+    let d = detect_own(&bytes, &mark, Encoding::MacRoman, Choices::default());
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::MacRoman, EncodingSource::Attribute, false)
+    );
+    assert_eq!(d.notes, []);
+
+    // The mark names MacRoman and the tag Windows-1253, over a byte 1253
+    // leaves unassigned: the tag is ignored with its usual note.
+    let mark = Interpretation {
+        encoding: Some(Encoding::MacRoman),
+        ..mark
+    };
+    let d = detect_own(&bytes, &mark, Encoding::Windows1253, Choices::default());
+    assert_ne!(d.encoding, Encoding::Windows1253);
+    assert_eq!(
+        (d.encoding_source, d.own_encoding_tag),
+        (EncodingSource::Guess, false)
+    );
+    assert_eq!(
+        d.notes,
+        [Note::TextEncodingDoesNotDecode {
+            encoding: Encoding::Windows1253
+        }]
+    );
+}
+
+/// The fingerprint is the file's length and the hash of its head: the same
+/// length with a different head is another file, and the mark is ignored.
+#[test]
+fn an_own_mark_whose_head_hash_differs_is_ignored() {
+    let (bytes, mark) = own_tag_file();
+    let fingerprint = mark.file.unwrap();
+    let stale = Interpretation {
+        file: Some(Fingerprint {
+            length: fingerprint.length,
+            head_hash: fingerprint.head_hash ^ 1,
+        }),
+        ..mark
+    };
+    let d = detect_own(&bytes, &stale, Encoding::Windows1253, Choices::default());
+    assert_ne!(d.encoding, Encoding::Windows1253);
+    assert!(!d.own_encoding_tag);
+    assert_eq!(
+        d.notes,
+        [Note::TextEncodingDoesNotDecode {
+            encoding: Encoding::Windows1253
+        }]
+    );
+}
+
 // ---- user choices (DESIGN §3.2) -------------------------------------------
 
 #[test]

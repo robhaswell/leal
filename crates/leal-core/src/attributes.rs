@@ -44,8 +44,15 @@
 //!   Other keys made of lowercase letters, digits, `_` and `-` are ignored,
 //!   so a later Leal can add some without older ones rejecting the
 //!   attribute. Any other key (`" delimiter"`, `Header`), a key given twice,
-//!   or an unknown value for one of the keys above makes the value
-//!   unreadable, so a garbled attribute is noted rather than half-read.
+//!   or an unknown value for `delimiter`, `header` or `file` makes the
+//!   value unreadable, so a garbled attribute is noted rather than
+//!   half-read.
+//! - An `encoding` that names no encoding Leal reads from a tag (unknown,
+//!   malformed or UTF-16) doesn't spoil the rest: it reads as no encoding,
+//!   the remembered delimiter, header and fingerprint are kept, and
+//!   [`Interpretation::parse_noting`] says it was ignored, so detection
+//!   can report it. The encoding then falls back to
+//!   `com.apple.TextEncoding` as for any file (ADR-0004 decision 11).
 
 use crate::detect::FIRST_PAINT_BYTES;
 use crate::dialect::{Delimiter, Encoding};
@@ -222,9 +229,22 @@ impl Interpretation {
     ///
     /// Returns an [`InterpretationError`] if the value isn't UTF-8, doesn't
     /// start with `v=1`, has an item that isn't `key=value`, repeats a key,
-    /// or gives `delimiter`, `header`, `file` or `encoding` a value not
-    /// listed above.
+    /// or gives `delimiter`, `header` or `file` a value not listed above.
+    /// An unrecognised `encoding` isn't an error: see
+    /// [`Interpretation::parse_noting`].
     pub fn parse(value: &[u8]) -> Result<Self, InterpretationError> {
+        Self::parse_noting(value).map(|(interpretation, _)| interpretation)
+    }
+
+    /// Like [`Interpretation::parse`], and also says whether an `encoding`
+    /// item was ignored because it names no encoding Leal reads from a tag
+    /// (an unknown or malformed name, or UTF-16), in which case
+    /// [`Interpretation::encoding`] is `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpretation::parse`].
+    pub fn parse_noting(value: &[u8]) -> Result<(Self, bool), InterpretationError> {
         let fail = |reason: String| Err(InterpretationError { reason });
         let Ok(text) = std::str::from_utf8(value) else {
             return fail("not UTF-8".to_owned());
@@ -238,6 +258,7 @@ impl Interpretation {
         }
         let mut seen: Vec<&str> = Vec::new();
         let mut result = Interpretation::default();
+        let mut encoding_ignored = false;
         for item in items {
             let Some((key, value)) = item.split_once('=') else {
                 return fail(format!("`{item}` is not key=value"));
@@ -267,13 +288,13 @@ impl Interpretation {
                 },
                 "encoding" => match ascii_compatible_named(value) {
                     Some(e) => result.encoding = Some(e),
-                    None => return fail(format!("unknown encoding `{value}`")),
+                    None => encoding_ignored = true,
                 },
                 // A later version's addition; see the module docs.
                 _ => {}
             }
         }
-        Ok(result)
+        Ok((result, encoding_ignored))
     }
 
     /// The attribute value for this interpretation, for example
@@ -490,6 +511,37 @@ mod tests {
         );
     }
 
+    /// An unknown, malformed or UTF-16 `encoding` costs only the encoding:
+    /// the rest of the value is kept, and the parse says it was ignored.
+    #[test]
+    fn unrecognised_encodings_are_ignored_not_errors() {
+        let file = Fingerprint {
+            length: 5,
+            head_hash: 0xab,
+        };
+        for bad in ["", "greek", "Windows-1253", "1253", "utf-16le", "utf-16be"] {
+            let value =
+                format!("v=1;delimiter=pipe;encoding={bad};header=no;file=5-00000000000000ab");
+            let (read, ignored) = Interpretation::parse_noting(value.as_bytes()).unwrap();
+            assert!(ignored, "{bad}");
+            assert_eq!(
+                read,
+                Interpretation {
+                    delimiter: Some(Delimiter::Pipe),
+                    header: Some(false),
+                    file: Some(file),
+                    encoding: None,
+                },
+                "{bad}"
+            );
+            assert_eq!(Interpretation::parse(value.as_bytes()), Ok(read), "{bad}");
+        }
+        let (read, ignored) = Interpretation::parse_noting(b"v=1;encoding=macintosh").unwrap();
+        assert_eq!((read.encoding, ignored), (Some(Encoding::MacRoman), false));
+        // A repeated key is still an error, whatever the values.
+        assert!(Interpretation::parse(b"v=1;encoding=greek;encoding=greek").is_err());
+    }
+
     /// FNV-1a 64's published test vectors, and the 64 KB limit.
     #[test]
     fn fingerprints_hash_the_first_64_kb() {
@@ -526,11 +578,6 @@ mod tests {
             b"v=1;file=12-00000000000000AB",
             b"v=1;file=-00000000000000ab",
             b"v=1;file=x-00000000000000ab",
-            b"v=1;encoding=",
-            b"v=1;encoding=greek",
-            b"v=1;encoding=Windows-1253",
-            b"v=1;encoding=1253",
-            b"v=1;encoding=utf-16le",
             b"v=1;encoding=windows-1253;encoding=windows-1253",
             b"\xFFv=1",
         ] {

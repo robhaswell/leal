@@ -157,6 +157,10 @@ pub enum Note {
     },
     /// Leal's interpretation attribute couldn't be read.
     InterpretationUnreadable,
+    /// Leal's interpretation attribute has an `encoding` Leal doesn't read
+    /// from a tag (unknown, malformed or UTF-16). Only the encoding is
+    /// ignored: the delimiter, header and fingerprint are kept.
+    InterpretationEncodingIgnored,
     /// The file has changed since Leal saved the interpretation attribute,
     /// and the remembered delimiter no longer fits it.
     InterpretationNotSensible {
@@ -287,9 +291,9 @@ pub fn detect(
     // Leal's interpretation attribute, and the encoding it records for the
     // file Leal saved, if this is still that file (ADR-0013 decision 2).
     let fingerprint = Fingerprint::from_head(head, file_len);
-    let interpretation = hints.interpretation.map(Interpretation::parse);
+    let interpretation = hints.interpretation.map(Interpretation::parse_noting);
     let own_encoding = match &interpretation {
-        Some(Ok(i)) if i.file == Some(fingerprint) => i.encoding,
+        Some(Ok((i, _))) if i.file == Some(fingerprint) => i.encoding,
         _ => None,
     };
     let (encoding, encoding_source) = choose_encoding(
@@ -389,7 +393,7 @@ fn choose_encoding(
 /// with a note.
 fn remembered(
     fingerprint: Fingerprint,
-    parsed: Option<Result<Interpretation, InterpretationError>>,
+    parsed: Option<Result<(Interpretation, bool), InterpretationError>>,
     scores: &Scores,
     guess: Option<Delimiter>,
     notes: &mut Vec<Note>,
@@ -397,10 +401,13 @@ fn remembered(
     let Some(parsed) = parsed else {
         return Interpretation::default();
     };
-    let Ok(interpretation) = parsed else {
+    let Ok((interpretation, encoding_ignored)) = parsed else {
         notes.push(Note::InterpretationUnreadable);
         return Interpretation::default();
     };
+    if encoding_ignored {
+        notes.push(Note::InterpretationEncodingIgnored);
+    }
     let unchanged = interpretation.file == Some(fingerprint);
     if let Some(d) = interpretation.delimiter
         && !unchanged

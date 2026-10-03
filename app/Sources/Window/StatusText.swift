@@ -159,7 +159,7 @@ enum StatusText {
         let encoding = notes.contains {
             switch $0 {
             case .textEncodingUnreadable, .textEncodingUnsupported, .textEncodingUtf16WithoutBom, .textEncodingDoesNotDecode: true
-            case .interpretationUnreadable, .interpretationNotSensible: false
+            case .interpretationUnreadable, .interpretationEncodingIgnored, .interpretationNotSensible: false
             }
         }
         if encoding {
@@ -193,6 +193,8 @@ enum StatusText {
             )
         case .interpretationUnreadable:
             String(localized: "Leal’s remembered settings for this file couldn’t be read, so Leal ignored them.", comment: "Status bar tooltip: an ignored attribute")
+        case .interpretationEncodingIgnored:
+            String(localized: "Leal’s remembered encoding for this file isn’t one Leal reads, so Leal ignored it.", comment: "Status bar tooltip: an ignored attribute")
         case let .interpretationNotSensible(delimiter):
             String(
                 localized: "The file changed since Leal remembered its delimiter (\(Self.delimiter(delimiter))), so Leal guessed again.",

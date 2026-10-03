@@ -621,6 +621,10 @@ fn every_interpretation_note_converts() {
             InterpretationNote::InterpretationUnreadable,
         ),
         (
+            Note::InterpretationEncodingIgnored,
+            InterpretationNote::InterpretationEncodingIgnored,
+        ),
+        (
             Note::InterpretationNotSensible {
                 delimiter: CoreDelimiter::Pipe,
             },

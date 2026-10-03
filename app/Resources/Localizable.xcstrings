@@ -403,6 +403,9 @@
     "Leal read the encoding from the file’s encoding attribute, which the app that saved it set." : {
       "comment" : "Status bar tooltip: encoding source"
     },
+    "Leal’s remembered encoding for this file isn’t one Leal reads, so Leal ignored it." : {
+      "comment" : "Status bar tooltip: an ignored attribute"
+    },
     "Leal’s remembered settings for this file couldn’t be read, so Leal ignored them." : {
       "comment" : "Status bar tooltip: an ignored attribute"
     },

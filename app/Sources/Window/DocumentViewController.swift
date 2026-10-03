@@ -365,11 +365,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             )
         }
 
-        // The suggestions read the file again too: off until a Reload.
-        for suggestion in [delimiterBanner, encodingBanner] {
-            suggestion?.button?.isEnabled = model.canReinterpret
-            suggestion?.button?.toolTip = rereadReason
-        }
+        updateSuggestionButtons()
 
         let order = [driveBanner, readOnlyBanner, diagnosticsBanner, delimiterBanner, encodingBanner].compactMap { $0 }
         if banners.arrangedSubviews != order {
@@ -530,6 +526,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     private func setHeaderRow(_ header: Bool) {
         scheduler.noteUserInput()
+        guard savingAsUTF8 == nil else { return NSSound.beep() }
         model.setHeaderRow(header)
     }
 
@@ -562,6 +559,22 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         reopen(encoding: encoding)
     }
 
+    /// Whether the file can be read another way (a different delimiter,
+    /// encoding or header row): not once it changed on disk until a Reload,
+    /// nor while Save As UTF-8 replaces the file shown.
+    private var canReinterpret: Bool {
+        model.canReinterpret && savingAsUTF8 == nil
+    }
+
+    /// The suggestions read the file again too: off until a Reload, and
+    /// while Save As UTF-8 is under way.
+    private func updateSuggestionButtons() {
+        for suggestion in [delimiterBanner, encodingBanner] {
+            suggestion?.button?.isEnabled = canReinterpret
+            suggestion?.button?.toolTip = rereadReason
+        }
+    }
+
     /// Why reading the file another way is off, if it is for a reason the
     /// user can act on: it changed while Leal read it, so Reload first. The
     /// core refuses to read it again then (`ChangedOnDisk`).
@@ -574,17 +587,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case #selector(toggleHeaderRow(_:)):
             menuItem.state = model.interpretation.header ? .on : .off
             menuItem.toolTip = rereadReason
-            return model.canReinterpret
+            // Not while Save As UTF-8 replaces the file shown.
+            return canReinterpret
         case #selector(treatAsDelimiter(_:)):
             menuItem.state = MainMenu.delimiter(of: menuItem) == model.interpretation.delimiter ? .on : .off
             menuItem.toolTip = rereadReason
-            // Not while Save As UTF-8 replaces the file shown.
-            return model.canReinterpret && savingAsUTF8 == nil
+            return canReinterpret
         case #selector(reopenWithEncoding(_:)):
             let encoding = MainMenu.encoding(of: menuItem)
             menuItem.state = encoding == model.interpretation.encoding ? .on : .off
             menuItem.toolTip = rereadReason
-            return model.canReinterpret && savingAsUTF8 == nil
+            return canReinterpret
                 && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
             return !model.isFailed && model.diagnostics?.diagnostics.isEmpty == false
@@ -1044,7 +1057,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// SEAM(2.5): the save's progress (`SaveJob.progress`) isn't shown yet;
     /// 2.5's save progress in the status bar shows this one's too.
     private(set) var savingAsUTF8: Task<Void, Never>? {
-        didSet { updateSaveAsUTF8Button() }
+        didSet {
+            updateSaveAsUTF8Button()
+            updateSuggestionButtons()
+        }
     }
 
     /// Whether Save As UTF-8 can start: not while one is under way, nor
@@ -1085,6 +1101,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 // Including the core refusing to start it
                 // (`DocumentModel.saveAsUTF8`).
                 self?.showSaveAsUTF8Failure(failure)
+            } catch is CancellationError {
+                // The window is closing (`savingAsUTF8?.cancel()`): no alert.
             } catch {
                 // Saved, but the copy couldn't be read back.
                 self?.showReloadError(error)
