@@ -120,7 +120,7 @@ use volume::VolumeFlags;
 pub(crate) use volume::VolumeKind;
 pub use write::Placed;
 pub(crate) use write::{
-    Existing, Put, Snapshot, Staged, SwapError, can_write, look_afresh, same_file,
+    Existing, Put, Snapshot, Staged, SwapError, as_on_disk, can_write, look_afresh, same_file,
 };
 
 /// The largest file the fallback reads into memory, when its volume can't

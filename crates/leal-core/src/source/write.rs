@@ -194,6 +194,34 @@ pub fn identity_at(path: &Path) -> io::Result<FileIdentity> {
     Ok(identity_of(&metadata))
 }
 
+/// `path` with its last part spelled as the volume has it: after a save on
+/// a volume that ignores case, the name the file already had, not the one
+/// asked for (`A.CSV` for `a.csv`). `path` itself if that can't be learned.
+///
+/// It lists the folder (`F_GETPATH` gives back the name asked for): an
+/// entry of exactly that name, or else the one that is the same file.
+#[must_use]
+pub fn as_on_disk(path: &Path) -> PathBuf {
+    use std::os::unix::fs::DirEntryExt;
+    let (Some(name), Ok(metadata)) = (path.file_name(), fs::metadata(path)) else {
+        return path.to_owned();
+    };
+    let Ok(entries) = fs::read_dir(parent_of(path)) else {
+        return path.to_owned();
+    };
+    let mut same_file = None;
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        if entry_name == name {
+            return path.to_owned();
+        }
+        if same_file.is_none() && entry.ino() == metadata.ino() {
+            same_file = Some(entry_name);
+        }
+    }
+    same_file.map_or_else(|| path.to_owned(), |name| path.with_file_name(name))
+}
+
 /// What is at `path` itself, a symbolic link not followed: its identity,
 /// and whether it is a regular file. Opened afresh where it can be
 /// (`O_NOFOLLOW`), otherwise `lstat`ed.
@@ -440,13 +468,26 @@ impl Staged {
         // Its owner can open it to change its metadata whatever its mode.
         let file = File::open(&self.path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        sys::clear_acl(&file)?;
+        // Copied again from `like`, last, by `apply_metadata`; where the
+        // volume has none, nothing to clear.
+        let _ = sys::clear_acl(&file);
+        let mut skipped = Vec::new();
         for name in sys::list_xattrs(&file)? {
-            if !attributes.iter().any(|(ours, _)| *ours == name.as_c_str()) {
-                sys::remove_xattr(&file, &name)?;
+            let name: &CStr = &name;
+            // Leal's own two are set below; the system's own stay.
+            let system = name.to_bytes().starts_with(NEVER_PREFIX) || NEVER.contains(&name);
+            if system || attributes.iter().any(|(ours, _)| *ours == name) {
+                continue;
+            }
+            match sys::remove_xattr(&file, name) {
+                Ok(()) => {}
+                Err(error) if skippable(&error) => {
+                    skipped.push(name.to_string_lossy().into_owned());
+                }
+                Err(error) => return Err(error),
             }
         }
-        let mut skipped = copy_attributes(&like.file, &file)?;
+        skipped.extend(copy_attributes(&like.file, &file)?);
         for &(name, value) in attributes {
             let set = match value {
                 Some(value) => sys::set_xattr(&file, name, value),
@@ -601,24 +642,17 @@ impl Staged {
 
     /// Keeps the old file a swap left in the new file's folder, next to
     /// `destination` under a visible name, or, if it can't be moved there,
-    /// where it is (the folder is then never cleaned up). Returns where it
-    /// is.
+    /// in that folder (which is then never cleaned up) under
+    /// `destination`'s own name. Returns where it is.
     fn keep_old(&mut self, destination: &Path, exclusive: bool) -> Option<PathBuf> {
-        let lossy = |name: &std::ffi::OsStr| name.to_string_lossy().into_owned();
-        let stem = destination
-            .file_stem()
-            .map_or_else(|| "file".to_owned(), lossy);
-        let extension = destination
-            .extension()
-            .map_or_else(String::new, |extension| format!(".{}", lossy(extension)));
         let parent = parent_of(destination);
         for n in 1..100 {
             let label = if n == 1 {
-                "replaced, kept by Leal".to_owned()
+                " (replaced, kept by Leal)".to_owned()
             } else {
-                format!("replaced, kept by Leal {n}")
+                format!(" (replaced, kept by Leal {n})")
             };
-            let candidate = parent.join(format!("{stem} ({label}){extension}"));
+            let candidate = parent.join(kept_name(destination, &label));
             let moved = if exclusive {
                 sys::rename_new(&self.path, &candidate)
             } else if fs::symlink_metadata(&candidate).is_ok() {
@@ -632,8 +666,41 @@ impl Staged {
                 Err(_) => break,
             }
         }
-        self.folder.take().map(TempFolder::keep)
+        // The staged file keeps its recorded name (`leal-<id>`) until here:
+        // the next launch's cleanup deletes a crashed save's file by it.
+        let kept = self.folder.take()?.keep();
+        let named = kept.with_file_name(kept_name(destination, ""));
+        Some(if fs::rename(&kept, &named).is_ok() {
+            named
+        } else {
+            kept
+        })
     }
+}
+
+/// The longest file name a volume takes, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// `destination`'s file name with `suffix` before its extension, its stem
+/// shortened (at a character boundary) so the whole fits in [`NAME_MAX`]
+/// bytes; without the extension if the suffix and it alone wouldn't fit.
+fn kept_name(destination: &Path, suffix: &str) -> String {
+    let lossy = |name: &std::ffi::OsStr| name.to_string_lossy().into_owned();
+    let stem = destination
+        .file_stem()
+        .map_or_else(|| "file".to_owned(), lossy);
+    let mut extension = destination
+        .extension()
+        .map_or_else(String::new, |extension| format!(".{}", lossy(extension)));
+    if suffix.len() + extension.len() >= NAME_MAX {
+        extension.clear();
+    }
+    let room = NAME_MAX.saturating_sub(suffix.len() + extension.len());
+    let mut end = stem.len().min(room);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}{extension}", &stem[..end])
 }
 
 #[cfg(test)]
@@ -756,4 +823,26 @@ fn copy_to_scratch(
     drop(copy);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
     Ok(folder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kept file's name fits a volume's limit: the stem is shortened, at
+    /// a character boundary, and the suffix and extension kept.
+    #[test]
+    fn kept_names_fit_name_max() {
+        let short = kept_name(Path::new("/x/a.csv"), " (replaced, kept by Leal)");
+        assert_eq!(short, "a (replaced, kept by Leal).csv");
+        let long = format!("/x/{}.csv", "\u{e9}".repeat(200));
+        let name = kept_name(Path::new(&long), " (replaced, kept by Leal 2)");
+        assert!(name.len() <= NAME_MAX, "{}", name.len());
+        assert!(name.len() > NAME_MAX - 2);
+        assert!(name.ends_with("\u{e9} (replaced, kept by Leal 2).csv"));
+        let odd = format!("/x/a.{}", "x".repeat(250));
+        let name = kept_name(Path::new(&odd), " (replaced, kept by Leal)");
+        assert_eq!(name, "a (replaced, kept by Leal)");
+        assert_eq!(kept_name(Path::new("/x/a.csv"), ""), "a.csv");
+    }
 }

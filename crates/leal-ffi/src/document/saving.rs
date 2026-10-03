@@ -29,7 +29,11 @@
 //!   ([`SaveOutcome::edits_during_save`]). For NSDocument's change count,
 //!   the app takes `changeCountToken` for the edits as they were at the
 //!   snapshot ([`SaveProgress::snapshot_version`], against
-//!   [`Document::edit_version`] after each edit), not counts of cells.
+//!   [`Document::edit_version`] after each edit), not counts of cells. Edit
+//!   versions only ever increase, across saves and re-reads too: the
+//!   reading a save makes carries on from the old one's version, with the
+//!   edits carried over counted within it (no version of their own), so the
+//!   token noted at the version current when the save ended still matches.
 //!   When the save ends, the document's cached first screen
 //!   ([`Document::first_screen`]) becomes the new reading's, and the new
 //!   reading's jobs are watched for panics, whether or not anyone waits.
@@ -339,10 +343,6 @@ impl Document {
             let document = Arc::clone(&self);
             let finished = job.clone();
             job.job().control().on_finish(move || {
-                // A drive back during the save, reconnected as it ended.
-                if let Some(restarted) = finished.restarted() {
-                    document.adopt_restart(restarted);
-                }
                 if let Some(Ok(saved)) = finished.result()
                     && let Some(screen) = &saved.reread
                 {
@@ -356,6 +356,11 @@ impl Document {
                         }
                     }
                     document.watch_jobs();
+                }
+                // A drive back during the save, reconnected as it ended:
+                // after the save's own screen, which a restart follows.
+                if let Some(restarted) = finished.restarted() {
+                    document.adopt_restart(restarted);
                 }
             });
             Ok(Arc::new(SaveJob {
@@ -393,6 +398,17 @@ impl SaveJob {
             total: progress.total,
             snapshot_version: progress.snapshot_version,
         }
+    }
+
+    /// The generation the document was read again at as the save ended,
+    /// if it was: a check of the file during the save found its removable
+    /// drive back, and the reconnecting waited for the save. Set before the
+    /// save finishes, whatever its outcome; the app then does what it does
+    /// when `checkOriginal` reads the file again (new jobs, diagnostics and
+    /// review, the same first screen).
+    #[must_use]
+    pub fn restarted(&self) -> Option<u64> {
+        self.job.restarted().map(|restarted| restarted.to)
     }
 
     /// The save's job, for its id.

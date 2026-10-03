@@ -450,27 +450,27 @@ impl Drop for Acl {
 /// quarantine, which a safe save doesn't keep. A save sets it last, so an
 /// entry denying attribute or permission writes can't stop anything before
 /// it (ADR-0012 decision 1). If `from` has none, `to` is given an empty one,
-/// so entries it inherited from the folder it was made in don't stay.
+/// so entries it inherited from the folder it was made in don't stay; that
+/// is best-effort, and not reported if it fails, as there was nothing of the
+/// old file's to keep.
 pub(super) fn copy_acl(from: &File, to: &File) -> io::Result<()> {
     // SAFETY: the descriptor is open, borrowed from `from` for the call;
     // the type is a plain integer. The result is null or a list this
     // function owns, which `Acl` frees.
     let acl = unsafe { acl_get_fd_np(from.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    let acl = if acl.is_null() {
+    if acl.is_null() {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOENT) {
-            return Err(error);
-        }
-        // SAFETY: `acl_init` takes a plain count and returns a new list this
-        // function owns, or null.
-        let empty = unsafe { acl_init(1) };
-        if empty.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Acl(empty)
-    } else {
-        Acl(acl)
-    };
+        return match error.raw_os_error() {
+            // It has none (or its volume has none): nothing of the old
+            // file's to keep, so nothing to report if the clearing fails.
+            Some(libc::ENOENT | libc::ENOTSUP) => {
+                let _ = clear_acl(to);
+                Ok(())
+            }
+            _ => Err(error),
+        };
+    }
+    let acl = Acl(acl);
     // SAFETY: `acl.0` is a valid list from `acl_get_fd_np`, alive until
     // `acl` drops after this call, which only reads it. The descriptor is
     // open, borrowed from `to`.

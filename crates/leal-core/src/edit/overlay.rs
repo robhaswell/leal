@@ -243,11 +243,21 @@ impl Default for EditStore {
 #[derive(Debug, Default)]
 struct EditState {
     overlay: Arc<Overlay>,
-    /// The row each edit touched, in order. Its length is the store's
-    /// version.
+    /// The row each edit touched, in order. The store's version is `base`
+    /// plus its length.
     log: Vec<usize>,
+    /// The version the log starts from: a store that replaces another
+    /// (a save's rebase, a re-read with another split) carries on from its
+    /// version, so a document's edit versions only ever increase.
+    base: usize,
     /// How many cells are edited.
     cells: usize,
+}
+
+impl EditState {
+    fn version(&self) -> usize {
+        self.base + self.log.len()
+    }
 }
 
 impl EditStore {
@@ -292,12 +302,20 @@ impl EditStore {
     /// and where it carries later edits over from (task 2.2).
     pub(crate) fn snapshot(&self) -> (Arc<Overlay>, usize) {
         let state = self.read();
-        (Arc::clone(&state.overlay), state.log.len())
+        (Arc::clone(&state.overlay), state.version())
     }
 
     /// How many edits have been made: the version the edits are.
     pub(crate) fn version(&self) -> usize {
-        self.read().log.len()
+        self.read().version()
+    }
+
+    /// Makes the version `version` now, as the store this one replaces had
+    /// reached it: edits already logged here (a save's carry-over, made
+    /// before the store is current) are counted within it, not after it.
+    pub(crate) fn carry_on_from(&self, version: usize) {
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        state.base = version.saturating_sub(state.log.len());
     }
 
     /// Row `row`'s edits now, if it has any.
@@ -315,21 +333,22 @@ impl EditStore {
             .range(range)
             .map(|(&row, edits)| (row, Arc::clone(edits)))
             .collect();
-        (edited, state.log.len())
+        (edited, state.version())
     }
 
     /// The rows touched by every edit since version `at`, each once, in
     /// order, with their edits now, and the version now.
     pub(crate) fn since(&self, at: usize) -> (Vec<Touched>, usize) {
         let state = self.read();
-        let mut rows = state.log.get(at..).unwrap_or_default().to_vec();
+        let from = at.saturating_sub(state.base);
+        let mut rows = state.log.get(from..).unwrap_or_default().to_vec();
         rows.sort_unstable();
         rows.dedup();
         let rows = rows
             .into_iter()
             .map(|row| (row, state.overlay.row_arc(row).cloned()))
             .collect();
-        (rows, state.log.len())
+        (rows, state.version())
     }
 
     /// True if nothing is edited.

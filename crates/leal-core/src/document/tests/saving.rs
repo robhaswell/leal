@@ -561,7 +561,7 @@ fn held_at(document: &Arc<Document>, request: SaveRequest, at: usize) -> (SaveJo
     (job, move || held.0.send(()).unwrap())
 }
 
-use crate::document::saving::AT_SWAP;
+use crate::document::saving::{AT_SWAP, BEFORE_ADOPT};
 
 /// `work` on another thread, which must finish within a second: the main
 /// thread never waits for a save (DESIGN §3.9).
@@ -1180,6 +1180,15 @@ fn a_file_on_exfat_is_saved_over() {
     assert_eq!(document.storage(), Storage::Copy);
     // exFAT can't swap.
     assert_eq!(saved.placed, Placed::Renamed);
+    // The old file had no access control list: none is reported skipped.
+    assert!(
+        !saved
+            .skipped_metadata
+            .iter()
+            .any(|name| name == "access control list"),
+        "{:?}",
+        saved.skipped_metadata
+    );
     // Save again: the document's identity of the file still holds.
     set(&document, 4, 1, "again");
     save(&document, &path, SaveKind::Save).unwrap();
@@ -1490,4 +1499,111 @@ fn save_as_onto_a_folder_is_refused() {
         leftovers(&dir.0, &["a.csv", "folder.csv", "scratch", "records"]),
         [""; 0]
     );
+}
+
+/// Edit versions only ever increase: across a save with no edits since
+/// the last, and across one with an edit made while it ran (the carry-over
+/// has no version of its own).
+#[test]
+fn edit_versions_only_ever_increase_across_saves() {
+    let dir = Dir::new("save-versions");
+    let bytes = sample(4 * SAVE_CHUNK_BYTES);
+    let path = dir.file("a.csv", &bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 1, "one");
+    let edited = document.edit_version();
+    assert!(edited > 0);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(document.edit_version(), edited, "a save is no edit");
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(document.edit_version(), edited, "nor is a second one");
+    // Indexed again, so the save below is held while it writes.
+    wait_for_index(&document);
+
+    let (job, go_on) = held_save(&document, SaveRequest::new(&path, SaveKind::Save));
+    assert_eq!(job.progress().snapshot_version, Some(edited));
+    document.set_cell(2, 1, "during").unwrap().unwrap();
+    let during = document.edit_version();
+    assert!(during > edited);
+    go_on();
+    let saved = job.wait().unwrap().clone();
+    assert_eq!(saved.edits_during_save, [(2, 1)]);
+    assert_eq!(
+        document.edit_version(),
+        during,
+        "carried over, no new version"
+    );
+    set(&document, 3, 1, "after");
+    assert!(document.edit_version() > during);
+}
+
+/// Once the new reading is made and before it becomes current (the save
+/// held there), an edit returns at once, and is carried over.
+#[test]
+fn an_edit_just_before_the_new_reading_is_current_is_carried_over() {
+    let dir = Dir::new("save-edit-before-adopt");
+    let bytes = sample(64 * 1024);
+    let path = dir.file("a.csv", &bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 1, "saved");
+    let (job, go_on) = held_at(
+        &document,
+        SaveRequest::new(&path, SaveKind::Save),
+        BEFORE_ADOPT,
+    );
+    promptly({
+        let document = Arc::clone(&document);
+        move || {
+            document.set_cell(2, 1, "late").unwrap().unwrap();
+        }
+    });
+    go_on();
+    let saved = job.wait().unwrap().clone();
+    assert_eq!(saved.edits_during_save, [(2, 1)]);
+    assert!(String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(",saved,"));
+    assert_eq!(document.full_value(2, 1).unwrap().as_deref(), Some("late"));
+    assert!(document.has_edits());
+}
+
+/// Save As to a symbolic link that leads nowhere is refused, and the link
+/// left as it is: Leal doesn't make the file it names.
+#[test]
+fn save_as_to_a_dangling_link_is_refused() {
+    let dir = Dir::new("save-as-dangling");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", b"a,b\n");
+    let document = open_at(&path, &dir, &scheduler);
+    let link = dir.0.join("link.csv");
+    std::os::unix::fs::symlink(dir.0.join("nowhere.csv"), &link).unwrap();
+    assert_eq!(
+        save(&document, &link, SaveKind::SaveAs).unwrap_err(),
+        "NotAFile"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!dir.0.join("nowhere.csv").exists());
+}
+
+/// Save As to another case of an existing file's name, on a volume that
+/// ignores case (the scratch volume, usually): `Saved::path` is the name
+/// on disk.
+#[test]
+fn save_as_reports_the_name_on_disk() {
+    let dir = Dir::new("save-as-case");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", b"a,b\n");
+    let existing = dir.file("b.csv", b"old\n");
+    if !dir.0.join("B.CSV").exists() {
+        return; // a volume that minds case: nothing to test
+    }
+    let document = open_at(&path, &dir, &scheduler);
+    let saved = save(&document, &dir.0.join("B.CSV"), SaveKind::SaveAs).unwrap();
+    assert_eq!(saved.path.file_name().unwrap(), "b.csv");
+    assert_eq!(std::fs::read(&existing).unwrap(), b"a,b\n");
 }

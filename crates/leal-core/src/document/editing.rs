@@ -211,12 +211,13 @@ impl Document {
         !self.current().edits.is_empty()
     }
 
-    /// The edits' version: how many edits (each change, undo and redo)
-    /// the current reading's edits have had. A save's
+    /// The edits' version: it goes up with each edit (each change, undo and
+    /// redo, by the rows it touches) and never goes down. A save's
     /// [`snapshot_version`](crate::save::SaveProgress::snapshot_version)
     /// is one: the edits up to it are in the file the save writes, and
-    /// those after it aren't. It counts within one set of edits; the
-    /// reading a save makes starts its own, with the edits carried over.
+    /// those after it aren't. The reading a save makes carries on from the
+    /// old reading's version, the edits carried over counted within it (no
+    /// version of their own); so does a re-read with another split.
     #[must_use]
     pub fn edit_version(&self) -> u64 {
         u64::try_from(self.current().edits.version()).unwrap_or(u64::MAX)

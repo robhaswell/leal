@@ -355,11 +355,12 @@ impl Document {
         self.call(|| Ok(self.document.has_edits()))
     }
 
-    /// The edits' version: how many edits (each change, undo and redo) the
-    /// current reading's edits have had. A save's
-    /// `SaveProgress.snapshot_version` is one; the app notes it after each
-    /// edit, with NSDocument's `changeCountToken`, to know which token the
-    /// saved file matches (task 2.5).
+    /// The edits' version: it goes up with each edit (each change, undo and
+    /// redo, by the rows it touches) and never goes down, across saves and
+    /// re-reads too (a save's carry-over has no version of its own). A
+    /// save's `SaveProgress.snapshot_version` is one; the app notes it after
+    /// each edit, with NSDocument's `changeCountToken`, to know which token
+    /// the saved file matches (task 2.5).
     ///
     /// # Errors
     ///

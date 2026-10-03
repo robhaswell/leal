@@ -71,6 +71,7 @@ fn a_save_writes_the_edit_and_the_document_reads_the_saved_file() {
         std::fs::metadata(&path).unwrap().modified().ok()
     );
     assert!(outcome.swapped);
+    assert_eq!(job.restarted(), None);
     assert!(outcome.edits_during_save.is_empty() && outcome.skipped_metadata.is_empty());
     // The undo history carries on.
     document.undo(command).unwrap();

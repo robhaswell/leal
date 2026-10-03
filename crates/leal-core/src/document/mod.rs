@@ -628,18 +628,22 @@ impl Document {
     /// and the save checks again when it ends ([`recheck`](Self::recheck)):
     /// it may replace the reading. `None` if nothing was restarted.
     fn reconnect_and_restart(&self, source: &Arc<Source>, path: &Path) -> Option<Restarted> {
+        // `recheck` is set before `saving` is looked at, and a save clears
+        // `saving` before it looks at `recheck` (both `SeqCst`): if this
+        // sees a save running, that save sees `recheck` when it ends.
+        self.recheck.store(true, Ordering::SeqCst);
+        if self.saving.load(Ordering::SeqCst) {
+            return None;
+        }
         // A save takes its turn before it takes the writer lock for its
         // snapshot, so under the lock, a save not seen yet starts on the
         // reading made here.
-        if self.saving.load(Ordering::Acquire) {
-            self.recheck.store(true, Ordering::Release);
-            return None;
-        }
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.saving.load(Ordering::Acquire) {
-            self.recheck.store(true, Ordering::Release);
+        if self.saving.load(Ordering::SeqCst) {
             return None;
         }
+        // Done here, not left for a save.
+        self.recheck.store(false, Ordering::SeqCst);
         let old = self.current();
         if !Arc::ptr_eq(&old.source, source) || !source.reconnect(path) {
             return None;
@@ -1683,7 +1687,10 @@ fn edits_after(old: &Reading, detection: &Detection) -> Result<Arc<EditStore>, D
     if same_split {
         Ok(Arc::clone(&old.edits))
     } else if old.edits.is_empty() {
-        Ok(Arc::default())
+        // A new lineage, whose versions carry on from the old edits'.
+        let edits = EditStore::default();
+        edits.carry_on_from(old.edits.version());
+        Ok(Arc::new(edits))
     } else {
         Err(DocumentError::UnsavedEdits)
     }

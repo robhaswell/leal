@@ -236,7 +236,8 @@ impl SavePlan {
 #[derive(Clone, Debug)]
 pub struct Saved {
     /// Where the file was written (the destination, a symbolic link
-    /// followed).
+    /// followed), its name as the volume spells it (on a volume that
+    /// ignores case, the name the file there already had).
     pub path: PathBuf,
     /// Its length in bytes.
     pub len: u64,

@@ -72,7 +72,7 @@ use crate::save::{
 use crate::schedule::{Interval, JobError, JobHandle, Priority};
 use crate::source::{
     Existing, FileIdentity, INTERPRETATION_ATTRIBUTE_C, OriginalState, Put, RawAttributes, Source,
-    Staged, SwapError, TEXT_ENCODING_ATTRIBUTE_C, VolumeInfo, VolumeKind, can_write,
+    Staged, SwapError, TEXT_ENCODING_ATTRIBUTE_C, VolumeInfo, VolumeKind, as_on_disk, can_write,
     kind_of_folder, look_afresh, same_file,
 };
 
@@ -115,6 +115,17 @@ pub(crate) type ChunkHook = Arc<dyn Fn(usize) + Send + Sync>;
 /// place, under the watcher's lock.
 #[cfg(test)]
 pub(crate) const AT_SWAP: usize = usize::MAX;
+
+/// What a test hook is called with once the new reading is made, before
+/// it takes the writer lock to become current.
+#[cfg(test)]
+pub(crate) const BEFORE_ADOPT: usize = usize::MAX - 1;
+
+/// No such points outside tests.
+#[cfg(not(test))]
+const AT_SWAP: usize = 0;
+#[cfg(not(test))]
+const BEFORE_ADOPT: usize = 0;
 
 /// No hook outside tests.
 #[cfg(not(test))]
@@ -243,7 +254,7 @@ struct Turn<'a>(&'a AtomicBool);
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -311,18 +322,20 @@ impl Document {
                     checkpoints.set(checkpoints.get() + 1);
                     job.checkpoint().map_err(|_| SaveError::Cancelled)
                 };
-                let at_swap = || {
+                let reached = |point: usize| {
                     #[cfg(test)]
                     if let Some(hook) = &hook {
-                        hook(AT_SWAP);
+                        hook(point);
                     }
                     #[cfg(not(test))]
-                    let _ = &hook;
+                    let _ = (&hook, point);
                 };
-                let result = document.save_now(&request, &checkpoint, &at_swap, &progress);
+                let result = document.save_now(&request, &checkpoint, &reached, &progress);
                 // Its turn given up: a check that found the drive back
-                // meanwhile reconnects now.
-                if document.recheck.swap(false, Ordering::AcqRel)
+                // meanwhile reconnects now. (`SeqCst` with the check's own
+                // order, `recheck` then `saving`: one of the two sees the
+                // other, so a check is never left undone.)
+                if document.recheck.swap(false, Ordering::SeqCst)
                     && let (_, Some(restarted)) = document.check_original_restarting()
                 {
                     let _ = progress.restarted.set(restarted);
@@ -422,7 +435,7 @@ impl Document {
         loop {
             if self
                 .saving
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return Ok(Turn(&self.saving));
@@ -437,7 +450,7 @@ impl Document {
         &self,
         request: &SaveRequest,
         checkpoint: &dyn Fn() -> Result<(), SaveError>,
-        at_swap: &dyn Fn(),
+        reached: &dyn Fn(usize),
         progress: &SaveShared,
     ) -> Result<Saved, SaveError> {
         // 1 and 2: this save's turn, the whole file indexed, then the edits'
@@ -550,6 +563,11 @@ impl Document {
                 .finish(existing.as_ref())
                 .map_err(write("flushing the new file"))?,
         );
+        // Only its status-change time is needed from here: the old file
+        // isn't held open across the swap and its deletion (on a share,
+        // an open file can't be deleted, only renamed aside).
+        let changed_before = existing.as_ref().map(Existing::changed);
+        drop(existing);
         let cancelled = Cell::new(false);
         let snapshot = staged.snapshot(temps, volume.folder.clone(), &|| {
             cancelled.set(checkpoint().is_err());
@@ -571,7 +589,7 @@ impl Document {
         let original = self.original.replace_with(
             &destination,
             |opened, diverged| {
-                at_swap();
+                reached(AT_SWAP);
                 if kind != SaveKind::Save {
                     return Ok(());
                 }
@@ -580,7 +598,7 @@ impl Document {
                 }
                 let now = unchanged(&destination, opened, request)?;
                 checked.set(Some(*now.identity()));
-                if existing.as_ref().map(Existing::changed) != Some(now.changed()) {
+                if changed_before != Some(now.changed()) {
                     // Its permissions, flags or attributes changed while
                     // the save ran (the contents didn't): checked again,
                     // and its metadata copied again.
@@ -635,7 +653,10 @@ impl Document {
             Source::from_snapshot(&destination, snapshot, identity, raw, temps, kind_of_volume)
                 .map_err(|error| error.to_string())
                 .and_then(|source| self.rebuilt(&reading, &Arc::new(source), &extent, &streamed))
-                .and_then(|new| self.adopt(&reading, new, &overlay, version, extent.rows));
+                .and_then(|new| {
+                    reached(BEFORE_ADOPT);
+                    self.adopt(&reading, new, &overlay, version, extent.rows)
+                });
         // Deletes the old file a swap left in the new file's folder (unless
         // it was kept), with no lock held.
         drop(staged);
@@ -672,7 +693,7 @@ impl Document {
             }
         };
         Ok(Saved {
-            path: destination,
+            path: as_on_disk(&destination),
             len: streamed.len,
             rows: extent.rows,
             complete: extent.complete,
@@ -794,6 +815,11 @@ impl Document {
             return Err("the document was read again while it was saved".to_owned());
         }
         let (carried, lost) = carry_over(old, written, version, &new.reading, rows);
+        // The new edits carry on from the old ones' version, the carry-over
+        // counted within it: a document's edit versions only ever increase,
+        // and the app's change-count token for the version now still says
+        // what the edits are.
+        new.reading.edits.carry_on_from(old.edits.version());
         let reading = Arc::new(new.reading);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&reading);
         drop(one_at_a_time);
