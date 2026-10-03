@@ -140,6 +140,9 @@ fn save_as_utf8_reaches_swift() {
         .unwrap();
     let outcome = block_on(job.wait()).unwrap();
     assert_eq!(std::fs::read(&copy).unwrap(), b"\xEF\xBB\xBFa,b\n");
+    assert_eq!(outcome.byte_count, 7);
+    let progress = job.progress();
+    assert_eq!((progress.written, progress.total), (7, 7), "all of it");
     assert_eq!(outcome.recorded_encoding, Some(TextEncoding::Utf8));
     let screen = outcome.first_screen.unwrap();
     assert_eq!(screen.interpretation.encoding, TextEncoding::Utf8);

@@ -569,7 +569,9 @@ impl Document {
             out.flush().map_err(write("writing the new file"))?;
             (streamed, head)
         };
+        // Written in full. (Converting, the progress counted the bytes read.)
         progress.total.store(streamed.len, Ordering::Relaxed);
+        progress.written.store(streamed.len, Ordering::Relaxed);
 
         // 5: metadata, attributes, flushed, the next snapshot, closed.
         progress.set_phase(SavePhase::Flushing);
