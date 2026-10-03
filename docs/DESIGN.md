@@ -30,7 +30,8 @@ edit**. The name is old Scots/English for *faithful*; the command is `leal`.
 - Formulas, formatting, charts, multiple sheets, `.xlsx`.
 - SQL querying or joins (VisiData and DuckDB already do this well).
 - Windows or Linux GUIs. The core stays portable so these remain possible.
-- Editing UTF-16 files. v1 opens them read-only with a notice (§4.3).
+- Saving UTF-16 files in place. They can be edited, but v1 saves them only
+  as UTF-8 (Save As UTF-8; §4.3, ADR-0013).
 - Files larger than 4 GiB.
 
 ### Performance and memory budgets
@@ -49,6 +50,7 @@ columns, UTF-8, quoted fields containing some newlines.
 | Filter with full scan | < 300 ms |
 | Sort on one column | < 1 s |
 | Save after one edit | < 500 ms |
+| Save As UTF-8 of the reference file from UTF-16 | < 1 s (ADR-0013) |
 | Leal's own heap for the reference file (see below) | < 40 MB |
 | Idle app with no document | < 30 MB physical footprint |
 
@@ -866,7 +868,9 @@ to run concurrently and asserts first paint is still under 150 ms.
 - **Revert to Saved** asks to discard unsaved edits first, and goes through
   the same path as File ▸ Reload from Disk, never AppKit's default
   `read(from:)` (§3.6, ADR-0008 decision 4).
-- UTF-16 files open read-only in v1, with a notice and **Save As UTF-8**.
+- UTF-16 files can be edited, but Save is off for them: the notice offers
+  **Save As UTF-8**, which names any cells that can't be converted so the
+  user can fix them and try again (ADR-0013, ADR-0008 decision 7).
 - Sandbox-compatible from the start (security-scoped access, temp files in the
   container), so a Mac App Store build stays possible.
 

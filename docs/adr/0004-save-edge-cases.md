@@ -1,6 +1,7 @@
 # 0004 — Save edge cases
 
 - Status: accepted (approved by Rob, 2026-09-30)
+- Refined by: ADR-0013 (decision 11: Leal's own encoding tags are trusted)
 - Date: 2026-09-30
 
 ## Context
