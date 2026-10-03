@@ -546,6 +546,67 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// Deletes column `column` from rows `rows` alone, by value: what
+    /// undoing a column insert after a save does (ADR-0014 decision 3),
+    /// on the rows the insert gave a cell. Padding left at a row's end
+    /// goes with it (ADR-0014 decision 5).
+    ///
+    /// # Errors
+    ///
+    /// [`SaveError::InvalidEdit`] (naming a `DeleteColumn`) if a row isn't
+    /// there or doesn't have the column; nothing is changed then.
+    pub fn delete_column_from(&mut self, column: usize, rows: &[usize]) -> Result<(), SaveError> {
+        let invalid = || SaveError::InvalidEdit(Edit::DeleteColumn { column });
+        if rows
+            .iter()
+            .any(|&r| self.rows.get(r).is_none_or(|row| row.cells.len() <= column))
+        {
+            return Err(invalid());
+        }
+        for &r in rows {
+            let cells = &mut self.rows[r].cells;
+            cells.remove(column);
+            while cells.last() == Some(&Cell::Appended(None)) {
+                cells.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts a column back at `at` by value, in each row of `cells` with its
+    /// value: what undoing a column delete after a save does (ADR-0014
+    /// decision 3). Each value is a new field (rule 3); a row now shorter
+    /// than `at` is padded to it first, as for a hatched cell (rule 12).
+    ///
+    /// # Errors
+    ///
+    /// [`SaveError::InvalidEdit`] (naming an `InsertColumn`) if a row isn't
+    /// there; nothing is changed then.
+    pub fn restore_column(
+        &mut self,
+        at: usize,
+        cells: &[(usize, String)],
+    ) -> Result<(), SaveError> {
+        if cells.iter().any(|&(r, _)| r >= self.rows.len()) {
+            return Err(SaveError::InvalidEdit(Edit::InsertColumn {
+                at,
+                value: String::new(),
+            }));
+        }
+        for (r, value) in cells {
+            let row = &mut self.rows[*r].cells;
+            if row.len() < at {
+                row.resize(at, Cell::Appended(None));
+            }
+            let cell = Cell::Edited {
+                field: None,
+                value: value.clone(),
+            };
+            row.insert(at, cell);
+        }
+        Ok(())
+    }
+
     fn apply_unchecked(&mut self, edit: &Edit) -> Result<(), SaveError> {
         let invalid = || SaveError::InvalidEdit(edit.clone());
         match edit {
