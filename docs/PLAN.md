@@ -495,7 +495,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - [x] **2.4a Rows.** Insert and delete rows in the core: the piece list,
     stable row ids, the `RowMap` seam in every row walk, Find remapping,
     undo and redo. Not saved yet.
-  - [ ] **2.4b Columns.** Insert and delete columns: the column map, per-row
+  - [x] **2.4b Columns.** Insert and delete columns: the column map, per-row
     applied flags, cell identities for undo, per-column quoting in the
     oracle and the product (ADR-0004 decision 2). Not saved yet.
   - [ ] **2.4c Saving them.** The writer walks the piece list, the splices
