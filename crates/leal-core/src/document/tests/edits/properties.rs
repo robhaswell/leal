@@ -879,22 +879,21 @@ fn replaying_the_history_into_a_fresh_document_gives_the_same_cells() {
         prop_assert!(replay.refused.is_empty());
         let rows = document.row_count();
         prop_assert_eq!(fresh.row_count(), rows);
-        // By value, a cell may be an empty field where the document has
-        // none: a blank line's hatched edit, its row deleted and the delete
-        // undone (an inserted row's own value in the replay), then set
-        // back to `""`, as after a save. Otherwise the same cells.
-        let trimmed = |document: &Document| -> Vec<Vec<String>> {
+        // One way only: a row delete undone by value comes back as an
+        // inserted row, and an inserted row can't have a missing cell, so
+        // the replay may carry trailing empty fields where the original
+        // had missing cells (ADR-0014 decision 3, ADR-0012 decision 4).
+        // Anything else, a lost trailing field included, is a failure.
+        let cells = |document: &Document| -> Vec<Vec<String>> {
             let rows = document.rows(0..rows, 1000).unwrap().into_iter();
-            rows.map(|row| {
-                let mut texts: Vec<String> = row.into_iter().map(|cell| cell.text).collect();
-                while texts.last().is_some_and(String::is_empty) {
-                    texts.pop();
-                }
-                texts
-            })
-            .collect()
+            rows.map(|row| row.into_iter().map(|cell| cell.text).collect())
+                .collect()
         };
-        prop_assert_eq!(trimmed(&fresh), trimmed(&document));
+        for (fresh, doc) in cells(&fresh).iter().zip(cells(&document)) {
+            prop_assert!(fresh.len() >= doc.len());
+            prop_assert_eq!(&fresh[..doc.len()], &doc[..]);
+            prop_assert!(fresh[doc.len()..].iter().all(String::is_empty));
+        }
         // Undoing the replayed history in reverse order leaves no edits.
         for command in replay.commands.iter().rev() {
             fresh.apply(&command.inverse()).unwrap();
