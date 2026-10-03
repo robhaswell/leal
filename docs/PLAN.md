@@ -703,6 +703,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     now an idle timeout that runs from the last request.
   - [ ] Investigate the occasional slow launch (433 and 479 ms, against a
     median of about 160 ms; probably the first launch after a build).
+  - [ ] From 2.6a's review: the `snapshot` helper's 5-pass loop should fail
+    when strips never settle; `GridDataSource.readAhead`'s `wanted.set`
+    should come before its early returns; queued alerts could skip a failed
+    document; `updateWindowMinimum` with no window.
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
