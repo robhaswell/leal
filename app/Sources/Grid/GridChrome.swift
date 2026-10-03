@@ -140,18 +140,19 @@ final class GridHeaderView: NSView {
 
 /// The row-number gutter. It is as tall as the grid and sits in its own
 /// clip view left of the scroll view, which follows the grid's vertical
-/// scrolling; so, like the grid, it draws only the strip a scroll exposes.
+/// scrolling; like the grid, it is drawn into strips that the scroll moves
+/// (`GridStrips`).
 /// The active cell's row number is in the accent colour (ADR-0002
 /// question 3); rows not read yet have no number (question 4).
 @MainActor
-final class GridGutterView: NSView {
+final class GridGutterView: StripContentView {
     weak var dataSource: (any GridDataSource)?
     var rowHeight = GridMetrics.rowHeight
     var activeRow: Int? {
         didSet {
             guard activeRow != oldValue else { return }
             for row in [oldValue, activeRow].compactMap({ $0 }) {
-                setNeedsDisplay(NSRect(x: 0, y: CGFloat(row) * rowHeight, width: bounds.width, height: rowHeight))
+                invalidate(NSRect(x: 0, y: CGFloat(row) * rowHeight, width: bounds.width, height: rowHeight))
             }
         }
     }
@@ -162,7 +163,7 @@ final class GridGutterView: NSView {
             guard selectedRows != oldValue else { return }
             for rows in [oldValue, selectedRows].compactMap({ $0 }) {
                 let rect = NSRect(x: 0, y: CGFloat(rows.lowerBound) * rowHeight, width: bounds.width, height: CGFloat(rows.count) * rowHeight)
-                setNeedsDisplay(rect.intersection(visibleRect))
+                invalidate(rect)
             }
         }
     }
@@ -199,7 +200,9 @@ final class GridGutterView: NSView {
         get { true }
         set {}
     }
-    override var isOpaque: Bool { true }
+    /// Opaque when it draws itself; with strips its layer is empty.
+    override var isOpaque: Bool { strips == nil }
+    override var stripRowHeight: CGFloat { rowHeight }
 
     /// The width that fits the numbers of `rows` rows.
     static func width(rows: Int) -> CGFloat {
@@ -217,8 +220,9 @@ final class GridGutterView: NSView {
         needsDisplay = true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
+    /// Draws the numbers in `dirtyRect`: for AppKit's drawing, or for a
+    /// strip (`GridStrips`).
+    override func drawContent(in dirtyRect: CGRect, context: CGContext) {
         draws += 1
         let palette = GridPalette.current()
         context.setFillColor(palette.gutterBackground)
@@ -363,5 +367,14 @@ final class GridScrollView: NSScrollView {
     override func reflectScrolledClipView(_ clipView: NSClipView) {
         super.reflectScrolledClipView(clipView)
         onScroll?()
+    }
+
+    /// The clip view and scrollers were laid out: the strips' view covers
+    /// the clip view again.
+    var onTile: (() -> Void)?
+
+    override func tile() {
+        super.tile()
+        onTile?()
     }
 }

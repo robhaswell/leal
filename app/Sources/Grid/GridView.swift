@@ -7,6 +7,17 @@ struct CellPosition: Equatable, Hashable, Sendable {
     var column: Int
 }
 
+/// How many rows above and below its own a row's text's ink reaches
+/// (stacked marks), for the strips (task 2.0b).
+struct InkSpill: Equatable, Sendable {
+    var above = 0
+    var below = 0
+
+    func union(_ other: InkSpill) -> InkSpill {
+        InkSpill(above: max(above, other.above), below: max(below, other.below))
+    }
+}
+
 /// The grid's cells: the document view of the grid's scroll view (ADR-0001
 /// option B). It is as tall as all the rows, but draws only the cells in
 /// the area AppKit asks for, with Core Text, from `TextLineCache`.
@@ -14,7 +25,7 @@ struct CellPosition: Equatable, Hashable, Sendable {
 /// It is the grid's first responder: keys become `GridMove`s and clicks
 /// select cells, both handed to `GridContainerView` through closures.
 @MainActor
-final class GridView: NSView, NSMenuItemValidation {
+final class GridView: StripContentView, NSMenuItemValidation {
     weak var dataSource: (any GridDataSource)?
     var geometry = GridLayout()
     /// The selection (task 1.8): the active cell (ADR-0002 question 3) and
@@ -22,9 +33,10 @@ final class GridView: NSView, NSMenuItemValidation {
     var selection: GridSelection? {
         didSet {
             guard selection != oldValue else { return }
-            let visible = visibleRect.insetBy(dx: -2, dy: -2)
+            // (Not cut to the visible rectangle: strips ahead of the scroll
+            // show the selection too.)
             for rect in [oldValue, selection].compactMap({ $0.flatMap(selectionRect) }) {
-                setNeedsDisplay(rect.insetBy(dx: -2, dy: -2).intersection(visible))
+                invalidate(rect.insetBy(dx: -2, dy: -2))
             }
         }
     }
@@ -82,7 +94,8 @@ final class GridView: NSView, NSMenuItemValidation {
         get { true }
         set {}
     }
-    override var isOpaque: Bool { true }
+    /// Opaque when it draws itself; with strips its layer is empty.
+    override var isOpaque: Bool { strips == nil }
     override var acceptsFirstResponder: Bool { true }
 
     /// The cached lines carry colours, so a new appearance needs new ones.
@@ -100,8 +113,12 @@ final class GridView: NSView, NSMenuItemValidation {
         needsDisplay = true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
+    override var stripRowHeight: CGFloat { geometry.rowHeight }
+
+    /// Draws the cells in `dirtyRect`, in this view's coordinates, into
+    /// `context`: for AppKit's drawing (`draw(_:)`), or for a strip
+    /// (`GridStrips`), the same drawing either way.
+    override func drawContent(in dirtyRect: CGRect, context: CGContext) {
         draws += 1
         drawnArea += dirtyRect.width * dirtyRect.height
         let palette = GridPalette.current()
@@ -128,9 +145,21 @@ final class GridView: NSView, NSMenuItemValidation {
         let rows = geometry.rowRange(minY: dirtyRect.minY, maxY: dirtyRect.maxY, rows: rowCount)
         let columns = geometry.columnRange(minX: dirtyRect.minX, maxX: dirtyRect.maxX)
         if !rows.isEmpty, !columns.isEmpty {
-            source.prepare(rows: rows, columns: columns)
-            highlighter?.prepareHighlights(rows: rows, columns: columns)
-            drawCells(rows: rows, columns: columns, loaded: loaded, source: source, palette: palette, context: context)
+            // With strips, rows outside `rows` whose ink spills into them
+            // are drawn too (cut to the strip): see `spills`.
+            let drawn = strips == nil ? [rows] : rowsReaching(rows, rowCount: rowCount)
+            let span = drawn[0].lowerBound..<drawn[drawn.count - 1].upperBound
+            source.prepare(rows: span, columns: columns)
+            highlighter?.prepareHighlights(rows: span, columns: columns)
+            drawCells(
+                rows: drawn,
+                own: rows,
+                columns: columns,
+                loaded: loaded,
+                source: source,
+                palette: palette,
+                context: context
+            )
             if firstDrawTime == nil, loaded > 0 {
                 firstDrawTime = CACurrentMediaTime()
                 onFirstRows?()
@@ -153,7 +182,9 @@ final class GridView: NSView, NSMenuItemValidation {
                 CellPainter.drawActiveCellRing(in: rect, palette: palette, context: context)
             }
         }
-        ahead.update(visible: visibleRect, geometry: geometry, source: source, palette: palette, lines: lines, caretOffsets: highlighter != nil)
+        // With strips, the rows ahead are drawn in all their columns.
+        let drawnWidth = strips.map { (minX: CGFloat(0), maxX: $0.stripWidth) }
+        ahead.update(visible: visibleRect, drawnWidth: drawnWidth, geometry: geometry, source: source, palette: palette, lines: lines, caretOffsets: highlighter != nil)
     }
 
     /// The selection's cells, as one rectangle, if the grid has them.
@@ -174,8 +205,70 @@ final class GridView: NSView, NSMenuItemValidation {
         return highlight.isCurrent && !highlight.ranges.isEmpty
     }
 
+    // MARK: Ink that spills past its row (task 2.0b)
+
+    /// Rows whose text's ink spills past them (stacked marks: "Z̵̧̢̛"), with
+    /// how many rows it reaches above and below. A strip ends between two
+    /// rows, and Core Animation cuts its drawing there; so a strip also
+    /// draws the rows outside it whose ink reaches it (cut to the strip),
+    /// and what is shown is what drawing the whole view at once shows. It
+    /// is learnt as rows are drawn into strips; a row first drawn after a
+    /// strip its ink reaches redraws that part of the strip (the next
+    /// frame). Without strips, AppKit's drawing is as it was.
+    private var spills: [Int: InkSpill] = [:]
+    /// The most rows any ink in `spills` reaches: how far from a strip to
+    /// look.
+    private var farthestSpill = 0
+
+    /// `rows`, and the rows outside them whose ink spills into them, in
+    /// order: each a range.
+    private func rowsReaching(_ rows: Range<Int>, rowCount: Int) -> [Range<Int>] {
+        guard farthestSpill > 0 else { return [rows] }
+        var drawn: [Range<Int>] = []
+        for row in max(0, rows.lowerBound - farthestSpill)..<rows.lowerBound {
+            if let spill = spills[row], row + spill.below >= rows.lowerBound { drawn.append(row..<(row + 1)) }
+        }
+        drawn.append(rows)
+        for row in rows.upperBound..<min(rowCount, rows.upperBound + farthestSpill) {
+            if let spill = spills[row], row - spill.above < rows.upperBound { drawn.append(row..<(row + 1)) }
+        }
+        return drawn
+    }
+
+    /// Row `row` was drawn, in all its columns (`whole`) or some, and its
+    /// ink reaches `spill`: if that is news, the rows outside `own` (those
+    /// being drawn) that its ink reaches now, or reached before, are drawn
+    /// again.
+    private func noteSpill(_ spill: InkSpill, row: Int, whole: Bool, own: Range<Int>) {
+        let old = spills[row] ?? InkSpill()
+        let new = whole ? spill : old.union(spill)
+        guard new != old else { return }
+        if spills.count > 10_000 {
+            spills.removeAll()
+            farthestSpill = 0
+        }
+        if new == InkSpill() {
+            spills[row] = nil
+        } else {
+            spills[row] = new
+            farthestSpill = max(farthestSpill, new.above, new.below)
+        }
+        // The rows the ink reaches, now or before, less those being drawn.
+        let reach = old.union(new)
+        let height = geometry.rowHeight
+        let low = max(0, row - reach.above)
+        let high = row + reach.below + 1
+        for (first, end) in [(low, min(high, own.lowerBound)), (max(low, own.upperBound), high)] where first < end {
+            invalidate(CGRect(x: 0, y: CGFloat(first) * height, width: bounds.width, height: CGFloat(end - first) * height))
+        }
+    }
+
+    /// Draws the cells of `rows` (in order) in `columns`. `own` are the
+    /// rows of the area being drawn; the others are only there for their
+    /// ink that spills into it.
     private func drawCells(
-        rows: Range<Int>,
+        rows: [Range<Int>],
+        own: Range<Int>,
         columns: Range<Int>,
         loaded: Int,
         source: any GridDataSource,
@@ -183,7 +276,13 @@ final class GridView: NSView, NSMenuItemValidation {
         context: CGContext
     ) {
         let numeric = columns.map { source.isNumeric(column: $0) }
-        for row in rows {
+        let learning = strips != nil
+        let whole = columns == 0..<geometry.columnCount
+        for row in rows.joined() {
+            var spill = InkSpill()
+            defer {
+                if learning { noteSpill(spill, row: row, whole: whole, own: own) }
+            }
             for column in columns {
                 let rect = geometry.cellRect(row: row, column: column)
                 let alignment: CellAlignment = numeric[column - columns.lowerBound] ? .trailing : .leading
@@ -221,6 +320,9 @@ final class GridView: NSView, NSMenuItemValidation {
                         )
                     }
                     CellPainter.addText(line, in: rect, font: font, alignment: alignment, to: glyphs, context: context, ellipsisColor: palette.text)
+                    if learning {
+                        spill = spill.union(CellPainter.inkSpill(of: line, in: rect, font: font))
+                    }
                     cellsDrawn += 1
                 case .notLoaded:
                     glyphs.draw(in: context)

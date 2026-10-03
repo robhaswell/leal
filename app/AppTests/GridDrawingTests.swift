@@ -594,6 +594,13 @@ final class GridDrawingTests: XCTestCase {
         grid.scrollView.reflectScrolledClipView(clip)
     }
 
+    /// Rows past the visible ones by this many are past the strip drawn
+    /// ahead of the scroll (task 2.0b: `GridStrips` draws a strip's rows
+    /// beyond the visible area, and the lines it makes are the draw's, not
+    /// the read-ahead's), and within the half screen the read-ahead lays
+    /// out when it has no direction.
+    private static let pastTheStrips = 2 * GridStrips.rows
+
     func testTheGridLaysOutTheRowsAheadOfTheScroll() throws {
         let source = FakeGridSource(rows: 10_000, columns: 3)
         source.text = { row, column in "r\(row)c\(column)" }
@@ -604,7 +611,7 @@ final class GridDrawingTests: XCTestCase {
         try draw(gridView)
         // Rows below the visible ones are laid out: their lines are cached
         // before any draw asks for them.
-        let below = Int(grid.scrollView.contentView.bounds.maxY / 22) + 2
+        let below = Int(grid.scrollView.contentView.bounds.maxY / 22) + Self.pastTheStrips
         let key = LineRequest(value: "r\(below)c0", truncated: false, width: 100, number: false).key
         waitUntil("the lines are made") { gridView.lines.contains(key) }
         XCTAssertGreaterThan(gridView.ahead.linesMade, 0)
@@ -656,7 +663,7 @@ final class GridDrawingTests: XCTestCase {
         scroll(grid, toRow: 10)
         try draw(gridView)
         let sent = gridView.ahead.batchesSent
-        let below = Int(grid.scrollView.contentView.bounds.maxY / 22) + 2
+        let below = Int(grid.scrollView.contentView.bounds.maxY / 22) + Self.pastTheStrips
         let key = LineRequest(value: "r\(below)c0", truncated: false, width: 100, number: false).key
         XCTAssertFalse(gridView.lines.contains(key))
         gridView.ahead.reset()
@@ -668,7 +675,7 @@ final class GridDrawingTests: XCTestCase {
         defer { LineReadAhead.resumeForTesting() }
         scroll(grid, toRow: 40)
         try draw(gridView)
-        let later = Int(grid.scrollView.contentView.bounds.maxY / 22) + 2
+        let later = Int(grid.scrollView.contentView.bounds.maxY / 22) + Self.pastTheStrips
         let laterKey = LineRequest(value: "r\(later)c0", truncated: false, width: 100, number: false).key
         LineReadAhead.resumeForTesting()
         waitUntil("the next batch is back") { gridView.ahead.batchesBack == gridView.ahead.batchesSent }

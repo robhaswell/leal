@@ -28,6 +28,9 @@ enum DocumentChange: Equatable, Sendable {
     case reloaded
     /// The document failed after a panic in the core (DESIGN §3.9).
     case failed
+    /// The values of these grid rows changed (an edit, an undo or a redo:
+    /// `cellsChanged(rows:)`): redraw them.
+    case cells(Range<Int>)
 }
 
 /// One open file, as the window shows it: the core's `Document` (through
@@ -855,10 +858,12 @@ final class DocumentModel: GridDataSource {
     /// SEAM(2.5): the values of `rows` (grid rows) changed: an edit, an
     /// undo or a redo. The tiles holding them are read again when drawn,
     /// and a read of them already under way is thrown away when it comes
-    /// back (`CellTileCache.invalidate`). See docs/tasks/2.0a.md, "For
-    /// editing", for what else an edit must refresh.
+    /// back (`CellTileCache.invalidate`); the window redraws them, in every
+    /// strip that shows them (`.cells`, task 2.0b). See docs/tasks/2.0a.md,
+    /// "For editing", for what else an edit must refresh.
     func cellsChanged(rows: Range<Int>) {
         tiles.invalidate(rows: rows)
+        onChange?(.cells(rows))
     }
 
     /// How many of the grid's reads ahead have come back, kept or dropped,

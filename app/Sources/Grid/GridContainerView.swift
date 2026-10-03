@@ -18,6 +18,37 @@ final class GridContainerView: NSView {
     let gutterClip = NSClipView()
     let cornerView = GridCornerView()
     let pill = IndexingPillView()
+    /// Views over the cells that follow the scroll, above the strips: the
+    /// in-cell editor's place (task 2.5).
+    let overlay = GridOverlayView()
+
+    /// The strips the cells are drawn into (ADR-0011), while the grid is no
+    /// wider than `stripMaximumWidth`; `nil` while AppKit draws them.
+    private(set) var strips: GridStrips?
+    /// The strips the gutter's numbers are drawn into. The gutter is never
+    /// wide, so it always has them (unless `allowsStrips` is off).
+    private(set) var gutterStrips: GridStrips?
+    /// Whether the grid may draw into strips. Off only for the scroll
+    /// benchmark's comparison with AppKit's drawing (`-LealStrips NO`, in
+    /// bench builds) and for tests' reference drawing.
+    let allowsStrips: Bool
+
+    /// Grids wider than this keep AppKit's drawing (ADR-0011): a strip is
+    /// as wide as the grid, and wider strips cost too much memory.
+    static let stripMaximumWidth: CGFloat = 4_096
+    /// A grid that went past `stripMaximumWidth` goes back to strips only
+    /// once it is this narrow, so a column dragged back and forth across
+    /// the line doesn't switch the drawing on every step.
+    static let stripReturnWidth: CGFloat = 3_840
+
+    /// Strips unless a bench build was asked for AppKit's drawing.
+    static var stripsByDefault: Bool {
+        #if LEAL_BENCH
+            UserDefaults.standard.object(forKey: "LealStrips") == nil || UserDefaults.standard.bool(forKey: "LealStrips")
+        #else
+            true
+        #endif
+    }
 
     weak var dataSource: (any GridDataSource)? {
         didSet {
@@ -105,7 +136,12 @@ final class GridContainerView: NSView {
         set { gridView.highlighter = newValue }
     }
 
-    override init(frame: NSRect) {
+    override convenience init(frame: NSRect) {
+        self.init(frame: frame, allowsStrips: Self.stripsByDefault)
+    }
+
+    init(frame: NSRect, allowsStrips: Bool) {
+        self.allowsStrips = allowsStrips
         super.init(frame: frame)
         scrollView.documentView = gridView
         scrollView.hasVerticalScroller = true
@@ -158,6 +194,17 @@ final class GridContainerView: NSView {
         for view in [scrollView, headerView, gutterClip, cornerView, pill] as [NSView] {
             addSubview(view)
         }
+        // Over the clip view, under the scrollers: the strips' view (when
+        // there are strips), then the overlay.
+        scrollView.addSubview(overlay, positioned: .above, relativeTo: scrollView.contentView)
+        scrollView.onTile = { [weak self] in self?.placeStrips() }
+        if allowsStrips {
+            let gutterStrips = GridStrips(content: gutterView)
+            addSubview(gutterStrips.view, positioned: .above, relativeTo: gutterClip)
+            gutterView.strips = gutterStrips
+            self.gutterStrips = gutterStrips
+        }
+        updateDrawing()
         pill.isHidden = true
     }
 
@@ -211,6 +258,7 @@ final class GridContainerView: NSView {
         gutterClip.frame = NSRect(x: 0, y: header, width: gutterWidth, height: max(0, height - header))
         scrollView.frame = NSRect(x: gutterWidth, y: header, width: max(0, width - gutterWidth), height: max(0, height - header))
         updateDocumentSize()
+        placeStrips()
         positionPill()
         revealJumpedToCell(wasShown: jumpedCellWasShown)
     }
@@ -251,13 +299,98 @@ final class GridContainerView: NSView {
             width: max(geometry.totalWidth, visible.width),
             height: max(geometry.height(rows: dataSource?.rowCount ?? 0), visible.height)
         )
+        var changed = false
         if gridView.frame.size != size {
             gridView.setFrameSize(size)
+            changed = true
         }
         let gutter = NSSize(width: gutterClip.frame.width, height: size.height)
         if gutterView.frame.size != gutter {
             gutterView.setFrameSize(gutter)
+            changed = true
         }
+        if changed {
+            updateDrawing()
+            placeStrips()
+        }
+    }
+
+    // MARK: Strips (ADR-0011)
+
+    /// Strips for a grid up to `stripMaximumWidth` wide, AppKit's drawing
+    /// for a wider one, switching back below `stripReturnWidth`.
+    private func updateDrawing() {
+        let width = gridView.frame.width
+        let wanted = allowsStrips && width <= (strips == nil ? Self.stripReturnWidth : Self.stripMaximumWidth)
+        guard wanted != (strips != nil) else { return }
+        if wanted {
+            let strips = GridStrips(content: gridView, widthStep: GridStrips.gridWidthStep)
+            strips.view.backingScaleForTesting = stripScaleForTesting
+            scrollView.addSubview(strips.view, positioned: .below, relativeTo: overlay)
+            self.strips = strips
+            gridView.strips = strips
+            placeStrips()
+        } else {
+            gridView.strips = nil
+            strips?.view.removeFromSuperview()
+            strips = nil
+        }
+    }
+
+    /// For tests: the scale strips are drawn at, as if the window were on a
+    /// display of that scale (a test can't move its window between
+    /// displays); `nil` for the window's own.
+    var stripScaleForTesting: CGFloat? {
+        didSet {
+            for strips in [strips, gutterStrips].compactMap({ $0 }) {
+                strips.view.backingScaleForTesting = stripScaleForTesting
+                // As AppKit tells views when the window changes display.
+                strips.view.viewDidChangeBackingProperties()
+            }
+        }
+    }
+
+    /// The strips' view covers the clip view, and the strips its visible
+    /// part; the overlay follows the scroll too. Called on every scroll.
+    private func placeStrips() {
+        let clip = scrollView.contentView
+        keepStripsUnderScrollers()
+        if let strips {
+            if strips.view.frame != clip.frame { strips.view.frame = clip.frame }
+            strips.update(visible: clip.bounds)
+        }
+        if overlay.frame != clip.frame { overlay.frame = clip.frame }
+        overlay.follow(visible: clip.bounds)
+        if let gutterStrips {
+            if gutterStrips.view.frame != gutterClip.frame { gutterStrips.view.frame = gutterClip.frame }
+            gutterStrips.update(visible: gutterClip.bounds)
+        }
+    }
+
+    /// The strips' view and the overlay are just above the clip view, in
+    /// that order: under the scrollers, which the scroll view puts just
+    /// above the clip view when it makes them (after the strips' view).
+    private func keepStripsUnderScrollers() {
+        let wanted = [strips?.view, overlay].compactMap { $0 }
+        let subviews = scrollView.subviews
+        guard let clip = subviews.firstIndex(of: scrollView.contentView) else { return }
+        let next = subviews[(clip + 1)...].prefix(wanted.count)
+        guard !next.elementsEqual(wanted, by: ===) else { return }
+        for view in wanted.reversed() {
+            scrollView.addSubview(view, positioned: .above, relativeTo: scrollView.contentView)
+        }
+    }
+
+    /// The values of `rows` (grid rows) changed: an edit, an undo or a
+    /// redo (SEAM(2.5)). Their cells and numbers are drawn again, in every
+    /// strip that shows them (and, if their ink spilled past them before or
+    /// does now, the rows it reaches: `GridView.spills`).
+    func cellsChanged(rows: Range<Int>) {
+        guard !rows.isEmpty else { return }
+        let top = CGFloat(rows.lowerBound) * geometry.rowHeight
+        let height = CGFloat(rows.count) * geometry.rowHeight
+        gridView.invalidate(CGRect(x: 0, y: top, width: gridView.bounds.width, height: height))
+        gutterView.invalidate(CGRect(x: 0, y: top, width: gutterView.bounds.width, height: height))
     }
 
     // MARK: Data
@@ -330,6 +463,7 @@ final class GridContainerView: NSView {
         if gutterClip.bounds.origin.y != origin.y {
             gutterClip.setBoundsOrigin(NSPoint(x: 0, y: origin.y))
         }
+        placeStrips()
         updatePill()
     }
 

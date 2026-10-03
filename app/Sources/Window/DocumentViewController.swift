@@ -37,6 +37,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     var onReadOnlyChanged: ((Bool) -> Void)?
     /// What the lock glyph was last told.
     private var shownReadOnly: Bool?
+    /// The reading of the file the grid's strips were last drawn for: a
+    /// new one (a Reload, Treat As, the Header row, a drive's file read
+    /// again, a save's new snapshot) redraws them all, whatever the change
+    /// that brought it (task 2.0b).
+    private var drawnReading: ReadingID?
 
     /// The file's banner (`FileBanner`), if one shows.
     private(set) var driveBanner: BannerView?
@@ -190,6 +195,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         findBar.onIgnoreCase = { [weak self] _ in self?.search(for: self?.findBar.field.stringValue ?? "") }
         find.onChange = { [weak self] in self?.findChanged() }
         find.onSelect = { [weak self] cell in self?.grid.select(cell) }
+        drawnReading = model.readingID
         model.onChange = { [weak self] change in self?.modelChanged(change) }
         updateBanners()
         statusBar.show(model.status)
@@ -199,6 +205,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     private func modelChanged(_ change: DocumentChange) {
+        if model.readingID != drawnReading {
+            // Every value may be different: nothing drawn for the old
+            // reading stays, in the strips or the laid-out lines.
+            drawnReading = model.readingID
+            grid.invalidateContent()
+        }
         switch change {
         case .progress:
             if grid.geometry.columnCount != model.columnCount {
@@ -251,6 +263,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             detailsPopover?.close()
             find.stop()
             onFailure?()
+        case let .cells(rows):
+            grid.cellsChanged(rows: rows)
         }
         updateBanners()
         statusBar.show(model.status)

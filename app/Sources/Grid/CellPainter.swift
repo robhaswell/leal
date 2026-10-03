@@ -149,6 +149,10 @@ struct LaidOutLine: @unchecked Sendable {
     let fitted: Fitted?
     /// `TextLine.offset(at:)`'s table, if it was asked for.
     let caretOffsets: [CGFloat]?
+    /// The ink's bounds, from the line's origin, y going up: from the
+    /// glyphs' boxes as laid out, stacked marks included (task 2.0b: ink
+    /// can spill past its row).
+    let ink: CGRect
 
     init(_ line: CTLine) {
         self.line = line
@@ -156,11 +160,13 @@ struct LaidOutLine: @unchecked Sendable {
         runs = GlyphRun.runs(of: line)
         fitted = nil
         caretOffsets = nil
+        ink = CTLineGetImageBounds(line, nil)
     }
 
     private init(_ other: LaidOutLine, fitted: Fitted?, caretOffsets: [CGFloat]?) {
         line = other.line
         width = other.width
+        ink = other.ink
         runs = other.runs
         self.fitted = fitted
         self.caretOffsets = caretOffsets
@@ -222,10 +228,14 @@ final class TextLine {
     private(set) var fitted: LaidOutLine.Fitted?
     private var caretOffsets: [CGFloat]?
     private var caretOffsetsMade = false
+    /// The ink's bounds (`LaidOutLine.ink`); a cut line's ink is within
+    /// them.
+    let ink: CGRect
 
     init(_ laidOut: LaidOutLine) {
         line = laidOut.line
         width = laidOut.width
+        ink = laidOut.ink
         runs = laidOut.runs
         fitted = laidOut.fitted
         caretOffsets = laidOut.caretOffsets
@@ -657,10 +667,27 @@ enum CellPainter {
         case .leading: rect.minX + GridMetrics.cellPadding
         case .trailing: rect.maxX - GridMetrics.cellPadding - width
         }
+        return (drawn, x, baseline(in: rect, font: font))
+    }
+
+    /// The baseline of a line of `font` in a cell: vertically centred.
+    static func baseline(in rect: CGRect, font: NSFont) -> CGFloat {
         let ascent = font.ascender
         let descent = -font.descender
-        let baseline = (rect.minY + (rect.height - (ascent + descent)) / 2 + ascent).rounded()
-        return (drawn, x, baseline)
+        return (rect.minY + (rect.height - (ascent + descent)) / 2 + ascent).rounded()
+    }
+
+    /// How many rows above and below its own `line`'s ink reaches, drawn
+    /// in a cell `rect` (task 2.0b): stacked marks can spill past the row.
+    static func inkSpill(of line: TextLine, in rect: CGRect, font: NSFont) -> InkSpill {
+        let base = baseline(in: rect, font: font)
+        // The ink goes from `base - ink.maxY` down to `base - ink.minY`.
+        let over = rect.minY - (base - line.ink.maxY)
+        let under = (base - line.ink.minY) - rect.maxY
+        return InkSpill(
+            above: over > 0 ? Int((over / rect.height).rounded(.up)) : 0,
+            below: under > 0 ? Int((under / rect.height).rounded(.up)) : 0
+        )
     }
 
     /// A skeleton cell (mockup 02b): a rounded bar whose length varies from
