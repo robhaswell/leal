@@ -1,5 +1,6 @@
 import AppKit
 import LealFFI
+import os
 
 /// A document window's content (DESIGN §4.1): banners at the top, the grid,
 /// and the status bar. It binds the grid to the `DocumentModel` and passes
@@ -28,7 +29,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// main thread (task 2.0). Without one, the model reloads.
     var onReload: (() async throws -> Void)?
     /// A Reload, while it is under way.
-    private(set) var reloading: Task<Void, Never>?
+    private(set) var reloading: Task<Void, Never>? {
+        didSet { updateSaveAsUTF8Button() }
+    }
     /// Whether the file is read-only (UTF-16) changed: the window's lock
     /// glyph follows it.
     var onReadOnlyChanged: ((Bool) -> Void)?
@@ -323,6 +326,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 key: key
             )
         }
+        updateSaveAsUTF8Button()
 
         // The irregularities (mockup 03a).
         let kinds = Int(model.diagnostics?.bannerKinds ?? 0)
@@ -455,7 +459,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // Opening the file reads it, which on a network share can block:
         // always off the main thread (task 2.0, ADR-0009). The window shows
         // the old snapshot until the new one is ready.
-        guard reloading == nil else { return }
+        guard reloading == nil, savingAsUTF8 == nil else { return }
         let reload = onReload
         let model = model
         model.willReload()
@@ -531,11 +535,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     func treatAs(_ delimiter: Delimiter) {
         scheduler.noteUserInput()
+        guard savingAsUTF8 == nil else { return NSSound.beep() }
         model.treatAs(delimiter)
     }
 
     func reopen(encoding: TextEncoding) {
         scheduler.noteUserInput()
+        guard savingAsUTF8 == nil else { return NSSound.beep() }
         model.reopen(encoding: encoding)
     }
 
@@ -572,12 +578,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case #selector(treatAsDelimiter(_:)):
             menuItem.state = MainMenu.delimiter(of: menuItem) == model.interpretation.delimiter ? .on : .off
             menuItem.toolTip = rereadReason
-            return model.canReinterpret
+            // Not while Save As UTF-8 replaces the file shown.
+            return model.canReinterpret && savingAsUTF8 == nil
         case #selector(reopenWithEncoding(_:)):
             let encoding = MainMenu.encoding(of: menuItem)
             menuItem.state = encoding == model.interpretation.encoding ? .on : .off
             menuItem.toolTip = rereadReason
-            return model.canReinterpret && encoding.map(model.interpretation.encodingChoices.contains) == true
+            return model.canReinterpret && savingAsUTF8 == nil
+                && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
             return !model.isFailed && model.diagnostics?.diagnostics.isEmpty == false
         case #selector(showFind(_:)):
@@ -590,8 +598,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             menuItem.title = isInspectorShown ? MainMenu.hideInspector : MainMenu.showInspector
             return !model.isFailed
         case #selector(reloadFromDisk(_:)):
-            // There must be a file to open again, and no Reload under way.
-            return !model.isFailed && !model.isReloading && reloading == nil
+            // There must be a file to open again, and no Reload or Save As
+            // UTF-8 under way.
+            return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil
                 && model.original.state != .deleted && model.original.state != .unavailable
         default:
             return true
@@ -832,6 +841,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     func documentWillClose() {
         find.stop()
         inspectorTask?.cancel()
+        // The save stops (its job is cancelled with the task), writing
+        // nothing, and says nothing.
+        savingAsUTF8?.cancel()
         wrapIndicator.dismiss()
     }
 
@@ -996,9 +1008,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// ADR-0008 decision 7): a save panel, then the core writes the file in
     /// UTF-8 there, and the window shows that copy, which can be edited.
     /// Bytes that can't be converted are named, and nothing is written.
+    /// The button is off while one is under way or a Reload is
+    /// (`canSaveAsUTF8`); asked anyway, it beeps.
     @objc func saveAsUTF8(_ sender: Any?) {
         scheduler.noteUserInput()
-        guard savingAsUTF8 == nil, let window = view.window else { return }
+        guard canSaveAsUTF8, let window = view.window else { return NSSound.beep() }
         chooseUTF8Destination(Self.utf8CopyName(of: model.url), model.url.deletingLastPathComponent(), window) { [weak self] url in
             guard let self, let url else { return }
             self.startSavingAsUTF8(to: url)
@@ -1024,8 +1038,30 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// (`CSVDocument.saveAsUTF8(to:)`), so it follows the copy. Returns
     /// whether it saved. Without one, the model saves and reloads.
     var onSaveAsUTF8: ((URL) async throws -> Bool)?
-    /// A Save As UTF-8, while it is under way.
-    private(set) var savingAsUTF8: Task<Void, Never>?
+    /// A Save As UTF-8, while it is under way. Reload, Treat As and Reopen
+    /// with Encoding are off meanwhile: each would read the file again
+    /// while the save replaces it.
+    /// SEAM(2.5): the save's progress (`SaveJob.progress`) isn't shown yet;
+    /// 2.5's save progress in the status bar shows this one's too.
+    private(set) var savingAsUTF8: Task<Void, Never>? {
+        didSet { updateSaveAsUTF8Button() }
+    }
+
+    /// Whether Save As UTF-8 can start: not while one is under way, nor
+    /// during a Reload.
+    var canSaveAsUTF8: Bool {
+        savingAsUTF8 == nil && reloading == nil && !model.isReloading
+    }
+
+    /// The banner's button is on only when Save As UTF-8 can start, so a
+    /// second click visibly does nothing.
+    private func updateSaveAsUTF8Button() {
+        readOnlyBanner?.button?.isEnabled = canSaveAsUTF8
+    }
+
+    /// An alert that came while the view had no window, shown when it has
+    /// one again.
+    private var queuedAlert: NSAlert?
 
     /// The name Save As UTF-8 suggests: the file's own, with "(UTF-8)".
     static func utf8CopyName(of url: URL) -> String {
@@ -1046,6 +1082,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                     try await model.reloadInBackground(from: url)
                 }
             } catch let failure as SaveFailure {
+                // Including the core refusing to start it
+                // (`DocumentModel.saveAsUTF8`).
                 self?.showSaveAsUTF8Failure(failure)
             } catch {
                 // Saved, but the copy couldn't be read back.
@@ -1055,13 +1093,33 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
     }
 
-    /// Why Save As UTF-8 didn't save. Nothing was written either way.
+    /// Why Save As UTF-8 didn't save. Nothing was written either way. The
+    /// details go to the log; a failed document says so itself.
     private func showSaveAsUTF8Failure(_ failure: SaveFailure) {
-        guard let window = view.window, let message = SaveText.saveAsUTF8Failure(failure, headerRows: model.headerRows) else { return }
+        guard let message = SaveText.saveAsUTF8Failure(failure, headerRows: model.headerRows) else { return }
+        Logger.document.error("Save As UTF-8 failed: \(String(describing: failure), privacy: .public)")
+        guard !model.isFailed else { return }
         let alert = NSAlert()
         alert.messageText = message.title
         alert.informativeText = message.detail
+        present(alert)
+    }
+
+    /// Shows `alert` on the window, or once the view has one again.
+    private func present(_ alert: NSAlert) {
+        guard let window = view.window else {
+            queuedAlert = alert
+            return
+        }
         showAlert(alert, window)
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        if let alert = queuedAlert {
+            queuedAlert = nil
+            present(alert)
+        }
     }
 
     /// Shows `alert` as a sheet on `window`. Tests replace it, so that no

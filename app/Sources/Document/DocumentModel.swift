@@ -1344,7 +1344,9 @@ final class DocumentModel: GridDataSource {
     /// waits for it (DESIGN §3.9); cancelling the task cancels the save.
     /// Returns `nil` if the document has failed or closed.
     ///
-    /// - Throws: the `SaveFailure` the save ended with.
+    /// - Throws: the `SaveFailure` the save ended with, or why the core
+    /// wouldn't start it, as one: `DocumentFailed` (the document fails, as
+    /// for any core call) or `Internal`.
     func saveAsUTF8(to url: URL) async throws -> SaveOutcome? {
         guard failure == nil, let handle else { return nil }
         // Asking FileManager about a volume can block (a share): not here.
@@ -1361,7 +1363,16 @@ final class DocumentModel: GridDataSource {
             maxChars: GridMetrics.maxCellCharacters
         )
         coreCalls += 1
-        let job = try handle.save(options: options)
+        let job: SaveJob
+        do {
+            job = try handle.save(options: options)
+        } catch {
+            report(error)
+            if case let .DocumentFailed(_, message)? = error as? LealError {
+                throw SaveFailure.DocumentFailed(message: message)
+            }
+            throw SaveFailure.Internal(message: String(describing: error))
+        }
         return try await job.outcome()
     }
 

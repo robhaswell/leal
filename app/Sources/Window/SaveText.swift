@@ -12,7 +12,8 @@ enum SaveText {
     }
 
     /// Why Save As UTF-8 didn't save; `nil` if it was cancelled, which says
-    /// nothing. Nothing was written either way.
+    /// nothing. Nothing was written either way. The core's own words
+    /// (English) are for the log, never shown.
     static func saveAsUTF8Failure(_ failure: SaveFailure, headerRows: Int) -> Message? {
         let title = String(
             localized: "The UTF-8 copy wasn’t saved.",
@@ -25,17 +26,13 @@ enum SaveText {
         case let .Unconvertible(encoding, cells, more):
             // ADR-0008 decision 7, F5: named, never replaced.
             let name = StatusText.encodingName(encoding)
-            let first = cells.first.map { cell($0, headerRows: headerRows) } ?? ""
-            if cells.count == 1 && !more {
-                detail = String(
-                    localized: "The cell at \(first) holds bytes that aren’t \(name) text, so they can’t be converted. Leal never replaces them.",
-                    comment: "Alert text: Save As UTF-8 refused one cell; where it is, as in \"row 3, column 2\", and the file's encoding"
-                )
+            if let place = cells.first {
+                detail = unconvertible(cells.count, more: more, first: cell(place, headerRows: headerRows), encoding: name)
             } else {
-                let count = more ? String(localized: "More than \(cells.count.formatted())", comment: "Alert text: how many cells Save As UTF-8 refused, when it stopped counting") : cells.count.formatted()
+                // The core always names one; said without a place anyway.
                 detail = String(
-                    localized: "\(count) cells hold bytes that aren’t \(name) text, the first at \(first), so they can’t be converted. Leal never replaces them.",
-                    comment: "Alert text: Save As UTF-8 refused several cells; how many, the file's encoding, and where the first is"
+                    localized: "Some of the file’s bytes aren’t \(name) text, so they can’t be converted. Leal never replaces them.",
+                    comment: "Alert text: Save As UTF-8 refused cells without saying which; the file's encoding"
                 )
             }
         case .TooLarge:
@@ -58,8 +55,21 @@ enum SaveText {
                 localized: "Leal may not write the file at that place.",
                 comment: "Alert text: Save As UTF-8 onto a file Leal may not write"
             )
-        case let .Io(_, _, message):
-            detail = message
+        case .Io:
+            detail = String(
+                localized: "Leal couldn’t write the copy there. Check that the drive has room and that you may write to that folder.",
+                comment: "Alert text: Save As UTF-8 failed writing the file (a full disk, no permission); the details are in the log"
+            )
+        case .ChangedElsewhere:
+            detail = String(
+                localized: "The file at that place changed while Leal was saving. Try again.",
+                comment: "Alert text: Save As UTF-8's destination changed during the save"
+            )
+        case .DocumentFailed, .Internal:
+            detail = String(
+                localized: "Something went wrong inside Leal. Try again, or reopen the file first.",
+                comment: "Alert text: Save As UTF-8 failed because of a problem in Leal itself; the details are in the log"
+            )
         default:
             detail = String(
                 localized: "Leal couldn’t read all of the file. Try again, or reopen it first.",
@@ -67,6 +77,22 @@ enum SaveText {
             )
         }
         return Message(title: title, detail: detail)
+    }
+
+    /// The cells Save As UTF-8 refused: `count` of them (or more, if
+    /// `more`), the first at `first`.
+    private static func unconvertible(_ count: Int, more: Bool, first: String, encoding name: String) -> String {
+        if count == 1 && !more {
+            return String(
+                localized: "The cell at \(first) holds bytes that aren’t \(name) text, so they can’t be converted. Leal never replaces them.",
+                comment: "Alert text: Save As UTF-8 refused one cell; where it is, as in \"row 3, column 2\", and the file's encoding"
+            )
+        }
+        let counted = more ? String(localized: "More than \(count.formatted())", comment: "Alert text: how many cells Save As UTF-8 refused, when it stopped counting") : count.formatted()
+        return String(
+            localized: "\(counted) cells hold bytes that aren’t \(name) text, the first at \(first), so they can’t be converted. Leal never replaces them.",
+            comment: "Alert text: Save As UTF-8 refused several cells; how many, the file's encoding, and where the first is"
+        )
     }
 
     /// Where a cell is, in the gutter's numbers: "row 3, column 2", or "the

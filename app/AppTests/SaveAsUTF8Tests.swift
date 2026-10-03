@@ -115,6 +115,84 @@ final class SaveAsUTF8Tests: XCTestCase {
         document.close()
     }
 
+    /// While Save As UTF-8 runs, its button is off (a second click visibly
+    /// does nothing) and so are Reload, Treat As and Reopen with Encoding;
+    /// closing the document cancels it, writing nothing and saying nothing.
+    func testWhileSavingTheButtonAndRereadsAreOffAndClosingCancels() async throws {
+        let (url, _) = try utf16File("slow.csv", "id\tname\r\n1\tX\r\n")
+        let (document, model, controller) = try open(url)
+        let content = controller.content
+        let button = try XCTUnwrap(content.readOnlyBanner?.button)
+        let reload = NSMenuItem(title: "", action: #selector(DocumentViewController.reloadFromDisk(_:)), keyEquivalent: "")
+        let treatAs = NSMenuItem(title: "", action: #selector(DocumentViewController.treatAsDelimiter(_:)), keyEquivalent: "")
+        let reopen = NSMenuItem(title: "", action: #selector(DocumentViewController.reopenWithEncoding(_:)), keyEquivalent: "")
+        reopen.representedObject = EncodingBox(model.interpretation.encoding)
+        let items = [reload, treatAs, reopen]
+        XCTAssertTrue(button.isEnabled)
+        XCTAssertEqual(items.map(content.validateMenuItem), [true, true, true])
+
+        content.chooseUTF8Destination = { _, _, _, done in done(self.directory.appending(path: "slow (UTF-8).csv")) }
+        content.onSaveAsUTF8 = { _ in
+            // A save that runs until it is cancelled, as the core's does.
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+            throw SaveFailure.Cancelled
+        }
+        var shown: NSAlert?
+        content.showAlert = { alert, _ in shown = alert }
+        button.performClick(nil)
+        let task = try XCTUnwrap(content.savingAsUTF8)
+        XCTAssertFalse(button.isEnabled)
+        XCTAssertEqual(items.map(content.validateMenuItem), [false, false, false])
+        content.saveAsUTF8(nil) // refused: still the same save
+        XCTAssertTrue(content.savingAsUTF8 == task)
+
+        document.close()
+        await task.value
+        XCTAssertNil(content.savingAsUTF8)
+        XCTAssertNil(shown, "a cancelled save says nothing")
+    }
+
+    /// During a Reload, Save As UTF-8 is off.
+    func testSaveAsUTF8IsOffDuringAReload() async throws {
+        let (url, _) = try utf16File("reloading.csv", "id\tname\r\n1\tX\r\n")
+        let (document, _, controller) = try open(url)
+        let content = controller.content
+        let button = try XCTUnwrap(content.readOnlyBanner?.button)
+        content.onReload = {
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+        content.reloadFromDisk(nil)
+        XCTAssertFalse(content.canSaveAsUTF8)
+        XCTAssertFalse(button.isEnabled)
+        let reloading = try XCTUnwrap(content.reloading)
+        reloading.cancel()
+        await reloading.value
+        XCTAssertTrue(content.canSaveAsUTF8)
+        XCTAssertTrue(button.isEnabled)
+        document.close()
+    }
+
+    /// The core's English never shows, and each failure has words of its
+    /// own.
+    func testFailuresAreWordedWithoutTheCoresEnglish() throws {
+        func detail(_ failure: SaveFailure) throws -> String {
+            try XCTUnwrap(SaveText.saveAsUTF8Failure(failure, headerRows: 1)).detail
+        }
+        let io = try detail(.Io(step: "writing the new file", code: 28, message: "No space left on device (os error 28)"))
+        XCTAssertFalse(io.contains("os error"), io)
+        let generic = try detail(.Unavailable)
+        for failure in [SaveFailure.Internal(message: "boom"), .DocumentFailed(message: "boom"), .ChangedElsewhere] {
+            let text = try detail(failure)
+            XCTAssertNotEqual(text, generic, "\(failure)")
+            XCTAssertFalse(text.contains("boom"), text)
+        }
+        XCTAssertEqual(
+            try detail(.Unconvertible(encoding: .windows1253, cells: [], more: false)),
+            "Some of the file’s bytes aren’t Windows-1253 text, so they can’t be converted. Leal never replaces them."
+        )
+        XCTAssertNil(SaveText.saveAsUTF8Failure(.Cancelled, headerRows: 1))
+    }
+
     /// The suggested name keeps the extension, and a file without one gets
     /// none.
     func testTheSuggestedNameSaysUTF8() {

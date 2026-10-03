@@ -20,6 +20,11 @@
 //!   waits for the new file's index pass. Budget-only, as `one_edit`.
 //! - `save/utf8_no_disk`: the same conversion into a writer that keeps
 //!   nothing, compared between commits.
+//! - `save/utf8_from_1252`: Save As UTF-8 from a single-byte encoding into
+//!   a writer that keeps nothing, compared between commits: the reference
+//!   file read as Windows-1252, so each of its non-ASCII bytes is looked up
+//!   in the encoding's table and written as two or three bytes of UTF-8
+//!   (the text reads as mojibake; the work is the same).
 //!
 //! The file is a copy of the reference file (a clone, on APFS) in a
 //! temporary folder: the benchmark saves over it. Both are one group, with
@@ -31,6 +36,8 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use leal_bench::report::Side;
+use leal_core::detect::Choices;
+use leal_core::dialect::Encoding;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::save::{SaveKind, SaveRequest};
 use leal_core::schedule::{Scheduler, SchedulerConfig};
@@ -150,8 +157,38 @@ fn save(c: &mut Criterion) {
                 .expect("the write")
         });
     });
+
+    // Save As UTF-8 from a single-byte encoding: a copy of the reference
+    // file, read as Windows-1252.
+    let single_byte = root.join("reference-1252.csv");
+    std::fs::copy(&reference, &single_byte).expect("a copy of the reference file");
+    let (windows_1252, _) = Document::open(
+        &single_byte,
+        &temp,
+        VolumeInfo::default(),
+        &scheduler,
+        OpenOptions {
+            choices: Choices {
+                encoding: Some(Encoding::Windows1252),
+                ..Choices::default()
+            },
+            ..OpenOptions::default()
+        },
+        None,
+    )
+    .expect("opening the copy as Windows-1252");
+    windows_1252.index_job().wait().expect("indexing");
+    common::whole_file(&mut group, windows_1252.source().len());
+    group.bench_function("utf8_from_1252", |b| {
+        b.iter(|| {
+            windows_1252
+                .save_to_writer(SaveKind::SaveAsUtf8, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
     group.finish();
     common::canary(c, "save", Side::After);
+    drop(windows_1252);
     drop(utf16_document);
     drop(document);
     let _ = std::fs::remove_dir_all(&root);

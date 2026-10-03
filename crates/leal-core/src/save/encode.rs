@@ -103,6 +103,11 @@ struct SingleByte {
 
 impl SingleByte {
     /// The table for `encoding`, a single-byte encoding, built at first use.
+    ///
+    /// # Panics
+    ///
+    /// If `encoding` is UTF-8 or UTF-16, which have no table: callers check
+    /// [`Encoding::is_ascii_compatible`] and UTF-8 first.
     fn of(encoding: Encoding) -> &'static SingleByte {
         static TABLES: OnceLock<Vec<(Encoding, SingleByte)>> = OnceLock::new();
         let tables = TABLES.get_or_init(|| {
@@ -115,9 +120,8 @@ impl SingleByte {
         tables
             .iter()
             .find(|(e, _)| *e == encoding)
-            .or_else(|| tables.first())
             .map(|(_, table)| table)
-            .unwrap_or_else(|| unreachable!("there are single-byte encodings"))
+            .unwrap_or_else(|| unreachable!("{encoding:?} is not a single-byte encoding"))
     }
 
     fn build(encoding: Encoding) -> SingleByte {

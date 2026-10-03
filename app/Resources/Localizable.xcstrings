@@ -388,6 +388,9 @@
     "Leal couldn’t reload “%@”." : {
       "comment" : "Alert title: Reload failed (task 1.9); the file's name"
     },
+    "Leal couldn’t write the copy there. Check that the drive has room and that you may write to that folder." : {
+      "comment" : "Alert text: Save As UTF-8 failed writing the file (a full disk, no permission); the details are in the log"
+    },
     "Leal guessed the encoding from the start of the file." : {
       "comment" : "Status bar tooltip: encoding source"
     },
@@ -569,11 +572,17 @@
     "Show the irregularities (%@ kinds)" : {
       "comment" : "Tooltip of the status bar's diagnostics badge"
     },
+    "Some of the file’s bytes aren’t %@ text, so they can’t be converted. Leal never replaces them." : {
+      "comment" : "Alert text: Save As UTF-8 refused cells without saying which; the file's encoding"
+    },
     "Something other than a file is at that place." : {
       "comment" : "Alert text: Save As UTF-8 onto a folder or similar"
     },
     "Something went wrong inside Leal. Close the file and open it again." : {
       "comment" : "Error after a panic in the Rust core: the document can't be used any more"
+    },
+    "Something went wrong inside Leal. Try again, or reopen the file first." : {
+      "comment" : "Alert text: Save As UTF-8 failed because of a problem in Leal itself; the details are in the log"
     },
     "Switch" : {
       "comment" : "Suggestion banner button: read the file with the suggested delimiter (DESIGN §3.2)"
@@ -618,6 +627,9 @@
     },
     "The drive with this file was disconnected. Leal shows the rows it had read; Save is off until the drive is back, and Save As keeps a copy." : {
       "comment" : "Banner: the file's removable drive was disconnected before Leal had read it all (ADR-0006)"
+    },
+    "The file at that place changed while Leal was saving. Try again." : {
+      "comment" : "Alert text: Save As UTF-8's destination changed during the save"
     },
     "The file at that place is locked." : {
       "comment" : "Alert text: Save As UTF-8 onto a locked file"
