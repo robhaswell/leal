@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 95c1680d271a73d2774da4b68cb7bb41f2b1d12a59b5cdf78343acae21201d9c # shrinks to (delimiter, bytes) = (Comma, [44, 34, 59, 59, 34, 10])
+cc f2f5b9a9c381fe2d8699e2131377c2fa94fe8b73252779f6a3518e2c1a300e09 # shrinks to file = GeneratedCsv { bytes: b"\xfe\xff\x00\n\x00", dialect: ModelDialect { delimiter: Comma, line_endings: Uniform(Lf), bom: false, quoting: Minimal }, encoding: Utf16Be, rows: [ModelRow { fields: [Unquoted("")], line_ending: Some(Lf) }], diagnostics: [(InvalidEncoding, 1), (BlankLines, 1), (BomPresent, 1)] }

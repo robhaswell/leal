@@ -453,8 +453,33 @@ impl GeneratedCsv {
     /// `Messiness::invalid_utf8` off, as [`csv_file_utf16`] does).
     #[must_use]
     pub fn into_utf16(self, little_endian: bool) -> GeneratedCsv {
+        self.into_utf16_with(little_endian, &Utf16Faults::default())
+    }
+
+    /// [`into_utf16`](Self::into_utf16), with text that isn't valid UTF-16
+    /// (ADR-0003 decision 7, ADR-0008 decision 7):
+    ///
+    /// - each of `faults.lone_surrogates` picks a character of a value (any
+    ///   but the delimiter, `"`, CR and LF) and writes it as an **unpaired
+    ///   surrogate**: a high one, or a low one where a high one would be
+    ///   followed by the next pick's low one and pair with it. The model and
+    ///   the layout hold U+FFFD there, which is how it reads;
+    /// - `faults.odd_byte` adds that byte at the end of the file, **a final
+    ///   odd byte**, which isn't a whole code unit. It belongs to the last
+    ///   row (a new one, after a line ending), and reads as U+FFFD. It is in
+    ///   the bytes and the layout only, not in the model.
+    ///
+    /// # Panics
+    ///
+    /// As [`into_utf16`](Self::into_utf16).
+    #[must_use]
+    pub fn into_utf16_with(self, little_endian: bool, faults: &Utf16Faults) -> GeneratedCsv {
         let mut model = self.model;
         model.dialect.bom = false;
+        let delimiter = model.dialect.delimiter.byte();
+        for pick in &faults.lone_surrogates {
+            replace_with_lone_surrogate(&mut model.rows, delimiter, *pick);
+        }
         normalize(&mut model.rows, false, Messiness::ALL);
         let (utf8, layout8) = model.serialize();
         let text = std::str::from_utf8(&utf8).expect("UTF-16 models need valid UTF-8 values");
@@ -466,9 +491,22 @@ impl GeneratedCsv {
         let mut bytes = bom.to_vec();
         let mut map = vec![0; utf8.len() + 1];
         let mut units = [0u16; 2];
-        for (i, c) in text.char_indices() {
+        let mut chars = text.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
             map[i..i + c.len_utf8()].fill(bytes.len());
-            for unit in c.encode_utf16(&mut units) {
+            let lone;
+            let written: &[u16] = if c == char::REPLACEMENT_CHARACTER {
+                // No value holds U+FFFD but a fault's, which is an unpaired
+                // surrogate. A high one is unpaired unless a low one comes
+                // next, which only another fault's can be.
+                let next_is_fault =
+                    chars.peek().map(|&(_, n)| n) == Some(char::REPLACEMENT_CHARACTER);
+                lone = [if next_is_fault { LONE_LOW } else { LONE_HIGH }];
+                &lone
+            } else {
+                c.encode_utf16(&mut units)
+            };
+            for &unit in written {
                 let pair = if little_endian {
                     unit.to_le_bytes()
                 } else {
@@ -479,7 +517,7 @@ impl GeneratedCsv {
         }
         map[utf8.len()] = bytes.len();
         let at = |o: usize| map[o];
-        let layout = Layout {
+        let mut layout = Layout {
             bom_len: bom.len(),
             rows: layout8
                 .rows
@@ -499,6 +537,10 @@ impl GeneratedCsv {
                 })
                 .collect(),
         };
+        if let Some(odd) = faults.odd_byte {
+            add_odd_byte(&mut layout, &model, bytes.len());
+            bytes.push(odd);
+        }
         let diagnostics = diagnostics::derive(&layout, &bytes, encoding);
         GeneratedCsv {
             model,
@@ -508,15 +550,193 @@ impl GeneratedCsv {
             diagnostics,
         }
     }
+
+    /// The same model written without a UTF-8 BOM (repaired as a model
+    /// without one must be: a first field that would start with BOM-like
+    /// bytes is quoted). Unchanged if it had none.
+    #[must_use]
+    pub fn without_bom(self) -> GeneratedCsv {
+        if !self.model.dialect.bom {
+            return self;
+        }
+        let mut model = self.model;
+        model.dialect.bom = false;
+        normalize(&mut model.rows, false, Messiness::ALL);
+        GeneratedCsv::from_model(model)
+    }
+
+    /// The same file, opened as `encoding`, a single-byte encoding: the
+    /// bytes and their layout as they are (every structural byte is ASCII
+    /// in all of them), the values read in `encoding`
+    /// ([`crate::dialect::decode_value`]), the diagnostics derived for it.
+    /// Bytes `encoding` leaves unassigned stay, and read as U+FFFD
+    /// (`invalid_encoding`). The other single-byte encodings come only from
+    /// the file's attribute or the user's choice (ADR-0005 decision 5).
+    ///
+    /// # Panics
+    ///
+    /// If `encoding` isn't single-byte, or the file has a BOM, which only
+    /// its own encoding can read.
+    #[must_use]
+    pub fn in_single_byte(self, encoding: Encoding) -> GeneratedCsv {
+        assert!(encoding.is_single_byte(), "{encoding:?}");
+        assert_eq!(
+            self.layout.bom_len, 0,
+            "a file with a BOM is read in its own encoding"
+        );
+        let diagnostics = diagnostics::derive(&self.layout, &self.bytes, encoding);
+        GeneratedCsv {
+            encoding,
+            diagnostics,
+            ..self
+        }
+    }
+}
+
+/// What [`GeneratedCsv::into_utf16_with`] writes that isn't valid UTF-16.
+#[derive(Clone, Debug, Default)]
+pub struct Utf16Faults {
+    /// Characters of values written as unpaired surrogates: each picks the
+    /// character at that place (modulo their number) among all those that
+    /// can be, in file order.
+    pub lone_surrogates: Vec<usize>,
+    /// A final odd byte.
+    pub odd_byte: Option<u8>,
+}
+
+/// The high surrogate a fault writes when it can't pair (U+D83D, the first
+/// unit of most emoji).
+const LONE_HIGH: u16 = 0xD83D;
+/// The low surrogate a fault writes before another fault (U+DE00).
+const LONE_LOW: u16 = 0xDC00;
+
+/// The odd bytes a UTF-16 file may end with: a NUL, an LF, a quote and a
+/// letter, which would be structural or text in a whole unit, and a byte
+/// of a surrogate.
+const ODD_BYTES: [u8; 5] = [0x00, b'\n', b'"', b'A', 0xD8];
+
+/// Replaces the character `pick` chooses, among those of every value (and
+/// text after a closing quote) that aren't the delimiter, `"`, CR or LF,
+/// with U+FFFD. Nothing if there is none.
+fn replace_with_lone_surrogate(rows: &mut [ModelRow], delimiter: u8, pick: usize) {
+    let structural = |c: char| {
+        u8::try_from(u32::from(c))
+            .is_ok_and(|b| b == delimiter || b == b'"' || b == b'\r' || b == b'\n')
+    };
+    let mut parts: Vec<&mut Vec<u8>> = rows
+        .iter_mut()
+        .flat_map(|r| r.fields.iter_mut())
+        .flat_map(|f| match f {
+            ModelField::Unquoted(v) | ModelField::Unterminated(v) => vec![v],
+            ModelField::Quoted { value, trailing } => vec![value, trailing],
+        })
+        .collect();
+    let eligible = |part: &Vec<u8>| {
+        String::from_utf8_lossy(part)
+            .chars()
+            .filter(|&c| !structural(c))
+            .count()
+    };
+    let total: usize = parts.iter().map(|p| eligible(p)).sum();
+    if total == 0 {
+        return;
+    }
+    let mut n = pick % total;
+    for part in &mut parts {
+        let here = eligible(part);
+        if n >= here {
+            n -= here;
+            continue;
+        }
+        let text = String::from_utf8_lossy(part).into_owned();
+        let mut seen = 0;
+        let replaced: String = text
+            .chars()
+            .map(|c| {
+                if structural(c) {
+                    return c;
+                }
+                seen += 1;
+                if seen == n + 1 {
+                    char::REPLACEMENT_CHARACTER
+                } else {
+                    c
+                }
+            })
+            .collect();
+        **part = replaced.into_bytes();
+        return;
+    }
+}
+
+/// Adds a final odd byte at `at` (the end of the file) to `layout`, as a
+/// parser finds it: a row of its own after a line ending (or in a file with
+/// no rows), otherwise the end of the last field, read as U+FFFD. After a
+/// closing quote, that is text after it, so the field shows its raw text.
+fn add_odd_byte(layout: &mut Layout, model: &CsvModel, at: usize) {
+    let replacement = char::REPLACEMENT_CHARACTER.to_string().into_bytes();
+    let needs_row = layout.rows.last().is_none_or(|r| r.line_ending.is_some());
+    if needs_row {
+        layout.rows.push(RowLayout {
+            span: at..at + 1,
+            line_ending: None,
+            fields: vec![FieldLayout {
+                span: at..at + 1,
+                quoted: false,
+                value: replacement,
+                text_after_quote: None,
+                unterminated: false,
+            }],
+        });
+        return;
+    }
+    let (Some(row), Some(model_field)) = (
+        layout.rows.last_mut(),
+        model.rows.last().and_then(|r| r.fields.last()),
+    ) else {
+        return;
+    };
+    row.span.end += 1;
+    let Some(field) = row.fields.last_mut() else {
+        return;
+    };
+    field.span.end += 1;
+    match model_field {
+        ModelField::Quoted { trailing, .. } if trailing.is_empty() => {
+            // A closed quote: the byte is text after it, and the field
+            // shows its raw text.
+            field.text_after_quote = Some(at);
+            field.value = model_field.raw();
+            field.value.extend_from_slice(&replacement);
+        }
+        _ => field.value.extend_from_slice(&replacement),
+    }
 }
 
 /// Like [`csv_file`], but written as UTF-16 LE or BE with a BOM; see
-/// [`GeneratedCsv::into_utf16`]. `Messiness::invalid_utf8` is ignored (the
-/// corpus covers unpaired surrogates); NUL values become U+0000 code units.
+/// [`GeneratedCsv::into_utf16`]. NUL values become U+0000 code units.
+/// `Messiness::invalid_utf8` means text that isn't valid UTF-16 instead
+/// ([`GeneratedCsv::into_utf16_with`]): in a third of the files, one or
+/// two unpaired surrogates in values; in one in five, a final odd byte.
 pub fn csv_file_utf16(config: CsvConfig) -> impl Strategy<Value = GeneratedCsv> {
+    let invalid = config.messiness.invalid_utf8;
     let mut config = config;
     config.messiness.invalid_utf8 = false;
-    (csv_file(config), any::<bool>()).prop_map(|(file, le)| file.into_utf16(le))
+    let faults = if invalid {
+        (
+            prop_oneof![2 => Just(Vec::new()), 1 => vec(any::<usize>(), 1..=2)],
+            prop::option::weighted(0.2, select(&ODD_BYTES[..])),
+        )
+            .prop_map(|(lone_surrogates, odd_byte)| Utf16Faults {
+                lone_surrogates,
+                odd_byte,
+            })
+            .boxed()
+    } else {
+        Just(Utf16Faults::default()).boxed()
+    };
+    (csv_file(config), any::<bool>(), faults)
+        .prop_map(|(file, le, faults)| file.into_utf16_with(le, &faults))
 }
 
 impl fmt::Debug for GeneratedCsv {

@@ -14,6 +14,11 @@ publish = false
 # Strategies are part of this crate's public API, so proptest is a normal
 # dependency here (it is still dev-only for every product crate).
 proptest.workspace = true
+# The WHATWG tables for the single-byte encodings other than Windows-1252
+# and ISO-8859-1 (task 2.3), which the oracle can't sensibly type out. The
+# oracle uses its encoder (`encode_from_utf8_without_replacement`); the
+# product inverts its decoder's table, so the two still check each other.
+encoding_rs.workspace = true
 # Sidecar parsing (`tests/corpus/**/*.expected.toml`).
 serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }

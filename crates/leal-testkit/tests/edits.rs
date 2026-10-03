@@ -6,13 +6,13 @@ mod oracle;
 use leal_testkit::diagnostics::{self, DiagnosticKind};
 use leal_testkit::dialect::{
     Bom, Delimiter, Encoding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value, encode_value,
-    expected_encoding, reopen_encoding,
+    expected_encoding, reopen_encoding, unassigned_bytes,
 };
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
-use leal_testkit::save::{Document, Edit, Fix, SaveError};
+use leal_testkit::save::{CellSource, Document, Edit, Fix, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, csv_file, csv_file_utf16};
-use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for};
+use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for, single_byte_edit_case};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::Index;
@@ -139,6 +139,187 @@ proptest! {
     fn utf16_saves_are_refused(case in edits_for(csv_file_utf16(CsvConfig::clean()), 2)) {
         prop_assert_eq!(case.saved.unwrap_err(), SaveError::ReadOnly);
     }
+
+    /// Every single-byte encoding (task 2.3): a save's splices describe its
+    /// output, which reads back in that encoding as the document's values;
+    /// or it names exactly the cells holding a character the encoding
+    /// can't write (F5).
+    #[test]
+    fn single_byte_edits_save_or_name_the_unencodable_cells(
+        case in single_byte_edit_case(CsvConfig::clean()),
+    ) {
+        let encoding = case.file.encoding;
+        let values = final_values(&case);
+        let unencodable: Vec<(usize, usize)> = cells_where(&case, |r, c| {
+            edited(&case, r, c) && encode_value(&values[r][c], encoding).is_err()
+        });
+        match &case.saved {
+            Ok(saved) => {
+                prop_assert!(unencodable.is_empty());
+                prop_assert_eq!(&saved.bytes, &apply_changes(&case.file.bytes, &saved.changes));
+                let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), encoding);
+                prop_assert_eq!(read_back(&parsed.layout, encoding), padded(values));
+            }
+            Err(SaveError::Unencodable(cells)) => prop_assert_eq!(cells, &unencodable),
+            Err(e) => prop_assert!(false, "unexpected {}", e),
+        }
+    }
+
+    /// Save As UTF-8 (ADR-0008 decision 7) from clean files in any
+    /// encoding: the output is UTF-8, with a UTF-8 BOM exactly when the
+    /// file had a BOM, and reads back as the document's values; or it
+    /// names exactly the unedited cells whose bytes aren't text in the
+    /// file's encoding (F5).
+    #[test]
+    fn save_as_utf8_reads_back_the_same_values(case in any_encoding_case(CsvConfig::clean())) {
+        let mut doc = case.file.document();
+        for e in &case.edits {
+            doc.apply(e).expect("strategy edits are valid");
+        }
+        let expected = unconvertible_cells(&case, &doc);
+        match doc.save_as_utf8() {
+            Ok(saved) => {
+                prop_assert_eq!(&expected, &Vec::new());
+                prop_assert_eq!(saved.encoding_hint, Some(Encoding::Utf8));
+                let had_bom = Bom::detect(&case.file.bytes) != Bom::None;
+                let bom = if had_bom { Bom::Utf8 } else { Bom::None };
+                prop_assert_eq!(Bom::detect(&saved.bytes), bom);
+                if case.file.encoding == Encoding::Utf8 {
+                    prop_assert_eq!(Ok(saved.bytes), doc.save().map(|s| s.bytes));
+                } else {
+                    prop_assert!(std::str::from_utf8(&saved.bytes).is_ok());
+                    let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), Encoding::Utf8);
+                    prop_assert_eq!(parsed.check_tiles(case.file.delimiter()), Ok(()));
+                    prop_assert_eq!(
+                        read_back(&parsed.layout, Encoding::Utf8),
+                        padded(final_values(&case))
+                    );
+                    let endings: Vec<_> = parsed.layout.rows.iter().map(|r| r.line_ending).collect();
+                    prop_assert_eq!(endings, saved.line_endings);
+                }
+            }
+            Err(SaveError::Unconvertible(cells)) => {
+                prop_assert!(!cells.is_empty());
+                prop_assert_eq!(cells, expected);
+            }
+            Err(e) => prop_assert!(false, "unexpected {}", e),
+        }
+    }
+
+    /// The same refusals from messy files, whose unpaired surrogates, final
+    /// odd bytes and unassigned bytes are where the cells come from.
+    #[test]
+    fn save_as_utf8_names_exactly_the_cells_it_cant_convert(
+        case in any_encoding_case(CsvConfig::messy()),
+    ) {
+        let mut doc = case.file.document();
+        for e in &case.edits {
+            doc.apply(e).expect("strategy edits are valid");
+        }
+        let expected = unconvertible_cells(&case, &doc);
+        match doc.save_as_utf8() {
+            Ok(saved) => {
+                prop_assert_eq!(&expected, &Vec::new());
+                if case.file.encoding != Encoding::Utf8 {
+                    prop_assert!(std::str::from_utf8(&saved.bytes).is_ok());
+                }
+            }
+            Err(SaveError::Unconvertible(cells)) => prop_assert_eq!(cells, expected),
+            Err(e) => prop_assert!(false, "unexpected {}", e),
+        }
+    }
+}
+
+/// Edit cases in every encoding: UTF-8 and Windows-1252 as detected, the
+/// other single-byte encodings, and UTF-16.
+fn any_encoding_case(config: CsvConfig) -> impl Strategy<Value = EditCase> {
+    prop_oneof![
+        edit_case(config),
+        single_byte_edit_case(config),
+        edits_for(csv_file_utf16(config), 4),
+    ]
+}
+
+/// The cells of the edited document (row, column) where `pick` holds.
+fn cells_where(case: &EditCase, pick: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize)> {
+    let values = final_values(case);
+    (0..values.len())
+        .flat_map(|r| (0..values[r].len()).map(move |c| (r, c)))
+        .filter(|&(r, c)| pick(r, c))
+        .collect()
+}
+
+/// Whether the edited document's cell holds a value of its own.
+fn edited(case: &EditCase, row: usize, column: usize) -> bool {
+    let mut doc = case.file.document();
+    for e in &case.edits {
+        doc.apply(e).expect("strategy edits are valid");
+    }
+    doc.cell_source(row, column) == Some(CellSource::Edited)
+}
+
+/// Each row's values as `layout` reads them in `encoding`.
+fn read_back(layout: &Layout, encoding: Encoding) -> Vec<Vec<String>> {
+    layout
+        .rows
+        .iter()
+        .map(|r| {
+            r.fields
+                .iter()
+                .map(|f| decode_value(&f.value, encoding))
+                .collect()
+        })
+        .collect()
+}
+
+/// ADR-0004 decision 6: a row left with no cells is written as `""`, so it
+/// reads back as one empty field.
+fn padded(values: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    values
+        .into_iter()
+        .map(|r| if r.is_empty() { vec![String::new()] } else { r })
+        .collect()
+}
+
+/// The cells Save As UTF-8 must name: those of `doc` (the case's file with
+/// its edits) that still hold an original field with bytes that aren't
+/// text in the file's encoding. Found from the bytes, not by converting.
+fn unconvertible_cells(case: &EditCase, doc: &Document<'_>) -> Vec<(usize, usize)> {
+    let file = &case.file;
+    let offsets: Vec<usize> = match file.encoding {
+        // Not converted: its bytes are kept as they are.
+        Encoding::Utf8 => Vec::new(),
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            diagnostics::utf16_nul_and_invalid_offsets(
+                &file.bytes,
+                file.layout.bom_len,
+                file.encoding == Encoding::Utf16Le,
+            )
+            .1
+        }
+        single_byte => {
+            let unassigned = unassigned_bytes(single_byte);
+            (0..file.bytes.len())
+                .filter(|&at| unassigned[usize::from(file.bytes[at])])
+                .collect()
+        }
+    };
+    let bad: Vec<(usize, usize)> = offsets
+        .iter()
+        .filter_map(|&at| file.layout.field_of_offset(at))
+        .collect();
+    let mut cells = Vec::new();
+    for r in 0..doc.row_count() {
+        for c in 0..doc.row_len(r) {
+            if let (Some(CellSource::Original { field }), Some(source)) =
+                (doc.cell_source(r, c), doc.source_row(r))
+                && bad.contains(&(source, field))
+            {
+                cells.push((r, c));
+            }
+        }
+    }
+    cells
 }
 
 #[test]
@@ -198,6 +379,87 @@ fn edit_strategy_reaches_every_kind_of_edit() {
             .any(|c| c.saved.as_ref().is_ok_and(|s| s.changes.len() == 1
                 && c.edits.len() == 1
                 && matches!(c.edits[0], Edit::SetCell { .. })))
+    );
+}
+
+/// The task 2.3 strategies reach what they are for: every single-byte
+/// encoding, saves in each of them that write characters other than ASCII
+/// and that are refused (F5), and Save As UTF-8 refusals from an unpaired
+/// surrogate, a final odd byte and an unassigned single byte.
+#[test]
+fn encoding_strategies_reach_every_case() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    let single = single_byte_edit_case(CsvConfig::messy());
+    let mut encodings = std::collections::HashSet::new();
+    let (mut written, mut refused) = (0, 0);
+    for _ in 0..2000 {
+        let case = single.new_tree(&mut runner).unwrap().current();
+        encodings.insert(case.file.encoding);
+        match &case.saved {
+            Ok(saved)
+                if saved
+                    .changes
+                    .iter()
+                    .any(|c| c.replacement.iter().any(|&b| b >= 0x80)) =>
+            {
+                written += 1;
+            }
+            Err(SaveError::Unencodable(_)) => refused += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(encodings.len(), Encoding::SINGLE_BYTE.len());
+    assert!(written >= 100, "{written} saves writing high bytes");
+    assert!(refused >= 100, "{refused} refused");
+
+    let utf16 = edits_for(csv_file_utf16(CsvConfig::messy()), 4);
+    let (mut surrogate, mut odd) = (0, 0);
+    for _ in 0..2000 {
+        let case = utf16.new_tree(&mut runner).unwrap().current();
+        let mut doc = case.file.document();
+        for e in &case.edits {
+            doc.apply(e).unwrap();
+        }
+        if let Err(SaveError::Unconvertible(_)) = doc.save_as_utf8() {
+            let (_, invalid) = diagnostics::utf16_nul_and_invalid_offsets(
+                &case.file.bytes,
+                2,
+                case.file.encoding == Encoding::Utf16Le,
+            );
+            if invalid.iter().any(|&at| at + 1 == case.file.bytes.len())
+                && case.file.bytes.len() % 2 == 1
+            {
+                odd += 1;
+            } else {
+                surrogate += 1;
+            }
+        }
+    }
+    assert!(
+        surrogate >= 50,
+        "{surrogate} refused for an unpaired surrogate"
+    );
+    assert!(odd >= 20, "{odd} refused for a final odd byte");
+
+    let unassigned = (0..2000)
+        .map(|_| single.new_tree(&mut runner).unwrap().current())
+        .filter(|case| {
+            let mut doc = case.file.document();
+            for e in &case.edits {
+                doc.apply(e).unwrap();
+            }
+            matches!(doc.save_as_utf8(), Err(SaveError::Unconvertible(_)))
+        })
+        .count();
+    eprintln!(
+        "single-byte saves: {written} writing high bytes, {refused} refused; Save As UTF-8 refused: {surrogate} for a surrogate, {odd} for an odd byte, {unassigned} for an unassigned byte"
+    );
+    assert!(
+        unassigned >= 20,
+        "{unassigned} refused for an unassigned byte"
     );
 }
 

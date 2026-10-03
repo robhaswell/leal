@@ -30,12 +30,10 @@ pub fn delimiter(d: tk::Delimiter) -> Delimiter {
 }
 
 pub fn encoding(e: tk::Encoding) -> Encoding {
-    match e {
-        tk::Encoding::Utf8 => Encoding::Utf8,
-        tk::Encoding::Utf16Le => Encoding::Utf16Le,
-        tk::Encoding::Utf16Be => Encoding::Utf16Be,
-        tk::Encoding::Windows1252 => Encoding::Windows1252,
-    }
+    Encoding::ALL
+        .into_iter()
+        .find(|ours| ours.iana_name() == e.name())
+        .expect("the testkit's encodings are Leal's")
 }
 
 pub fn bom(b: tk::Bom) -> Bom {

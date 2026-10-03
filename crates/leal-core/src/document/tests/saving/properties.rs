@@ -58,22 +58,21 @@ static SCHEDULER: LazyLock<Scheduler> = LazyLock::new(scheduler);
 static DIR: LazyLock<Dir> = LazyLock::new(|| Dir::new("save-properties"));
 
 fn core_encoding(e: tk::Encoding) -> Encoding {
-    match e {
-        tk::Encoding::Utf8 => Encoding::Utf8,
-        tk::Encoding::Windows1252 => Encoding::Windows1252,
-        tk::Encoding::Utf16Le => Encoding::Utf16Le,
-        tk::Encoding::Utf16Be => Encoding::Utf16Be,
-    }
+    Encoding::ALL
+        .into_iter()
+        .find(|ours| ours.iana_name() == e.name())
+        .unwrap()
 }
 
 fn tk_encoding(e: Encoding) -> Option<tk::Encoding> {
-    Some(match e {
-        Encoding::Utf8 => tk::Encoding::Utf8,
-        Encoding::Windows1252 => tk::Encoding::Windows1252,
-        Encoding::Utf16Le => tk::Encoding::Utf16Le,
-        Encoding::Utf16Be => tk::Encoding::Utf16Be,
-        _ => return None,
-    })
+    [
+        tk::Encoding::Utf8,
+        tk::Encoding::Utf16Le,
+        tk::Encoding::Utf16Be,
+    ]
+    .into_iter()
+    .chain(tk::Encoding::SINGLE_BYTE)
+    .find(|theirs| theirs.name() == e.iana_name())
 }
 
 fn tk_line_ending(l: crate::dialect::LineEnding) -> tk::LineEnding {

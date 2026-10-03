@@ -45,12 +45,10 @@ fn utf8() -> IndexDialect {
 }
 
 fn from_tk(encoding: TkEncoding) -> Encoding {
-    match encoding {
-        TkEncoding::Utf8 => Encoding::Utf8,
-        TkEncoding::Utf16Le => Encoding::Utf16Le,
-        TkEncoding::Utf16Be => Encoding::Utf16Be,
-        TkEncoding::Windows1252 => Encoding::Windows1252,
-    }
+    Encoding::ALL
+        .into_iter()
+        .find(|e| e.iana_name() == encoding.name())
+        .unwrap()
 }
 
 fn tk_kind(kind: DiagnosticKind) -> TkKind {
@@ -166,7 +164,6 @@ fn expected_marks(bytes: &[u8], dialect: IndexDialect, encoding: TkEncoding) -> 
     };
     let offsets: Vec<usize> = match encoding {
         TkEncoding::Utf8 => nul_bytes().chain(tk::invalid_utf8_offsets(bytes)).collect(),
-        TkEncoding::Windows1252 => nul_bytes().collect(),
         TkEncoding::Utf16Le | TkEncoding::Utf16Be => {
             let (nuls, invalid) = tk::utf16_nul_and_invalid_offsets(
                 bytes,
@@ -174,6 +171,18 @@ fn expected_marks(bytes: &[u8], dialect: IndexDialect, encoding: TkEncoding) -> 
                 encoding == TkEncoding::Utf16Le,
             );
             nuls.into_iter().chain(invalid).collect()
+        }
+        single_byte => {
+            let unassigned = leal_testkit::dialect::unassigned_bytes(single_byte);
+            nul_bytes()
+                .chain(
+                    bytes
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &b)| unassigned[usize::from(b)])
+                        .map(|(i, _)| i),
+                )
+                .collect()
         }
     };
     for offset in offsets {
@@ -294,9 +303,9 @@ fn arbitrary(bytes: &[u8], delimiter: u8, choice: usize) -> (Vec<u8>, IndexDiale
                 0
             },
         ),
-        TkEncoding::Windows1252 => (bytes.to_vec(), 0),
         TkEncoding::Utf16Le => ([&[0xFF, 0xFE], bytes].concat(), 2),
         TkEncoding::Utf16Be => ([&[0xFE, 0xFF], bytes].concat(), 2),
+        _ => (bytes.to_vec(), 0),
     };
     (
         bytes,

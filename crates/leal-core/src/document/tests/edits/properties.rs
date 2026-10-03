@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use leal_testkit::diagnostics::DiagnosticKind as TkKind;
-use leal_testkit::dialect as tk;
 use leal_testkit::save::{CellSource, Document as Oracle, Edit as OracleEdit, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, GeneratedCsv};
 use leal_testkit::strategies::edits::{EditCase, edit_case};
@@ -62,12 +61,9 @@ fn open_case(file: &GeneratedCsv, header: bool) -> Document {
     let choices = Choices {
         delimiter: Some(Delimiter::from_byte(file.delimiter().byte()).unwrap()),
         header: Some(header),
-        encoding: Some(match file.encoding {
-            tk::Encoding::Utf8 => Encoding::Utf8,
-            tk::Encoding::Windows1252 => Encoding::Windows1252,
-            tk::Encoding::Utf16Le => Encoding::Utf16Le,
-            tk::Encoding::Utf16Be => Encoding::Utf16Be,
-        }),
+        encoding: Encoding::ALL
+            .into_iter()
+            .find(|e| e.iana_name() == file.encoding.name()),
     };
     let options = OpenOptions {
         choices,

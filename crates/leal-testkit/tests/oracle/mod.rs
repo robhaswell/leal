@@ -209,7 +209,7 @@ pub struct Analysis {
 /// 1.2's job, tested against the same sidecars.
 pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analysis {
     match encoding {
-        Encoding::Utf8 | Encoding::Windows1252 => {
+        ascii_compatible if ascii_compatible.is_ascii_compatible() => {
             let layout = parse(bytes, delimiter);
             let diagnostics = diagnostics::derive(&layout, bytes, encoding);
             Analysis {
@@ -220,8 +220,8 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
                 parsed: bytes.to_vec(),
             }
         }
-        Encoding::Utf16Le | Encoding::Utf16Be => {
-            // Parse the UTF-8 transcoding, then map every offset back to the
+        _ => {
+            // UTF-16. Parse the UTF-8 transcoding, then map every offset back to the
             // file. Structural characters are single code units, so every
             // span boundary is a character boundary and maps exactly.
             let bom_len = Bom::detect(bytes).bytes().len();
@@ -293,7 +293,12 @@ impl Analysis {
         let f = self.layout.rows.get(row)?.fields.get(field)?;
         Some(match self.encoding {
             Encoding::Windows1252 => decode_windows_1252(&f.value),
-            _ => String::from_utf8_lossy(&f.value).into_owned(),
+            Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be => {
+                String::from_utf8_lossy(&f.value).into_owned()
+            }
+            // The other single-byte encodings come only from the attribute
+            // or the user; their tables are encoding_rs's.
+            other => leal_testkit::dialect::decode_value(&f.value, other),
         })
     }
 

@@ -294,7 +294,6 @@ fn a_share_file_changed_elsewhere_mid_copy_is_changed_while_reading() {
 #[test]
 fn corpus_files_read_through_a_share_match_their_sidecars() {
     use crate::dialect::Delimiter as CoreDelimiter;
-    use leal_testkit::dialect::Encoding as TkEncoding;
     let dir = Dir::new("share-corpus");
     let cases = leal_testkit::corpus::load().unwrap();
     assert!(!cases.is_empty());
@@ -304,12 +303,9 @@ fn corpus_files_read_through_a_share_match_their_sidecars() {
         let choices = Choices {
             delimiter: CoreDelimiter::from_byte(expected.dialect.delimiter.byte()),
             header: Some(expected.dialect.header),
-            encoding: Some(match expected.dialect.encoding {
-                TkEncoding::Utf8 => Encoding::Utf8,
-                TkEncoding::Utf16Le => Encoding::Utf16Le,
-                TkEncoding::Utf16Be => Encoding::Utf16Be,
-                TkEncoding::Windows1252 => Encoding::Windows1252,
-            }),
+            encoding: Encoding::ALL
+                .into_iter()
+                .find(|e| e.iana_name() == expected.dialect.encoding.name()),
         };
         let opening = OpenOptions {
             choices,

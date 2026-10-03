@@ -96,9 +96,9 @@ fn dialect_for(delimiter: u8, encoding: Encoding, bom_len: usize) -> IndexDialec
         delimiter,
         quote: b'"',
         code_unit: match encoding {
-            Encoding::Utf8 | Encoding::Windows1252 => CodeUnit::Byte,
             Encoding::Utf16Le => CodeUnit::Utf16Le,
             Encoding::Utf16Be => CodeUnit::Utf16Be,
+            _ => CodeUnit::Byte,
         },
         bom_len,
     }

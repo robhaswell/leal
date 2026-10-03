@@ -141,7 +141,7 @@ impl Bom {
     }
 }
 
-/// A text encoding Leal reads (DESIGN §3.2).
+/// A text encoding Leal reads (DESIGN §3.2, ADR-0005 decision 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
 pub enum Encoding {
     /// UTF-8, with or without a BOM.
@@ -156,15 +156,120 @@ pub enum Encoding {
     /// Windows-1252, the default single-byte fallback.
     #[serde(rename = "windows-1252")]
     Windows1252,
+    /// Windows-1250 (like the rest below, only from the attribute or the
+    /// user).
+    #[serde(rename = "windows-1250")]
+    Windows1250,
+    /// Windows-1251.
+    #[serde(rename = "windows-1251")]
+    Windows1251,
+    /// Windows-1253.
+    #[serde(rename = "windows-1253")]
+    Windows1253,
+    /// Windows-1254.
+    #[serde(rename = "windows-1254")]
+    Windows1254,
+    /// Windows-1255.
+    #[serde(rename = "windows-1255")]
+    Windows1255,
+    /// Windows-1256.
+    #[serde(rename = "windows-1256")]
+    Windows1256,
+    /// Windows-1257.
+    #[serde(rename = "windows-1257")]
+    Windows1257,
+    /// Windows-1258.
+    #[serde(rename = "windows-1258")]
+    Windows1258,
+    /// ISO-8859-1: every byte is the code point of the same value.
+    #[serde(rename = "iso-8859-1")]
+    Iso8859_1,
+    /// ISO-8859-2.
+    #[serde(rename = "iso-8859-2")]
+    Iso8859_2,
+    /// ISO-8859-15.
+    #[serde(rename = "iso-8859-15")]
+    Iso8859_15,
+    /// Mac Roman.
+    #[serde(rename = "macintosh")]
+    MacRoman,
 }
 
 impl Encoding {
+    /// The single-byte encodings Leal reads (ADR-0005 decision 5): every
+    /// encoding but UTF-8 and UTF-16.
+    pub const SINGLE_BYTE: [Encoding; 13] = [
+        Encoding::Windows1252,
+        Encoding::Windows1250,
+        Encoding::Windows1251,
+        Encoding::Windows1253,
+        Encoding::Windows1254,
+        Encoding::Windows1255,
+        Encoding::Windows1256,
+        Encoding::Windows1257,
+        Encoding::Windows1258,
+        Encoding::Iso8859_1,
+        Encoding::Iso8859_2,
+        Encoding::Iso8859_15,
+        Encoding::MacRoman,
+    ];
+
     /// True for the encodings in which every structural byte (`,` `;` `\t`
     /// `|` `"` CR LF) is a single ASCII byte, so a parser can work on the
     /// raw bytes. False for UTF-16.
     #[must_use]
     pub fn is_ascii_compatible(self) -> bool {
-        matches!(self, Encoding::Utf8 | Encoding::Windows1252)
+        !matches!(self, Encoding::Utf16Le | Encoding::Utf16Be)
+    }
+
+    /// True for the single-byte encodings ([`Encoding::SINGLE_BYTE`]).
+    #[must_use]
+    pub fn is_single_byte(self) -> bool {
+        !matches!(self, Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be)
+    }
+
+    /// The encoding's IANA name, as macOS writes it in
+    /// `com.apple.TextEncoding` (and as the corpus sidecars spell it).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "utf-8",
+            Encoding::Utf16Le => "utf-16le",
+            Encoding::Utf16Be => "utf-16be",
+            Encoding::Windows1252 => "windows-1252",
+            Encoding::Windows1250 => "windows-1250",
+            Encoding::Windows1251 => "windows-1251",
+            Encoding::Windows1253 => "windows-1253",
+            Encoding::Windows1254 => "windows-1254",
+            Encoding::Windows1255 => "windows-1255",
+            Encoding::Windows1256 => "windows-1256",
+            Encoding::Windows1257 => "windows-1257",
+            Encoding::Windows1258 => "windows-1258",
+            Encoding::Iso8859_1 => "iso-8859-1",
+            Encoding::Iso8859_2 => "iso-8859-2",
+            Encoding::Iso8859_15 => "iso-8859-15",
+            Encoding::MacRoman => "macintosh",
+        }
+    }
+
+    /// The WHATWG table of a single-byte encoding other than Windows-1252
+    /// (typed out in this module) and ISO-8859-1 (every byte its own code
+    /// point).
+    fn whatwg(self) -> Option<&'static encoding_rs::Encoding> {
+        Some(match self {
+            Encoding::Windows1250 => encoding_rs::WINDOWS_1250,
+            Encoding::Windows1251 => encoding_rs::WINDOWS_1251,
+            Encoding::Windows1253 => encoding_rs::WINDOWS_1253,
+            Encoding::Windows1254 => encoding_rs::WINDOWS_1254,
+            Encoding::Windows1255 => encoding_rs::WINDOWS_1255,
+            Encoding::Windows1256 => encoding_rs::WINDOWS_1256,
+            Encoding::Windows1257 => encoding_rs::WINDOWS_1257,
+            Encoding::Windows1258 => encoding_rs::WINDOWS_1258,
+            Encoding::Iso8859_2 => encoding_rs::ISO_8859_2,
+            Encoding::Iso8859_15 => encoding_rs::ISO_8859_15,
+            Encoding::MacRoman => encoding_rs::MACINTOSH,
+            _ => return None,
+        })
     }
 }
 
@@ -242,6 +347,8 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
 ///   `invalid_encoding` in the usual way: pass the result to
 ///   [`crate::diagnostics::derive`], which checks UTF-8 validity whenever the
 ///   encoding is UTF-8.
+/// - Another single-byte hint is honoured only if every byte is a
+///   character in it ([`decodes`]): some leave bytes unassigned.
 /// - A UTF-16 hint on a file without a UTF-16 BOM is ignored.
 /// - With no hint, the guess applies ([`expected_encoding`]).
 #[must_use]
@@ -251,8 +358,33 @@ pub fn reopen_encoding(bytes: &[u8], hint: Option<Encoding>) -> Encoding {
     }
     match hint {
         Some(h @ (Encoding::Utf8 | Encoding::Windows1252)) => h,
+        Some(h) if h.is_single_byte() && decodes(bytes, h) => h,
         _ => expected_encoding(bytes),
     }
+}
+
+/// Whether every byte of `bytes` is a character in `encoding`: false if
+/// `encoding` is a single-byte encoding that leaves one of them unassigned
+/// (for example 0xAA in Windows-1253).
+#[must_use]
+pub fn decodes(bytes: &[u8], encoding: Encoding) -> bool {
+    let unassigned = unassigned_bytes(encoding);
+    !bytes.iter().any(|&b| unassigned[usize::from(b)])
+}
+
+/// For each byte value, whether `encoding`, a single-byte encoding, leaves
+/// it unassigned (it decodes as U+FFFD). All false for any other encoding.
+#[must_use]
+pub fn unassigned_bytes(encoding: Encoding) -> [bool; 256] {
+    let mut unassigned = [false; 256];
+    if let Some(whatwg) = encoding.whatwg() {
+        for (b, slot) in (0..=u8::MAX).zip(unassigned.iter_mut()) {
+            *slot = whatwg
+                .decode_without_bom_handling_and_without_replacement(&[b])
+                .is_none();
+        }
+    }
+    unassigned
 }
 
 /// Windows-1252 bytes 0x80–0x9F, as the WHATWG Encoding Standard maps them.
@@ -278,14 +410,53 @@ pub fn decode_windows_1252(bytes: &[u8]) -> String {
 }
 
 /// Decodes bytes in an ASCII-compatible encoding for display: UTF-8 with
-/// invalid sequences as U+FFFD, or Windows-1252. For UTF-16 the bytes are
-/// taken as UTF-8, because the testkit stores UTF-16 values transcoded (see
+/// invalid sequences as U+FFFD, or a single-byte encoding with any byte it
+/// leaves unassigned as U+FFFD. For UTF-16 the bytes are taken as UTF-8,
+/// because the testkit stores UTF-16 values transcoded (see
 /// [`crate::layout::FieldLayout::value`]).
 #[must_use]
 pub fn decode_value(bytes: &[u8], encoding: Encoding) -> String {
     match encoding {
         Encoding::Windows1252 => decode_windows_1252(bytes),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
+        Encoding::Iso8859_1 => bytes.iter().map(|&b| char::from(b)).collect(),
+        other => match other.whatwg() {
+            Some(whatwg) => whatwg.decode_without_bom_handling(bytes).0.into_owned(),
+            None => String::from_utf8_lossy(bytes).into_owned(),
+        },
+    }
+}
+
+/// The text `raw` (bytes as a file in `encoding` holds them) stands for,
+/// for Save As UTF-8 (ADR-0008 decision 7), or `None` if any of it isn't
+/// text there: invalid UTF-8, a byte a single-byte encoding leaves
+/// unassigned, an unpaired surrogate or a final odd byte in UTF-16. Unlike
+/// [`decode_value`], `raw` is the file's own bytes (UTF-16 included), and
+/// nothing is replaced.
+#[must_use]
+pub fn decode_strict(raw: &[u8], encoding: Encoding) -> Option<String> {
+    match encoding {
+        Encoding::Utf8 => std::str::from_utf8(raw).ok().map(str::to_owned),
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let (pairs, odd) = raw.as_chunks::<2>();
+            if !odd.is_empty() {
+                return None;
+            }
+            let units = pairs.iter().map(|&pair| {
+                if encoding == Encoding::Utf16Le {
+                    u16::from_le_bytes(pair)
+                } else {
+                    u16::from_be_bytes(pair)
+                }
+            });
+            char::decode_utf16(units)
+                .collect::<Result<String, _>>()
+                .ok()
+        }
+        Encoding::Windows1252 | Encoding::Iso8859_1 => Some(decode_value(raw, encoding)),
+        other => other
+            .whatwg()?
+            .decode_without_bom_handling_and_without_replacement(raw)
+            .map(std::borrow::Cow::into_owned),
     }
 }
 
@@ -293,7 +464,7 @@ pub fn decode_value(bytes: &[u8], encoding: Encoding) -> String {
 ///
 /// # Errors
 ///
-/// Returns the first character Windows-1252 cannot represent. UTF-16 files
+/// Returns the first character the encoding cannot represent. UTF-16 files
 /// are read-only in v1, so encoding into UTF-16 is always an error (with
 /// the first character, or U+0000 for empty text).
 pub fn encode_value(text: &str, encoding: Encoding) -> Result<Vec<u8>, char> {
@@ -312,7 +483,32 @@ pub fn encode_value(text: &str, encoding: Encoding) -> Result<Vec<u8>, char> {
                 }
             })
             .collect(),
+        Encoding::Iso8859_1 => text
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).map_err(|_| c))
+            .collect(),
         Encoding::Utf16Le | Encoding::Utf16Be => Err(text.chars().next().unwrap_or('\0')),
+        other => {
+            let first = text.chars().next().unwrap_or('\0');
+            let Some(whatwg) = other.whatwg() else {
+                return Err(first);
+            };
+            // The encoder, not the decoder's table inverted (which is how
+            // leal-core encodes), so the two check each other.
+            let mut encoder = whatwg.new_encoder();
+            // A single-byte encoding writes at most one byte a character.
+            let mut out = vec![0; text.len()];
+            let (result, _, written) =
+                encoder.encode_from_utf8_without_replacement(text, &mut out, true);
+            match result {
+                encoding_rs::EncoderResult::InputEmpty => {
+                    out.truncate(written);
+                    Ok(out)
+                }
+                encoding_rs::EncoderResult::Unmappable(c) => Err(c),
+                encoding_rs::EncoderResult::OutputFull => Err(first),
+            }
+        }
     }
 }
 
@@ -354,6 +550,86 @@ mod tests {
             reopen_encoding(ascii, Some(Encoding::Utf16Le)),
             Encoding::Utf8
         );
+    }
+
+    /// Every single-byte encoding: each byte it assigns decodes to a
+    /// character that encodes back to that byte and to no other, and each
+    /// byte it leaves unassigned reads as U+FFFD, isn't text, and makes a
+    /// hint for it not hold.
+    #[test]
+    fn single_byte_encodings_round_trip_every_assigned_byte() {
+        let mut unassigned_somewhere = 0;
+        for encoding in Encoding::SINGLE_BYTE {
+            let unassigned = unassigned_bytes(encoding);
+            let mut seen = std::collections::HashSet::new();
+            for b in 0..=u8::MAX {
+                let text = decode_value(&[b], encoding);
+                if unassigned[usize::from(b)] {
+                    unassigned_somewhere += 1;
+                    assert_eq!(text, "\u{FFFD}", "{encoding:?} {b:#04x}");
+                    assert_eq!(decode_strict(&[b], encoding), None);
+                    assert!(!decodes(&[b'a', b], encoding));
+                    assert_eq!(
+                        reopen_encoding(&[b'a', b], Some(encoding)),
+                        expected_encoding(&[b'a', b])
+                    );
+                    continue;
+                }
+                assert_eq!(text.chars().count(), 1, "{encoding:?} {b:#04x}");
+                assert!(seen.insert(text.clone()), "{encoding:?} {b:#04x} twice");
+                assert_eq!(decode_strict(&[b], encoding).as_deref(), Some(&*text));
+                assert_eq!(
+                    encode_value(&text, encoding),
+                    Ok(vec![b]),
+                    "{encoding:?} {b:#04x}"
+                );
+                if b < 0x80 {
+                    assert_eq!(text, char::from(b).to_string(), "{encoding:?}: ASCII");
+                }
+            }
+            assert_eq!(encode_value("\u{FFFD}", encoding), Err('\u{FFFD}'));
+            assert_eq!(encode_value("a😀", encoding), Err('😀'));
+            assert!(encoding.is_single_byte() && encoding.is_ascii_compatible());
+        }
+        // Windows-1253, 1255 and 1257, among others, leave some bytes
+        // unassigned.
+        assert!(unassigned_somewhere > 10, "{unassigned_somewhere}");
+        assert!(unassigned_bytes(Encoding::Windows1253)[0xAA]);
+        assert!(!unassigned_bytes(Encoding::Windows1252).contains(&true));
+        assert!(!unassigned_bytes(Encoding::Iso8859_1).contains(&true));
+        // Spot checks against the code charts.
+        assert_eq!(decode_value(b"\xC0", Encoding::Windows1251), "А");
+        assert_eq!(decode_value(b"\xDB", Encoding::MacRoman), "€");
+        assert_eq!(decode_value(b"\xA4", Encoding::Iso8859_15), "€");
+        assert_eq!(decode_value(b"\x80", Encoding::Iso8859_1), "\u{80}");
+        assert_eq!(encode_value("Ł", Encoding::Windows1250), Ok(vec![0xA3]));
+        assert_eq!(encode_value("é", Encoding::Windows1251), Err('é'));
+        // A hint for an encoding the bytes decode in holds.
+        assert_eq!(
+            reopen_encoding(b"\xC0,b\n", Some(Encoding::Windows1251)),
+            Encoding::Windows1251
+        );
+    }
+
+    #[test]
+    fn utf16_text_is_strict() {
+        assert_eq!(
+            decode_strict(b"a\0b\0", Encoding::Utf16Le).as_deref(),
+            Some("ab")
+        );
+        assert_eq!(
+            decode_strict(b"\0a\0b", Encoding::Utf16Be).as_deref(),
+            Some("ab")
+        );
+        // 😀 as a pair, then each half alone, then an odd byte.
+        assert_eq!(
+            decode_strict(b"\x3D\xD8\x00\xDE", Encoding::Utf16Le).as_deref(),
+            Some("😀")
+        );
+        assert_eq!(decode_strict(b"\x3D\xD8a\0", Encoding::Utf16Le), None);
+        assert_eq!(decode_strict(b"a\0\x00\xDE", Encoding::Utf16Le), None);
+        assert_eq!(decode_strict(b"a\0b", Encoding::Utf16Le), None);
+        assert_eq!(decode_strict(b"\xFF", Encoding::Utf8), None);
     }
 
     #[test]

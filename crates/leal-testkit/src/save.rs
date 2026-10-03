@@ -28,6 +28,10 @@
 //!    than `c`. Shorter (ragged) rows are left alone.
 //! 7. If an edited value can't be encoded, saving fails naming the cells
 //!    (§3.7, F5). UTF-16 files are read-only in v1, so saving them fails.
+//!    [`Document::save_as_utf8`] (ADR-0008 decision 7) writes the same
+//!    rows in UTF-8 instead, from any encoding: every unedited field's text
+//!    converted, the BOM a UTF-8 one if there was one; it fails naming the
+//!    unedited cells whose bytes aren't text in the file's encoding.
 //! 8. A row whose bytes would be empty is written as `""`, unless it was an
 //!    original blank row, which stays blank (ADR-0004 decision 6). A blank
 //!    row that ends up last in a file with no trailing newline would vanish,
@@ -70,9 +74,19 @@
 use std::fmt;
 
 use crate::dialect::{
-    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value,
-    encode_value, expected_encoding,
+    Delimiter, Encoding, LineEnding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_strict,
+    decode_value, encode_value, expected_encoding,
 };
+
+/// Why a cell can't be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bad {
+    /// Its new value holds a character the encoding can't represent.
+    Unencodable,
+    /// Its original bytes aren't text in the file's encoding (Save As
+    /// UTF-8).
+    Unconvertible,
+}
 use crate::fidelity::{Change, apply_changes};
 use crate::layout::Layout;
 
@@ -191,6 +205,12 @@ pub enum SaveError {
     /// These cells (final logical row, column) hold characters the file's
     /// encoding can't represent (F5).
     Unencodable(Vec<(usize, usize)>),
+    /// Save As UTF-8 (ADR-0008 decision 7): these cells (final logical
+    /// row, column) are unedited fields whose bytes aren't text in the
+    /// file's encoding (an unpaired surrogate or a final odd byte in
+    /// UTF-16, a byte a single-byte encoding leaves unassigned), so they
+    /// can't be converted (F5).
+    Unconvertible(Vec<(usize, usize)>),
     /// UTF-16 files are read-only in v1.
     ReadOnly,
     /// The edit would put bytes inside an unterminated quote (ADR-0004
@@ -203,6 +223,7 @@ impl fmt::Display for SaveError {
         match self {
             SaveError::InvalidEdit(e) => write!(f, "edit {e:?} is out of range"),
             SaveError::Unencodable(cells) => write!(f, "cells {cells:?} can't be encoded"),
+            SaveError::Unconvertible(cells) => write!(f, "cells {cells:?} can't be converted"),
             SaveError::ReadOnly => f.write_str("UTF-16 files are read-only"),
             SaveError::AfterUnterminatedQuote(e) => {
                 write!(f, "edit {e:?} would land inside an unterminated quote")
@@ -581,12 +602,45 @@ impl<'a> Document<'a> {
         if matches!(self.encoding, Encoding::Utf16Le | Encoding::Utf16Be) {
             return Err(SaveError::ReadOnly);
         }
+        self.write(false)
+    }
+
+    /// The expected output of **Save As UTF-8** now (ADR-0008 decision 7):
+    /// the same rows, fields, quoting, delimiters and line endings, every
+    /// unedited field's text converted from the file's encoding and every
+    /// edited value written in UTF-8, by the same rules as [`save`]
+    /// (fixes included). A UTF-8 BOM only if the file had a BOM (of any
+    /// encoding). `encoding_hint` is always UTF-8: the attribute is set.
+    /// From a UTF-8 file, the same bytes as [`save`] (invalid bytes are kept
+    /// as they are, F4).
+    ///
+    /// The bytes change throughout, so `changes` is empty: there are no
+    /// splices to compare.
+    ///
+    /// [`save`]: Document::save
+    ///
+    /// # Errors
+    ///
+    /// [`SaveError::Unconvertible`] naming every unedited cell whose bytes
+    /// aren't text in the file's encoding: an unpaired surrogate or a final
+    /// odd byte in UTF-16, or a byte a single-byte encoding leaves
+    /// unassigned. Nothing is substituted (F5).
+    pub fn save_as_utf8(&self) -> Result<SavedFile, SaveError> {
+        let mut saved = self.write(self.encoding != Encoding::Utf8)?;
+        saved.encoding_hint = Some(Encoding::Utf8);
+        Ok(saved)
+    }
+
+    /// The output of a save in the file's own encoding, or (`transcode`)
+    /// converted to UTF-8.
+    fn write(&self, transcode: bool) -> Result<SavedFile, SaveError> {
         let quote_all = self.layout.quotes_every_field();
         let dominant = self.layout.line_endings().0.unwrap_or(LineEnding::Lf);
         let trailing_newline = self.layout.trailing_newline();
 
         // Each row's content bytes, and whether it is byte-for-byte original.
-        let mut bad = Vec::new();
+        let mut unencodable = Vec::new();
+        let mut unconvertible = Vec::new();
         let mut contents: Vec<(Vec<u8>, bool)> = Vec::with_capacity(self.rows.len());
         for (ri, row) in self.rows.iter().enumerate() {
             let untouched = row.source.is_some_and(|s| {
@@ -598,7 +652,7 @@ impl<'a> Document<'a> {
                         .all(|(i, c)| *c == Cell::Original(i))
             });
             let mut content = Vec::new();
-            if untouched {
+            if untouched && !transcode {
                 let span = self.layout.rows[row.source.unwrap_or(0)].span.clone();
                 content.extend_from_slice(&self.bytes[span]);
             } else {
@@ -606,16 +660,20 @@ impl<'a> Document<'a> {
                     if ci > 0 {
                         content.push(self.delimiter.byte());
                     }
-                    match self.cell_bytes(row, cell, quote_all) {
+                    match self.cell_bytes(row, cell, quote_all, transcode) {
                         Ok(b) => content.extend_from_slice(&b),
-                        Err(()) => bad.push((ri, ci)),
+                        Err(Bad::Unencodable) => unencodable.push((ri, ci)),
+                        Err(Bad::Unconvertible) => unconvertible.push((ri, ci)),
                     }
                 }
             }
             contents.push((content, untouched));
         }
-        if !bad.is_empty() {
-            return Err(SaveError::Unencodable(bad));
+        if !unencodable.is_empty() {
+            return Err(SaveError::Unencodable(unencodable));
+        }
+        if !unconvertible.is_empty() {
+            return Err(SaveError::Unconvertible(unconvertible));
         }
 
         // Line endings, then rule 4 for the end of the file.
@@ -678,7 +736,7 @@ impl<'a> Document<'a> {
                 .iter()
                 .any(|bom| content.starts_with(bom))
             && let Some(cell) = row.cells.first()
-            && let Ok(first) = self.cell_bytes(row, cell, quote_all)
+            && let Ok(first) = self.cell_bytes(row, cell, quote_all, transcode)
         {
             let rest = content[first.len()..].to_vec();
             *content = [quote(&first), rest].concat();
@@ -694,12 +752,22 @@ impl<'a> Document<'a> {
             .zip(&endings)
             .map(|((c, _), e)| [c.as_slice(), e.map_or(&b""[..], LineEnding::bytes)].concat())
             .collect();
-        let bytes: Vec<u8> = std::iter::once(&self.bytes[..self.layout.bom_len])
+        // Save As UTF-8 writes a UTF-8 BOM if the file had any BOM.
+        let bom = match (transcode, self.layout.bom_len) {
+            (_, 0) => &b""[..],
+            (true, _) => UTF8_BOM,
+            (false, len) => &self.bytes[..len],
+        };
+        let bytes: Vec<u8> = std::iter::once(bom)
             .chain(serialized.iter().map(Vec::as_slice))
             .flatten()
             .copied()
             .collect();
-        let changes = self.changes(&serialized, &contents, &endings);
+        let changes = if transcode {
+            Vec::new()
+        } else {
+            self.changes(&serialized, &contents, &endings)
+        };
         // ADR-0004 decision 11: record the encoding when a reopen would
         // otherwise guess differently, or when the file already had a hint.
         let guess_differs = expected_encoding(&bytes) != self.encoding;
@@ -714,16 +782,37 @@ impl<'a> Document<'a> {
         })
     }
 
-    fn cell_bytes(&self, row: &DocRow, cell: &Cell, quote_all: bool) -> Result<Vec<u8>, ()> {
+    /// A cell's bytes as written: an original field's raw bytes (converted
+    /// to UTF-8 if `transcode`), or a new value encoded in the file's
+    /// encoding (UTF-8 if `transcode`).
+    fn cell_bytes(
+        &self,
+        row: &DocRow,
+        cell: &Cell,
+        quote_all: bool,
+        transcode: bool,
+    ) -> Result<Vec<u8>, Bad> {
+        let target = if transcode {
+            Encoding::Utf8
+        } else {
+            self.encoding
+        };
         match cell {
             Cell::Original(f) => {
-                let s = row.source.ok_or(())?;
-                Ok(self.bytes[self.layout.rows[s].fields[*f].span.clone()].to_vec())
+                let s = row.source.ok_or(Bad::Unconvertible)?;
+                let raw = &self.bytes[self.layout.rows[s].fields[*f].span.clone()];
+                if transcode {
+                    decode_strict(raw, self.encoding)
+                        .map(String::into_bytes)
+                        .ok_or(Bad::Unconvertible)
+                } else {
+                    Ok(raw.to_vec())
+                }
             }
             Cell::Appended(None) => Ok(Vec::new()),
             Cell::Appended(Some(value)) => {
-                expected_field_bytes(value, self.encoding, self.delimiter, false, quote_all)
-                    .map_err(|_| ())
+                expected_field_bytes(value, target, self.delimiter, false, quote_all)
+                    .map_err(|_| Bad::Unencodable)
             }
             Cell::Edited { field, value } => {
                 // TODO(ADR-0004 #2): a new field (inserted row or column, so
@@ -734,14 +823,8 @@ impl<'a> Document<'a> {
                     (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted,
                     _ => false,
                 };
-                expected_field_bytes(
-                    value,
-                    self.encoding,
-                    self.delimiter,
-                    original_quoted,
-                    quote_all,
-                )
-                .map_err(|_| ())
+                expected_field_bytes(value, target, self.delimiter, original_quoted, quote_all)
+                    .map_err(|_| Bad::Unencodable)
             }
         }
     }
@@ -824,7 +907,7 @@ impl<'a> Document<'a> {
             for (k, cell) in cells.iter().enumerate().take(fields) {
                 if let Cell::Edited { .. } = cell {
                     let bytes = self
-                        .cell_bytes(&self.rows[j], cell, quote_all)
+                        .cell_bytes(&self.rows[j], cell, quote_all, false)
                         .unwrap_or_default();
                     let span = orig.fields[k].span.clone();
                     if bytes != self.bytes[span.clone()] {
@@ -838,7 +921,7 @@ impl<'a> Document<'a> {
             for cell in &cells[fields..] {
                 appended.push(self.delimiter.byte());
                 appended.extend(
-                    self.cell_bytes(&self.rows[j], cell, quote_all)
+                    self.cell_bytes(&self.rows[j], cell, quote_all, false)
                         .unwrap_or_default(),
                 );
             }
@@ -1158,6 +1241,136 @@ mod tests {
         assert_eq!(doc.save(), Err(SaveError::Unencodable(vec![(0, 0)])));
         let doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf16Le);
         assert_eq!(doc.save(), Err(SaveError::ReadOnly));
+    }
+
+    /// Every single-byte encoding saves its own characters, and refuses
+    /// others, naming the cells.
+    #[test]
+    fn single_byte_encodings_save_their_own_characters() {
+        let bytes = b"a,b\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1251);
+        doc.apply(&set(0, 1, "Жук")).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"a,\xC6\xF3\xEA\n");
+        doc.apply(&set(0, 0, "é")).unwrap();
+        assert_eq!(doc.save(), Err(SaveError::Unencodable(vec![(0, 0)])));
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Iso8859_1);
+        doc.apply(&set(0, 0, "\u{80}é")).unwrap();
+        assert_eq!(doc.save().unwrap().bytes, b"\x80\xE9,b\n");
+    }
+
+    /// ADR-0008 decision 7: Save As UTF-8 converts every field, writes
+    /// edits in UTF-8, and keeps delimiters, quoting and line endings.
+    #[test]
+    fn save_as_utf8_converts_every_field() {
+        let bytes = b"caf\xE9,\"\x80;x\"\r\nb\n";
+        let layout = simple_layout(bytes, &[(0, 1)]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
+        doc.apply(&set(1, 0, "😀")).unwrap();
+        assert_eq!(doc.save(), Err(SaveError::Unencodable(vec![(1, 0)])));
+        let saved = doc.save_as_utf8().unwrap();
+        assert_eq!(saved.bytes, "café,\"€;x\"\r\n😀\n".as_bytes());
+        assert_eq!(saved.encoding_hint, Some(Encoding::Utf8));
+        assert!(saved.changes.is_empty());
+        // From UTF-8: the bytes Save writes, invalid ones kept.
+        let bytes = b"a,\xFF\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Utf8);
+        doc.apply(&set(0, 0, "é")).unwrap();
+        let saved = doc.save_as_utf8().unwrap();
+        assert_eq!(saved.bytes, doc.save().unwrap().bytes);
+        assert_eq!(saved.bytes, b"\xC3\xA9,\xFF\n");
+    }
+
+    /// A byte the encoding leaves unassigned can't be converted: the cell
+    /// is named, and editing it lets the file convert (F5).
+    #[test]
+    fn save_as_utf8_names_the_cells_it_cant_convert() {
+        let bytes = b"a,\xAA\n\xAAb,c\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1253);
+        assert_eq!(
+            doc.save_as_utf8(),
+            Err(SaveError::Unconvertible(vec![(0, 1), (1, 0)]))
+        );
+        doc.apply(&set(0, 1, "x")).unwrap();
+        doc.apply(&set(1, 0, "Ω")).unwrap();
+        assert_eq!(doc.save_as_utf8().unwrap().bytes, "a,x\nΩ,c\n".as_bytes());
+    }
+
+    /// A UTF-16 file: a UTF-8 BOM for its BOM, and an unpaired surrogate or
+    /// a final odd byte named by its cell.
+    #[test]
+    fn save_as_utf8_from_utf16() {
+        use crate::strategies::csv::{
+            CsvModel, GeneratedCsv, LineEndings, ModelDialect, ModelField, ModelRow, QuotingStyle,
+            Utf16Faults,
+        };
+        let model = CsvModel {
+            dialect: ModelDialect {
+                delimiter: Delimiter::Semicolon,
+                line_endings: LineEndings::Uniform(LineEnding::Crlf),
+                bom: false,
+                quoting: QuotingStyle::Minimal,
+            },
+            rows: vec![ModelRow {
+                fields: vec![
+                    ModelField::Unquoted("ab".as_bytes().to_vec()),
+                    ModelField::Quoted {
+                        value: "😀;\n".as_bytes().to_vec(),
+                        trailing: Vec::new(),
+                    },
+                ],
+                line_ending: Some(LineEnding::Crlf),
+            }],
+        };
+        let file = GeneratedCsv::from_model(model.clone()).into_utf16(true);
+        let doc = file.document();
+        let saved = doc.save_as_utf8().unwrap();
+        assert_eq!(saved.bytes, "\u{FEFF}ab;\"😀;\n\"\r\n".as_bytes());
+        // The first character, "a", as an unpaired surrogate.
+        let faults = Utf16Faults {
+            lone_surrogates: vec![0],
+            odd_byte: None,
+        };
+        let file = GeneratedCsv::from_model(model.clone()).into_utf16_with(false, &faults);
+        assert_eq!(&file.bytes[..4], b"\xFE\xFF\xD8\x3D");
+        let mut doc = file.document();
+        assert_eq!(doc.value(0, 0).as_deref(), Some("\u{FFFD}b"));
+        assert_eq!(
+            doc.save_as_utf8(),
+            Err(SaveError::Unconvertible(vec![(0, 0)]))
+        );
+        doc.apply(&set(0, 0, "fixed")).unwrap();
+        assert_eq!(
+            doc.save_as_utf8().unwrap().bytes,
+            "\u{FEFF}fixed;\"😀;\n\"\r\n".as_bytes()
+        );
+        // A final odd byte: a row of its own after the CRLF.
+        let faults = Utf16Faults {
+            lone_surrogates: Vec::new(),
+            odd_byte: Some(b'A'),
+        };
+        let file = GeneratedCsv::from_model(model).into_utf16_with(true, &faults);
+        let doc = file.document();
+        assert_eq!(doc.row_count(), 2);
+        assert_eq!(
+            doc.save_as_utf8(),
+            Err(SaveError::Unconvertible(vec![(1, 0)]))
+        );
+    }
+
+    /// The fixes apply to the UTF-8 written: a first field starting with
+    /// U+FEFF is quoted in a file that had no BOM.
+    #[test]
+    fn save_as_utf8_quotes_a_bom_like_first_field() {
+        let bytes = b"a,b\n";
+        let layout = simple_layout(bytes, &[]);
+        let mut doc = Document::new(bytes, &layout, Delimiter::Comma, Encoding::Windows1252);
+        doc.apply(&set(0, 0, "\u{FEFF}x")).unwrap();
+        let saved = doc.save_as_utf8().unwrap();
+        assert_eq!(saved.bytes, "\"\u{FEFF}x\",b\n".as_bytes());
+        assert_eq!(saved.fixes, [Fix::BomLikeQuoted]);
     }
 
     /// ADR-0004 decision 6.

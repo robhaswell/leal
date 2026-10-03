@@ -205,7 +205,8 @@ pub fn utf16_nul_and_invalid_offsets(
 /// [`DiagnosticKind::ALL`] order.
 ///
 /// - UTF-8: NUL is a 0x00 byte; invalid encoding is invalid UTF-8.
-/// - Windows-1252: NUL is a 0x00 byte; every byte is valid.
+/// - A single-byte encoding: NUL is a 0x00 byte; invalid encoding is a
+///   byte it leaves unassigned (none in Windows-1252 or ISO-8859-1).
 /// - UTF-16: NUL is a U+0000 code unit; invalid encoding is an unpaired
 ///   surrogate (ADR-0003 decision 7) or a final odd byte.
 #[must_use]
@@ -263,9 +264,18 @@ pub fn derive(layout: &Layout, bytes: &[u8], encoding: Encoding) -> Vec<Diagnost
             positions_of(0, bytes).collect(),
             invalid_utf8_offsets(bytes),
         ),
-        Encoding::Windows1252 => (positions_of(0, bytes).collect(), Vec::new()),
         Encoding::Utf16Le | Encoding::Utf16Be => {
             utf16_nul_and_invalid_offsets(bytes, layout.bom_len, encoding == Encoding::Utf16Le)
+        }
+        single_byte => {
+            let unassigned = crate::dialect::unassigned_bytes(single_byte);
+            let invalid = bytes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &b)| unassigned[usize::from(b)])
+                .map(|(at, _)| at)
+                .collect();
+            (positions_of(0, bytes).collect(), invalid)
         }
     };
     push(

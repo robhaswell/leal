@@ -46,12 +46,10 @@ fn utf8() -> RowParser {
 }
 
 fn from_tk(encoding: TkEncoding) -> Encoding {
-    match encoding {
-        TkEncoding::Utf8 => Encoding::Utf8,
-        TkEncoding::Utf16Le => Encoding::Utf16Le,
-        TkEncoding::Utf16Be => Encoding::Utf16Be,
-        TkEncoding::Windows1252 => Encoding::Windows1252,
-    }
+    Encoding::ALL
+        .into_iter()
+        .find(|e| e.iana_name() == encoding.name())
+        .unwrap()
 }
 
 fn to_tk(le: LineEnding) -> TkLineEnding {

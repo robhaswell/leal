@@ -27,7 +27,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::{Index, select};
 
-use crate::dialect::{Delimiter, Encoding, LineEnding};
+use crate::dialect::{Delimiter, Encoding, LineEnding, decode_value};
 use crate::save::{Edit, SaveError, SavedFile};
 use crate::strategies::csv::{
     CsvConfig, CsvModel, GeneratedCsv, LineEndings, ModelDialect, ModelField, ModelRow,
@@ -120,7 +120,32 @@ impl fmt::Debug for EditCase {
 #[derive(Clone, Copy, Debug)]
 enum RawValue {
     Literal(&'static str),
+    /// `x` and the character one of the bytes 0x80–0xFF stands for in the
+    /// file's encoding (in Windows-1252 for UTF-8 and UTF-16), so that each
+    /// single-byte encoding is edited with its own characters (task 2.3).
+    /// U+FFFD for a byte the encoding leaves unassigned, which no
+    /// single-byte encoding can write.
+    Native(Index),
     Original,
+}
+
+impl RawValue {
+    /// The value, unless it is the cell's original one.
+    fn literal(self, encoding: Encoding) -> Option<String> {
+        match self {
+            RawValue::Literal(s) => Some(s.to_owned()),
+            RawValue::Native(pick) => {
+                let byte = u8::try_from(0x80 + pick.index(0x80)).unwrap_or(0xFF);
+                let encoding = if encoding.is_single_byte() {
+                    encoding
+                } else {
+                    Encoding::Windows1252
+                };
+                Some(format!("x{}", decode_value(&[byte], encoding)))
+            }
+            RawValue::Original => None,
+        }
+    }
 }
 
 /// An edit before its coordinates are resolved against the document.
@@ -176,6 +201,7 @@ const WINDOWS_1252_UTF16_BOM_LIKE: [&str; 2] = [EDIT_VALUES[1], EDIT_VALUES[2]];
 fn raw_value() -> impl Strategy<Value = RawValue> {
     prop_oneof![
         6 => select(&EDIT_VALUES[..]).prop_map(RawValue::Literal),
+        1 => any::<Index>().prop_map(RawValue::Native),
         1 => Just(RawValue::Original),
     ]
 }
@@ -228,6 +254,21 @@ pub fn edit_case(config: CsvConfig) -> impl Strategy<Value = EditCase> {
         (false, false) => csv_file(config).boxed(),
     };
     edits_for(files, 6)
+}
+
+/// Edit cases over files from [`csv_file`]`(config)` opened in one of the
+/// single-byte encodings (all of them, ADR-0005 decision 5;
+/// [`GeneratedCsv::in_single_byte`]), up to 6 edits each. Half the files
+/// already have the encoding hint (`com.apple.TextEncoding`), the way an
+/// encoding detection never picks reaches a document; the others had it
+/// chosen. A BOM in the generated file is dropped first, since only its
+/// own encoding reads it. Every encoding is picked equally often, so most
+/// of the files are in one that only the hint or the user can give.
+pub fn single_byte_edit_case(config: CsvConfig) -> impl Strategy<Value = EditCase> {
+    let files = (csv_file(config), select(&Encoding::SINGLE_BYTE[..]))
+        .prop_map(|(file, encoding)| file.without_bom().in_single_byte(encoding));
+    (files, vec(raw_edit(), 0..=6), prop::bool::weighted(0.5))
+        .prop_map(|(file, raw, hinted)| resolve(file, &raw, hinted))
 }
 
 /// Up to three LF rows of one to three Latin-1 words, then a `café` row, all
@@ -312,8 +353,8 @@ pub fn edits_for(
 /// Resolves raw edits against the document as it evolves, and saves.
 /// `hinted` gives the file an existing encoding hint, where one can exist.
 fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
-    let existing_hint = (hinted && matches!(file.encoding, Encoding::Utf8 | Encoding::Windows1252))
-        .then_some(file.encoding);
+    let existing_hint = (hinted && file.encoding.is_ascii_compatible()).then_some(file.encoding);
+    let encoding = file.encoding;
     let mut doc = file.document().with_existing_hint(existing_hint);
     let mut edits = Vec::new();
     let mut refused = Vec::new();
@@ -340,10 +381,9 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                     None => column.index(len),
                 };
                 let original = doc.original_value(row, column);
-                let value = match value {
-                    RawValue::Literal(s) => s.to_owned(),
-                    RawValue::Original => original.clone().unwrap_or_default(),
-                };
+                let value = value
+                    .literal(encoding)
+                    .unwrap_or_else(|| original.clone().unwrap_or_default());
                 step.push(Edit::SetCell { row, column, value });
                 if let (true, Some(original)) = (revert, original) {
                     step.push(Edit::SetCell {
@@ -358,14 +398,28 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                     continue;
                 }
                 let value = match value {
-                    FirstValue::BomLike(i) if file.encoding == Encoding::Windows1252 => {
+                    FirstValue::BomLike(i) if encoding == Encoding::Windows1252 => {
                         i.get(&WINDOWS_1252_UTF16_BOM_LIKE[..]).to_string()
                     }
-                    FirstValue::BomLike(_) => EDIT_VALUES[0].to_owned(),
-                    FirstValue::Other(RawValue::Literal(s)) => s.to_owned(),
-                    FirstValue::Other(RawValue::Original) => {
-                        doc.original_value(0, 0).unwrap_or_default()
+                    FirstValue::BomLike(i) if encoding.is_single_byte() => {
+                        // The encoding's own characters for the BOMs'
+                        // bytes, where it has them all; otherwise "\u{FEFF}x",
+                        // which it can't write.
+                        let own: Vec<String> = [&b"\xFF\xFE"[..], b"\xFE\xFF", b"\xEF\xBB\xBF"]
+                            .into_iter()
+                            .filter(|bom| crate::dialect::decodes(bom, encoding))
+                            .map(|bom| decode_value(bom, encoding))
+                            .collect();
+                        if own.is_empty() {
+                            EDIT_VALUES[0].to_owned()
+                        } else {
+                            i.get(&own).clone()
+                        }
                     }
+                    FirstValue::BomLike(_) => EDIT_VALUES[0].to_owned(),
+                    FirstValue::Other(value) => value
+                        .literal(encoding)
+                        .unwrap_or_else(|| doc.original_value(0, 0).unwrap_or_default()),
                 };
                 step.push(Edit::SetCell {
                     row: 0,
@@ -377,9 +431,10 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                 let at = at.index(doc.row_count() + 1);
                 let n = doc.typical_row_len();
                 let values = (0..n)
-                    .map(|i| match values[i % values.len()] {
-                        RawValue::Literal(s) => s.to_owned(),
-                        RawValue::Original => String::new(),
+                    .map(|i| {
+                        values[i % values.len()]
+                            .literal(encoding)
+                            .unwrap_or_default()
                     })
                     .collect();
                 step.push(Edit::InsertRow { at, values });
@@ -393,10 +448,7 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
             }
             RawEdit::InsertColumn { at, value } => {
                 let at = at.index(doc.max_row_len() + 1);
-                let value = match value {
-                    RawValue::Literal(s) => s.to_owned(),
-                    RawValue::Original => String::new(),
-                };
+                let value = value.literal(encoding).unwrap_or_default();
                 step.push(Edit::InsertColumn { at, value });
             }
             RawEdit::DeleteColumn { column } => {
