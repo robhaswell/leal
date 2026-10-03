@@ -266,6 +266,17 @@ fn the_header_row_is_logical_row_zero() {
     assert_eq!(texts(&document).last().unwrap(), &["end"]);
 }
 
+/// A matching header row is left out of the summary's row count as well
+/// as its match count.
+#[test]
+fn a_matching_header_row_isnt_counted_in_the_summary() {
+    let dir = Dir::new("rows-header-summary");
+    let document = open_with(&dir, "a.csv", b"name,marlow\nmarlow,x\ny,z\n", true);
+    let search = search(&document, "marlow");
+    let summary = *search.job().wait().unwrap();
+    assert_eq!((summary.rows, summary.matches), (1, 1));
+}
+
 /// Every row can be deleted (§7): no rows, no columns, and nothing found.
 #[test]
 fn every_row_can_be_deleted() {
@@ -341,6 +352,44 @@ fn marks_follow_inserted_and_deleted_rows() {
         walk_forward(&document, DiagnosticKind::NulBytes),
         [Place { row: 2, column: 0 }]
     );
+}
+
+/// **Next** and **Previous** over many deleted and inserted rows search
+/// the file's marks a constant number of times, not once per piece of the
+/// row list (each search can run to the next mark anywhere in the file).
+/// Counted by a hook, so it can't flake like a timing.
+#[test]
+fn marks_search_does_not_scale_with_the_pieces() {
+    use crate::diagnostics::MARK_SEARCHES;
+    let dir = Dir::new("rows-marks-cost");
+    let mut bytes = b"a,b\nlone\n".to_vec();
+    for _ in 0..400 {
+        bytes.extend_from_slice(b"1,2\n");
+    }
+    bytes.extend_from_slice(b"end\n");
+    let document = open_with(&dir, "a.csv", &bytes, false);
+    // Every other plain row deleted, and a plain row inserted after each
+    // pair: some 200 deleted and 100 inserted pieces.
+    for row in (3..400).rev().step_by(2) {
+        delete(&document, row, 1);
+    }
+    for row in (2..200).rev().step_by(2) {
+        insert(&document, row, &[&["1", "2"]]);
+    }
+    let last = document.row_count() - 1;
+    assert!(document.row_flags(1..2)[0].ragged);
+    assert!(document.row_flags(last..last + 1)[0].ragged);
+    let searches = |f: &dyn Fn() -> Option<usize>| {
+        MARK_SEARCHES.with(|n| n.set(0));
+        let row = f();
+        (row, MARK_SEARCHES.with(std::cell::Cell::get))
+    };
+    let (row, count) = searches(&|| document.next_row_with_diagnostic(2));
+    assert_eq!(row, Some(last));
+    assert!(count <= 3, "{count} searches of the marks for Next");
+    let (row, count) = searches(&|| document.previous_row_with_diagnostic(last));
+    assert_eq!(row, Some(1));
+    assert!(count <= 3, "{count} searches of the marks for Previous");
 }
 
 /// ADR-0004 decision 8 (§7): nothing may follow an open unterminated

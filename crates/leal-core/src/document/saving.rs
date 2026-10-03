@@ -1173,8 +1173,6 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
     })
 }
 
-/// Every edited value written must be encodable in the encoding written
-/// (F5): checked before anything is written, naming each cell that isn't.
 /// Until task 2.4c, a save with rows inserted or deleted is refused before
 /// anything is written: the writer doesn't walk the piece list yet.
 fn check_rows(overlay: &Overlay) -> Result<(), SaveError> {
@@ -1185,6 +1183,8 @@ fn check_rows(overlay: &Overlay) -> Result<(), SaveError> {
     }
 }
 
+/// Every edited value written must be encodable in the encoding written
+/// (F5): checked before anything is written, naming each cell that isn't.
 fn check_encodable(overlay: &Overlay, extent: &Extent<'_>) -> Result<(), SaveError> {
     let encoding = extent.target;
     let cells: Vec<(usize, usize)> = overlay

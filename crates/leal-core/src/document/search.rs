@@ -512,10 +512,11 @@ impl Found {
             .iter()
             .filter_map(|&row| Some((self.map.logical_of(row).ok()?, Slot::Original(row))))
             .collect();
+        let first = self.inserted.partition_point(|m| m.logical < rows.start);
+        let last = self.inserted.partition_point(|m| m.logical < rows.end);
         wanted.extend(
-            self.inserted
+            self.inserted[first..last.max(first)]
                 .iter()
-                .filter(|m| rows.contains(&m.logical))
                 .map(|m| (m.logical, Slot::Inserted(m.n))),
         );
         wanted.sort_unstable_by_key(|&(logical, _)| logical);
@@ -1032,9 +1033,12 @@ impl SearchState {
         let mut found = self.lock();
         found.complete = true;
         found.searched = found.searched.max(available);
+        // The header row is searched like any row, but left out of the
+        // answers, so it isn't counted.
+        let header_row = usize::from(found.header_cells() > 0);
         Poll::Ready(Ok(SearchSummary {
             matches: found.total(),
-            rows: found.rows.len() + found.inserted.len(),
+            rows: (found.rows.len() + found.inserted.len()).saturating_sub(header_row),
         }))
     }
 

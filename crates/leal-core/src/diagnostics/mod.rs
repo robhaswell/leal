@@ -108,6 +108,14 @@ pub(crate) use find::{
 pub(crate) use marks::Mark;
 use marks::RowMarks;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread searched the row marks for the next or
+    /// previous marked row: a test hook for the cost of **Next** and
+    /// **Previous** over inserted and deleted rows (task 2.4a).
+    pub(crate) static MARK_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The most locations a diagnostic keeps (DESIGN §3.5). The count covers
 /// every occurrence.
 pub const MAX_LOCATIONS: usize = 1000;
@@ -391,6 +399,8 @@ impl Diagnostics {
     /// It reads one byte per row, 64 at a time.
     #[must_use]
     pub fn next_row_with_diagnostic(&self, from: usize) -> Option<usize> {
+        #[cfg(test)]
+        MARK_SEARCHES.with(|n| n.set(n.get() + 1));
         self.read().marks.next(from)
     }
 
@@ -399,6 +409,8 @@ impl Diagnostics {
     /// **Previous**.
     #[must_use]
     pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
+        #[cfg(test)]
+        MARK_SEARCHES.with(|n| n.set(n.get() + 1));
         self.read().marks.previous(to)
     }
 

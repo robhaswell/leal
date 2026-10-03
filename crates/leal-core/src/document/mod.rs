@@ -162,10 +162,6 @@ struct RowBytes<'a, 'r> {
 /// lock.
 const SEARCH_BATCH: usize = 256;
 
-/// How many logical rows a walk over the piece list takes at a time
-/// (**Next** and **Previous** with rows inserted or deleted).
-const WALK_ROWS: usize = 1 << 20;
-
 /// The row of the occurrence of `kind` that **Next** from `start`
 /// (`Forward`) or **Previous** before it would find, if the report's
 /// locations decide it. They list every occurrence in file order up to the
@@ -1029,33 +1025,41 @@ impl Document {
         let Some(len) = map.len() else {
             return Self::next_marked(&reading, diagnostics, &overlay, from..usize::MAX);
         };
+        if from >= len {
+            return None;
+        }
+        // One search through the file's own rows from where `from` is among
+        // them, passing over deleted ones, then any inserted row between
+        // `from` and what it found.
         let mode = diagnostics.marked_rows_and_mode().1;
-        let mut at = from;
-        while at < len {
-            let end = len.min(at.saturating_add(WALK_ROWS));
-            let mut logical = at;
-            for segment in map.segments(at..end) {
-                match &segment {
-                    Segment::Original(range) => {
-                        let rows = to_usize(range.start)..to_usize(range.end);
-                        if let Some(row) = Self::next_marked(&reading, diagnostics, &overlay, rows)
-                        {
-                            return Some(logical + row - to_usize(range.start));
-                        }
-                    }
-                    Segment::Inserted(range) => {
-                        for (k, n) in range.clone().enumerate() {
-                            if inserted_flags(&reading, &overlay, n, mode).marked {
-                                return Some(logical + k);
-                            }
-                        }
+        let rows = map.physical_rows().unwrap_or(0);
+        let mut physical = map.physical_at_or_after(from);
+        let found = loop {
+            let Some(row) =
+                Self::next_marked(&reading, diagnostics, &overlay, physical..usize::MAX)
+            else {
+                break None;
+            };
+            let row = u32::try_from(row).unwrap_or(u32::MAX);
+            match map.logical_of(row) {
+                Ok(logical) => break Some(logical),
+                Err(_) if row < rows => physical = to_usize(map.next_live(row + 1)),
+                Err(_) => break None,
+            }
+        };
+        let end = found.unwrap_or(len);
+        let mut logical = from;
+        for segment in map.segments(from..end) {
+            if let Segment::Inserted(range) = &segment {
+                for (k, n) in range.clone().enumerate() {
+                    if inserted_flags(&reading, &overlay, n, mode).marked {
+                        return Some(logical + k);
                     }
                 }
-                logical += segment.len();
             }
-            at = end;
+            logical += segment.len();
         }
-        None
+        found
     }
 
     /// The last row before `to` with a warning or an error, for
@@ -1073,39 +1077,42 @@ impl Document {
         let Some(len) = map.len() else {
             return Self::previous_marked(&reading, diagnostics, &overlay, 0..to);
         };
+        // As for Next: one search backward through the file's own rows.
+        let to = to.min(len);
         let mode = diagnostics.marked_rows_and_mode().1;
-        let mut at = to.min(len);
-        while at > 0 {
-            let start = at.saturating_sub(WALK_ROWS);
-            let mut logical = start;
-            let mut segments = Vec::new();
-            for segment in map.segments(start..at) {
-                let len = segment.len();
-                segments.push((logical, segment));
-                logical += len;
+        let mut physical = map.physical_at_or_after(to);
+        let found = loop {
+            let Some(row) = Self::previous_marked(&reading, diagnostics, &overlay, 0..physical)
+            else {
+                break None;
+            };
+            let row = u32::try_from(row).unwrap_or(u32::MAX);
+            match map.logical_of(row) {
+                Ok(logical) => break Some(logical),
+                Err(_) => match map.live_end_before(row) {
+                    0 => break None,
+                    end => physical = to_usize(end),
+                },
             }
-            for (logical, segment) in segments.into_iter().rev() {
-                match &segment {
-                    Segment::Original(range) => {
-                        let rows = to_usize(range.start)..to_usize(range.end);
-                        if let Some(row) =
-                            Self::previous_marked(&reading, diagnostics, &overlay, rows)
-                        {
-                            return Some(logical + row - to_usize(range.start));
-                        }
-                    }
-                    Segment::Inserted(range) => {
-                        for (k, n) in range.clone().enumerate().rev() {
-                            if inserted_flags(&reading, &overlay, n, mode).marked {
-                                return Some(logical + k);
-                            }
-                        }
+        };
+        let begin = found.map_or(0, |logical| logical + 1);
+        let mut logical = begin;
+        let mut segments = Vec::new();
+        for segment in map.segments(begin..to) {
+            let len = segment.len();
+            segments.push((logical, segment));
+            logical += len;
+        }
+        for (logical, segment) in segments.into_iter().rev() {
+            if let Segment::Inserted(range) = &segment {
+                for (k, n) in range.clone().enumerate().rev() {
+                    if inserted_flags(&reading, &overlay, n, mode).marked {
+                        return Some(logical + k);
                     }
                 }
             }
-            at = start;
         }
-        None
+        found
     }
 
     /// The first marked physical row among `rows`, edited rows as they
@@ -1298,6 +1305,9 @@ impl Document {
         // inserted row between `start` and what they found.
         let mode = diagnostics.marked_rows_and_mode().1;
         let inserted = |n: u32| inserted_place(&reading, &overlay, n, kind, mode);
+        // An inserted row has only these kinds: for the others, nothing
+        // needs walking.
+        let in_inserted = matches!(kind, DiagnosticKind::RaggedRows | DiagnosticKind::NulBytes);
         let rows = map.physical_rows().unwrap_or(0);
         if direction == Direction::Forward {
             let mut physical = map.physical_at_or_after(start);
@@ -1312,7 +1322,11 @@ impl Document {
                     Err(_) => break None,
                 }
             };
-            let end = found.map_or(len, |(logical, _)| logical);
+            let end = if in_inserted {
+                found.map_or(len, |(logical, _)| logical)
+            } else {
+                start
+            };
             let mut logical = start;
             for segment in map.segments(start..end) {
                 if let Segment::Inserted(range) = &segment {
@@ -1342,7 +1356,11 @@ impl Document {
                     },
                 }
             };
-            let begin = found.map_or(0, |(logical, _)| logical + 1);
+            let begin = if in_inserted {
+                found.map_or(0, |(logical, _)| logical + 1)
+            } else {
+                to
+            };
             let mut logical = begin;
             let mut segments = Vec::new();
             for segment in map.segments(begin..to) {

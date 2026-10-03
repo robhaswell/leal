@@ -372,10 +372,16 @@ impl EditState {
     }
 
     fn log(&mut self, first: RowId, count: u32) {
-        let total = self.ends.last().copied().unwrap_or(0) + to_usize(count);
-        self.log.push((first, count));
-        self.ends.push(total);
+        log_run(&mut self.log, &mut self.ends, first, count);
     }
+}
+
+/// [`EditState::log`], over the log's own fields, for when others are
+/// borrowed too.
+fn log_run(log: &mut Vec<(RowId, u32)>, ends: &mut Vec<usize>, first: RowId, count: u32) {
+    let total = ends.last().copied().unwrap_or(0) + to_usize(count);
+    log.push((first, count));
+    ends.push(total);
 }
 
 /// `cells` edited cells, once a row's edits `before` are `after`.
@@ -561,18 +567,19 @@ impl EditStore {
     /// their values.
     pub(crate) fn set_rows(&self, rows: Vec<(RowId, Option<RowEdits>)>) {
         let mut state = self.write();
-        let mut cells = state.cells;
-        let overlay = Arc::make_mut(&mut state.overlay);
-        let mut ids = Vec::with_capacity(rows.len());
+        let EditState {
+            overlay,
+            log,
+            ends,
+            cells,
+            ..
+        } = &mut *state;
+        let overlay = Arc::make_mut(overlay);
         for (id, edits) in rows {
             let edits = edits.map(Arc::new);
-            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
+            *cells = counted(*cells, overlay.rows.get(&id), edits.as_ref());
             overlay.set(id, edits);
-            ids.push(id);
-        }
-        state.cells = cells;
-        for id in ids {
-            state.log(id, 1);
+            log_run(log, ends, id, 1);
         }
     }
 
