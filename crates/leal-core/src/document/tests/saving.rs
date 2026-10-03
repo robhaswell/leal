@@ -2139,9 +2139,12 @@ fn padding_goes_with_its_hatched_cell_until_a_save() {
     let document = open_at(&path, &dir, &scheduler);
     set(&document, 1, 2, "x");
     save(&document, &path, SaveKind::Save).unwrap();
+    // Column operations wait for the saved file's marks (its index pass).
+    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,,x\n");
     document.delete_column(2).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
+    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,\n");
 }
 
@@ -2156,22 +2159,27 @@ fn column_commands_are_undone_by_value_after_a_save() {
     let document = open_at(&path, &dir, &scheduler);
     let deleted = document.delete_column(0).unwrap().unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
+    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"b\nd\n\"\"\n");
     document.apply(&deleted.inverse()).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
+    wait_for_index(&document);
     // The row left `""` is a field now, so it comes back one longer.
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 
     let inserted = document.insert_column(1, "x").unwrap().unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
+    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,x,b\nc,x,d\ne,x,\"\"\n");
     set(&document, 0, 1, "y");
-    assert!(matches!(
-        document.apply(&inserted.inverse()),
-        Err(EditError::ValueChanged { .. })
-    ));
+    let refused = document.apply(&inserted.inverse());
+    assert!(
+        matches!(refused, Err(EditError::ValueChanged { .. })),
+        "{refused:?}"
+    );
     set(&document, 0, 1, "x");
     document.apply(&inserted.inverse()).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
+    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 }
