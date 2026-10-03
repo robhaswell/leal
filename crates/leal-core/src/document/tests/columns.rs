@@ -364,3 +364,45 @@ fn quoting_census_judges_each_column_now() {
     document.delete_rows(0, 2).unwrap();
     assert!(census(&document).quoted(2));
 }
+
+/// The marks of unedited rows follow the columns: a deleted column takes a
+/// flagged field's warning with it (the row is read to find out), and an
+/// inserted value with a NUL marks every row it went into.
+#[test]
+fn marks_follow_inserted_and_deleted_columns() {
+    let dir = Dir::new("columns-marks");
+    let document = open_with(&dir, "a.csv", b"a,b\nc,d\0\ne,f\n", false);
+    let marked = |document: &Document| -> Vec<bool> {
+        document.row_flags(0..3).iter().map(|f| f.marked).collect()
+    };
+    assert_eq!(marked(&document), [false, true, false]);
+    let deleted = delete(&document, 1);
+    assert_eq!(marked(&document), [false, false, false]);
+    assert!(!document.row_has_diagnostic(1));
+    assert_eq!(document.next_row_with_diagnostic(0), None);
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::NulBytes, 0)
+            .unwrap(),
+        None
+    );
+    let inserted = insert(&document, 1, "n\0");
+    assert_eq!(marked(&document), [true, true, true]);
+    assert_eq!(document.next_row_with_diagnostic(1), Some(1));
+    assert_eq!(document.previous_row_with_diagnostic(3), Some(2));
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::NulBytes, 2)
+            .unwrap(),
+        Some(Place { row: 2, column: 1 })
+    );
+    document.apply(&inserted.inverse()).unwrap();
+    document.apply(&deleted.inverse()).unwrap();
+    assert_eq!(marked(&document), [false, true, false]);
+    assert_eq!(
+        document
+            .next_with_kind(DiagnosticKind::NulBytes, 0)
+            .unwrap(),
+        Some(Place { row: 1, column: 1 })
+    );
+}

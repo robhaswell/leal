@@ -495,6 +495,33 @@ fn corpus_case(name: &str) -> (Vec<u8>, Layout, Delimiter, Encoding) {
     (case.bytes, layout, d, enc)
 }
 
+/// Rule 12 (task 2.4b): padding is only before an edited hatched cell, so
+/// deleting the column of a row's last one takes the padding too, and the
+/// row's own bytes come back; padding before a cell that stays, stays.
+#[test]
+fn deleting_a_hatched_cells_column_takes_its_padding() {
+    let bytes = b"a,b,c,d\ne\n";
+    let d = Delimiter::Comma;
+    let layout = oracle::analyze(bytes, d, Encoding::Utf8).layout;
+    let mut doc = Document::new(bytes, &layout, d, Encoding::Utf8);
+    let set = |column: usize, value: &str| Edit::SetCell {
+        row: 1,
+        column,
+        value: value.into(),
+    };
+    doc.apply(&set(3, "x")).unwrap();
+    assert_eq!(doc.row_len(1), 4);
+    doc.apply(&Edit::DeleteColumn { column: 3 }).unwrap();
+    assert_eq!(doc.row_len(1), 1, "the padding went with it");
+    assert_eq!(doc.save().unwrap().bytes, b"a,b,c\ne\n");
+    // With a later hatched cell, the padding before the deleted one stays.
+    doc.apply(&set(1, "y")).unwrap();
+    doc.apply(&set(3, "z")).unwrap();
+    doc.apply(&Edit::DeleteColumn { column: 1 }).unwrap();
+    assert_eq!(doc.cell_source(1, 1), Some(CellSource::Padding));
+    assert_eq!(doc.save().unwrap().bytes, b"a,c\ne,,z\n");
+}
+
 /// ADR-0004 decision 2 and ADR-0005 decision 3: a new field is quoted if
 /// its column has a non-empty field and every non-empty one is quoted.
 /// Empty fields, blank lines, new cells and edited fields' new values don't
