@@ -244,7 +244,7 @@ impl Document {
             value: Some(value),
             expected: None,
         };
-        let (lineage, mut changes) = self.change(None, &[target])?;
+        let (lineage, mut changes) = self.change(None, &[target], false)?;
         Ok(changes.pop().map(|change| Command {
             lineage,
             edit: Edit::SetCell(change),
@@ -272,7 +272,7 @@ impl Document {
                 expected: None,
             })
             .collect();
-        let (lineage, changes) = self.change(None, &targets)?;
+        let (lineage, changes) = self.change(None, &targets, false)?;
         let changed = !changes.is_empty();
         Ok(changed.then_some(Command {
             lineage,
@@ -308,7 +308,7 @@ impl Document {
                 .apply_rows(Some(command.lineage), &command.edit)
                 .map(|_| ());
         }
-        self.change(Some(command.lineage), &targets(command))
+        self.change(Some(command.lineage), &targets(command), false)
             .map(|_| ())
     }
 
@@ -338,12 +338,13 @@ impl Document {
             } else if command.is_structural() {
                 self.apply_rows(None, &command.edit)
             } else {
-                self.change(None, &targets(command)).map(|(lineage, _)| {
-                    Some(Command {
-                        lineage,
-                        edit: command.edit.clone(),
+                self.change(None, &targets(command), true)
+                    .map(|(lineage, changes)| {
+                        Some(Command {
+                            lineage,
+                            edit: replayed(&command.edit, &changes),
+                        })
                     })
-                })
             };
             match applied {
                 Ok(Some(command)) => replay.commands.push(command),
@@ -487,16 +488,18 @@ impl Document {
     /// Applies `targets` in order, all or none, and returns the changes
     /// made (cells that already held their value are left out) with the
     /// lineage they were made in. With `lineage`, a command's, it must be
-    /// the edits' own.
+    /// the edits' own. `replaying` a journal, a missing cell a command
+    /// means may be an empty field now, as after a save (see [`holds`]).
     fn change(
         &self,
         lineage: Option<Lineage>,
         targets: &[Target<'_>],
+        replaying: bool,
     ) -> Result<(Lineage, Vec<CellChange>), EditError> {
         // One change at a time, and none while the file is read again.
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let reading = self.current();
-        Self::change_in(&reading, lineage, targets)
+        Self::change_in(&reading, lineage, targets, replaying)
     }
 
     /// [`change`](Self::change) in `reading`, with the writer lock held by
@@ -506,6 +509,7 @@ impl Document {
         reading: &Reading,
         lineage: Option<Lineage>,
         targets: &[Target<'_>],
+        replaying: bool,
     ) -> Result<(Lineage, Vec<CellChange>), EditError> {
         let store = &reading.edits;
         if lineage.is_some_and(|lineage| lineage != store.lineage()) {
@@ -514,8 +518,10 @@ impl Document {
         let overlay = store.overlay();
         let parser = &reading.parser;
         // After a save, a missing cell a command names may be a field now
-        // (see `holds`).
-        let rebased = store.is_rebased();
+        // (see `holds`), and so may it in a replay: a row delete undone by
+        // value puts a blank line's hatched edit back as an inserted row's
+        // own value (task 2.4a).
+        let rebased = store.is_rebased() || replaying;
         let mut rows: BTreeMap<usize, Work<'_>> = BTreeMap::new();
         let mut changes = Vec::new();
         for target in targets {
@@ -666,6 +672,36 @@ fn targets(command: &Command) -> Vec<Target<'_>> {
             expected: Some(change.old.as_deref()),
         })
         .collect()
+}
+
+/// A replayed cell edit as this document's command: `edit`, with each
+/// missing value it means that a cell holds as an empty field here
+/// (`changes`, as made; see [`holds`]) given as that field, so that undoing
+/// it here finds what it left.
+fn replayed(edit: &Edit, changes: &[CellChange]) -> Edit {
+    let made = |change: &CellChange| {
+        let mut made = changes
+            .iter()
+            .filter(|made| (made.row, made.column) == (change.row, change.column));
+        (made.next(), made.next_back())
+    };
+    let fix = |change: &CellChange| {
+        let mut change = change.clone();
+        let (first, last) = made(&change);
+        let last = last.or(first);
+        if change.old.is_none() && first.is_some_and(|made| made.old.as_deref() == Some("")) {
+            change.old = Some(String::new());
+        }
+        if change.new.is_none() && last.is_some_and(|made| made.new.as_deref() == Some("")) {
+            change.new = Some(String::new());
+        }
+        change
+    };
+    match edit {
+        Edit::SetCell(change) => Edit::SetCell(fix(change)),
+        Edit::SetCells(changes) => Edit::SetCells(changes.iter().map(fix).collect()),
+        edit => edit.clone(),
+    }
 }
 
 /// The column limit: a cell past the row's cells and past

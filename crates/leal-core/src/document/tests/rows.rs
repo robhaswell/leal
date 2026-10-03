@@ -548,3 +548,36 @@ fn a_row_command_from_other_edits_applies_by_value() {
         Err(EditError::OtherLineage)
     ));
 }
+
+/// A blank line's hatched edit, its row deleted and the delete undone, then
+/// set back to `""`: the command makes the cell missing. Replayed, the
+/// undo puts the row back by value, as an inserted row whose own value
+/// the cell is, so the cell is emptied instead, as after a save; undoing
+/// the replayed commands leaves no edits.
+#[test]
+fn a_replayed_hatched_cell_made_missing_in_a_row_put_back_is_emptied() {
+    let dir = Dir::new("rows-replay-hatched");
+    let bytes = b"a,b\n\nc,d\n";
+    let document = open_with(&dir, "a.csv", bytes, false);
+    let mut history = vec![set_cell(&document, 1, 1, "x")];
+    let deleted = delete(&document, 1, 1);
+    document.apply(&deleted.inverse()).unwrap();
+    history.extend([deleted.clone(), deleted.inverse()]);
+    let back = set_cell(&document, 1, 1, "");
+    assert_eq!(back.changes()[0].new, None, "missing again");
+    history.push(back);
+    assert_eq!(texts(&document)[1], [""]);
+    let fresh = open_with(&dir, "b.csv", bytes, false);
+    let replay = fresh.replay(&history);
+    assert!(replay.refused.is_empty(), "{:?}", replay.refused);
+    assert_eq!(replay.commands.len(), history.len());
+    assert_eq!(texts(&fresh)[1], ["", ""]);
+    for command in replay.commands.iter().rev() {
+        fresh.apply(&command.inverse()).unwrap();
+    }
+    assert!(!fresh.has_edits());
+    assert_eq!(
+        texts(&fresh),
+        texts(&open_with(&dir, "c.csv", bytes, false))
+    );
+}
