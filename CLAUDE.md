@@ -35,6 +35,26 @@ there are no pull requests and no long-lived branches.
   `docs/PLAN.md` once CI is green.
 - **Docs-only changes** (ADRs, plan updates, mockups) are committed straight
   to `main`.
+- **Token budget** (Rob, 2026-10-03). Usage limits are real, so the build is
+  run lean:
+  - **Review once, at the right depth.** One combined reviewer per task; two
+    only where file safety is at stake (saving, fidelity). Fix must-fix and
+    should-fix findings; collect nits for a periodic tidy-up task. Check
+    the fixes with one narrow re-review of the changed code, not a full
+    round.
+  - **Fresh agents for fix rounds.** Give a new agent a short brief (the
+    findings and the files involved) instead of resuming one whose context
+    is large.
+  - **Read narrowly.** Read files in targeted ranges; grep long logs and
+    bench output instead of reading them whole.
+  - **Smaller tasks.** Split a task bigger than about a day into parts
+    (e.g. 2.2 would have been four).
+  - **Model by job.** Sonnet for docs merges, CI and flaky-test fixes,
+    narrow re-reviews and tidy-ups; Opus for implementing and for the main
+    review of risky tasks.
+  - **Short task notes.** At most about 200 lines; review history goes in
+    commit messages, not the notes.
+  - **At most two agents at once.**
 - **Phase gates.** At the end of each phase, parallel reviewers cover
   fidelity/correctness, Rust quality, performance, test strength
   (`cargo-mutants`) and Swift/AppKit. Each finding is verified before it is
