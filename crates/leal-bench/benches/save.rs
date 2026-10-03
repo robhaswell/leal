@@ -17,8 +17,14 @@
 //!   file (about 1,000 pieces in the piece list), then Save over it, timed
 //!   as `one_edit`: the writer walks the piece list, one delete a row, and
 //!   the rebase builds the new index from the plan. Budget-only, as
-//!   `one_edit`. TODO(2.4b): `save/column_insert`, a save after a column
-//!   insert, once columns can be inserted.
+//!   `one_edit`.
+//! - `save/column_insert` (PLAN 2.4c): a column inserted near the start of
+//!   every row, then Save over it, timed as `one_edit`: every row is
+//!   written whole, after the per-column quoting census (a pass over the
+//!   file, as the new field is written), and the rebase builds the new
+//!   index from the plan. Recorded only: no budget, and not compared
+//!   between commits (the disk's noise, as `one_edit`). The column is
+//!   deleted and saved again, untimed, after each.
 //! - `save/rows_deleted_no_disk`: the same save's work without the disk,
 //!   compared between commits.
 //! - `save/utf8_from_utf16` (PLAN 2.3): Save As UTF-8 of the reference
@@ -55,6 +61,9 @@ mod common;
 
 /// The edited row: the middle of the file.
 const ROW: usize = 500_000;
+
+/// Where `save/column_insert` inserts its column.
+const COLUMN: usize = 2;
 
 /// Rows deleted for `save/rows_deleted`.
 const DELETED: usize = 1_000;
@@ -124,6 +133,38 @@ fn save(c: &mut Criterion) {
             document
                 .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
                 .expect("the write")
+        });
+    });
+
+    // A save after a column insert (task 2.4c): every row rewritten.
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(20));
+    group.bench_function("column_insert", |b| {
+        b.iter_custom(|iterations| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iterations {
+                document.index_job().wait().expect("indexing");
+                document
+                    .insert_column(COLUMN, "new")
+                    .expect("the insert")
+                    .expect("a change");
+                let started = Instant::now();
+                let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+                job.wait().expect("the save");
+                total += started.elapsed();
+                // Back to the reference file's columns, untimed.
+                document.index_job().wait().expect("indexing");
+                document
+                    .delete_column(COLUMN)
+                    .expect("the delete")
+                    .expect("a change");
+                let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+                job.wait().expect("the save");
+            }
+            total
         });
     });
 

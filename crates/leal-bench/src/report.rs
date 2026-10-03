@@ -236,12 +236,14 @@ pub fn group_of(id: &str) -> &str {
 /// simulated network share's open (task 2.0) reads the same way. A save
 /// (task 2.2) writes the whole reference file and flushes it to the disk
 /// (`F_FULLFSYNC`), so its time is the runner's disk's; so does Save As
-/// UTF-8 (task 2.3), and a save after rows deleted (task 2.4c).
-pub const BUDGET_ONLY: [&str; 7] = [
+/// UTF-8 (task 2.3), and a save after rows deleted or a column inserted
+/// (task 2.4c; the latter has no budget, so it is recorded only).
+pub const BUDGET_ONLY: [&str; 8] = [
     "open/first_paint_removable_under_load",
     "open/first_paint_share_under_load",
     "open/first_paint_slow_share_small",
     "open/first_paint_slow_share",
+    "save/column_insert",
     "save/one_edit",
     "save/rows_deleted",
     "save/utf8_from_utf16",

@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use leal_testkit::fidelity::{Change, assert_identical, assert_only_changed};
 
 use crate::attributes::{Fingerprint, Interpretation};
-use crate::edit::Command;
+use crate::edit::{Command, EditError};
 use crate::save::Placed;
 use crate::save::{Fix, SaveError, SaveKind, SaveRequest, Saved};
 use crate::source::tests::{attribute, write_attribute};
@@ -2090,4 +2090,88 @@ fn inserted_and_deleted_rows_keep_the_files_line_endings() {
         saved_after("rows-none", b"\xEF\xBB\xBFa\nb\n", delete(0, 2)),
         b"\xEF\xBB\xBF"
     );
+}
+
+/// Task 2.4c, columns saved: a row a column operation changed is written
+/// whole, the others aren't touched; a new field is quoted by its column
+/// as the document now has it (ADR-0014 decision 4).
+#[test]
+fn a_column_insert_writes_the_rows_it_reaches() {
+    let saved = saved_after("columns-insert", b"a,b\nc\n\nd,e,f\n", |document| {
+        document.insert_column(1, "x").unwrap();
+    });
+    // The blank line never gains a column (ADR-0004 decision 5).
+    assert_eq!(saved, b"a,x,b\nc,x\n\nd,x,e,f\n");
+    let saved = saved_after("columns-quoting", b"\"a\",\"b\"\n\"c\",d\n", |document| {
+        document.insert_column(0, "n").unwrap();
+        document
+            .insert_rows(0, &[vec!["p".into(), "q".into(), "r".into()]])
+            .unwrap();
+    });
+    // Column 1 is the file's first, which quotes every field.
+    assert_eq!(saved, b"p,\"q\",r\nn,\"a\",\"b\"\nn,\"c\",d\n");
+}
+
+/// ADR-0014 decision 6 (ADR-0004 decision 6): a row column deletes leave
+/// with no cells is written `""`, so it doesn't vanish; a blank line is
+/// never reached, and stays one.
+#[test]
+fn a_row_left_with_no_cells_is_written_quoted_empty() {
+    let saved = saved_after("columns-empty", b"a,b\nc\n\nd\n", |document| {
+        document.delete_column(0).unwrap();
+    });
+    assert_eq!(saved, b"b\n\"\"\n\n\"\"\n");
+}
+
+/// ADR-0014 decision 5 in saved bytes: deleting the column of a short
+/// row's last hatched edit gives the row its own bytes back; after a
+/// save, the padding is a real field and stays.
+#[test]
+fn padding_goes_with_its_hatched_cell_until_a_save() {
+    let saved = saved_after("columns-padding", b"a,b\nc\n", |document| {
+        set(document, 1, 2, "x");
+        document.delete_column(2).unwrap();
+    });
+    assert_eq!(saved, b"a,b\nc\n");
+    let dir = Dir::new("columns-padding-saved");
+    let path = dir.file("a.csv", b"a,b\nc\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 2, "x");
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,,x\n");
+    document.delete_column(2).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,\n");
+}
+
+/// ADR-0014 decision 3: a column command undone after a save works by
+/// value: a delete's cells are put back (`Restore`), an insert's are
+/// taken out if they still read as it left them.
+#[test]
+fn column_commands_are_undone_by_value_after_a_save() {
+    let dir = Dir::new("columns-undo");
+    let path = dir.file("a.csv", b"a,b\nc,d\ne\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    let deleted = document.delete_column(0).unwrap().unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"b\nd\n\"\"\n");
+    document.apply(&deleted.inverse()).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    // The row left `""` is a field now, so it comes back one longer.
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
+
+    let inserted = document.insert_column(1, "x").unwrap().unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,x,b\nc,x,d\ne,x,\"\"\n");
+    set(&document, 0, 1, "y");
+    assert!(matches!(
+        document.apply(&inserted.inverse()),
+        Err(EditError::ValueChanged { .. })
+    ));
+    set(&document, 0, 1, "x");
+    document.apply(&inserted.inverse()).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 }
