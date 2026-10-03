@@ -710,3 +710,80 @@ fn a_run_without_frame_work() {
     );
     assert!(!scrolling.measured.contains("p50 0.0"));
 }
+
+/// `ps -o time=` gives minutes and seconds, then hours and days as they
+/// grow (task 2.0b: WindowServer's CPU time).
+#[test]
+fn ps_times_are_read() {
+    use leal_bench::perf::parse_ps_time;
+    assert_eq!(parse_ps_time("0:28.55"), Some(28.55));
+    assert_eq!(parse_ps_time(" 2467:14.65\n"), Some(2467.0 * 60.0 + 14.65));
+    assert_eq!(parse_ps_time("1:02:03.04"), Some(3723.04));
+    assert_eq!(
+        parse_ps_time("2-01:02:03.04"),
+        Some(2.0 * 86_400.0 + 3723.04)
+    );
+    assert_eq!(parse_ps_time(""), None);
+    assert_eq!(parse_ps_time("x:01"), None);
+}
+
+/// The CPU time between two moments is interpolated from the samples
+/// around each, and unknown outside them.
+#[test]
+fn cpu_time_between_two_moments() {
+    use leal_bench::perf::cpu_between;
+    let samples = [
+        (10.0, 100.0),
+        (10.25, 100.05),
+        (10.5, 100.15),
+        (10.75, 100.15),
+    ];
+    // From 10.125 (100.025) to 10.625 (100.15).
+    assert!(close(cpu_between(&samples, 10.125, 10.625).unwrap(), 0.125));
+    assert!(close(cpu_between(&samples, 10.0, 10.75).unwrap(), 0.15));
+    assert_eq!(
+        cpu_between(&samples, 9.9, 10.5),
+        None,
+        "before the first sample"
+    );
+    assert_eq!(cpu_between(&samples, 10.0, 11.0), None, "after the last");
+    assert_eq!(cpu_between(&samples, 10.5, 10.25), None, "backwards");
+    assert_eq!(cpu_between(&[], 1.0, 2.0), None);
+}
+
+/// The figures task 2.0b added to the scroll benchmark's JSON, and runs
+/// with AppKit's drawing kept apart from the verdicts.
+#[test]
+fn strips_figures_are_read_and_appkit_runs_kept_apart() {
+    let mut raw = robs_run();
+    edit_scrolls(&mut raw, &["afterLoad"], |run| {
+        run["drawing"] = "strips".into();
+        run["scroll"]["otherThreadsCPUMean"] = 0.42.into();
+        run["windowServerCPUPerFrameMs"] = 0.8.into();
+        run["footprintPeakMB"] = 230.0.into();
+    });
+    let before = verdicts(&raw);
+    let mut appkit = raw["scrolls"]["afterLoad"].clone();
+    for run in appkit.as_array_mut().unwrap() {
+        run["drawing"] = "appkit".into();
+        run["scroll"]["late"] = 500.into();
+    }
+    raw["scrollsAppKit"] = serde_json::json!({ "afterLoad": appkit });
+    let run = PerfRun::parse(&raw);
+    let first = &run.scroll_runs("afterLoad")[0];
+    assert_eq!(first.drawing.as_deref(), Some("strips"));
+    assert_eq!(first.other_threads_ms, Some(0.42));
+    assert_eq!(first.window_server_ms, Some(0.8));
+    assert_eq!(first.footprint_peak_mb, Some(230.0));
+    assert_eq!(run.scrolls_appkit["afterLoad"].len(), 3);
+    assert_eq!(
+        run.scrolls_appkit["afterLoad"][0].drawing.as_deref(),
+        Some("appkit")
+    );
+    // AppKit's runs (with 500 late frames each) don't change a verdict.
+    assert_eq!(verdicts(&raw), before);
+    // Rob's run has none of these.
+    let robs = PerfRun::parse(&robs_run());
+    let old = &robs.scroll_runs("afterLoad")[0];
+    assert_eq!((old.drawing.as_ref(), old.window_server_ms), (None, None));
+}

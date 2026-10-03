@@ -427,6 +427,18 @@ pub struct ScrollRun {
     pub stalls: u64,
     /// The window was visible at the end.
     pub visible: bool,
+    /// How the grid drew (task 2.0b): `strips`, or `appkit` (a grid wider
+    /// than 4,096 pt, or `-LealStrips NO`), if the run reported it.
+    pub drawing: Option<String>,
+    /// The CPU time per frame of the process's other threads (Core
+    /// Animation rendering the strips, the reads and layout ahead,
+    /// background jobs), in ms, if the run reported it.
+    pub other_threads_ms: Option<f64>,
+    /// WindowServer's CPU time per frame while the scroll stages ran, in
+    /// ms (`leal-perf` reads it with `ps`), if measured.
+    pub window_server_ms: Option<f64>,
+    /// The footprint's peak while scrolling, in MB, if the run reported it.
+    pub footprint_peak_mb: Option<f64>,
 }
 
 impl ScrollRun {
@@ -461,6 +473,13 @@ impl ScrollRun {
                 .get("windowVisible")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            drawing: json
+                .get("drawing")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            other_threads_ms: optional(scroll, "otherThreadsCPUMean"),
+            window_server_ms: optional(json, "windowServerCPUPerFrameMs"),
+            footprint_peak_mb: optional(json, "footprintPeakMB"),
         })
     }
 
@@ -536,6 +555,43 @@ impl ScrollRun {
             thousands(frames)
         )
     }
+}
+
+/// A process's CPU time as `ps -o time=` prints it (`2467:14.65`,
+/// `1:02:03.04`, `2-01:02:03.04`: days, hours, minutes, seconds), in
+/// seconds.
+#[must_use]
+pub fn parse_ps_time(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (days, rest) = match text.split_once('-') {
+        Some((days, rest)) => (days.parse::<f64>().ok()?, rest),
+        None => (0.0, text),
+    };
+    let mut seconds = 0.0;
+    for part in rest.split(':') {
+        seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(days * 86_400.0 + seconds)
+}
+
+/// The CPU time a process spent between `start` and `end` (seconds since
+/// 1970), from `samples` of (when, its CPU time so far), in order:
+/// interpolated between the samples either side of each end. `None` if
+/// the samples don't cover the span.
+#[must_use]
+pub fn cpu_between(samples: &[(f64, f64)], start: f64, end: f64) -> Option<f64> {
+    let at = |time: f64| -> Option<f64> {
+        let after = samples.iter().position(|&(when, _)| when >= time)?;
+        if after == 0 {
+            // Only if the first sample is at `time` itself.
+            return (samples[0].0 <= time).then_some(samples[0].1);
+        }
+        let (t0, c0) = samples[after - 1];
+        let (t1, c1) = samples[after];
+        Some(c0 + (c1 - c0) * (time - t0) / (t1 - t0))
+    };
+    (end > start).then_some(())?;
+    Some(at(end)? - at(start)?)
 }
 
 /// `6150` as `6,150`.
@@ -663,6 +719,10 @@ pub struct PerfRun {
     pub reopens_ms: Vec<f64>,
     /// Each scenario's scroll runs, by name ([`SCENARIOS`]).
     pub scrolls: HashMap<String, Vec<ScrollRun>>,
+    /// With `--compare-drawing`, each scenario's runs with AppKit's drawing
+    /// (`-LealStrips NO`, task 2.0b), alternated with those in `scrolls`.
+    /// Only for comparison: the verdicts are `scrolls`'.
+    pub scrolls_appkit: HashMap<String, Vec<ScrollRun>>,
 }
 
 impl PerfRun {
@@ -684,18 +744,21 @@ impl PerfRun {
                 })
                 .unwrap_or_default()
         };
-        let mut scrolls = HashMap::new();
-        for name in SCENARIOS {
-            let runs: Vec<ScrollRun> = raw["scrolls"][name]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(ScrollRun::parse)
-                .collect();
-            if !runs.is_empty() {
-                scrolls.insert(name.to_owned(), runs);
+        let scenarios = |key: &str| {
+            let mut scrolls = HashMap::new();
+            for name in SCENARIOS {
+                let runs: Vec<ScrollRun> = raw[key][name]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(ScrollRun::parse)
+                    .collect();
+                if !runs.is_empty() {
+                    scrolls.insert(name.to_owned(), runs);
+                }
             }
-        }
+            scrolls
+        };
         PerfRun {
             model: machine_model(&raw["environment"]),
             launches: maps("launches"),
@@ -704,7 +767,8 @@ impl PerfRun {
                 .as_array()
                 .map(|v| v.iter().filter_map(Value::as_f64).collect())
                 .unwrap_or_default(),
-            scrolls,
+            scrolls: scenarios("scrolls"),
+            scrolls_appkit: scenarios("scrollsAppKit"),
         }
     }
 

@@ -4,7 +4,7 @@
 //! ```text
 //! leal-perf --app Leal.app --bench-app Leal.app --file reference.csv
 //!           [--big-file big.csv] [--runs N] [--speed fast|moderate]
-//!           [--no-scroll] [--out DIR]
+//!           [--no-scroll | --only-scroll] [--compare-drawing] [--out DIR]
 //! ```
 //!
 //! Every launch is the way the app ships: `open`, so LaunchServices starts
@@ -26,7 +26,12 @@
 //! - **Scrolling**: `--bench-app` (a `LEAL_BENCH` build) scrolling itself
 //!   (`ScrollBench`): after the load; from the first rows, with a search
 //!   running (background work pausing as rule 3 says); and on `--big-file`
-//!   from the first rows with nothing pausing (the stress case).
+//!   from the first rows with nothing pausing (the stress case). While each
+//!   runs, WindowServer's CPU time is read with `ps` every 250 ms, for the
+//!   render server's share of each frame (task 2.0b). `--only-scroll` runs
+//!   only these. `--compare-drawing` runs each twice, alternating, with the
+//!   grid drawn into strips (as it ships) and by AppKit (`-LealStrips NO`,
+//!   as before task 2.0b), and reports both; the verdicts are the strips'.
 //!
 //! The verdicts follow DESIGN §1's notes on what each budget means.
 //!
@@ -43,11 +48,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use leal_bench::perf::{
     HeapReport, PerfRun, Row, SCENARIOS, ScrollRun, Signpost, Spread, Timeline, collect,
-    launched_after_ms, table,
+    cpu_between, launched_after_ms, parse_ps_time, table,
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll] [--out DIR]";
+const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll | --only-scroll] [--compare-drawing] [--out DIR]";
 
 /// The app's sandbox container, where the scroll benchmark writes.
 const CONTAINER_TMP: &str = "Library/Containers/io.github.robhaswell.leal/Data/tmp";
@@ -72,6 +77,10 @@ struct Options {
     find: String,
     settle: Duration,
     scroll: bool,
+    /// Only the scroll runs: no launches, opens or reopens.
+    only_scroll: bool,
+    /// Each scroll run twice, with strips and with AppKit's drawing.
+    compare_drawing: bool,
     out: PathBuf,
 }
 
@@ -85,6 +94,8 @@ fn options() -> Result<Options, String> {
     let mut find = "SKU-".to_owned();
     let mut settle = Duration::from_secs(5);
     let mut scroll = true;
+    let mut only_scroll = false;
+    let mut compare_drawing = false;
     let mut out = PathBuf::from("target/perf");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -103,10 +114,17 @@ fn options() -> Result<Options, String> {
                 );
             }
             "--no-scroll" => scroll = false,
+            "--only-scroll" => only_scroll = true,
+            "--compare-drawing" => compare_drawing = true,
             "--out" => out = PathBuf::from(value()?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             _ => return Err(format!("unexpected argument `{arg}`\n{USAGE}")),
         }
+    }
+    if only_scroll && !scroll {
+        return Err(format!(
+            "--only-scroll and --no-scroll leave nothing to run\n{USAGE}"
+        ));
     }
     let absolute =
         |p: PathBuf| std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()));
@@ -120,6 +138,8 @@ fn options() -> Result<Options, String> {
         find,
         settle,
         scroll,
+        only_scroll,
+        compare_drawing,
         out,
     })
 }
@@ -146,31 +166,34 @@ fn run() -> Result<(), String> {
         "leal-perf: {}",
         environment["summary"].as_str().unwrap_or("")
     );
-    let log = LogStream::start()?;
-
-    // Launch and idle memory: no document.
     let mut launches = Vec::new();
-    for run in 1..=options.runs {
-        eprintln!("leal-perf: launch {run} of {}", options.runs);
-        launches.push(launch_run(&options, &log)?);
-    }
-    // Open, index and the heap: the reference file.
     let mut opens = Vec::new();
-    for run in 1..=options.runs {
-        eprintln!("leal-perf: open {run} of {}", options.runs);
-        opens.push(open_run(&options, &log)?);
-    }
-    // Opens in a running app: the bench build closes the file and opens it
-    // again, five times.
     let mut reopens = Vec::new();
-    for run in 1..=options.runs {
-        eprintln!("leal-perf: reopen {run} of {}", options.runs);
-        reopens.extend(reopen_run(&options, &log)?);
+    if !options.only_scroll {
+        let log = LogStream::start()?;
+        // Launch and idle memory: no document.
+        for run in 1..=options.runs {
+            eprintln!("leal-perf: launch {run} of {}", options.runs);
+            launches.push(launch_run(&options, &log)?);
+        }
+        // Open, index and the heap: the reference file.
+        for run in 1..=options.runs {
+            eprintln!("leal-perf: open {run} of {}", options.runs);
+            opens.push(open_run(&options, &log)?);
+        }
+        // Opens in a running app: the bench build closes the file and
+        // opens it again, five times.
+        for run in 1..=options.runs {
+            eprintln!("leal-perf: reopen {run} of {}", options.runs);
+            reopens.extend(reopen_run(&options, &log)?);
+        }
     }
-    drop(log);
 
-    // Scrolling, in the bench build.
+    // Scrolling, in the bench build: with strips, and with
+    // `--compare-drawing` with AppKit's drawing too, alternating which
+    // goes first.
     let mut scrolls: HashMap<&str, Vec<Value>> = HashMap::new();
+    let mut scrolls_appkit: HashMap<&str, Vec<Value>> = HashMap::new();
     if options.scroll {
         let mut scenarios: Vec<(&str, &Path, Vec<String>)> = vec![
             ("afterLoad", &options.file, vec![]),
@@ -201,25 +224,47 @@ fn run() -> Result<(), String> {
         }
         for (name, file, extra) in &scenarios {
             for run in 1..=options.runs {
-                eprintln!("leal-perf: scroll {name}, {run} of {}", options.runs);
-                // A run that fails (the display slept, the app hung) is
-                // reported and left out; the others still count.
-                let json = match scroll_run(&options, file, extra) {
-                    Ok(json) => json,
-                    Err(message) => {
-                        eprintln!("warning: scroll {name} run {run} left out: {message}");
-                        continue;
-                    }
-                };
-                let parsed = ScrollRun::parse(&json).ok_or(format!(
-                    "the scroll benchmark's JSON has no results: {json}"
-                ))?;
-                if parsed.stalls > 0 {
-                    eprintln!(
-                        "warning: scroll {name} run {run}: the display link stopped for more than half a second; the run is kept but flagged"
-                    );
+                let mut drawings = vec![false];
+                if options.compare_drawing {
+                    drawings = if run % 2 == 1 {
+                        vec![false, true]
+                    } else {
+                        vec![true, false]
+                    };
                 }
-                scrolls.entry(name).or_default().push(json);
+                for appkit in drawings {
+                    let label = if appkit { " (AppKit's drawing)" } else { "" };
+                    eprintln!("leal-perf: scroll {name}{label}, {run} of {}", options.runs);
+                    let mut args = extra.clone();
+                    if appkit {
+                        args.extend(["-LealStrips".into(), "NO".into()]);
+                    }
+                    // A run that fails (the display slept, the app hung) is
+                    // reported and left out; the others still count.
+                    let json = match scroll_run(&options, file, &args) {
+                        Ok(json) => json,
+                        Err(message) => {
+                            eprintln!(
+                                "warning: scroll {name}{label} run {run} left out: {message}"
+                            );
+                            continue;
+                        }
+                    };
+                    let parsed = ScrollRun::parse(&json).ok_or(format!(
+                        "the scroll benchmark's JSON has no results: {json}"
+                    ))?;
+                    if parsed.stalls > 0 {
+                        eprintln!(
+                            "warning: scroll {name}{label} run {run}: the display link stopped for more than half a second; the run is kept but flagged"
+                        );
+                    }
+                    let target = if appkit {
+                        &mut scrolls_appkit
+                    } else {
+                        &mut scrolls
+                    };
+                    target.entry(name).or_default().push(json);
+                }
             }
         }
     }
@@ -230,6 +275,7 @@ fn run() -> Result<(), String> {
         "opens": opens,
         "reopensMs": reopens,
         "scrolls": scrolls,
+        "scrollsAppKit": scrolls_appkit,
     });
     let report = render(&raw);
     println!("{report}");
@@ -294,29 +340,98 @@ fn format_report(environment: &Value, rows: &[Row], run: &PerfRun) -> String {
         describe(&run.opens, "firstPaintMs", "ms"),
         describe(&run.opens, "footprintMB", "MB")
     );
-    for name in SCENARIOS {
-        for (i, r) in run.scroll_runs(name).iter().enumerate() {
-            let _ = writeln!(
-                out,
-                "- Scroll `{name}` run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {}, {} frames busy over 8.3 ms, {:.1} M instructions a frame at {:.2} GHz; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB; screen {} Hz{}",
-                i + 1,
-                ScrollRun::describe_late(r.late, r.frames),
-                r.p99_ms,
-                r.describe_cpu(),
-                r.busy_over_120hz,
-                r.instructions_mean,
-                r.ghz,
-                ScrollRun::describe_late(r.while_indexing.0, r.while_indexing.1),
-                ScrollRun::describe_late(r.while_finding.0, r.while_finding.1),
-                r.find_runs,
-                r.heap_peak_mb,
-                r.screen_fps,
-                match (r.stalls > 0, r.visible) {
-                    (true, _) => " (flagged: the display link stopped)",
-                    (false, false) => " (window not visible at the end: the screen was locked)",
-                    _ => "",
+    let figure =
+        |v: Option<f64>, digits: usize| v.map_or("—".to_owned(), |v| format!("{v:.digits$}"));
+    for (runs, kind) in [
+        (&run.scrolls, ""),
+        (&run.scrolls_appkit, ", AppKit's drawing"),
+    ] {
+        for name in SCENARIOS {
+            for (i, r) in runs
+                .get(name)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .enumerate()
+            {
+                let _ = writeln!(
+                    out,
+                    "- Scroll `{name}`{kind} run {}: {}, frame p99 {:.1} ms, main-thread CPU p50/p99 {}, {} frames busy over 8.3 ms, {:.1} M instructions a frame at {:.2} GHz; other threads {} ms and WindowServer {} ms a frame; while indexing {}; while searching {} ({} searches); heap peak {:.1} MB, footprint peak {} MB; drawn by {}; screen {} Hz{}",
+                    i + 1,
+                    ScrollRun::describe_late(r.late, r.frames),
+                    r.p99_ms,
+                    r.describe_cpu(),
+                    r.busy_over_120hz,
+                    r.instructions_mean,
+                    r.ghz,
+                    figure(r.other_threads_ms, 2),
+                    figure(r.window_server_ms, 2),
+                    ScrollRun::describe_late(r.while_indexing.0, r.while_indexing.1),
+                    ScrollRun::describe_late(r.while_finding.0, r.while_finding.1),
+                    r.find_runs,
+                    r.heap_peak_mb,
+                    figure(r.footprint_peak_mb, 0),
+                    r.drawing.as_deref().unwrap_or("—"),
+                    r.screen_fps,
+                    match (r.stalls > 0, r.visible) {
+                        (true, _) => " (flagged: the display link stopped)",
+                        (false, false) => " (window not visible at the end: the screen was locked)",
+                        _ => "",
+                    }
+                );
+            }
+        }
+    }
+    if !run.scrolls_appkit.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nDrawing compared (`--compare-drawing`, runs alternated; task 2.0b): strips against AppKit's drawing\n"
+        );
+        let _ = writeln!(
+            out,
+            "| Scroll run | Main-thread CPU p50 / p99 | Instructions a frame | Other threads | WindowServer | Late frames | Footprint peak |\n|---|---|---|---|---|---|---|"
+        );
+        let spread = |runs: &[ScrollRun],
+                      value: &dyn Fn(&ScrollRun) -> Option<f64>,
+                      unit: &str,
+                      digits: usize| {
+            let values: Vec<f64> = runs.iter().filter_map(value).collect();
+            let (Some(low), Some(high)) = (
+                values.iter().copied().reduce(f64::min),
+                values.iter().copied().reduce(f64::max),
+            ) else {
+                return "—".to_owned();
+            };
+            if format!("{low:.digits$}") == format!("{high:.digits$}") {
+                format!("{low:.digits$} {unit}")
+            } else {
+                format!("{low:.digits$}–{high:.digits$} {unit}")
+            }
+        };
+        for name in SCENARIOS {
+            let pair = [
+                ("strips", run.scroll_runs(name)),
+                (
+                    "AppKit",
+                    run.scrolls_appkit.get(name).map_or(&[][..], Vec::as_slice),
+                ),
+            ];
+            for (drawing, runs) in pair {
+                if runs.is_empty() {
+                    continue;
                 }
-            );
+                let late: Vec<String> = runs.iter().map(|r| r.late.to_string()).collect();
+                let _ = writeln!(
+                    out,
+                    "| `{name}`, {drawing} | {} / {} | {} | {} | {} | {} | {} |",
+                    spread(runs, &|r| r.cpu_p50_ms, "ms", 2),
+                    spread(runs, &|r| r.cpu_p99_ms, "ms", 2),
+                    spread(runs, &|r| Some(r.instructions_mean), "M", 1),
+                    spread(runs, &|r| r.other_threads_ms, "ms", 2),
+                    spread(runs, &|r| r.window_server_ms, "ms", 2),
+                    late.join(", "),
+                    spread(runs, &|r| r.footprint_peak_mb, "MB", 0),
+                );
+            }
         }
     }
     out
@@ -445,10 +560,17 @@ fn scroll_run(options: &Options, file: &Path, extra: &[String]) -> Result<Value,
     let result = (|| {
         let launched = Launched::open(&options.bench_app, Some(file), &args)?;
         let deadline = Instant::now() + Duration::from_secs(480);
+        // WindowServer's CPU time, every 250 ms while the run lasts: the
+        // render server composites the strips (task 2.0b).
+        let server = window_server_pid();
+        let mut samples: Vec<(f64, f64)> = Vec::new();
         while launched.is_running() {
             if Instant::now() > deadline {
                 launched.quit();
                 return Err("the scroll benchmark didn't finish in 480 s".to_owned());
+            }
+            if let Some(cpu) = server.and_then(process_cpu_seconds) {
+                samples.push((now_seconds(), cpu));
             }
             thread::sleep(Duration::from_millis(250));
         }
@@ -459,7 +581,21 @@ fn scroll_run(options: &Options, file: &Path, extra: &[String]) -> Result<Value,
             )
         })?;
         let _ = std::fs::remove_file(&out);
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", out.display()))
+        let mut json: Value =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", out.display()))?;
+        let span = (
+            json["scrollStartedAt"].as_f64(),
+            json["scrollEndedAt"].as_f64(),
+            json["scroll"]["frames"].as_f64(),
+        );
+        if let (Some(start), Some(end), Some(frames)) = span
+            && frames > 0.0
+            && let Some(cpu) = cpu_between(&samples, start, end)
+        {
+            json["windowServerCPUPerFrameMs"] = json!(cpu * 1000.0 / frames);
+            json["windowServerCPUPercent"] = json!(cpu * 100.0 / (end - start));
+        }
+        Ok(json)
     })();
     let _ = awake.kill();
     let _ = awake.wait();
@@ -565,6 +701,27 @@ fn pids_of(executable: &Path) -> Vec<u32> {
         .lines()
         .filter_map(|l| l.trim().parse().ok())
         .collect()
+}
+
+/// WindowServer's PID, if it can be found.
+fn window_server_pid() -> Option<u32> {
+    let output = Command::new("pgrep")
+        .args(["-x", "WindowServer"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| l.trim().parse().ok())
+}
+
+/// A process's CPU time so far, in seconds, from `ps` (which can read it
+/// for another user's process, such as WindowServer's).
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    let output = Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    parse_ps_time(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn heap_report(pid: u32) -> Result<HeapReport, String> {

@@ -68,6 +68,18 @@ final class ScrollBench: NSObject {
     /// The grid area drawn per frame, in screens.
     private var drawn: [String: [Double]] = [:]
     private var lastDrawn: CGFloat = 0
+    /// The whole process's CPU time per frame, every thread (task 2.0b:
+    /// strips are rasterised on Core Animation's threads, not the main
+    /// thread), in ms.
+    private var processCPU: [String: [Double]] = [:]
+    private var lastProcessCPU: Double = 0
+    /// Strips drawn (the grid's and the gutter's) per frame (task 2.0b).
+    private var stripsDrawn: [String: [Double]] = [:]
+    private var lastStripsDrawn = 0
+    /// When the scroll stages started and ended (seconds since 1970), for
+    /// `leal-perf` to read WindowServer's CPU time over them.
+    private var scrollStart: Double?
+    private var scrollEnd: Double?
     private var refresh: [Double] = []
     private var peakFootprint = 0.0
     private var peakHeap = 0.0
@@ -299,10 +311,25 @@ final class ScrollBench: NSObject {
         findRuns += 1
     }
 
+    /// The process's CPU time so far, every thread, in ms.
+    private static func processCPUms() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        func ms(_ time: timeval) -> Double { Double(time.tv_sec) * 1000 + Double(time.tv_usec) / 1000 }
+        return ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    /// Strips drawn so far, the grid's and the gutter's.
+    private var stripsDrawnNow: Int {
+        (content.grid.strips?.stripsDrawn ?? 0) + (content.grid.gutterStrips?.stripsDrawn ?? 0)
+    }
+
     @objc private func tick(_ link: CADisplayLink) {
         let timestamp = link.timestamp
         let wall = CACurrentMediaTime()
         let cpuNow = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+        let processNow = Self.processCPUms()
+        let stripsNow = stripsDrawnNow
         let countsNow = ThreadCounts.current()
         refresh.append((link.targetTimestamp - link.timestamp) * 1000)
         let indexing = !content.model.isIndexComplete
@@ -327,7 +354,14 @@ final class ScrollBench: NSObject {
                 }
                 let screen = max(1, content.grid.scrollView.contentSize.width * content.grid.scrollView.contentSize.height)
                 drawn[phase, default: []].append(Double((content.grid.gridView.drawnArea - lastDrawn) / screen))
+                processCPU[phase, default: []].append(processNow - lastProcessCPU)
+                // (A grid that switched to or from strips starts its count
+                // again.)
+                stripsDrawn[phase, default: []].append(Double(max(0, stripsNow - lastStripsDrawn)))
                 if phase != "jumpEnd", phase != "jumpTop" {
+                    let now = Date().timeIntervalSince1970
+                    if scrollStart == nil { scrollStart = now - (timestamp - lastTimestamp) }
+                    scrollEnd = now
                     for (work, running) in [("whileIndexing", indexing), ("whileFinding", finding)] where running {
                         background[work, default: ([], [], [])].intervals.append((timestamp - lastTimestamp) * 1000)
                         background[work, default: ([], [], [])].busy.append(max(0, (wall - lastWall) - slept) * 1000)
@@ -344,6 +378,8 @@ final class ScrollBench: NSObject {
         lastCPU = cpuNow
         lastCounts = countsNow ?? ThreadCounts()
         lastDrawn = content.grid.gridView.drawnArea
+        lastProcessCPU = processNow
+        lastStripsDrawn = stripsNow
         ticks += 1
         if ticks % 15 == 0 {
             // The probe is the bench's own work, not Leal's: walking every
@@ -351,11 +387,13 @@ final class ScrollBench: NSObject {
             // otherwise count towards the next frame (task 2.0a).
             let probeWall = CACurrentMediaTime()
             let probeCPU = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+            let probeProcess = Self.processCPUms()
             let probeCounts = ThreadCounts.current()
             peakFootprint = max(peakFootprint, Memory.footprintMB())
             peakHeap = max(peakHeap, Memory.heapMB())
             lastWall += CACurrentMediaTime() - probeWall
             lastCPU += clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - probeCPU
+            lastProcessCPU += Self.processCPUms() - probeProcess
             if let probeCounts, let after = ThreadCounts.current(), lastCounts.instructions > 0 {
                 lastCounts.instructions += after.instructions - probeCounts.instructions
                 lastCounts.cycles += after.cycles - probeCounts.cycles
@@ -385,12 +423,15 @@ final class ScrollBench: NSObject {
         var scrollCPU: [Double] = []
         var scrollInstructions: [Double] = []
         var scrollCycles: [Double] = []
+        var scrollProcess: [Double] = []
+        var scrollStrips: [Double] = []
         var phases: [String: Any] = [:]
         for (phase, values) in intervals {
             var stats = Self.stats(values, refresh: refreshMs, busy: busy[phase] ?? [], cpu: cpu[phase] ?? [])
             let area = drawn[phase] ?? []
             stats["drawnScreensPerFrame"] = area.isEmpty ? 0 : area.reduce(0, +) / Double(area.count)
             Self.addCounts(to: &stats, instructions: instructions[phase] ?? [], cycles: cycles[phase] ?? [], cpu: cpu[phase] ?? [])
+            Self.addThreads(to: &stats, process: processCPU[phase] ?? [], main: cpu[phase] ?? [], strips: stripsDrawn[phase] ?? [])
             phases[phase] = stats
             if phase != "jumpEnd", phase != "jumpTop" {
                 scrollIntervals += values
@@ -398,6 +439,8 @@ final class ScrollBench: NSObject {
                 scrollCPU += cpu[phase] ?? []
                 scrollInstructions += instructions[phase] ?? []
                 scrollCycles += cycles[phase] ?? []
+                scrollProcess += processCPU[phase] ?? []
+                scrollStrips += stripsDrawn[phase] ?? []
             }
         }
         result["phases"] = phases
@@ -411,9 +454,23 @@ final class ScrollBench: NSObject {
         }
         var scroll = Self.stats(scrollIntervals, refresh: refreshMs, busy: scrollBusy, cpu: scrollCPU)
         Self.addCounts(to: &scroll, instructions: scrollInstructions, cycles: scrollCycles, cpu: scrollCPU)
+        Self.addThreads(to: &scroll, process: scrollProcess, main: scrollCPU, strips: scrollStrips)
         result["scroll"] = scroll
         result["jumpEndMs"] = intervals["jumpEnd"]?.first ?? 0
         let grid = content.grid
+        // Task 2.0b: how the grid drew, and when the scroll stages ran
+        // (for WindowServer's CPU time, which `leal-perf` reads).
+        result["drawing"] = grid.strips != nil ? "strips" : "appkit"
+        result["gutterDrawing"] = grid.gutterStrips != nil ? "strips" : "appkit"
+        result["gridWidth"] = Double(grid.gridView.frame.width)
+        result["stripWidth"] = Double(grid.strips?.stripWidth ?? 0)
+        result["visibleWidth"] = Double(grid.scrollView.contentView.bounds.width)
+        result["stripWholeRedraws"] = grid.strips?.wholeRedraws ?? 0
+        result["stripResizes"] = grid.strips?.resizes ?? 0
+        if let scrollStart, let scrollEnd {
+            result["scrollStartedAt"] = scrollStart
+            result["scrollEndedAt"] = scrollEnd
+        }
         result["cellsDrawn"] = grid.gridView.cellsDrawn
         result["gridDraws"] = grid.gridView.draws
         result["gridDrawnScreens"] = Double(grid.gridView.drawnArea / max(1, grid.scrollView.contentSize.width * grid.scrollView.contentSize.height))
@@ -471,6 +528,20 @@ final class ScrollBench: NSObject {
         stats["cyclesP99"] = percentile(cyclesSorted, 0.99)
         let cpuMs = cpu.reduce(0, +)
         stats["mainThreadGHz"] = cpuMs > 0 ? cycles.reduce(0, +) / cpuMs : 0
+    }
+
+    /// The process's CPU time per frame, every thread, and the part not on
+    /// the main thread (Core Animation's rendering of the strips, the
+    /// reads and layout ahead, background jobs), in ms; and the strips
+    /// drawn per frame.
+    private static func addThreads(to stats: inout [String: Any], process: [Double], main: [Double], strips: [Double]) {
+        guard !process.isEmpty else { return }
+        let processMean = process.reduce(0, +) / Double(process.count)
+        let mainMean = main.isEmpty ? 0 : main.reduce(0, +) / Double(main.count)
+        stats["processCPUMean"] = processMean
+        stats["otherThreadsCPUMean"] = max(0, processMean - mainMean)
+        stats["stripsPerFrameMean"] = strips.isEmpty ? 0 : strips.reduce(0, +) / Double(strips.count)
+        stats["stripsPerFrameMax"] = strips.max() ?? 0
     }
 
     private static func median(_ values: [Double]) -> Double {
