@@ -150,6 +150,28 @@ From the 2.0a review:
   WindowServer to composite; measure its CPU and late frames, not only
   Leal's main thread.
 
+## Measured in task 2.0b (for Rob to accept)
+
+Rebuilt on 2.0a as landed, same binary, alternated, 1,200 × 784 pt window
+on Retina, visible width 1,134 pt (docs/tasks/2.0b.md, "Where strips pay"):
+
+| Grid width | Instructions p50 / p99, strips vs AppKit | Footprint peak, strips − AppKit |
+|---|---|---|
+| 1,230 pt (reference file) | 2.1 / 6.1 vs 6.4 / 9.7 M | +47 MB |
+| 1,691 pt (1.5 × visible) | 2.2–2.3 / 6.9–7.4 vs 6.4 / 9.7 M | +68–74 MB |
+| 1,996 pt (1.76 ×) | 2.2–2.3 / 9.5–30.7 vs 5.8–6.4 / 9.8–10.1 M | +83–85 MB |
+| 3,720 pt (3.3 ×) | 2.8 / 84 vs 5.9 / 10.8 M | +185 MB |
+
+WindowServer's CPU a frame is about the same with strips (1.97 against
+1.85 ms, and 2.20 against 2.40 ms with a search).
+
+**Proposed refinement of the line**: strips while the grid is within 1.5
+times the visible width and no wider than 4,096 pt; back to strips below
+1.4 times (3,840 pt). A strip's cost grows with the grid's width and
+AppKit's with the visible width, so a fixed 4,096 pt line costs as much
+memory as 1.10's tiles and is slower at p99. Task 2.0b implements this
+refinement; the Decision above still says 4,096 pt until Rob accepts it.
+
 ## Consequences
 
 - PLAN: a follow-up task (the coordinator adds it) to land strips with the
