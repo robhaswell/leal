@@ -430,7 +430,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - A test: after a reconnect without the clone, a same-size change to the
     first 64 KB with its modification time put back stops the copy with
     `ChangedOnDisk`, rather than being read unnoticed.
-- [ ] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
+- [x] **2.2 Serializer** — splice writer (§3.7); property tests for F1–F5.
   - Replays the testkit's `EditCase` edits on the real document with
     `existing_hint` passed through, and requires the same bytes, splices,
     `line_endings`, `encoding_hint` and `fixes` as the oracle (0.2 notes).
@@ -481,6 +481,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     single-byte encoding) makes it refuse and name the cells; nothing is
     substituted. The UTF-16 generator gains unpaired surrogates and odd
     final bytes to cover it. (ADR-0008 decision 7)
+  - From 2.2 (docs/tasks/2.2.md, "What 2.3, 2.4 and 2.5 need"):
+    - `save::encode` returns the encoded bytes, or the character that
+      can't be encoded;
+    - `SaveError::EncodingNotSupported` becomes F5's `Unencodable`, and the
+      save property's `TODO(2.3)` branch goes.
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   - Per-column quoting for new fields (ADR-0004 decision 2), in the oracle
     and the product, with a unit test and edit-strategy coverage; this
@@ -505,6 +510,14 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - undo and redo name cells by identity (a field, an inserted column or
       an appended cell), and inserted rows get their own store, keyed by an
       id from the piece list.
+  - From 2.2 (docs/tasks/2.2.md, "What 2.3, 2.4 and 2.5 need"):
+    - `row_splices` gets inserted rows and fields (with the per-column
+      quoting rule), the CR/LF split, and deleted rows' and columns'
+      splices;
+    - the writer (`stream`) walks the piece list, not `overlay.rows_in`;
+    - `RowIndex::shifted` can't serve once rows move: the rebase waits for
+      the index pass, or builds the index from the plan;
+    - the save's carry-over maps rows through the piece list.
 - [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
   Save / Save As / Revert, safe-save with metadata preserved.
   - In-cell editing uses an `NSTextField` overlaid on the cell; Return
@@ -578,7 +591,8 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
   - The user sees one prompt about a file changed elsewhere, never both
     Leal's and NSDocument's own. Decide what Save does for a deleted file
-    (`can_save()` is true today). (phase 1 review)
+    (`can_save()` is true today; the core's save refuses it as `missing`,
+    and Save As works). (phase 1 review, 2.2)
   - Swift wraps the save's await in `withTaskCancellationHandler`, which
     calls the job's `cancel()` (2.2; ADR-0005 decision 6).
   - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
@@ -596,6 +610,44 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       `catchUpJob()`), and retry a `Pending` Next or Previous once it
       clears.
     - Clear the undo history when the split changes (a new lineage).
+  - From 2.2 (docs/tasks/2.2.md, "What 2.3, 2.4 and 2.5 need"; ADR-0012's
+    consequences):
+    - Override NSDocument's save to start the core's job, inside an
+      `NSFileCoordinator` write with `.forReplacing` (the document as file
+      presenter), serialised with `performAsynchronousFileAccess`.
+    - Set `fileModificationDate` from `SaveOutcome.modified`.
+    - Always pass an item-replacement folder on the file's volume, and a
+      second one for the snapshot, with a defined fallback where AppKit
+      can't make one (shares, FAT).
+    - Check the swap under the real sandbox entitlements (a user-selected
+      file's security scope, `renamex_np` in the item-replacement folder).
+    - Test on a real SMB share while Leal holds descriptors on the file:
+      the swap, its fallback, and close-time updates.
+    - Ask on `diverged` before Save and on `changedElsewhere`, then save
+      again with `overwriteChanged`; offer Duplicate on `notWritable` and
+      Unlock on `locked`; try again after `moving`.
+    - Word each `SaveFailure` (`notAFile` included); name `skippedEdits`
+      and `encodingNotSupported`'s cells; log `skippedMetadata` and
+      `rereadError`.
+    - Change-count tokens, not counts: note `changeCountToken` with
+      `editVersion()` after each edit; when a save ends, apply the token
+      noted at `progress().snapshotVersion`, and reset the recovery
+      journal to the commands after that version.
+    - After a save (`SaveOutcome.firstScreen` set), as after a re-read:
+      adopt the new generation; drop the tiles and flag blocks; reset the
+      diagnostics and the review and wait for the new reading's; restart
+      Find on it; keep the column widths and the undo stack; drop the old
+      search and copy objects; count `editsDuringSave` as unsaved.
+    - When `keptOldFile` is set, move it at once somewhere lasting (a
+      Recovered folder in Application Support, say), then tell the user
+      where it is.
+    - When a save ends with `SaveJob.restarted()` set (a drive back during
+      the save), do what `restarted(_:)` does after `checkOriginal`.
+    - Disable Treat As, Reopen with Encoding and the header toggle while a
+      save runs (`LealError.saving` otherwise).
+    - The whole-file delimiter review's part of ADR-0008 decision 8
+      (`SEAM(2.5)`): write the interpretation attribute when the rebased
+      reading's review suggests another delimiter.
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
@@ -618,6 +670,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     edit. This narrows ADR-0005 decision 2's literal text; explicitly
     padding a short row would be a future "Fill missing cells" command.
     (2.1 notes, "Decisions and interpretations")
+  - For the phase 2 gate, for the record (already accepted by Rob with
+    ADR-0012): the save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`,
+    so a power cut within about a second of a save can give back the old
+    file, never a mix of the two. (2.2 notes, "Decisions and
+    interpretations"; DESIGN §3.7)
 
 ## Phase 3 — Filter and sort
 

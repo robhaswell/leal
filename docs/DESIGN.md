@@ -178,14 +178,20 @@ and reads its identity with `fstat`, which makes network file systems
 revalidate.
 
 **Leal's own save is not an outside change** (ADR-0008 decision 1). After
-a successful save, Leal rebases the document onto the file it just wrote:
-- it takes a new snapshot (a clone, or a copy on removable drives and
-  shares) and re-indexes it;
+a successful save, Leal rebases the document onto the file it just wrote
+(§3.7):
+- it takes a new snapshot of the file it wrote (a clone of it, or, on a
+  removable drive or a share, the copy it wrote to the internal disk as it
+  went), never reading it back;
+- its rows read at once: their index is the old one's, shifted by each
+  edited row's change in length; the index pass runs again in the
+  background for the diagnostics and the review;
 - it gives the watcher the new identity, and treats the event from its own
   write as expected;
 - it clears the "changed elsewhere" flag;
 - edits and undo carry on (§3.6).
 
+Edits made while it saved carry over to the new file as unsaved edits.
 Saving twice in a row never shows a banner or an "overwrite?" prompt.
 
 **Opening off the main thread.** The app opens every file's core document
@@ -283,8 +289,8 @@ Shares have more rules (ADR-0009):
   it would mean reading the copied part again on every reconnect. Bytes
   not yet copied, and the first 64 KB, are checked.
 - **Revert to Saved** is AppKit's second read of the file, on the main
-  thread. Nothing saves in phase 1, so it can't be reached yet; task 2.5
-  sends it through Reload.
+  thread. The app doesn't save until task 2.5, so it can't be reached yet;
+  2.5 sends it through Reload.
 
 ### 3.2 Dialect and encoding detection
 
@@ -445,9 +451,10 @@ values.
 the core keeps no undo stack: undo applies a command's inverse, and redo
 applies it again. The commands survive a save: after saving, the saved file
 becomes the new base, in the same lineage, and the stored values still
-apply (§3.1, ADR-0008 decision 1), except that a hatched cell, a real field
-once saved, can't be made missing again by an undo (task 2.2 decides what
-that undo does).
+apply (§3.1, ADR-0008 decision 1). Undo across a save works by value
+(ADR-0012 decision 4): a hatched cell is a real field once saved, so
+undoing its edit after a save empties it rather than shortening the row,
+and a field saved quoted stays quoted.
 
 **Recovery by replay** (§3.9, ADR-0008 decision 5). An undo manager can't
 be listed, so the app also keeps an append-only journal of every command it
@@ -542,13 +549,97 @@ endings and row values (ADR-0004 §10, narrowed by ADR-0005 decision 1). The
 encoding, delimiter and header choice are guessed from the whole file, so
 Leal remembers them in extended attributes instead (§3.2).
 
-The app saves through `NSDocument`'s safe-save: the core writes to the
-temporary URL AppKit provides, which is then swapped in atomically. File
-permissions, extended attributes and Finder metadata are preserved, except
-the two attributes Leal writes itself (below). Just before writing, Leal
-checks that the original hasn't changed elsewhere; after a save it rebases
-the document onto the new file, so its own save never looks like an outside
-change (§3.1, ADR-0008 decisions 1 and 9).
+**The core does the safe save** (ADR-0012 decision 1), not `NSDocument`.
+A save is a job on a thread of its own; the main thread never waits for it,
+and edits carry on while it runs (§3.9). One save of a document runs at a
+time. It waits for the index pass (and, on a removable drive or a share,
+the copy), takes a snapshot of the edits, and writes from that.
+
+**The check before writing** (§3.1, ADR-0008 decision 9). Save opens the
+user's file afresh and looks at it with `fstat`. Each refusal has its own
+reason, so the app can say what to do:
+- **changed elsewhere**: the watcher saw a change, or it isn't the file
+  Leal opened or last saved (unless the user agreed to overwrite it);
+- **missing**, its volume not mounted, or still being moved;
+- **not writable** by Leal, or **locked** (immutable or append-only). A
+  rename needs only the folder's write access, so these are checked on the
+  file itself, and the app offers Duplicate or Unlock;
+- **not a regular file**.
+
+Save As refuses a locked file or anything but a regular file at its
+destination, and never follows a link that leads nowhere. Nothing is
+written until these pass.
+
+**Writing.** The new file is written in a folder on the destination's
+volume: the app's item-replacement folder, which a sandboxed app may write
+to, or, without one (the CLI, tests), a recorded hidden folder next to the
+file. The writer goes in file order, splicing in each edited row as it
+reaches it, and checks for a cancel before each chunk (§3.10 rule 3). On a
+removable drive or a share each byte is also teed to a copy on the internal
+disk. A file that would be 4 GiB or more, which Leal couldn't open again,
+is refused as soon as the output passes that size, before the new file
+goes anywhere (ADR-0012 decision 2). A cancel or a failure before the new
+file is in place deletes everything the save made, and the user's file is
+untouched.
+
+**Metadata, best-effort, by an explicit policy** (ADR-0012 decision 1), in
+an order where nothing earlier can block anything later:
+1. each extended attribute on its own, if the system keeps it for a safe
+   save (`XATTR_OPERATION_INTENT_SAVE`, which drops quarantine) or it is
+   Finder's info or the resource fork; never Leal's two, nor those the
+   system sets itself. One that can't be set is skipped and named, so one
+   protected attribute never makes a file unsaveable;
+2. Leal's two attributes (below);
+3. the owner and group (where Leal may), the creation date, the mode and
+   the user-settable flags;
+4. the access control list, last, so an entry that denies writing
+   attributes or permissions blocks nothing.
+
+**The flush.** `F_BARRIERFSYNC` orders the new file's bytes onto the disk
+before the rename that makes them the file, so a crash leaves the old file
+or the whole new one, never a mix (on a volume that journals the rename;
+see the limits below). It doesn't wait for the drive's cache to empty, so
+a power cut in about the second after a save can bring back the old file
+(accepted with ADR-0012; PLAN 2.7 lists it for the phase 2 gate). Where a
+barrier isn't supported, `F_FULLFSYNC`, and failing that `fsync`.
+
+**Into place**, under the watcher's lock only, so Leal's own save never
+looks like an outside change. Events the kernel has queued are looked at
+first, and a change found refuses the save. If the file's permissions,
+flags or attributes changed since the check, it is checked again and its
+metadata copied again. The method comes from the destination volume's
+capabilities (`ATTR_VOL_CAPABILITIES`), never from trying, since FAT
+reports a swap it didn't do:
+- **a swap** where the volume can (APFS): `renamex_np(RENAME_SWAP)`, then
+  the file swapped out is compared with the one checked before writing.
+  If another app changed it in between, or it isn't a regular file, it is
+  swapped back and the save refused. If it can't be looked at or swapped
+  back, the save has still succeeded and that file is **kept, never
+  deleted**: next to the user's as "name (replaced, kept by Leal).csv", or
+  in Leal's folder, and the outcome says where, for the app to move it
+  somewhere lasting and tell the user;
+- **a plain rename** over it where the volume can't swap (HFS+, exFAT,
+  FAT), with no check after;
+- for Save As to a new name, an exclusive rename where the volume has one.
+
+Once the new file is in place the save has succeeded, and nothing after
+returns an error. The watcher watches the new file as if just opened.
+
+**The rebase** (§3.1, ADR-0008 decision 1). The new reading is built with
+no lock held: its snapshot is the clone or the teed copy, its index the
+old one's, shifted, and its overlay empty, in the same lineage, so undo
+carries on, by value (§3.6, ADR-0012 decision 4). The document's lock is
+then taken briefly to carry over the edits made during the save and make
+the new reading current.
+- **Edits during a save carry over**, by value: each cell touched since
+  the snapshot is set to what it reads as now, on the new base, and stays
+  unsaved.
+- **Edit versions only ever increase**, across saves and re-reads, so the
+  app's change-count token noted at the save's snapshot still says what
+  was saved.
+- If the new file can't be mapped, the save has still succeeded; the
+  document keeps reading the old snapshot with its edits, and a later save
+  writes the same bytes.
 
 **Attributes written on save** (ADR-0008 decision 8). On every save, Leal
 writes the interpretation attribute (§3.2), with a fingerprint of the bytes
@@ -581,9 +672,29 @@ share disconnected, the file changed while it was being read, or it was
 deleted on another computer while being read (§3.1, ADR-0010).
 Save As writes only **complete rows** from the bytes Leal trusts, cut at
 the last row boundary, with the user's edits applied. It never writes half
-a row, half a character or an open quote. The dialog says plainly that the
-copy is incomplete ("about N of M rows"). Nothing is added to the file to
-mark it.
+a row, half a character or an open quote. It reports how many rows it
+wrote, and the dialog says plainly that the copy is incomplete ("about N
+of M rows"). Nothing is added to the file to mark it. Edits to rows it
+didn't write, including any made during the save, aren't saved, and the
+app names them.
+
+**Known v1 limits.**
+- **No swap on HFS+, exFAT or FAT.** These volumes can't swap, so the new
+  file is renamed over the old with no check after; a change another app
+  makes between the last check and the rename goes unseen.
+- **A write through a descriptor already open** in another process can
+  still land in the old file after the swap. No Mac API closes that.
+- **A crash between the swap and its check** leaves the file swapped out
+  in Leal's recorded folder, and the next launch's cleanup deletes it, even
+  if it was another app's version the check would have kept.
+- **No journal on exFAT or FAT.** A crash during the rename leaves the
+  folder as the volume's own repair finds it. APFS and HFS+ journal the
+  rename, so a crash there leaves the old file or the new one.
+- **A power cut in about the second after a save** can bring back the old
+  file, never a mix (the flush, above).
+- **What a safe save can't keep:** a hard link to the file keeps the old
+  contents; a symbolic link survives and its target is replaced; the owner
+  is kept only where Leal may set it.
 
 ### 3.8 Views: filter and sort
 
@@ -616,6 +727,15 @@ of physical row numbers to show, in order.
   `withTaskCancellationHandler`, which calls `cancel()`.
 - The main thread never waits on a long operation. While indexing, the row
   count is "rows indexed so far".
+- **The main thread never waits on a save's I/O** (ADR-0012). The locks are
+  split: a save takes the document's lock only to snapshot the edits (for
+  microseconds), and at the end to carry later edits over and make its new
+  reading current; it touches no file under it. The last check and the
+  rename into place run under the watcher's lock only, and the new reading
+  is built under neither. While a save runs, the file isn't read again with
+  other choices (Treat As, Reopen with Encoding and the header toggle are
+  refused), and a drive that comes back reconnects when the save ends. A
+  cancel stops a save only until the new file is in place.
 - **Edits are synchronous** calls, safe on the main thread, and serialized
   with each other and with re-reading. A search takes only the edits of the
   rows it is reading, never the whole overlay, so an edit during one stays
@@ -648,7 +768,7 @@ lower-priority work must never delay higher-priority work.
 | Priority | Work | When | QoS |
 |---|---|---|---|
 | **P0** | Off the main thread (§3.1): clone, map (ordinary reads on removable drives and shares), detect dialect and encoding from the first 64 KB. On the main thread: parse the first screen of rows, paint | Immediately, before anything else starts | User-initiated (the open), user-interactive (paint) |
-| **P1** | Row index (§3.3) and diagnostics (§3.5), in one pass (1.5); parsing rows as the user scrolls | Straight after P0 | User-initiated |
+| **P1** | Row index (§3.3) and diagnostics (§3.5), in one pass (1.5); parsing rows as the user scrolls. A save (§3.7), which never pauses for the user | Straight after P0; a save when asked | User-initiated |
 | **P2** | Whole-file dialect and encoding check (§3.2), refined column widths, number detection for alignment | Alongside or after P1 | Utility |
 | **P3** | Filter and sort acceleration (below) | Only on first use of filter/sort, or when idle | Utility, paused while the user scrolls or edits (rule 3) |
 
@@ -667,9 +787,10 @@ Rules:
    editing, P3 jobs pause at their next chunk boundary and resume when input
    has been idle for about 250 ms. Jobs work in chunks of at most ~5 ms so
    they can pause quickly.
-4. **Separate thread pools.** The index runs on its own thread. P2 and P3 run
-   on a `rayon` pool limited to (performance cores − 1) threads, so the main
-   thread and the indexer always have a core free.
+4. **Separate thread pools.** The index runs on its own thread, and so
+   does each save. P2 and P3 run on a `rayon` pool limited to (performance
+   cores − 1) threads, so the main thread and the indexer always have a
+   core free.
 5. **Scrolling before the index finishes.** The scrollbar is sized from an
    estimated row count (file size ÷ average row length so far), refined as the
    index grows. Scrolling within indexed rows is instant. Jumping past the
@@ -735,6 +856,10 @@ to run concurrently and asserts first paint is still under 150 ms.
 
 - `NSDocument`-based: Open Recent, window tabs, Save, Save As, Revert to
   Saved, dirty indicator.
+- **Save starts the core's save job** (§3.7, ADR-0012), in place of
+  NSDocument's own writing, inside an `NSFileCoordinator` write so other
+  apps and iCloud Drive get notice. The app passes it an item-replacement
+  folder on the file's volume.
 - **Autosave-in-place is off.** Leal only writes the file when the user saves.
 - **No Versions browser in v1** (ADR-0008 decision 10). AppKit's Versions
   browser needs autosave-in-place, so v1 offers **Revert to Saved** only.
