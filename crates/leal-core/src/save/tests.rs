@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::attributes::{Fingerprint, Interpretation};
-use crate::detect::{Choices, DialectSource, EncodingSource, Hints, detect};
+use crate::detect::{Choices, DialectSource, EncodingSource, FIRST_PAINT_BYTES, Hints, detect};
 use crate::dialect::{Delimiter, LineEnding};
 use crate::index::{CodeUnit, IndexDialect};
 use crate::rows::RowParser;
@@ -422,6 +422,7 @@ fn the_interpretation_is_recorded_for_a_choice_or_a_different_guess() {
         delimiter: Some(Delimiter::Semicolon),
         header: Some(true),
         file: Some(Fingerprint::of(file)),
+        encoding: None,
     };
     assert_eq!(plan(file, &detection, false).interpretation, Some(expected));
     // Read with commas (one column), which a reopen wouldn't guess.
@@ -433,4 +434,54 @@ fn the_interpretation_is_recorded_for_a_choice_or_a_different_guess() {
             .and_then(|i| i.delimiter),
         Some(Delimiter::Comma)
     );
+}
+
+/// ADR-0013 decision 2: the encoding is recorded as Leal's own, with the
+/// fingerprint, exactly when a reopen would otherwise ignore its tag; the
+/// delimiter and header only as before.
+#[test]
+fn the_encoding_is_marked_as_leals_own_when_a_reopen_would_ignore_it() {
+    let as_1253 = |file: &[u8], encoding: Encoding| {
+        let mut detection = guessed(file);
+        detection.encoding = encoding;
+        detection.encoding_source = EncodingSource::User;
+        detection
+    };
+    // 0xAA is unassigned in Windows-1253: the tag alone would be ignored.
+    let file = b"a,\xC1\xAA\n";
+    let decided = plan(file, &as_1253(file, Encoding::Windows1253), false);
+    assert_eq!(decided.text_encoding, Some(Encoding::Windows1253));
+    assert_eq!(
+        decided.interpretation,
+        Some(Interpretation {
+            file: Some(Fingerprint::of(file)),
+            encoding: Some(Encoding::Windows1253),
+            ..Interpretation::default()
+        })
+    );
+    // Every byte decodes: the tag holds by itself.
+    let file = b"a,\xC1\n";
+    let decided = plan(file, &as_1253(file, Encoding::Windows1253), false);
+    assert_eq!(decided.text_encoding, Some(Encoding::Windows1253));
+    assert_eq!(decided.interpretation, None);
+
+    // Past the first 64 KB only the review would see a byte that doesn't
+    // decode, so a longer file is marked whenever its encoding has one.
+    let mut long = b"a,\xC1\n".repeat(FIRST_PAINT_BYTES / 4 + 1);
+    long.truncate(FIRST_PAINT_BYTES + 4);
+    let longer = |encoding: Encoding| {
+        AttributePlan::decide(&AttributeFacts {
+            detection: &as_1253(&long, encoding),
+            had_text_encoding: true,
+            head: &long[..FIRST_PAINT_BYTES],
+            len: u64::try_from(long.len()).unwrap(),
+            census: None,
+            utf8: false,
+        })
+        .interpretation
+        .and_then(|i| i.encoding)
+    };
+    assert_eq!(longer(Encoding::Windows1253), Some(Encoding::Windows1253));
+    // Latin-1 assigns every byte.
+    assert_eq!(longer(Encoding::Iso8859_1), None);
 }

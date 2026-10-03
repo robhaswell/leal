@@ -12,8 +12,14 @@
 //! - **The interpretation attribute** records the delimiter and the header
 //!   choice, with the new file's fingerprint (ADR-0007 decision 1), when
 //!   either was the user's choice or came from the attribute, or when a
-//!   reopen's first paint, with the encoding as recorded, would guess
-//!   either differently. Otherwise it is removed.
+//!   reopen's first paint, with the attributes as recorded, would guess
+//!   either differently. It records the encoding too, with the
+//!   fingerprint, when a reopen would otherwise ignore
+//!   `com.apple.TextEncoding` because a byte doesn't decode in it (ADR-0004
+//!   decision 11): the tag is then Leal's own and holds (ADR-0013 decision
+//!   2). First paint decodes only the first 64 KB and the review the rest,
+//!   so a longer file records it whenever its encoding leaves a byte
+//!   unassigned. Otherwise the attribute is removed.
 //!
 //! Removing matters as much as writing: the save copies the old file's
 //! extended attributes to the new one, and an old fingerprint or a stale
@@ -29,7 +35,9 @@
 //! attribute then (see `docs/tasks/2.2.md`).
 
 use crate::attributes::{Fingerprint, Interpretation, text_encoding_value};
-use crate::detect::{Census, Choices, DialectSource, EncodingSource, Hints, detect};
+use crate::detect::{
+    Census, Choices, DialectSource, EncodingSource, Hints, detect, tag_must_decode,
+};
 use crate::dialect::{Bom, Encoding};
 
 /// What a save decides the file's two attributes should be.
@@ -90,10 +98,10 @@ impl AttributePlan {
     pub(crate) fn decide(facts: &AttributeFacts<'_>) -> AttributePlan {
         let document = facts.detection;
         let encoding = document.encoding;
-        let reopen = |text_encoding: Option<&[u8]>| {
+        let reopen = |text_encoding: Option<&[u8]>, interpretation: Option<&[u8]>| {
             let hints = Hints {
                 text_encoding,
-                interpretation: None,
+                interpretation,
             };
             detect(facts.head, facts.len, hints, Choices::default())
         };
@@ -101,7 +109,7 @@ impl AttributePlan {
             // Save As UTF-8 sets it, BOM or not (ADR-0008 decision 7).
             Some(Encoding::Utf8)
         } else if document.bom == Bom::None {
-            let first_paint = reopen(None).map(|d| d.encoding).ok();
+            let first_paint = reopen(None, None).map(|d| d.encoding).ok();
             let whole_file = facts.census.map(Census::guess);
             let record = facts.had_text_encoding
                 || document.encoding_source != EncodingSource::Guess
@@ -112,16 +120,38 @@ impl AttributePlan {
             facts.had_text_encoding.then_some(encoding)
         };
         let value = text_encoding.map(text_encoding_value);
-        let reopened = reopen(value.as_deref().map(str::as_bytes)).ok();
+        let tag = value.as_deref().map(str::as_bytes);
+        let file = Some(Fingerprint::from_head(facts.head, facts.len));
+
+        // ADR-0013 decision 2: a tag a reopen would ignore is made Leal's
+        // own. Past the first 64 KB only the review would find the byte.
+        let longer = facts.len > u64::try_from(facts.head.len()).unwrap_or(u64::MAX);
+        let own_encoding = text_encoding.filter(|&e| {
+            let ignored = reopen(tag, None).is_ok_and(|d| d.encoding != e);
+            ignored || (longer && tag_must_decode(e))
+        });
+        let own = Interpretation {
+            file,
+            encoding: own_encoding,
+            ..Interpretation::default()
+        };
+        let own_value = own_encoding.map(|_| own.to_attribute_value());
+
+        // The reopen, with the encoding as it will read.
+        let reopened = reopen(tag, own_value.as_deref().map(str::as_bytes)).ok();
         let chosen = document.delimiter_source != DialectSource::Guess
             || document.header_source != DialectSource::Guess;
         let differs = reopened
             .is_none_or(|d| d.delimiter != document.delimiter || d.header != document.header);
-        let interpretation = (chosen || differs).then(|| Interpretation {
-            delimiter: Some(document.delimiter),
-            header: Some(document.header),
-            file: Some(Fingerprint::from_head(facts.head, facts.len)),
-        });
+        let interpretation = if chosen || differs {
+            Some(Interpretation {
+                delimiter: Some(document.delimiter),
+                header: Some(document.header),
+                ..own
+            })
+        } else {
+            own_encoding.map(|_| own)
+        };
         AttributePlan {
             text_encoding,
             interpretation,

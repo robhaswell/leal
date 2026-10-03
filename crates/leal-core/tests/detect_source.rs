@@ -56,6 +56,7 @@ fn detection_reads_the_attributes_source_opens() {
         delimiter: Some(Delimiter::Comma),
         header: Some(false),
         file: Some(Fingerprint::of(bytes)),
+        encoding: None,
     };
     set_attribute(
         &path,

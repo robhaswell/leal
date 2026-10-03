@@ -638,6 +638,7 @@ fn a_save_keeps_the_files_metadata() {
         delimiter: Some(Delimiter::Semicolon),
         header: Some(false),
         file: Some(Fingerprint::of(b"elsewhere")),
+        encoding: None,
     };
     let value = stale.to_attribute_value();
     write_attribute(&path, INTERPRETATION_ATTRIBUTE_C, Some(value.as_bytes()));
@@ -696,6 +697,7 @@ fn a_save_records_what_a_reopen_would_guess_differently() {
         delimiter: Some(Delimiter::Comma),
         header: Some(false),
         file: Some(Fingerprint::of(&out)),
+        encoding: None,
     };
     assert_eq!(saved.attributes.interpretation, Some(expected));
     assert_eq!(
@@ -710,6 +712,84 @@ fn a_save_records_what_a_reopen_would_guess_differently() {
         (Encoding::Windows1252, Delimiter::Comma, false)
     );
     assert!(detection.notes.is_empty());
+}
+
+/// ADR-0013 decision 2: a file opened as Windows-1253 with a byte 1253
+/// leaves unassigned, edited in Greek and saved, reopens as 1253 showing the
+/// Greek. Its `com.apple.TextEncoding` alone would be ignored (ADR-0004
+/// decision 11); Leal marks it as its own in the interpretation attribute.
+#[test]
+fn leals_own_encoding_tag_holds_over_an_unassigned_byte() {
+    let dir = Dir::new("save-own-tag");
+    let scheduler = scheduler();
+    // "όνομα,πόλη" / "Νίκος,x?y" with 0xAA, unassigned in 1253.
+    let path = dir.file(
+        "a.csv",
+        b"\xfc\xed\xef\xec\xe1,\xf0\xfc\xeb\xe7\n\xcd\xdf\xea\xef\xf2,x\xaay\n",
+    );
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1253);
+    set(&document, 1, 0, "Αθήνα");
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    let out = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &out[..13],
+        b"\xfc\xed\xef\xec\xe1,\xf0\xfc\xeb\xe7\n\xc1\xe8"
+    );
+    assert_eq!(saved.attributes.text_encoding, Some(Encoding::Windows1253));
+    let own = Interpretation {
+        file: Some(Fingerprint::of(&out)),
+        encoding: Some(Encoding::Windows1253),
+        ..Interpretation::default()
+    };
+    assert_eq!(saved.attributes.interpretation, Some(own));
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        Some(own.to_attribute_value().into_bytes())
+    );
+    // The rebase read it as a reopen does, without forcing the old split.
+    assert_eq!(
+        document.detection().header_source,
+        crate::detect::DialectSource::Guess
+    );
+
+    let reopened = open_at(&path, &dir, &scheduler);
+    let detection = reopened.detection();
+    assert_eq!(detection.encoding, Encoding::Windows1253);
+    assert_eq!(detection.encoding_source, EncodingSource::Attribute);
+    assert!(detection.own_encoding_tag);
+    assert_eq!(detection.notes, []);
+    assert_eq!(reopened.full_value(1, 0).unwrap().as_deref(), Some("Αθήνα"));
+    assert_eq!(reopened.full_value(0, 1).unwrap().as_deref(), Some("πόλη"));
+    assert_eq!(
+        reopened.full_value(1, 1).unwrap().as_deref(),
+        Some("x\u{FFFD}y")
+    );
+    let review = *reopened.review_job().wait().unwrap();
+    assert_eq!(review.encoding_suggestion, None);
+
+    // Without Leal's mark, the same tag is another app's, and is ignored.
+    write_attribute(&path, INTERPRETATION_ATTRIBUTE_C, None);
+    let foreign = open_at(&path, &dir, &scheduler);
+    assert_ne!(foreign.detection().encoding, Encoding::Windows1253);
+    assert_eq!(
+        foreign.detection().notes,
+        [crate::detect::Note::TextEncodingDoesNotDecode {
+            encoding: Encoding::Windows1253
+        }]
+    );
+    // Nor once another app has changed the bytes (the fingerprint).
+    let mut changed = out.clone();
+    changed.push(b'\n');
+    std::fs::write(&path, &changed).unwrap();
+    write_attribute(
+        &path,
+        INTERPRETATION_ATTRIBUTE_C,
+        Some(own.to_attribute_value().as_bytes()),
+    );
+    write_attribute(&path, TEXT_ENCODING_ATTRIBUTE_C, Some(b"windows-1253;1283"));
+    let changed = open_at(&path, &dir, &scheduler);
+    assert_ne!(changed.detection().encoding, Encoding::Windows1253);
+    assert!(!changed.detection().own_encoding_tag);
 }
 
 // ---------------------------------------------------------------------------

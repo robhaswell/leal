@@ -336,10 +336,24 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
     }
 }
 
-/// The encoding a reopen uses, given the file's bytes and its encoding hint
-/// (ADR-0004 decision 11). The hint models the macOS
-/// `com.apple.TextEncoding` extended attribute; the testkit never reads or
-/// writes real attributes.
+/// Who wrote an encoding hint, which decides whether a single-byte one must
+/// decode to hold (ADR-0013 decision 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintWriter {
+    /// Another app, or Leal before task 2.3: ADR-0004 decision 11 applies.
+    OtherApp,
+    /// A save by Leal, which marks its hint as its own (in its
+    /// interpretation attribute, with the saved file's fingerprint)
+    /// whenever a reopen would otherwise ignore it. The file is unchanged
+    /// since, so the hint holds.
+    Leal,
+}
+
+/// The encoding a reopen uses, given the file's bytes, its encoding hint
+/// and who wrote the hint (ADR-0004 decision 11, ADR-0013 decision 2). The
+/// hint models the macOS `com.apple.TextEncoding` extended attribute, and
+/// [`HintWriter::Leal`] Leal's interpretation attribute marking it as its
+/// own; the testkit never reads or writes real attributes.
 ///
 /// - A BOM always decides; a hint can't contradict it.
 /// - Otherwise a UTF-8 or Windows-1252 hint is **always honoured**, whatever
@@ -347,17 +361,19 @@ pub fn expected_encoding(bytes: &[u8]) -> Encoding {
 ///   `invalid_encoding` in the usual way: pass the result to
 ///   [`crate::diagnostics::derive`], which checks UTF-8 validity whenever the
 ///   encoding is UTF-8.
-/// - Another single-byte hint is honoured only if every byte is a
-///   character in it ([`decodes`]): some leave bytes unassigned.
+/// - Another single-byte hint Leal wrote is honoured too. One another app
+///   wrote is honoured only if every byte is a character in it
+///   ([`decodes`]): some leave bytes unassigned.
 /// - A UTF-16 hint on a file without a UTF-16 BOM is ignored.
 /// - With no hint, the guess applies ([`expected_encoding`]).
 #[must_use]
-pub fn reopen_encoding(bytes: &[u8], hint: Option<Encoding>) -> Encoding {
+pub fn reopen_encoding(bytes: &[u8], hint: Option<Encoding>, writer: HintWriter) -> Encoding {
     if Bom::detect(bytes) != Bom::None {
         return expected_encoding(bytes);
     }
     match hint {
         Some(h @ (Encoding::Utf8 | Encoding::Windows1252)) => h,
+        Some(h) if h.is_single_byte() && writer == HintWriter::Leal => h,
         Some(h) if h.is_single_byte() && decodes(bytes, h) => h,
         _ => expected_encoding(bytes),
     }
@@ -519,35 +535,42 @@ mod tests {
     #[test]
     fn a_hint_beats_the_guess_but_not_a_bom() {
         let ascii = b"a,b\n";
-        assert_eq!(reopen_encoding(ascii, None), Encoding::Utf8);
         assert_eq!(
-            reopen_encoding(ascii, Some(Encoding::Windows1252)),
+            reopen_encoding(ascii, None, HintWriter::OtherApp),
+            Encoding::Utf8
+        );
+        assert_eq!(
+            reopen_encoding(ascii, Some(Encoding::Windows1252), HintWriter::OtherApp),
             Encoding::Windows1252
         );
         // "é" in UTF-8 is "Ã©" in Windows-1252; the hint decides which.
         let e = "é".as_bytes();
         assert_eq!(
-            reopen_encoding(e, Some(Encoding::Windows1252)),
+            reopen_encoding(e, Some(Encoding::Windows1252), HintWriter::OtherApp),
             Encoding::Windows1252
         );
         // A UTF-8 hint is honoured even when the bytes aren't valid UTF-8
         // (the guess would say Windows-1252); they get invalid_encoding.
         assert_eq!(expected_encoding(b"\xE9"), Encoding::Windows1252);
         assert_eq!(
-            reopen_encoding(b"\xE9", Some(Encoding::Utf8)),
+            reopen_encoding(b"\xE9", Some(Encoding::Utf8), HintWriter::OtherApp),
             Encoding::Utf8
         );
         assert_eq!(
-            reopen_encoding(b"\xFF\xFF\xFFa", Some(Encoding::Utf8)),
+            reopen_encoding(b"\xFF\xFF\xFFa", Some(Encoding::Utf8), HintWriter::OtherApp),
             Encoding::Utf8
         );
         // A BOM wins, and a UTF-16 hint without a BOM is ignored.
         assert_eq!(
-            reopen_encoding(b"\xEF\xBB\xBFa", Some(Encoding::Windows1252)),
+            reopen_encoding(
+                b"\xEF\xBB\xBFa",
+                Some(Encoding::Windows1252),
+                HintWriter::OtherApp
+            ),
             Encoding::Utf8
         );
         assert_eq!(
-            reopen_encoding(ascii, Some(Encoding::Utf16Le)),
+            reopen_encoding(ascii, Some(Encoding::Utf16Le), HintWriter::OtherApp),
             Encoding::Utf8
         );
     }
@@ -570,8 +593,13 @@ mod tests {
                     assert_eq!(decode_strict(&[b], encoding), None);
                     assert!(!decodes(&[b'a', b], encoding));
                     assert_eq!(
-                        reopen_encoding(&[b'a', b], Some(encoding)),
+                        reopen_encoding(&[b'a', b], Some(encoding), HintWriter::OtherApp),
                         expected_encoding(&[b'a', b])
+                    );
+                    // Leal's own hint holds (ADR-0013 decision 2).
+                    assert_eq!(
+                        reopen_encoding(&[b'a', b], Some(encoding), HintWriter::Leal),
+                        encoding
                     );
                     continue;
                 }
@@ -606,7 +634,11 @@ mod tests {
         assert_eq!(encode_value("é", Encoding::Windows1251), Err('é'));
         // A hint for an encoding the bytes decode in holds.
         assert_eq!(
-            reopen_encoding(b"\xC0,b\n", Some(Encoding::Windows1251)),
+            reopen_encoding(
+                b"\xC0,b\n",
+                Some(Encoding::Windows1251),
+                HintWriter::OtherApp
+            ),
             Encoding::Windows1251
         );
     }

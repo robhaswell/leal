@@ -223,7 +223,7 @@ proptest! {
         let value = common::text_encoding_attribute(hint);
         let hints = Hints { text_encoding: Some(&value), ..Hints::default() };
         let d = detect(&bytes, hints, Choices::default()).unwrap();
-        prop_assert_eq!(d.encoding, common::encoding(reopen_encoding(&bytes, Some(hint))));
+        prop_assert_eq!(d.encoding, common::encoding(reopen_encoding(&bytes, Some(hint), tk::HintWriter::OtherApp)));
         let from_attribute = tk::Bom::detect(&bytes) == tk::Bom::None
             && matches!(hint, tk::Encoding::Utf8 | tk::Encoding::Windows1252);
         prop_assert_eq!(d.encoding_source == EncodingSource::Attribute, from_attribute);

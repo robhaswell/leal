@@ -160,6 +160,16 @@ pub(crate) fn assigned_bytes(encoding: Encoding) -> [bool; 256] {
     assigned
 }
 
+/// Whether a `com.apple.TextEncoding` attribute naming `encoding` holds
+/// only where the bytes decode in it (ADR-0004 decision 11): an
+/// ASCII-compatible encoding other than UTF-8 and Windows-1252 that leaves
+/// some byte unassigned.
+pub(crate) fn tag_must_decode(encoding: Encoding) -> bool {
+    encoding.is_ascii_compatible()
+        && !matches!(encoding, Encoding::Utf8 | Encoding::Windows1252)
+        && assigned_bytes(encoding).contains(&false)
+}
+
 /// Where a chunk of about `size` bytes starting at `start` should end, so
 /// that chunks can be read one at a time: never inside a UTF-16 code unit,
 /// and never inside a UTF-8 sequence that could be valid, so that

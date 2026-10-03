@@ -17,8 +17,9 @@
 //!
 //! # `io.github.robhaswell.leal.interpretation`
 //!
-//! Leal's remembered delimiter and header choice (ADR-0005 decision 1), for
-//! example `v=1;delimiter=semicolon;header=yes;file=1532-9f3c0e1d2b4a5867`:
+//! Leal's remembered delimiter and header choice (ADR-0005 decision 1), and
+//! the encoding of a tag it wrote itself (ADR-0013 decision 2), for example
+//! `v=1;delimiter=semicolon;header=yes;file=1532-9f3c0e1d2b4a5867`:
 //!
 //! - UTF-8 text made of `key=value` items separated by `;`, with no spaces.
 //!   Whitespace and NULs around the whole value are ignored.
@@ -32,6 +33,13 @@
 //!   choices are used as they are. Once something else has changed the
 //!   file, they are used only if the file still parses sensibly with them
 //!   (see [`crate::detect`]). This is ADR-0007 decision 1.
+//! - `encoding` is the IANA name of the encoding Leal wrote the file in
+//!   and also recorded in `com.apple.TextEncoding` (for example
+//!   `windows-1253`; see [`Encoding::iana_name`]), when a reopen would
+//!   otherwise ignore that tag. While the file matches `file`, the tag is
+//!   Leal's own and is honoured even where a byte doesn't decode in it
+//!   (ADR-0013 decision 2). Added in task 2.3: older values have none, and
+//!   older Leal ignores it as an unknown key.
 //! - Any of these may be left out, meaning that part was not remembered.
 //!   Other keys made of lowercase letters, digits, `_` and `-` are ignored,
 //!   so a later Leal can add some without older ones rejecting the
@@ -133,6 +141,10 @@ pub struct Interpretation {
     pub header: Option<bool>,
     /// The file these choices were saved with.
     pub file: Option<Fingerprint>,
+    /// The encoding of the `com.apple.TextEncoding` tag Leal wrote with
+    /// the file, when a reopen would otherwise ignore it (ADR-0013
+    /// decision 2).
+    pub encoding: Option<Encoding>,
 }
 
 /// Identifies the exact bytes Leal saved, cheaply enough to check at first
@@ -210,7 +222,8 @@ impl Interpretation {
     ///
     /// Returns an [`InterpretationError`] if the value isn't UTF-8, doesn't
     /// start with `v=1`, has an item that isn't `key=value`, repeats a key,
-    /// or gives `delimiter` or `header` a value not listed above.
+    /// or gives `delimiter`, `header`, `file` or `encoding` a value not
+    /// listed above.
     pub fn parse(value: &[u8]) -> Result<Self, InterpretationError> {
         let fail = |reason: String| Err(InterpretationError { reason });
         let Ok(text) = std::str::from_utf8(value) else {
@@ -252,6 +265,10 @@ impl Interpretation {
                     Some(f) => result.file = Some(f),
                     None => return fail(format!("`{value}` is not a file fingerprint")),
                 },
+                "encoding" => match ascii_compatible_named(value) {
+                    Some(e) => result.encoding = Some(e),
+                    None => return fail(format!("unknown encoding `{value}`")),
+                },
                 // A later version's addition; see the module docs.
                 _ => {}
             }
@@ -274,8 +291,20 @@ impl Interpretation {
         if let Some(f) = self.file {
             value.push_str(&format!(";file={}-{:016x}", f.length, f.head_hash));
         }
+        if let Some(e) = self.encoding {
+            value.push_str(";encoding=");
+            value.push_str(e.iana_name());
+        }
         value
     }
+}
+
+/// The ASCII-compatible encoding (any but UTF-16) whose IANA name is
+/// `name`, exactly as [`Encoding::iana_name`] writes it.
+fn ascii_compatible_named(name: &str) -> Option<Encoding> {
+    Encoding::ALL
+        .into_iter()
+        .find(|e| e.is_ascii_compatible() && e.iana_name() == name)
 }
 
 #[cfg(test)]
@@ -379,18 +408,26 @@ mod tests {
             Some(Fingerprint::of(b"")),
             Some(Fingerprint::of(b"a,b\n")),
         ];
-        for delimiter in [None, Some(Delimiter::Comma), Some(Delimiter::Tab)] {
-            for header in [None, Some(true), Some(false)] {
-                for file in files {
-                    let i = Interpretation {
-                        delimiter,
-                        header,
-                        file,
-                    };
-                    assert_eq!(
-                        Interpretation::parse(i.to_attribute_value().as_bytes()),
-                        Ok(i)
-                    );
+        let encodings = Encoding::ALL
+            .into_iter()
+            .filter(|e| e.is_ascii_compatible())
+            .map(Some)
+            .chain([None]);
+        for encoding in encodings {
+            for delimiter in [None, Some(Delimiter::Comma), Some(Delimiter::Tab)] {
+                for header in [None, Some(true), Some(false)] {
+                    for file in files {
+                        let i = Interpretation {
+                            delimiter,
+                            header,
+                            file,
+                            encoding,
+                        };
+                        assert_eq!(
+                            Interpretation::parse(i.to_attribute_value().as_bytes()),
+                            Ok(i)
+                        );
+                    }
                 }
             }
         }
@@ -402,9 +439,22 @@ mod tests {
                     length: 5,
                     head_hash: 0xab
                 }),
+                encoding: None,
             }
             .to_attribute_value(),
             "v=1;delimiter=pipe;header=no;file=5-00000000000000ab"
+        );
+        assert_eq!(
+            Interpretation {
+                file: Some(Fingerprint {
+                    length: 5,
+                    head_hash: 0xab
+                }),
+                encoding: Some(Encoding::Windows1253),
+                ..Interpretation::default()
+            }
+            .to_attribute_value(),
+            "v=1;file=5-00000000000000ab;encoding=windows-1253"
         );
         assert_eq!(Interpretation::default().to_attribute_value(), "v=1");
     }
@@ -417,7 +467,26 @@ mod tests {
                 delimiter: Some(Delimiter::Tab),
                 header: Some(false),
                 file: None,
+                encoding: None,
             })
+        );
+    }
+
+    /// Values written before the `encoding` key (task 2.3) read as before,
+    /// with no encoding remembered, and are written back the same; the key
+    /// can come in any position.
+    #[test]
+    fn interpretations_without_an_encoding_still_read() {
+        let old = b"v=1;delimiter=semicolon;header=yes;file=1532-9f3c0e1d2b4a5867";
+        let read = Interpretation::parse(old).unwrap();
+        assert_eq!(read.delimiter, Some(Delimiter::Semicolon));
+        assert_eq!(read.encoding, None);
+        assert_eq!(read.to_attribute_value().as_bytes(), old);
+        assert_eq!(
+            Interpretation::parse(b"v=1;encoding=macintosh;header=no")
+                .unwrap()
+                .encoding,
+            Some(Encoding::MacRoman)
         );
     }
 
@@ -457,6 +526,12 @@ mod tests {
             b"v=1;file=12-00000000000000AB",
             b"v=1;file=-00000000000000ab",
             b"v=1;file=x-00000000000000ab",
+            b"v=1;encoding=",
+            b"v=1;encoding=greek",
+            b"v=1;encoding=Windows-1253",
+            b"v=1;encoding=1253",
+            b"v=1;encoding=utf-16le",
+            b"v=1;encoding=windows-1253;encoding=windows-1253",
             b"\xFFv=1",
         ] {
             assert!(

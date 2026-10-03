@@ -19,9 +19,9 @@
 //!   save wrote, gives the same BOM, encoding, delimiter and header choice,
 //!   every row's values and line endings, no note about the attributes, and
 //!   no whole-file review suggestion (phase 1 review). A single-byte
-//!   encoding's attribute holds only if every byte decodes in it (ADR-0004
-//!   decision 11), so a file with a byte it leaves unassigned is reopened
-//!   with the encoding chosen, as it was opened.
+//!   encoding's attribute Leal wrote holds even if a byte doesn't decode in
+//!   it, since Leal marks it as its own (ADR-0013 decision 2;
+//!   `tk::reopen_encoding` with `HintWriter::Leal`).
 //! - **The rebase** (ADR-0008 decision 1): the document reads the saved
 //!   file afterwards, with no edits left, in the same lineage.
 //! - **Save As UTF-8** (ADR-0008 decision 7): the bytes the oracle's
@@ -420,9 +420,9 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
 
 /// The reopen property (see the module docs): `path`, saved from
 /// `document`, opened afresh reads as it did, with no notes and no
-/// suggestions. A single-byte encoding's attribute holds only if every
-/// byte decodes in it (ADR-0004 decision 11; `tk::reopen_encoding`):
-/// otherwise the encoding is chosen again, as it was at open.
+/// suggestions. Leal's own single-byte attribute holds whatever the bytes
+/// (ADR-0013 decision 2; `tk::reopen_encoding`); were the model to say
+/// otherwise, the encoding would be chosen again, as it was at open.
 fn check_reopen(
     document: &Document,
     path: &Path,
@@ -432,7 +432,7 @@ fn check_reopen(
 ) -> Result<(), TestCaseError> {
     let on_disk = std::fs::read(path).unwrap();
     let holds = tk_encoding(encoding).is_some_and(|tk_encoding| {
-        tk::reopen_encoding(&on_disk, saved.encoding_hint) == tk_encoding
+        tk::reopen_encoding(&on_disk, saved.encoding_hint, tk::HintWriter::Leal) == tk_encoding
             || !tk_encoding.is_single_byte()
     });
     let options = OpenOptions {

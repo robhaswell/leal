@@ -65,6 +65,7 @@ fn interpretation_to_write(
         delimiter: Some(document.delimiter),
         header: Some(document.header),
         file: fingerprint.then(|| Fingerprint::of(saved)),
+        encoding: None,
     })
 }
 
@@ -254,6 +255,7 @@ proptest! {
                 delimiter: Some(remembered),
                 header: None,
                 file: None,
+                encoding: None,
             }
             .to_attribute_value();
             let hints = Hints {

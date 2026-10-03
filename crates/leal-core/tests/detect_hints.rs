@@ -340,6 +340,7 @@ fn a_sensible_remembered_interpretation_is_honoured() {
         delimiter: Some(Delimiter::Comma),
         header: Some(false),
         file: Some(Fingerprint::of(b"a;b\n")),
+        encoding: None,
     }
     .to_attribute_value();
     let d = with_interpretation(bytes, value.as_bytes());
@@ -386,6 +387,7 @@ fn a_remembered_interpretation_is_honoured_while_the_file_is_unchanged() {
         delimiter: Some(Delimiter::Comma),
         header: Some(false),
         file: Some(Fingerprint::of(bytes)),
+        encoding: None,
     }
     .to_attribute_value();
     let d = with_interpretation(bytes, value.as_bytes());

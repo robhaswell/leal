@@ -22,9 +22,12 @@
 //! 2. A BOM.
 //! 3. The `com.apple.TextEncoding` attribute (ADR-0004 decision 11). A
 //!    UTF-8 or Windows-1252 attribute is always honoured. Another supported
-//!    single-byte encoding is honoured only if the bytes decode under it. A
-//!    UTF-16 attribute without a UTF-16 BOM, an unsupported encoding and an
-//!    unreadable value are ignored, each with a [`Note`].
+//!    single-byte encoding is honoured only if the bytes decode under it,
+//!    unless Leal wrote the attribute itself: its interpretation attribute
+//!    records the same encoding with a [`Fingerprint`] the file still
+//!    matches (ADR-0013 decision 2). A UTF-16 attribute without a UTF-16
+//!    BOM, an unsupported encoding and an unreadable value are ignored,
+//!    each with a [`Note`].
 //! 4. The guess, ADR-0003 decision 1 applied to the first 64 KB.
 //!
 //! # Delimiter and header order
@@ -53,11 +56,13 @@ mod units;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::attributes::{Fingerprint, Interpretation, TextEncodingError, parse_text_encoding};
+use crate::attributes::{
+    Fingerprint, Interpretation, InterpretationError, TextEncodingError, parse_text_encoding,
+};
 use crate::dialect::{Bom, Delimiter, Encoding, LineEnding, QUOTE};
 use crate::source::RawAttributes;
 use delimiter::{Scores, Tally, best, score_of, scores, tally};
-pub(crate) use encoding::{Census, CensusStream};
+pub(crate) use encoding::{Census, CensusStream, tag_must_decode};
 use encoding::{assigned_bytes, chunk_end, decodes};
 use rows::{Row, Scanner, field_values, whole_rows};
 use units::Units;
@@ -189,6 +194,12 @@ pub struct Detection {
     pub trailing_newline: Option<bool>,
     /// Attribute problems, for the status bar.
     pub notes: Vec<Note>,
+    /// Whether the encoding is from a `com.apple.TextEncoding` attribute
+    /// Leal wrote itself (ADR-0013 decision 2): its interpretation
+    /// attribute records the same encoding, with a fingerprint the file
+    /// still matches. It holds even where a byte doesn't decode, so
+    /// [`review`] doesn't second-guess it.
+    pub own_encoding_tag: bool,
 }
 
 impl Detection {
@@ -273,27 +284,31 @@ pub fn detect(
     let body = &head[bom.len()..];
     let mut notes = Vec::new();
 
+    // Leal's interpretation attribute, and the encoding it records for the
+    // file Leal saved, if this is still that file (ADR-0013 decision 2).
+    let fingerprint = Fingerprint::from_head(head, file_len);
+    let interpretation = hints.interpretation.map(Interpretation::parse);
+    let own_encoding = match &interpretation {
+        Some(Ok(i)) if i.file == Some(fingerprint) => i.encoding,
+        _ => None,
+    };
     let (encoding, encoding_source) = choose_encoding(
         body,
         cut,
         bom,
         hints.text_encoding,
+        own_encoding,
         choices.encoding,
         &mut notes,
     )?;
+    let own_encoding_tag =
+        encoding_source == EncodingSource::Attribute && own_encoding == Some(encoding);
     let units = Units::new(body, encoding);
 
     // The delimiter: chosen, remembered, or guessed.
     let scores = scores(|d| tally(units, d, cut).score());
     let guess = best(&scores).map(|(d, _)| d);
-    let fingerprint = Fingerprint::from_head(head, file_len);
-    let remembered = remembered(
-        fingerprint,
-        hints.interpretation,
-        &scores,
-        guess,
-        &mut notes,
-    );
+    let remembered = remembered(fingerprint, interpretation, &scores, guess, &mut notes);
     let (delimiter, delimiter_source) = match (choices.delimiter, remembered.delimiter) {
         (Some(d), _) => (d, DialectSource::User),
         (None, Some(d)) => (d, DialectSource::Attribute),
@@ -324,6 +339,7 @@ pub fn detect(
         mixed_line_endings,
         trailing_newline,
         notes,
+        own_encoding_tag,
     })
 }
 
@@ -332,6 +348,7 @@ fn choose_encoding(
     cut: bool,
     bom: Bom,
     text_encoding: Option<&[u8]>,
+    own_encoding: Option<Encoding>,
     chosen: Option<Encoding>,
     notes: &mut Vec<Note>,
 ) -> Result<(Encoding, EncodingSource), ChoiceError> {
@@ -352,7 +369,10 @@ fn choose_encoding(
             Ok(e @ (Encoding::Utf8 | Encoding::Windows1252)) => {
                 return Ok((e, EncodingSource::Attribute));
             }
-            Ok(e) if decodes(body, e) => return Ok((e, EncodingSource::Attribute)),
+            // Leal's own tag holds whatever the bytes (ADR-0013 decision 2).
+            Ok(e) if own_encoding == Some(e) || decodes(body, e) => {
+                return Ok((e, EncodingSource::Attribute));
+            }
             Ok(e) => notes.push(Note::TextEncodingDoesNotDecode { encoding: e }),
             Err(TextEncodingError::Unreadable) => notes.push(Note::TextEncodingUnreadable),
             Err(TextEncodingError::Unsupported { cf_string_encoding }) => {
@@ -369,15 +389,15 @@ fn choose_encoding(
 /// with a note.
 fn remembered(
     fingerprint: Fingerprint,
-    value: Option<&[u8]>,
+    parsed: Option<Result<Interpretation, InterpretationError>>,
     scores: &Scores,
     guess: Option<Delimiter>,
     notes: &mut Vec<Note>,
 ) -> Interpretation {
-    let Some(value) = value else {
+    let Some(parsed) = parsed else {
         return Interpretation::default();
     };
-    let Ok(interpretation) = Interpretation::parse(value) else {
+    let Ok(interpretation) = parsed else {
         notes.push(Note::InterpretationUnreadable);
         return Interpretation::default();
     };
@@ -567,12 +587,14 @@ pub fn review_with(
     let in_use = detection.delimiter;
 
     // What to check: the encoding rule only for a guess, or for an
-    // attribute's single-byte encoding that must decode; every delimiter
+    // attribute's single-byte encoding that must decode (not Leal's own,
+    // ADR-0013 decision 2); every delimiter
     // only if the delimiter was guessed.
     let other_single_byte = encoding.is_ascii_compatible()
         && !matches!(encoding, Encoding::Utf8 | Encoding::Windows1252);
-    let check_decoding =
-        detection.encoding_source == EncodingSource::Attribute && other_single_byte;
+    let check_decoding = detection.encoding_source == EncodingSource::Attribute
+        && other_single_byte
+        && !detection.own_encoding_tag;
     let count_utf8 = detection.encoding_source == EncodingSource::Guess || check_decoding;
     let assigned = check_decoding.then(|| assigned_bytes(encoding));
     let guessed = detection.delimiter_source == DialectSource::Guess;

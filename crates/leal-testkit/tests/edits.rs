@@ -5,8 +5,8 @@ mod oracle;
 
 use leal_testkit::diagnostics::{self, DiagnosticKind};
 use leal_testkit::dialect::{
-    Bom, Delimiter, Encoding, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value, encode_value,
-    expected_encoding, reopen_encoding, unassigned_bytes,
+    Bom, Delimiter, Encoding, HintWriter, UTF8_BOM, UTF16BE_BOM, UTF16LE_BOM, decode_value,
+    encode_value, expected_encoding, reopen_encoding, unassigned_bytes,
 };
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
@@ -664,7 +664,7 @@ proptest! {
         let guess = expected_encoding(&saved.bytes);
         let needed = guess != case.file.encoding || case.existing_hint.is_some();
         prop_assert_eq!(saved.encoding_hint, needed.then_some(case.file.encoding));
-        let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint);
+        let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint, HintWriter::Leal);
         prop_assert_eq!(reopened, case.file.encoding);
 
         let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
@@ -707,9 +707,12 @@ fn encoding_can_flip_on_reopen() {
         let saved = doc.save().unwrap();
         // The save asks for a hint, and with it the reopen is right.
         assert_eq!(saved.encoding_hint, Some(enc));
-        assert_eq!(reopen_encoding(&saved.bytes, saved.encoding_hint), enc);
+        assert_eq!(
+            reopen_encoding(&saved.bytes, saved.encoding_hint, HintWriter::Leal),
+            enc
+        );
         // Without it, the guess flips.
-        (enc, reopen_encoding(&saved.bytes, None))
+        (enc, reopen_encoding(&saved.bytes, None, HintWriter::Leal))
     };
     // Windows-1252 with one high byte (€) → pure ASCII → UTF-8. The text
     // decodes the same either way; only future edits would encode
@@ -738,7 +741,7 @@ fn encoding_can_flip_on_reopen() {
     };
     doc.apply(&clear).unwrap();
     let saved = doc.save().unwrap();
-    let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint);
+    let reopened = reopen_encoding(&saved.bytes, saved.encoding_hint, HintWriter::Leal);
     let reparsed = oracle::analyze(&saved.bytes, Delimiter::Comma, reopened).layout;
     let found = diagnostics::derive(&reparsed, &saved.bytes, reopened);
     assert!(

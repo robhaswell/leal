@@ -249,8 +249,10 @@ pub struct SavedFile {
     /// document's encoding, when a reopen of `bytes` would otherwise guess a
     /// different one, or when the file already had a hint (which is then
     /// updated). `None` means write no hint. This models the macOS
-    /// `com.apple.TextEncoding` extended attribute; reopen with
-    /// [`crate::dialect::reopen_encoding`].
+    /// `com.apple.TextEncoding` extended attribute, which Leal marks as its
+    /// own when a reopen would otherwise ignore it (ADR-0013 decision 2);
+    /// reopen with [`crate::dialect::reopen_encoding`] and
+    /// [`HintWriter::Leal`](crate::dialect::HintWriter::Leal).
     pub encoding_hint: Option<Encoding>,
     /// The extra changes the save had to make to keep the file's structure
     /// (ADR-0004 decisions 6, 7 and 10), in the order they were made. Tests
