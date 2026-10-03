@@ -303,7 +303,9 @@ pub fn detect(
     // Everything else is read under that delimiter.
     let rows = whole_rows(units, delimiter.byte(), cut);
     let (line_ending, mixed_line_endings) = line_endings(rows.iter().map(|r| r.ending));
-    let trailing_newline = (!cut).then(|| rows.last().is_some_and(|r| r.ending.is_some()));
+    let trailing_newline = (!cut).then(|| {
+        rows.last().is_some_and(|r| r.ending.is_some()) && !ends_in_odd_byte(body, encoding)
+    });
     let (header, header_source) = match (choices.header, remembered.header) {
         (Some(h), _) => (h, DialectSource::User),
         (None, Some(h)) => (h, DialectSource::Attribute),
@@ -402,6 +404,14 @@ fn fits(scores: &Scores, remembered: Delimiter, guess: Option<Delimiter>) -> boo
         (Some(r), Some(g)) => r.at_least_as_consistent_as(&g),
         _ => true,
     }
+}
+
+/// Whether `body` (the file after its BOM) is UTF-16 ending in a final odd
+/// byte. The rows above are read in whole code units, but the index puts
+/// that byte in the last row (a row of its own after a line ending), which
+/// so has no line ending (task 2.3: the UTF-16 generator makes such files).
+fn ends_in_odd_byte(body: &[u8], encoding: Encoding) -> bool {
+    !encoding.is_ascii_compatible() && body.len() % 2 == 1
 }
 
 /// The most common of rows' line endings (ties go to the first seen) and
@@ -649,7 +659,7 @@ pub fn review_with(
         delimiter_suggestion,
         line_ending,
         mixed_line_endings,
-        trailing_newline: last_ending.flatten().is_some(),
+        trailing_newline: last_ending.flatten().is_some() && !ends_in_odd_byte(body, encoding),
     })
 }
 

@@ -68,6 +68,24 @@ fn a_first_row_longer_than_64_kb_still_decides_the_delimiter() {
 }
 
 /// The caller may pass only the first 64 KB, with the file's length.
+/// A UTF-16 file ending in an odd byte after its last line ending: the
+/// index makes that byte a row of its own with no line ending, so neither
+/// first paint nor the review says the file ends with one (task 2.3).
+#[test]
+fn a_final_odd_utf16_byte_is_a_last_row_with_no_line_ending() {
+    for (file, ends) in [
+        (&b"\xFF\xFEa\0\n\0"[..], true),
+        (b"\xFF\xFEa\0\n\0\n", false),
+        (b"\xFE\xFF\0a\0\n\0", false),
+        (b"\xFE\xFF\0a\0", false),
+    ] {
+        let d = plain(file);
+        assert_eq!(d.trailing_newline, Some(ends), "{file:?}");
+        assert_eq!(review(file, &d).trailing_newline, ends, "{file:?}");
+        assert_eq!(d.line_ending, (file.len() > 5).then_some(LineEnding::Lf));
+    }
+}
+
 #[test]
 fn first_paint_from_the_head_alone_is_the_same() {
     let file = repeated(b"a;b\n", b"1;\"x\ny\"\r\n", 5 * FIRST_PAINT_BYTES);
