@@ -239,6 +239,14 @@ fn clean_generator_reaches_every_dialect() {
     ] {
         assert!(has(&|f| f.model.dialect.quoting == q), "{q:?}");
     }
+    assert!(
+        has(
+            &|f| matches!(f.model.dialect.quoting, QuotingStyle::Columns(_))
+                && f.document().column_quoting().iter().any(|&q| q)
+                && !f.layout.quotes_every_field()
+        ),
+        "a quoted text column in a file that doesn't quote every field"
+    );
     assert!(has(&|f| f.bytes.is_empty()), "empty file");
     assert!(has(&|f| f.model.dialect.bom), "BOM");
     assert!(

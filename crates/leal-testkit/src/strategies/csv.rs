@@ -156,6 +156,10 @@ pub enum QuotingStyle {
     Always,
     /// Quote some fields at random, as hand-edited files do.
     Mixed,
+    /// Quote every field of some columns (bit `c` of the mask quotes
+    /// column `c`), as pandas' "quote text columns" style does: for
+    /// per-column quoting of new fields (ADR-0005 decision 3).
+    Columns(u8),
 }
 
 /// The line endings the model uses.
@@ -774,13 +778,16 @@ pub fn csv_file(config: CsvConfig) -> impl Strategy<Value = GeneratedCsv> {
         select(&Delimiter::ALL[..]),
         line_endings(m),
         prop::bool::weighted(0.25), // BOM
-        select(
-            &[
-                QuotingStyle::Minimal,
-                QuotingStyle::Always,
-                QuotingStyle::Mixed,
-            ][..],
-        ),
+        prop_oneof![
+            3 => select(
+                &[
+                    QuotingStyle::Minimal,
+                    QuotingStyle::Always,
+                    QuotingStyle::Mixed,
+                ][..],
+            ),
+            1 => any::<u8>().prop_map(QuotingStyle::Columns),
+        ],
         prop::bool::weighted(0.75), // trailing newline
         prop::bool::weighted(0.3),  // unterminated, if allowed
         1..=config.max_fields.max(1),
@@ -934,7 +941,8 @@ fn build(raw: RawFile, m: Messiness) -> CsvModel {
                 r.fields
                     .into_iter()
                     .take(count)
-                    .map(|f| build_field(f, delimiter, raw.dialect.quoting, m))
+                    .enumerate()
+                    .map(|(c, f)| build_field(f, c, delimiter, raw.dialect.quoting, m))
                     .collect()
             };
             let line_ending = match raw.dialect.line_endings {
@@ -966,7 +974,13 @@ fn build(raw: RawFile, m: Messiness) -> CsvModel {
     }
 }
 
-fn build_field(f: RawField, delimiter: u8, quoting: QuotingStyle, m: Messiness) -> ModelField {
+fn build_field(
+    f: RawField,
+    column: usize,
+    delimiter: u8,
+    quoting: QuotingStyle,
+    m: Messiness,
+) -> ModelField {
     let value = f.value;
     let needs_quotes = value.first() == Some(&b'"')
         || value
@@ -978,6 +992,7 @@ fn build_field(f: RawField, delimiter: u8, quoting: QuotingStyle, m: Messiness) 
             QuotingStyle::Minimal => false,
             QuotingStyle::Always => true,
             QuotingStyle::Mixed => f.quote,
+            QuotingStyle::Columns(mask) => column < 8 && mask & (1 << column) != 0,
         };
     if !quoted {
         return ModelField::Unquoted(value);

@@ -495,6 +495,66 @@ fn corpus_case(name: &str) -> (Vec<u8>, Layout, Delimiter, Encoding) {
     (case.bytes, layout, d, enc)
 }
 
+/// ADR-0004 decision 2 and ADR-0005 decision 3: a new field is quoted if
+/// its column has a non-empty field and every non-empty one is quoted.
+/// Empty fields, blank lines, new cells and edited fields' new values don't
+/// count; edited fields count by their original bytes.
+#[test]
+fn a_new_field_is_quoted_if_its_column_quotes_every_field() {
+    let bytes = b"\"id\",name,\"note\",\n\"1\",ann,,x\n\n\"2\",\"bob\",\"\",\n";
+    let d = Delimiter::Comma;
+    let layout = oracle::analyze(bytes, d, Encoding::Utf8).layout;
+    let mut doc = Document::new(bytes, &layout, d, Encoding::Utf8);
+    // Column 0 quotes every field; column 1 doesn't (`ann`); column 2's
+    // non-empty fields (`"note"`, `""`) are quoted; column 3 has none.
+    assert_eq!(doc.column_quoting(), [true, false, true, false]);
+    let row = |values: &[&str]| Edit::InsertRow {
+        at: 4,
+        values: values.iter().map(|v| (*v).to_owned()).collect(),
+    };
+    doc.apply(&row(&["3", "cy", "n", "z"])).unwrap();
+    let saved = doc.save().unwrap();
+    assert!(
+        saved.bytes.ends_with(b"\"3\",cy,\"n\",z\n"),
+        "{:?}",
+        saved.bytes.escape_ascii().to_string()
+    );
+
+    // An inserted column at 1 quotes like nothing yet (no original fields
+    // there now): only if needed. Its values don't make the column quoted.
+    doc.apply(&Edit::InsertColumn {
+        at: 1,
+        value: "q".into(),
+    })
+    .unwrap();
+    assert_eq!(doc.column_quoting(), [true, false, false, true, false]);
+    let saved = doc.save().unwrap();
+    assert!(saved.bytes.starts_with(b"\"id\",q,name,\"note\",\n"));
+    assert!(saved.bytes.ends_with(b"\"3\",q,cy,\"n\",z\n"));
+
+    // An edited field still counts by its original (unquoted) bytes, so
+    // editing `ann` doesn't make column 2 quoted.
+    doc.apply(&Edit::SetCell {
+        row: 1,
+        column: 2,
+        value: "a".into(),
+    })
+    .unwrap();
+    assert!(!doc.column_quoting()[2]);
+    // Deleting the rows with `name` and `ann` does. (A column with no
+    // non-empty field left, like the last one now, is left out.)
+    doc.apply(&Edit::DeleteRow { row: 1 }).unwrap();
+    assert_eq!(doc.column_quoting(), [true, false, false, true]);
+    doc.apply(&Edit::DeleteRow { row: 0 }).unwrap();
+    assert_eq!(doc.column_quoting(), [true, false, true, true]);
+    let saved = doc.save().unwrap();
+    assert!(
+        saved.bytes.ends_with(b"\"3\",q,\"cy\",\"n\",z\n"),
+        "{:?}",
+        saved.bytes.escape_ascii().to_string()
+    );
+}
+
 fn insert_row(at: usize) -> Edit {
     Edit::InsertRow {
         at,
@@ -902,6 +962,20 @@ fn coverage_counts(
             }
             doc.apply(e).unwrap();
         }
+        // ADR-0005 decision 3: a new field quoted for its column alone.
+        if case.saved.is_ok() && !case.file.layout.quotes_every_field() {
+            let quoted = doc.column_quoting();
+            let new_in_quoted = (0..doc.row_count()).any(|r| {
+                (0..doc.row_len(r)).any(|c| {
+                    quoted.get(c).copied().unwrap_or(false)
+                        && doc.cell_source(r, c) == Some(CellSource::Edited)
+                        && doc.original_value(r, c).is_none()
+                })
+            });
+            if new_in_quoted {
+                seen.push("quoting: a new field in a quoted column");
+            }
+        }
         seen.sort_unstable();
         seen.dedup();
         for s in seen {
@@ -944,6 +1018,7 @@ fn check_coverage(counts: &std::collections::BTreeMap<&str, usize>) -> Result<()
         "delete: last column",
         "insert: first column",
         "insert: after the last column",
+        "quoting: a new field in a quoted column",
     ];
     for name in expected {
         let n = counts.get(name).copied().unwrap_or(0);

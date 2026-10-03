@@ -16,8 +16,18 @@
 //!    bytes, edited fields are written by [`expected_field_bytes`], and the
 //!    delimiters and line ending are the row's own.
 //! 3. A new row uses the most common line ending (LF if the file has none)
-//!    and the file's quoting style: every field quoted if the file quotes
-//!    every field, otherwise only fields that need it.
+//!    and the file's quoting style. A **new field** (an inserted row's, or
+//!    an inserted column's) is quoted if it needs it, if the file quotes
+//!    every field, or if its column quotes every field: the column has at
+//!    least one non-empty field and every non-empty field in it is quoted
+//!    ([`column_quoting`](Document::column_quoting)). The column is the
+//!    logical column as the document is now; its fields are the original
+//!    fields at that position (edited ones judged by their original bytes)
+//!    in rows that aren't original blank lines; new cells don't count. An
+//!    empty field is one with no bytes in the file (`""` is non-empty).
+//!    Hatched cells (rule 12) are new values in old rows: quoted only if
+//!    needed or the file quotes every field. (ADR-0004 decision 2,
+//!    ADR-0005 decision 3, ADR-0014 decision 4.)
 //! 4. The trailing newline is kept as it was. If the file had none, the last
 //!    row of the output has none, and a row that used to be last but no
 //!    longer is gets the most common line ending.
@@ -65,8 +75,7 @@
 //! a reopen must find. The encoding is kept by the encoding hint
 //! ([`SavedFile::encoding_hint`], ADR-0004 decision 11).
 //!
-//! How these map to ADR-0004: rule 3 is decisions 1 and 3 (decision 2,
-//! per-column quoting, is not in yet: see `TODO(ADR-0004 #2)`); rule 4 is
+//! How these map to ADR-0004: rule 3 is decisions 1, 2 and 3; rule 4 is
 //! decision 4; rule 5 is decision 9; rule 6 is decision 5; rules 8, 9 and 10
 //! are decisions 6, 7 and 8; rules 9 and 11 are decision 10. Rule 12 is
 //! ADR-0005 decision 2.
@@ -88,6 +97,23 @@ enum Bad {
     Unconvertible,
 }
 use crate::fidelity::{Change, apply_changes};
+
+/// How new values are quoted when written (rule 3): every one if the file
+/// quotes every field; otherwise a new field also if its column quotes
+/// every field.
+#[derive(Clone, Debug, Default)]
+struct Quoting {
+    all: bool,
+    columns: Vec<bool>,
+}
+
+impl Quoting {
+    /// Whether a new field in logical column `column` is quoted (besides
+    /// needing it).
+    fn new_field(&self, column: usize) -> bool {
+        self.all || self.columns.get(column).copied().unwrap_or(false)
+    }
+}
 use crate::layout::Layout;
 
 /// The furthest a hatched-cell edit may reach (rule 12): column
@@ -636,7 +662,7 @@ impl<'a> Document<'a> {
     /// The output of a save in the file's own encoding, or (`transcode`)
     /// converted to UTF-8.
     fn write(&self, transcode: bool) -> Result<SavedFile, SaveError> {
-        let quote_all = self.layout.quotes_every_field();
+        let quoting = self.quoting();
         let dominant = self.layout.line_endings().0.unwrap_or(LineEnding::Lf);
         let trailing_newline = self.layout.trailing_newline();
 
@@ -662,7 +688,7 @@ impl<'a> Document<'a> {
                     if ci > 0 {
                         content.push(self.delimiter.byte());
                     }
-                    match self.cell_bytes(row, cell, quote_all, transcode) {
+                    match self.cell_bytes(row, ci, cell, &quoting, transcode) {
                         Ok(b) => content.extend_from_slice(&b),
                         Err(Bad::Unencodable) => unencodable.push((ri, ci)),
                         Err(Bad::Unconvertible) => unconvertible.push((ri, ci)),
@@ -738,7 +764,7 @@ impl<'a> Document<'a> {
                 .iter()
                 .any(|bom| content.starts_with(bom))
             && let Some(cell) = row.cells.first()
-            && let Ok(first) = self.cell_bytes(row, cell, quote_all, transcode)
+            && let Ok(first) = self.cell_bytes(row, 0, cell, &quoting, transcode)
         {
             let rest = content[first.len()..].to_vec();
             *content = [quote(&first), rest].concat();
@@ -784,14 +810,61 @@ impl<'a> Document<'a> {
         })
     }
 
+    /// Which logical columns quote every field (rule 3, ADR-0005 decision
+    /// 3, ADR-0014 decision 4): those with at least one non-empty original
+    /// field, every one of them quoted. A column's fields are the original
+    /// fields at its position now, edited ones by their original bytes, in
+    /// rows that aren't original blank lines; new cells don't count.
+    #[must_use]
+    pub fn column_quoting(&self) -> Vec<bool> {
+        // Per column: (a non-empty field seen, every one seen quoted).
+        let mut columns: Vec<(bool, bool)> = Vec::new();
+        for row in &self.rows {
+            let Some(source) = row.source else { continue };
+            if row.is_blank_line(self.layout) {
+                continue;
+            }
+            for (column, cell) in row.cells.iter().enumerate() {
+                let field = match cell {
+                    Cell::Original(f) | Cell::Edited { field: Some(f), .. } => *f,
+                    Cell::Edited { field: None, .. } | Cell::Appended(_) => continue,
+                };
+                let field = &self.layout.rows[source].fields[field];
+                if field.span.is_empty() {
+                    continue;
+                }
+                if columns.len() <= column {
+                    columns.resize(column + 1, (false, true));
+                }
+                let entry = &mut columns[column];
+                entry.0 = true;
+                entry.1 &= field.quoted;
+            }
+        }
+        columns
+            .into_iter()
+            .map(|(seen, quoted)| seen && quoted)
+            .collect()
+    }
+
+    /// How new values are quoted now (rule 3).
+    fn quoting(&self) -> Quoting {
+        Quoting {
+            all: self.layout.quotes_every_field(),
+            columns: self.column_quoting(),
+        }
+    }
+
     /// A cell's bytes as written: an original field's raw bytes (converted
     /// to UTF-8 if `transcode`), or a new value encoded in the file's
-    /// encoding (UTF-8 if `transcode`).
+    /// encoding (UTF-8 if `transcode`). `column` is the cell's logical
+    /// column, for a new field's quoting.
     fn cell_bytes(
         &self,
         row: &DocRow,
+        column: usize,
         cell: &Cell,
-        quote_all: bool,
+        quoting: &Quoting,
         transcode: bool,
     ) -> Result<Vec<u8>, Bad> {
         let target = if transcode {
@@ -812,20 +885,18 @@ impl<'a> Document<'a> {
                 }
             }
             Cell::Appended(None) => Ok(Vec::new()),
+            // A hatched cell keeps 2.2's rule (ADR-0014 decision 4).
             Cell::Appended(Some(value)) => {
-                expected_field_bytes(value, target, self.delimiter, false, quote_all)
+                expected_field_bytes(value, target, self.delimiter, false, quoting.all)
                     .map_err(|_| Bad::Unencodable)
             }
             Cell::Edited { field, value } => {
-                // TODO(ADR-0004 #2): a new field (inserted row or column, so
-                // `field` is `None`) should also be quoted when every existing
-                // non-empty field in its column is quoted. Task 2.4 adds that
-                // per-column check; for now only `quote_all` applies.
-                let original_quoted = match (row.source, field) {
-                    (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted,
-                    _ => false,
+                let quoted = match (row.source, field) {
+                    (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted || quoting.all,
+                    // A new field: an inserted row's or column's (rule 3).
+                    _ => quoting.new_field(column),
                 };
-                expected_field_bytes(value, target, self.delimiter, original_quoted, quote_all)
+                expected_field_bytes(value, target, self.delimiter, quoted, false)
                     .map_err(|_| Bad::Unencodable)
             }
         }
@@ -904,12 +975,12 @@ impl<'a> Document<'a> {
             });
         let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         if same_shape {
-            let quote_all = self.layout.quotes_every_field();
+            let quoting = self.quoting();
             let mut per_field = Vec::new();
             for (k, cell) in cells.iter().enumerate().take(fields) {
                 if let Cell::Edited { .. } = cell {
                     let bytes = self
-                        .cell_bytes(&self.rows[j], cell, quote_all, false)
+                        .cell_bytes(&self.rows[j], k, cell, &quoting, false)
                         .unwrap_or_default();
                     let span = orig.fields[k].span.clone();
                     if bytes != self.bytes[span.clone()] {
@@ -920,10 +991,10 @@ impl<'a> Document<'a> {
             // Hatched cells: the delimiter before each, and its bytes, at
             // the end of the row before its line ending.
             let mut appended = Vec::new();
-            for cell in &cells[fields..] {
+            for (k, cell) in cells.iter().enumerate().skip(fields) {
                 appended.push(self.delimiter.byte());
                 appended.extend(
-                    self.cell_bytes(&self.rows[j], cell, quote_all, false)
+                    self.cell_bytes(&self.rows[j], k, cell, &quoting, false)
                         .unwrap_or_default(),
                 );
             }

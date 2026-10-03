@@ -738,7 +738,7 @@ fn the_save_properties_compare_most_cases() {
     let converting = any_encoding_cases(CsvConfig::messy());
     let mut written = std::collections::HashSet::new();
     let (mut refused_single, mut refused_utf16) = (0, 0);
-    for _ in 0..400 {
+    for _ in 0..800 {
         let case = converting.new_tree(&mut runner).unwrap().current();
         match save_as_utf8_matches_the_oracle(&case).unwrap() {
             Converted::Written(encoding) => {
@@ -783,7 +783,9 @@ fn the_save_properties_compare_most_cases() {
 /// 21, 72, 35, 5 and 62 when written, task 2.3). Few single-byte
 /// encodings leave bytes unassigned, so few of their Save As UTF-8 are
 /// refused here; the testkit's `encoding_strategies_reach_every_case`
-/// covers that case more.
+/// covers that case more. Task 2.4b's quoted text columns changed what the
+/// seed generates, leaving one such refusal in 400 cases, so the Save As
+/// UTF-8 half runs 800 (5 refused, 121 from UTF-16).
 const MIN_HATCHED: usize = 23;
 const MIN_FIXED: usize = 23;
 const MIN_QUOTE_ALL: usize = 10;
