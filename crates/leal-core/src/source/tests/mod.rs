@@ -6,7 +6,7 @@ use super::*;
 use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 
@@ -185,13 +185,95 @@ impl DiskImage {
         });
     }
 
-    /// Detaches every device attached from this image, trying a normal
-    /// detach first and then `-force`. Returns the devices still attached.
+    /// Detaches every device attached from this image, as an eject does:
+    /// an ordinary detach, tried again with a backoff for
+    /// [`DETACH_NORMALLY_FOR`] while the volume is busy, then `-force` for
+    /// [`DETACH_FORCED_FOR`]. Returns the devices still attached after that:
+    /// a leaked image. What `hdiutil` said along the way goes to stderr,
+    /// which nextest shows when the test fails.
     pub(crate) fn detach_all(&self) -> Vec<String> {
-        for force in [false, false, true, true] {
-            let devices = attached_devices(&self.image);
+        self.detach(DETACH_NORMALLY_FOR, DETACH_FORCED_FOR)
+    }
+
+    /// Detaches the image with `-force` straight away, as if the drive were
+    /// unplugged with files on it still open (a normal detach is refused
+    /// then). Panics if the image is still attached afterwards.
+    pub(crate) fn force_detach(&self) {
+        let left = self.detach(Duration::ZERO, DETACH_FORCED_FOR);
+        assert!(
+            left.is_empty(),
+            "couldn't force-detach {} ({}); hdiutil's output is on stderr",
+            self.image.display(),
+            left.join(", ")
+        );
+    }
+
+    /// Detaches the image's devices: without `-force` for `normally_for`,
+    /// then with it until `forced_for` more has passed. Returns the devices
+    /// still attached.
+    ///
+    /// A device counts as detached once its `/dev` node has gone, even if
+    /// `hdiutil info` still lists it: `hdiutil` lags behind the kernel for a
+    /// moment after a detach (and after a drive ejects itself), and then
+    /// says "No such file or directory" to a detach of it. That is waited
+    /// out, but not counted as a leak.
+    fn detach(&self, normally_for: Duration, forced_for: Duration) -> Vec<String> {
+        let started = Instant::now();
+        let mut backoff = HDIUTIL_FIRST_BACKOFF;
+        // What went wrong along the way, reported if anything did.
+        let mut trouble = Vec::new();
+        let mut showed_holders = false;
+        loop {
+            let attachments = attachments_of(&self.image, &mut trouble);
+            // One device per attachment: detaching it detaches the rest.
+            let devices: Vec<String> = attachments
+                .iter()
+                .filter_map(|attachment| attachment.present.first().cloned())
+                .collect();
+            let elapsed = started.elapsed();
+            let out_of_time = elapsed >= normally_for + forced_for;
             if devices.is_empty() {
+                let lagging = attachments.iter().any(|a| !a.listed.is_empty());
+                if lagging && !out_of_time {
+                    // Gone from /dev, still in `hdiutil info`: let it catch up.
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(DETACH_MAX_BACKOFF);
+                    continue;
+                }
+                if lagging {
+                    trouble.push(format!(
+                        "after {elapsed:.1?}, hdiutil info still lists {} with no device \
+                         left in /dev; counted as detached",
+                        self.image.display()
+                    ));
+                }
+                if !trouble.is_empty() {
+                    eprintln!(
+                        "DiskImage: detached {} in {elapsed:.1?}, after:\n  {}",
+                        self.image.display(),
+                        trouble.join("\n  ")
+                    );
+                }
                 return devices;
+            }
+            if out_of_time {
+                eprintln!(
+                    "DiskImage: couldn't detach {} ({}) in {elapsed:.1?}{}",
+                    self.image.display(),
+                    devices.join(", "),
+                    if trouble.is_empty() {
+                        String::new()
+                    } else {
+                        format!(":\n  {}", trouble.join("\n  "))
+                    }
+                );
+                return devices;
+            }
+            let force = elapsed >= normally_for;
+            if force && !showed_holders && !normally_for.is_zero() {
+                // An ordinary detach kept failing: say who holds the volume.
+                showed_holders = true;
+                trouble.push(holders(&attachments));
             }
             for device in &devices {
                 let mut command = Command::new("/usr/bin/hdiutil");
@@ -199,44 +281,40 @@ impl DiskImage {
                 if force {
                     command.arg("-force");
                 }
-                // A failure here shows up as a device still attached.
-                let _ = command.output();
+                let at = started.elapsed();
+                let output = match command.output() {
+                    Ok(output) => output,
+                    Err(error) => {
+                        trouble.push(format!("couldn't run {command:?}: {error}"));
+                        continue;
+                    }
+                };
+                if !output.status.success() {
+                    // Not a failure if the device has gone meanwhile: the
+                    // next look at `/dev` counts it as detached.
+                    let gone = hdiutil_said(&output, DEVICE_GONE) && !in_dev(device);
+                    trouble.push(format!(
+                        "at {at:.1?}, {command:?} failed after {:.1?}{}: {}",
+                        started.elapsed() - at,
+                        if gone {
+                            " (the device had gone already)"
+                        } else {
+                            ""
+                        },
+                        hdiutil_message(&output)
+                    ));
+                }
             }
-            std::thread::sleep(HDIUTIL_FIRST_BACKOFF);
-        }
-        attached_devices(&self.image)
-    }
-
-    /// Detaches the image with `-force` straight away, as if the drive were
-    /// unplugged with files on it still open (a normal detach is refused
-    /// then). Panics if the image is still attached afterwards.
-    pub(crate) fn force_detach(&self) {
-        let mut backoff = HDIUTIL_FIRST_BACKOFF;
-        for _ in 0..HDIUTIL_ATTEMPTS {
-            let devices = attached_devices(&self.image);
-            if devices.is_empty() {
-                return;
-            }
-            for device in &devices {
-                // A failure here shows up as a device still attached.
-                let _ = Command::new("/usr/bin/hdiutil")
-                    .args(["detach", "-force"])
-                    .arg(device)
-                    .output();
-            }
-            if attached_devices(&self.image).is_empty() {
-                return;
+            // Checked again straight away: a detach that worked needs no wait.
+            if attachments_of(&self.image, &mut trouble)
+                .iter()
+                .all(|attachment| attachment.present.is_empty())
+            {
+                continue;
             }
             std::thread::sleep(backoff);
-            backoff *= 2;
+            backoff = (backoff * 2).min(DETACH_MAX_BACKOFF);
         }
-        let left = attached_devices(&self.image);
-        assert!(
-            left.is_empty(),
-            "couldn't force-detach {} ({})",
-            self.image.display(),
-            left.join(", ")
-        );
     }
 }
 
@@ -255,13 +333,49 @@ impl Drop for DiskImage {
     }
 }
 
-/// The whole-disk devices (`/dev/diskN`) attached from `image`, from
-/// `hdiutil info`. Empty if none are, or if `hdiutil info` fails.
-fn attached_devices(image: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("/usr/bin/hdiutil").arg("info").output() else {
+/// How long [`DiskImage::detach_all`] tries an ordinary detach, and then
+/// `-force`, before reporting the image as leaked; and the longest wait
+/// between two tries. A volume can be busy for a moment after a file on it
+/// is closed (the disk arbitration daemon, or another process, still
+/// looking at it); a refused ordinary detach itself takes from a fraction
+/// of a second to several.
+const DETACH_NORMALLY_FOR: Duration = Duration::from_secs(4);
+const DETACH_FORCED_FOR: Duration = Duration::from_secs(6);
+const DETACH_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// What `hdiutil detach` says about a device that has already gone.
+const DEVICE_GONE: &str = "No such file or directory";
+
+/// One attachment of an image, from `hdiutil info`.
+struct Attachment {
+    /// The whole-disk devices (`/dev/diskN`, not `/dev/diskNsM`) listed for
+    /// it: the disk itself first, then any APFS container on it.
+    listed: Vec<String>,
+    /// Those of them still in `/dev`. Detaching the first detaches the
+    /// rest.
+    present: Vec<String>,
+    /// Where its volumes are mounted.
+    mount_points: Vec<String>,
+}
+
+/// The attachments of `image` in `hdiutil info`. Tries `hdiutil info` a
+/// few times; if it never works, notes that in `trouble` and returns none.
+fn attachments_of(image: &Path, trouble: &mut Vec<String>) -> Vec<Attachment> {
+    let mut info = None;
+    for _ in 0..3 {
+        match Command::new("/usr/bin/hdiutil").arg("info").output() {
+            Ok(output) if output.status.success() => {
+                info = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+                break;
+            }
+            Ok(output) => trouble.push(format!("hdiutil info failed: {}", describe(&output))),
+            Err(error) => trouble.push(format!("couldn't run hdiutil info: {error}")),
+        }
+        std::thread::sleep(HDIUTIL_FIRST_BACKOFF);
+    }
+    let Some(info) = info else {
         return Vec::new();
     };
-    let info = String::from_utf8_lossy(&output.stdout);
     let image = image.to_string_lossy();
     // One section per attached image, each starting with a line of `=`.
     info.split("\n=")
@@ -271,16 +385,99 @@ fn attached_devices(image: &Path) -> Vec<String> {
                     .is_some_and(|(key, value)| key.trim() == "image-path" && value.trim() == image)
             })
         })
-        // The first device listed is the whole disk; detaching it detaches
-        // its partitions and any APFS container on it.
-        .filter_map(|section| {
-            section
+        .map(|section| {
+            // Device lines: `/dev/disk7s1<TAB>content hint<TAB>mount point`.
+            let devices: Vec<Vec<&str>> = section
                 .lines()
-                .find(|line| line.starts_with("/dev/disk"))
-                .and_then(|line| line.split_whitespace().next())
+                .filter(|line| line.starts_with("/dev/disk"))
+                .map(|line| line.split('\t').map(str::trim).collect())
+                .collect();
+            let listed: Vec<String> = devices
+                .iter()
+                .map(|fields| fields[0])
+                .filter(|device| {
+                    device["/dev/disk".len()..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                })
                 .map(str::to_owned)
+                .collect();
+            let present = listed
+                .iter()
+                .filter(|device| in_dev(device))
+                .cloned()
+                .collect();
+            let mount_points = devices
+                .iter()
+                .filter_map(|fields| fields.last().filter(|f| f.starts_with('/')))
+                .filter(|point| !point.starts_with("/dev/"))
+                .map(|point| (*point).to_owned())
+                .collect();
+            Attachment {
+                listed,
+                present,
+                mount_points,
+            }
         })
         .collect()
+}
+
+/// Whether the device node is still in `/dev`. Only "not found" counts as
+/// gone: any other error (such as not being allowed to look) doesn't.
+fn in_dev(device: &str) -> bool {
+    !matches!(fs::metadata(device), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Whether `hdiutil`'s output includes `text`.
+fn hdiutil_said(output: &std::process::Output, text: &str) -> bool {
+    String::from_utf8_lossy(&output.stdout).contains(text)
+        || String::from_utf8_lossy(&output.stderr).contains(text)
+}
+
+/// `hdiutil`'s exit status and what it said, without its deprecation
+/// warnings, on one line.
+fn hdiutil_message(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let said: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| !line.is_empty() && !line.contains("is deprecated"))
+        .collect();
+    format!("{} ({})", said.join(" / "), output.status)
+}
+
+/// The processes with files open on the attachments' volumes (`lsof`),
+/// for a report of why an ordinary detach is refused.
+fn holders(attachments: &[Attachment]) -> String {
+    let points: Vec<&String> = attachments
+        .iter()
+        .flat_map(|attachment| &attachment.mount_points)
+        .collect();
+    if points.is_empty() {
+        return "an ordinary detach kept failing; no volume is mounted".to_owned();
+    }
+    let mut command = Command::new("/usr/sbin/lsof");
+    command
+        .arg("-n")
+        .arg("-P")
+        .arg("+f")
+        .arg("--")
+        .args(&points);
+    match command.output() {
+        Ok(output) => {
+            let open = String::from_utf8_lossy(&output.stdout);
+            if open.trim().is_empty() {
+                format!("an ordinary detach kept failing; lsof finds nothing open on {points:?}")
+            } else {
+                format!(
+                    "an ordinary detach kept failing; open on {points:?}:\n    {}",
+                    open.trim_end().replace('\n', "\n    ")
+                )
+            }
+        }
+        Err(error) => format!("an ordinary detach kept failing; couldn't run lsof: {error}"),
+    }
 }
 
 /// Runs the `hdiutil` command `make_command` builds (a new one for each

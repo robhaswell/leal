@@ -2170,7 +2170,13 @@ fn a_copied_file_on_an_ejected_drive_can_be_saved_once_it_is_back() {
     assert_eq!(document.storage(), Storage::Copy);
 
     // An ordinary eject works: Leal only watches the file (`O_EVTONLY`).
-    assert!(image.detach_all().is_empty());
+    // (`detach_all` waits out a volume that is busy for a moment, and says
+    // on stderr if it had to force it.)
+    let left = image.detach_all();
+    assert!(
+        left.is_empty(),
+        "the eject left {left:?} attached; hdiutil's output is on stderr"
+    );
     wait_for_status(&reports, "the eject", |s| {
         s.state == OriginalState::Unavailable
     });

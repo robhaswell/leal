@@ -240,8 +240,9 @@ private struct DiskImage {
         }
     }
 
-    /// Detaches every device attached from the image, trying a normal detach
-    /// first and then `-force`, even if the test failed.
+    /// Detaches every device attached from the image, even if the test
+    /// failed: an ordinary detach, tried again with a backoff while the
+    /// volume is busy, then `-force` (as `DiskImage::detach_all` in Rust).
     func detach() {
         let left = Self.detachAll(imagePath: image.path)
         if !left.isEmpty {
@@ -249,46 +250,133 @@ private struct DiskImage {
         }
     }
 
-    /// Detaches the devices attached from `imagePath`. Returns the ones
-    /// still attached.
+    /// How long `detachAll` tries an ordinary detach, and then `-force`,
+    /// before giving up, and the longest wait between two tries. A volume
+    /// can be busy for a moment after a file on it is closed.
+    private static let detachNormallyFor: TimeInterval = 4
+    private static let detachForcedFor: TimeInterval = 6
+    private static let maxBackoff: TimeInterval = 1
+
+    /// Detaches the devices attached from `imagePath`, and prints what
+    /// `hdiutil` said if anything went wrong. Returns the devices still
+    /// attached: a leaked image.
+    ///
+    /// A device counts as detached once its `/dev` node has gone, even if
+    /// `hdiutil info` still lists it: `hdiutil` lags behind the kernel for
+    /// a moment after a detach, and then says "No such file or directory"
+    /// to a detach of it. That is waited out, but not counted as a leak.
     @discardableResult
     private static func detachAll(imagePath: String) -> [String] {
-        for force in [false, false, true, true] {
-            let devices = attachedDevices(imagePath: imagePath)
+        let started = Date()
+        var backoff = firstBackoff
+        var trouble: [String] = []
+        while true {
+            let attachments = Self.attachments(imagePath: imagePath)
+            // One device per attachment: detaching it detaches the rest.
+            let devices = attachments.compactMap(\.present.first)
+            let elapsed = Date().timeIntervalSince(started)
+            let outOfTime = elapsed >= detachNormallyFor + detachForcedFor
             if devices.isEmpty {
+                let lagging = attachments.contains { !$0.listed.isEmpty }
+                if lagging && !outOfTime {
+                    // Gone from /dev, still in `hdiutil info`: let it catch up.
+                    Thread.sleep(forTimeInterval: backoff)
+                    backoff = min(backoff * 2, maxBackoff)
+                    continue
+                }
+                if lagging {
+                    trouble.append("hdiutil info still lists the image with no device left in /dev; counted as detached")
+                }
+                if !trouble.isEmpty {
+                    print("DiskImage: detached \(imagePath) in \(seconds(elapsed)), after:\n  \(trouble.joined(separator: "\n  "))")
+                }
+                return []
+            }
+            if outOfTime {
+                print("DiskImage: couldn't detach \(imagePath) (\(devices.joined(separator: ", "))) in \(seconds(elapsed)):\n  \(trouble.joined(separator: "\n  "))")
                 return devices
             }
+            let force = elapsed >= detachNormallyFor
             for device in devices {
-                // A failure here shows up as a device still attached.
-                _ = try? run(["detach", device] + (force ? ["-force"] : []))
+                let arguments = ["detach", device] + (force ? ["-force"] : [])
+                let at = Date().timeIntervalSince(started)
+                do {
+                    let result = try run(arguments)
+                    if result.status != 0 {
+                        // Not a failure if the device has gone meanwhile:
+                        // the next look at /dev counts it as detached.
+                        let gone = result.outputText.contains("No such file or directory") && !inDev(device)
+                        trouble.append("""
+                        at \(seconds(at)), hdiutil \(arguments.joined(separator: " ")) failed\
+                        \(gone ? " (the device had gone already)" : "") with exit status \(result.status): \
+                        \(result.message)
+                        """)
+                    }
+                } catch {
+                    trouble.append("couldn't run hdiutil \(arguments.joined(separator: " ")): \(error)")
+                }
             }
-            Thread.sleep(forTimeInterval: firstBackoff)
+            // Checked again straight away: a detach that worked needs no wait.
+            if Self.attachments(imagePath: imagePath).allSatisfy(\.present.isEmpty) {
+                continue
+            }
+            Thread.sleep(forTimeInterval: backoff)
+            backoff = min(backoff * 2, maxBackoff)
         }
-        return attachedDevices(imagePath: imagePath)
     }
 
-    /// The whole-disk devices (`/dev/diskN`) attached from `imagePath`, from
-    /// `hdiutil info -plist`. Empty if none are, or if that fails.
-    private static func attachedDevices(imagePath: String) -> [String] {
-        guard
-            let result = try? run(["info", "-plist"]), result.status == 0,
-            let plist = try? PropertyListSerialization.propertyList(from: result.stdout, format: nil),
-            let images = (plist as? [String: Any])?["images"] as? [[String: Any]]
-        else {
-            return []
-        }
-        let resolved = URL(filePath: imagePath).resolvingSymlinksInPath().path
-        return images.compactMap { entry in
-            guard let path = entry["image-path"] as? String,
-                  path == imagePath || path == resolved,
-                  let entities = entry["system-entities"] as? [[String: Any]]
+    /// One attachment of an image, from `hdiutil info -plist`.
+    private struct Attachment {
+        /// The whole-disk devices (`/dev/diskN`, not `/dev/diskNsM`) listed
+        /// for it: the disk itself first, then any APFS container on it.
+        let listed: [String]
+        /// Those of them still in /dev.
+        let present: [String]
+    }
+
+    /// The attachments of `imagePath`, from `hdiutil info -plist`. Empty if
+    /// it has none, or if that fails three times.
+    private static func attachments(imagePath: String) -> [Attachment] {
+        for attempt in 1...3 {
+            guard
+                let result = try? run(["info", "-plist"]), result.status == 0,
+                let plist = try? PropertyListSerialization.propertyList(from: result.stdout, format: nil),
+                let images = (plist as? [String: Any])?["images"] as? [[String: Any]]
             else {
-                return nil
+                print("DiskImage: hdiutil info failed (attempt \(attempt) of 3)")
+                Thread.sleep(forTimeInterval: firstBackoff)
+                continue
             }
-            // The whole disk is the shortest device name (`/dev/disk7`, not
-            // `/dev/disk7s1`); detaching it detaches the rest.
-            return entities.compactMap { $0["dev-entry"] as? String }.min { $0.count < $1.count }
+            let resolved = URL(filePath: imagePath).resolvingSymlinksInPath().path
+            return images.compactMap { entry in
+                guard let path = entry["image-path"] as? String,
+                      path == imagePath || path == resolved,
+                      let entities = entry["system-entities"] as? [[String: Any]]
+                else {
+                    return nil
+                }
+                let listed = entities.compactMap { $0["dev-entry"] as? String }.filter(isWholeDisk)
+                return Attachment(listed: listed, present: listed.filter(inDev))
+            }
         }
+        return []
+    }
+
+    /// Whether `device` is a whole disk (`/dev/disk7`, not `/dev/disk7s1`).
+    private static func isWholeDisk(_ device: String) -> Bool {
+        let number = device.dropFirst("/dev/disk".count)
+        return device.hasPrefix("/dev/disk") && !number.isEmpty && number.allSatisfy(\.isASCII) && number.allSatisfy(\.isNumber)
+    }
+
+    /// Whether the device node is still in /dev. Only "not found" counts as
+    /// gone: any other error (such as not being allowed to look) doesn't.
+    private static func inDev(_ device: String) -> Bool {
+        var info = stat()
+        return stat(device, &info) == 0 || errno != ENOENT
+    }
+
+    private static func seconds(_ interval: TimeInterval) -> String {
+        String(format: "%.1f s", interval)
     }
 
     /// Runs `hdiutil` with the arguments `makeArguments` returns (called
@@ -342,6 +430,11 @@ private struct DiskImage {
             --- stderr ---
             \(String(decoding: stderr, as: UTF8.self))
             """
+        }
+
+        /// What `hdiutil` said, without its deprecation warnings, on one line.
+        var message: String {
+            outputText.split(separator: "\n").filter { !$0.contains("is deprecated") }.joined(separator: " / ")
         }
     }
 

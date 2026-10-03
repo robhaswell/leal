@@ -218,9 +218,9 @@ struct HelperDiskImage {
         let key = SHA256.hash(data: Data(checkout.utf8)).map { String(format: "%02x", $0) }.joined().prefix(12)
         return FileManager.default.temporaryDirectory.appending(path: "leal-disk-images").appending(path: String(key))
     }
-    /// How many times `hdiutil detach` is tried, and the wait before the
-    /// first retry (doubled for each one after).
-    private static let attempts = 5
+    /// How long `hdiutil detach -force` is tried for, and the wait before
+    /// the first retry (doubled for each one after, up to a second).
+    private static let detachForcedFor: TimeInterval = 6
     private static let firstBackoff: TimeInterval = 0.25
 
     let folder: URL
@@ -326,37 +326,95 @@ struct HelperDiskImage {
     /// (`hdiutil detach -force`, by device), once no file on it is open.
     /// Throws with `hdiutil`'s output if the image is still attached
     /// afterwards.
+    ///
+    /// A device counts as detached once its `/dev` node has gone, even if
+    /// `hdiutil info` still lists it: `hdiutil` lags behind the kernel for
+    /// a moment after a detach (the helper's, or a drive's own), and then
+    /// says "No such file or directory" to a detach of it.
     func forceDetach() throws {
+        let started = Date()
         var backoff = Self.firstBackoff
-        var last = ""
-        for _ in 1...Self.attempts {
-            guard isAttached() else { return }
-            let (status, output) = Self.hdiutil(["detach", device, "-force"])
-            last = "exit \(status): \(output)"
-            if !isAttached() { return }
+        var trouble: [String] = []
+        while true {
+            let devices = presentDevices()
+            if devices.isEmpty {
+                if !trouble.isEmpty {
+                    print("HelperDiskImage: detached \(image.path) after:\n  \(trouble.joined(separator: "\n  "))")
+                }
+                return
+            }
+            guard Date().timeIntervalSince(started) < Self.detachForcedFor else { break }
+            // One device per attachment: detaching it detaches the rest.
+            for device in devices {
+                let (status, output) = Self.hdiutil(["detach", device, "-force"])
+                if status != 0 {
+                    let gone = output.contains("No such file or directory") && !Self.inDev(device)
+                    let said = output.split(separator: "\n").filter { !$0.contains("is deprecated") }.joined(separator: " / ")
+                    trouble.append("at \(String(format: "%.1f s", Date().timeIntervalSince(started))), hdiutil detach \(device) -force failed\(gone ? " (the device had gone already)" : ""), exit \(status): \(said)")
+                }
+            }
+            if presentDevices().isEmpty { continue }
             // Still attached (hdiutil busy, or the volume still in use):
             // try again after a pause, as the Rust tests' `force_detach`.
             Thread.sleep(forTimeInterval: backoff)
-            backoff *= 2
+            backoff = min(backoff * 2, 1)
         }
-        if isAttached() {
-            throw NSError(domain: "HelperDiskImage", code: 4, userInfo: [NSLocalizedDescriptionKey: "Couldn't detach \(image.path): \(last)"])
+        let left = presentDevices()
+        if !left.isEmpty {
+            let report = "Couldn't detach \(image.path) (\(left.joined(separator: ", "))):\n  \(trouble.joined(separator: "\n  "))"
+            print("HelperDiskImage: \(report)")
+            throw NSError(domain: "HelperDiskImage", code: 4, userInfo: [NSLocalizedDescriptionKey: report])
         }
     }
 
-    /// Whether the image is attached, from `hdiutil info`.
+    /// Whether the image is attached: listed in `hdiutil info` with a
+    /// device still in /dev.
     func isAttached() -> Bool {
-        let (status, output) = Self.hdiutil(["info", "-plist"])
-        guard status == 0,
-              let plist = try? PropertyListSerialization.propertyList(from: Data(output.utf8), format: nil),
-              let entries = (plist as? [String: Any])?["images"] as? [[String: Any]]
-        else { return false }
-        let path = image.path(percentEncoded: false)
-        let resolved = image.resolvingSymlinksInPath().path(percentEncoded: false)
-        return entries.contains { entry in
-            let attached = entry["image-path"] as? String
-            return attached == path || attached == resolved
+        !presentDevices().isEmpty
+    }
+
+    /// For each attachment of the image in `hdiutil info`, the first of
+    /// its whole-disk devices (`/dev/diskN`: the disk, then any APFS
+    /// container on it) still in /dev. Empty if `hdiutil info` fails three
+    /// times.
+    private func presentDevices() -> [String] {
+        for _ in 1...3 {
+            let (status, output) = Self.hdiutil(["info", "-plist"])
+            guard status == 0,
+                  let plist = try? PropertyListSerialization.propertyList(from: Data(output.utf8), format: nil),
+                  let entries = (plist as? [String: Any])?["images"] as? [[String: Any]]
+            else {
+                print("HelperDiskImage: hdiutil info failed (exit \(status)): \(output)")
+                Thread.sleep(forTimeInterval: Self.firstBackoff)
+                continue
+            }
+            let path = image.path(percentEncoded: false)
+            let resolved = image.resolvingSymlinksInPath().path(percentEncoded: false)
+            return entries.compactMap { entry in
+                let attached = entry["image-path"] as? String
+                guard attached == path || attached == resolved,
+                      let entities = entry["system-entities"] as? [[String: Any]]
+                else { return nil }
+                return entities
+                    .compactMap { $0["dev-entry"] as? String }
+                    .first { Self.isWholeDisk($0) && Self.inDev($0) }
+            }
         }
+        return []
+    }
+
+    /// Whether `device` is a whole disk (`/dev/disk7`, not `/dev/disk7s1`).
+    private static func isWholeDisk(_ device: String) -> Bool {
+        let number = device.dropFirst("/dev/disk".count)
+        return device.hasPrefix("/dev/disk") && !number.isEmpty && number.allSatisfy(\.isASCII) && number.allSatisfy(\.isNumber)
+    }
+
+    /// Whether the device node is still in /dev. Only "not found" counts as
+    /// gone: any other error (the sandbox not letting the host look, say)
+    /// doesn't.
+    private static func inDev(_ device: String) -> Bool {
+        var info = stat()
+        return stat(device, &info) == 0 || errno != ENOENT
     }
 
     /// Tells the helper the test is done with the image: it detaches

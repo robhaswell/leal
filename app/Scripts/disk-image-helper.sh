@@ -89,36 +89,54 @@ hdiutil_retrying() {
     done
 }
 
-# The whole-disk devices attached from image $1, from `hdiutil info -plist`.
+# For each attachment of image $1 in `hdiutil info -plist`, its first
+# whole-disk device (/dev/diskN: the disk, then any APFS container on it)
+# still in /dev; detaching it detaches the rest. A device whose node has
+# gone counts as detached even while `hdiutil info` still lists it:
+# hdiutil lags behind the kernel for a moment after a detach, and then
+# says "No such file or directory" to a detach of it.
 devices_of() {
     /usr/bin/hdiutil info -plist 2>/dev/null | /usr/bin/python3 -c '
-import plistlib, sys, os
+import plistlib, re, sys, os
 image = os.path.realpath(sys.argv[1])
 for entry in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
     path = entry.get("image-path", "")
     if path == sys.argv[1] or os.path.realpath(path) == image:
         devices = [e["dev-entry"] for e in entry.get("system-entities", []) if "dev-entry" in e]
-        if devices:
-            print(min(devices, key=len))
+        present = [d for d in devices if re.fullmatch(r"/dev/disk[0-9]+", d) and os.path.exists(d)]
+        if present:
+            print(present[0])
 ' "$1"
 }
 
-# Detaches every device attached from image $1: normally, then by force.
+# Detaches every device attached from image $1, as the Rust tests'
+# DiskImage::detach_all: an ordinary detach, tried again with a backoff
+# for 4 s while the volume is busy, then -force for 6 s more. Logs what
+# hdiutil said if anything went wrong.
 detach_all() {
-    local image="$1" devices
-    for force in "" "" -force -force; do
+    local image="$1" devices device force output status backoff=0.25 trouble=""
+    local started=$SECONDS
+    while :; do
         devices="$(devices_of "$image")"
-        [ -z "$devices" ] && return 0
+        if [ -z "$devices" ]; then
+            [ -n "$trouble" ] && log "detached $image after:$trouble"
+            return 0
+        fi
+        [ $((SECONDS - started)) -ge 10 ] && break
+        force=""
+        [ $((SECONDS - started)) -ge 4 ] && force=-force
         for device in $devices; do
-            /usr/bin/hdiutil detach "$device" $force > /dev/null 2>&1
+            output="$(/usr/bin/hdiutil detach "$device" $force 2>&1)"
+            status=$?
+            [ "$status" -ne 0 ] && trouble="$trouble
+  at $((SECONDS - started)) s, hdiutil detach $device${force:+ $force} failed (exit $status): $(grep -v 'is deprecated' <<<"$output")"
         done
-        sleep 0.25
+        [ -z "$(devices_of "$image")" ] && continue
+        sleep "$backoff"
+        case "$backoff" in 0.25) backoff=0.5 ;; *) backoff=1 ;; esac
     done
-    devices="$(devices_of "$image")"
-    if [ -n "$devices" ]; then
-        log "warning: couldn't detach $image ($devices); run \`hdiutil detach -force\` on it"
-        return 1
-    fi
+    log "warning: couldn't detach $image ($devices); run \`hdiutil detach -force\` on it:$trouble"
+    return 1
 }
 
 # Serves one claimed request in folder $1.
