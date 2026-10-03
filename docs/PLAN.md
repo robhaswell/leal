@@ -488,7 +488,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       save property's `TODO(2.3)` branch goes.
 - [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   Split into parts of about a day (CLAUDE.md, token budget):
-  - [ ] **2.4d Design.** A short design in `docs/tasks/2.4.md` covering
+  - [x] **2.4d Design.** A short design in `docs/tasks/2.4.md` covering
     everything below (piece list and row ids, `RowMap`, column map and
     per-row applied flags, cell identities, the base epoch, Find, the
     writer and the rebase), so the parts fit. An ADR if it changes DESIGN.

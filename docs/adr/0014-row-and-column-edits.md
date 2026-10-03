@@ -1,6 +1,6 @@
 # 0014 — Row and column edits: when they run, Find, undo's base, quoting
 
-- Status: proposed
+- Status: accepted (approved by Rob, 2026-10-03)
 - Date: 2026-10-03
 - Changes: DESIGN §3.6 (Edits), §3.7 (rule 3), §3.9 (Find catching up;
   edits during a save); refines ADR-0005 decision 3
