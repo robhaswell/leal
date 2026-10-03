@@ -64,7 +64,14 @@ was rejected.
    decision 2. After a save the padding is a real field and stays.
 6. **A row that edits and column deletes leave with no cells is a blank
    line,** and column inserts skip it, as they skip every blank line
-   (ADR-0004 decision 5).
+   (ADR-0004 decision 5). On disk it is still written as `""` (ADR-0004
+   decision 6), so it doesn't vanish; after a save and reopen it is a
+   one-field row like any other.
+7. **A replay (recovery) works by value, like undo after a save.** A row
+   delete undone by value comes back as an inserted row, which can't have
+   a missing cell, so a replay may leave trailing empty fields where the
+   original had missing cells, and a command that expected a missing cell
+   accepts an empty field (ADR-0012 decision 4, decision 3 above).
 
 ## Consequences
 
