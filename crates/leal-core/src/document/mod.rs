@@ -64,6 +64,7 @@
 //! [`Indexer::chunked`]: crate::index::Indexer::chunked
 //! [`Priority::P3`]: crate::schedule::Priority::P3
 
+mod columns;
 mod editing;
 mod saving;
 mod search;
@@ -100,12 +101,16 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock};
 use crate::detect::{
     self, ChoiceError, Choices, Detection, FIRST_PAINT_BYTES, Hints, Review, detect, review_with,
 };
+use crate::diagnostics::RowCode;
 use crate::diagnostics::{
     DiagnosticKind, Diagnostics, Hit, Mark, Report, RowFlags, decided_by_bytes, field_with,
     next_hit, row_may_have,
 };
 use crate::dialect::{Encoding, QUOTE};
-use crate::edit::{EditStore, InsertedRow, Kinds, Overlay, RowEdits, RowId, Segment, Slot};
+use crate::edit::{
+    CellId, Columns, EditStore, InsertedRow, Kinds, Overlay, OverlayRow, Own as EditOwn, RowEdits,
+    RowId, Segment, Slot, TABLE,
+};
 use crate::index::{
     DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
     Status,
@@ -120,7 +125,7 @@ use crate::source::{
     OpenError, Original, OriginalState, OriginalStatus, ReadError, ReadErrorKind, Source, Storage,
     TempFolders, VolumeInfo,
 };
-use view::RowView;
+pub(crate) use view::RowView;
 
 /// Where an occurrence of a diagnostic is, for the details popover's
 /// **Previous** and **Next** (task 1.7): the cell to select.
@@ -743,7 +748,9 @@ impl Document {
     /// The grid's column count: the most common field count among the
     /// rows read so far (ADR-0003 decision 4), from the first 64 KB until
     /// the index has passed them. It can change while indexing and is
-    /// final once the index is complete. 0 for an empty file.
+    /// final once the index is complete. 0 for an empty file. Once columns
+    /// are inserted or deleted (task 2.4b), the length a row of that many
+    /// fields has after them.
     #[must_use]
     pub fn column_count(&self) -> usize {
         let reading = self.current();
@@ -751,7 +758,9 @@ impl Document {
             // Every row deleted.
             return 0;
         }
-        Self::rows_index(&reading).0.field_count_mode().unwrap_or(0)
+        let mode = Self::rows_index(&reading).0.field_count_mode();
+        let columns = reading.edits.columns();
+        mode.map_or(0, |mode| columns.fold_fields(mode))
     }
 
     /// Which columns hold numbers, from the first `sample` rows after the
@@ -794,14 +803,25 @@ impl Document {
     fn read_rows_of<T>(
         reading: &Reading,
         rows: Range<usize>,
-        mut each: impl FnMut(RowView<'_>) -> T,
+        each: impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
         // One look at the edits for the whole call: a reference count, and
         // for each row a look-up that finds nothing when there are no edits.
         let overlay = reading.edits.overlay();
+        Self::read_rows_with(reading, &overlay, rows, each)
+    }
+
+    /// [`read_rows_of`](Self::read_rows_of), with `overlay`'s edits (a
+    /// snapshot a command keeps, task 2.4b).
+    fn read_rows_with<T>(
+        reading: &Reading,
+        overlay: &Overlay,
+        rows: Range<usize>,
+        mut each: impl FnMut(RowView<'_>) -> T,
+    ) -> Result<Vec<T>, ReadError> {
         let map = overlay.map();
         if map.is_identity() {
-            return Self::read_physical(reading, &overlay, rows, &mut each);
+            return Self::read_physical(reading, overlay, rows, &mut each);
         }
         let available = map.rows_within(Self::rows_index(reading).1);
         let mut out = Vec::new();
@@ -809,14 +829,14 @@ impl Document {
             match segment {
                 Segment::Original(range) => out.extend(Self::read_physical(
                     reading,
-                    &overlay,
+                    overlay,
                     to_usize(range.start)..to_usize(range.end),
                     &mut each,
                 )?),
                 Segment::Inserted(range) => {
                     for n in range {
-                        if let Some((row, edits)) = inserted_row(&overlay, n) {
-                            out.push(each(RowView::inserted(&reading.parser, row, edits)));
+                        if let Some((row, cells)) = inserted_row(overlay, n) {
+                            out.push(each(RowView::inserted(&reading.parser, row, cells)));
                         }
                     }
                 }
@@ -865,7 +885,7 @@ impl Document {
                     &bytes,
                     base,
                     row,
-                    overlay.row(*r),
+                    overlay.physical(*r),
                 ))
             })
             .collect())
@@ -998,13 +1018,20 @@ impl Document {
                 let row = to_usize(row);
                 if let Some(edits) = overlay.row(row) {
                     let (marked, mode) = diagnostics.marked_rows_and_mode();
-                    let len = Self::edited_len(&reading, row, edits);
-                    return row < marked && edited_flags(len, edits, mode).marked;
+                    let flags = Self::edited_flags(&reading, &overlay, row, edits, mode);
+                    return row < marked && flags.marked;
+                }
+                if !overlay.columns().is_empty() {
+                    let marks = FoldedMarks::new(overlay.columns(), diagnostics);
+                    return diagnostics
+                        .code_of(row)
+                        .is_some_and(|code| marks.row_is(&reading, &overlay, row, code, None));
                 }
                 diagnostics.row_has_diagnostic(row)
             }
             Some(Slot::Inserted(n)) => {
-                inserted_flags(&reading, &overlay, n, diagnostics.marked_rows_and_mode().1).marked
+                let mode = folded(&overlay, diagnostics.marked_rows_and_mode().1);
+                inserted_flags(&reading, &overlay, n, mode).marked
             }
         }
     }
@@ -1031,7 +1058,7 @@ impl Document {
         // One search through the file's own rows from where `from` is among
         // them, passing over deleted ones, then any inserted row between
         // `from` and what it found.
-        let mode = diagnostics.marked_rows_and_mode().1;
+        let mode = folded(&overlay, diagnostics.marked_rows_and_mode().1);
         let rows = map.physical_rows().unwrap_or(0);
         let mut physical = map.physical_at_or_after(from);
         let found = loop {
@@ -1079,7 +1106,7 @@ impl Document {
         };
         // As for Next: one search backward through the file's own rows.
         let to = to.min(len);
-        let mode = diagnostics.marked_rows_and_mode().1;
+        let mode = folded(&overlay, diagnostics.marked_rows_and_mode().1);
         let mut physical = map.physical_at_or_after(to);
         let found = loop {
             let Some(row) = Self::previous_marked(&reading, diagnostics, &overlay, 0..physical)
@@ -1123,6 +1150,9 @@ impl Document {
         overlay: &Overlay,
         rows: Range<usize>,
     ) -> Option<usize> {
+        if !overlay.columns().is_empty() {
+            return Self::folded_marked(reading, diagnostics, overlay, rows, true, None);
+        }
         let (marked, mode) = diagnostics.marked_rows_and_mode();
         let mut at = rows.start;
         loop {
@@ -1130,9 +1160,10 @@ impl Document {
             // up to it that is marked now.
             let next = diagnostics.next_row_with_diagnostic(at);
             let end = next.map_or(marked, |row| row + 1).min(marked).min(rows.end);
-            if let Some((row, _)) = overlay.rows_in(at..end).find(|&(row, edits)| {
-                edited_flags(Self::edited_len(reading, row, edits), edits, mode).marked
-            }) {
+            if let Some((row, _)) = overlay
+                .rows_in(at..end)
+                .find(|&(row, edits)| Self::edited_flags(reading, overlay, row, edits, mode).marked)
+            {
                 return Some(row);
             }
             let row = next.filter(|&row| row < rows.end)?;
@@ -1151,18 +1182,18 @@ impl Document {
         overlay: &Overlay,
         rows: Range<usize>,
     ) -> Option<usize> {
+        if !overlay.columns().is_empty() {
+            return Self::folded_marked(reading, diagnostics, overlay, rows, false, None);
+        }
         let (marked, mode) = diagnostics.marked_rows_and_mode();
         let mut at = rows.end;
         loop {
             let previous = diagnostics.previous_row_with_diagnostic(at);
             let start = previous.unwrap_or(0).max(rows.start);
-            if let Some((row, _)) =
-                overlay
-                    .rows_in(start..at.min(marked))
-                    .rev()
-                    .find(|&(row, edits)| {
-                        edited_flags(Self::edited_len(reading, row, edits), edits, mode).marked
-                    })
+            if let Some((row, _)) = overlay
+                .rows_in(start..at.min(marked))
+                .rev()
+                .find(|&(row, edits)| Self::edited_flags(reading, overlay, row, edits, mode).marked)
             {
                 return Some(row);
             }
@@ -1191,7 +1222,7 @@ impl Document {
         if map.is_identity() {
             return Self::physical_flags(&reading, diagnostics, &overlay, rows);
         }
-        let mode = diagnostics.marked_rows_and_mode().1;
+        let mode = folded(&overlay, diagnostics.marked_rows_and_mode().1);
         let mut flags = Vec::with_capacity(rows.len());
         for segment in map.segments(rows.clone()) {
             match segment {
@@ -1218,11 +1249,21 @@ impl Document {
         rows: Range<usize>,
     ) -> Vec<RowFlags> {
         let mut flags = diagnostics.row_flags(rows.clone());
+        if !overlay.columns().is_empty() {
+            let marks = FoldedMarks::new(overlay.columns(), diagnostics);
+            for (row, flag) in rows.clone().zip(flags.iter_mut()) {
+                *flag = match diagnostics.code_of(row) {
+                    Some(code) if !overlay.contains(row) => {
+                        marks.flags(reading, overlay, row, code)
+                    }
+                    _ => RowFlags::default(),
+                };
+            }
+        }
         if !overlay.is_empty() {
             let (marked, mode) = diagnostics.marked_rows_and_mode();
             for (row, edits) in overlay.rows_in(rows.start..rows.end.min(marked)) {
-                let len = Self::edited_len(reading, row, edits);
-                flags[row - rows.start] = edited_flags(len, edits, mode);
+                flags[row - rows.start] = Self::edited_flags(reading, overlay, row, edits, mode);
             }
         }
         flags
@@ -1303,7 +1344,7 @@ impl Document {
         // Rows inserted or deleted (task 2.4a): the file's rows from where
         // `start` is among them, passing over deleted ones, then any
         // inserted row between `start` and what they found.
-        let mode = diagnostics.marked_rows_and_mode().1;
+        let mode = folded(&overlay, diagnostics.marked_rows_and_mode().1);
         let inserted = |n: u32| inserted_place(&reading, &overlay, n, kind, mode);
         // An inserted row has only these kinds: for the others, nothing
         // needs walking.
@@ -1399,17 +1440,27 @@ impl Document {
         if overlay.is_empty() {
             return self.search_kind(reading, diagnostics, report, kind, start, direction, search);
         }
+        let forward = direction == Direction::Forward;
+        if !overlay.columns().is_empty() {
+            // Columns inserted or deleted (task 2.4b): each row's marks as
+            // it reads now, from its field count, reading the flagged ones.
+            if !FoldedMarks::navigates(kind) {
+                return Ok(None);
+            }
+            let rows = if forward { start..usize::MAX } else { 0..start };
+            let found =
+                Self::folded_marked(reading, diagnostics, overlay, rows, forward, Some(kind));
+            return match found {
+                Some(row) => Self::place(reading, kind, row),
+                None => Ok(None),
+            };
+        }
         // With edits: the next occurrence in the file's own rows, unless an
         // edited row before it has the kind now. An edited row the file's
         // rows give is passed over, since it was checked as it reads now.
-        let (marked, mode) = diagnostics.marked_rows_and_mode();
-        let has = |row: usize, edits: &RowEdits| match kind {
-            DiagnosticKind::RaggedRows => {
-                mode.is_some_and(|mode| Self::edited_len(reading, row, edits) != mode)
-            }
-            other => edits.kinds().contains(Kinds::of(other)),
-        };
-        let forward = direction == Direction::Forward;
+        let (marked, _) = diagnostics.marked_rows_and_mode();
+        let has =
+            |row: usize, edits: &RowEdits| Self::edited_has(reading, overlay, row, edits, kind);
         let mut at = start;
         loop {
             let found =
@@ -1593,11 +1644,16 @@ impl Document {
                 .parser
                 .parse_row_in(index, row, &bytes, base)
                 .and_then(|parsed| {
-                    let view =
-                        RowView::new(&reading.parser, &bytes, base, &parsed, overlay.row(row));
+                    let view = RowView::new(
+                        &reading.parser,
+                        &bytes,
+                        base,
+                        &parsed,
+                        overlay.physical(row),
+                    );
                     if kind == DiagnosticKind::RaggedRows {
                         let cells = view.len();
-                        let mode = reading.index.field_count_mode();
+                        let mode = folded(&overlay, reading.index.field_count_mode());
                         Some(mode.map_or(cells, |mode| cells.min(mode)))
                     } else {
                         view.first_with(kind)
@@ -1921,14 +1977,14 @@ fn first_screen(
                 rows.extend(range.filter_map(|r| {
                     let r = to_usize(r);
                     let row = paint.parser.parse_row(&paint.head_index, r, head)?;
-                    let view = RowView::new(&paint.parser, head, 0, &row, edits.row(r));
+                    let view = RowView::new(&paint.parser, head, 0, &row, edits.physical(r));
                     Some(row_cells(&view, options.max_chars))
                 }));
             }
             Segment::Inserted(range) => {
                 rows.extend(range.filter_map(|n| {
-                    let (row, row_edits) = inserted_row(edits, n)?;
-                    let view = RowView::inserted(&paint.parser, row, row_edits);
+                    let (row, cells) = inserted_row(edits, n)?;
+                    let view = RowView::inserted(&paint.parser, row, cells);
                     Some(row_cells(&view, options.max_chars))
                 }));
             }
@@ -1944,7 +2000,7 @@ fn first_screen(
         column_count: if map.len() == Some(0) {
             0
         } else {
-            paint.head_index.field_count_mode().unwrap_or(0)
+            folded(edits, paint.head_index.field_count_mode()).unwrap_or(0)
         },
     }
 }
@@ -2163,30 +2219,263 @@ fn unavailable(source: &Source) -> JobError {
 impl Document {
     /// How many cells edited row `row` has now, as its `RowView` counts
     /// them ([`RowView::len`]). While the first 64 KB are trusted that is
-    /// the count kept with its edits, made from the same bytes as any read
-    /// of the row now, so no row is read. Once they are stale, the row is
-    /// read from the trusted copy (it may not be there: then the kept
-    /// count).
-    fn edited_len(reading: &Reading, row: usize, edits: &RowEdits) -> usize {
+    /// the count kept with its edits (laid out under the column inserts and
+    /// deletes), made from the same bytes as any read of the row now, so no
+    /// row is read. Once they are stale, the row is read from the trusted
+    /// copy (it may not be there: then the kept count).
+    fn edited_len(reading: &Reading, overlay: &Overlay, row: usize, edits: &RowEdits) -> usize {
+        let kept = || edits.len_in(overlay.columns(), None);
         if !reading.head_is_stale() {
-            return edits.len();
+            return kept();
         }
         Self::read_rows_of(reading, row..row + 1, |view| view.len())
             .ok()
             .and_then(|lens| lens.first().copied())
-            .unwrap_or_else(|| edits.len())
+            .unwrap_or_else(kept)
+    }
+
+    /// Edited row `row`'s marks as it reads now, against the most common
+    /// field count `mode` (as the file has it: folded here). An edited row
+    /// is blank only if its one cell is its own, unedited blank field.
+    fn edited_flags(
+        reading: &Reading,
+        overlay: &Overlay,
+        row: usize,
+        edits: &RowEdits,
+        mode: Option<usize>,
+    ) -> RowFlags {
+        let columns = overlay.columns();
+        let len = Self::edited_len(reading, overlay, row, edits);
+        let blank = edits.is_blank_in(columns, None);
+        let ragged = !blank && folded(overlay, mode).is_some_and(|mode| len != mode);
+        RowFlags {
+            marked: ragged || !edits.kinds_in(columns, original_id(row)).is_empty(),
+            ragged,
+        }
+    }
+
+    /// Whether edited row `row` has `kind` as it reads now.
+    fn edited_has(
+        reading: &Reading,
+        overlay: &Overlay,
+        row: usize,
+        edits: &RowEdits,
+        kind: DiagnosticKind,
+    ) -> bool {
+        match kind {
+            DiagnosticKind::RaggedRows => {
+                let mode = reading
+                    .diagnostics
+                    .get()
+                    .and_then(|d| d.marked_rows_and_mode().1);
+                Self::edited_flags(reading, overlay, row, edits, mode).ragged
+            }
+            other => edits
+                .kinds_in(overlay.columns(), original_id(row))
+                .contains(Kinds::of(other)),
+        }
+    }
+
+    /// With columns inserted or deleted (task 2.4b): the first (`forward`)
+    /// or last physical row among `rows` that is marked now, or has `kind`.
+    /// Candidate rows come from the marks a batch at a time (by their field
+    /// counts' default layouts, and their flags), with every edited row
+    /// between; an unedited flagged row is read, since a column delete may
+    /// have taken its flagged field.
+    fn folded_marked(
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        overlay: &Overlay,
+        rows: Range<usize>,
+        forward: bool,
+        kind: Option<DiagnosticKind>,
+    ) -> Option<usize> {
+        let marks = FoldedMarks::new(overlay.columns(), diagnostics);
+        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let end = rows.end.min(marked);
+        if rows.start >= end {
+            return None;
+        }
+        let edited_has = |row: usize, edits: &RowEdits| match kind {
+            None => Self::edited_flags(reading, overlay, row, edits, mode).marked,
+            Some(kind) => Self::edited_has(reading, overlay, row, edits, kind),
+        };
+        let pick = |code: RowCode| marks.may_be(code, kind);
+        let mut at = if forward { rows.start } else { end };
+        loop {
+            let batch = diagnostics.rows_picked(at, forward, SEARCH_BATCH, &pick);
+            let full = batch.len() == SEARCH_BATCH;
+            // The rows this batch covers: up to its last candidate if it
+            // is full, otherwise to the end of `rows`.
+            let covered = match (forward, full, batch.last()) {
+                (true, true, Some(&(row, _))) => at..(row + 1).min(end),
+                (true, _, _) => at..end,
+                (false, true, Some(&(row, _))) => row.max(rows.start)..at,
+                (false, _, _) => rows.start..at,
+            };
+            let mut candidates: Vec<usize> = batch
+                .iter()
+                .map(|&(row, _)| row)
+                .filter(|row| covered.contains(row) && !overlay.contains(*row))
+                .collect();
+            candidates.extend(overlay.rows_in(covered.clone()).map(|(row, _)| row));
+            candidates.sort_unstable();
+            if !forward {
+                candidates.reverse();
+            }
+            for row in candidates {
+                let hit = match overlay.row(row) {
+                    Some(edits) => edited_has(row, edits),
+                    None => diagnostics
+                        .code_of(row)
+                        .is_some_and(|code| marks.row_is(reading, overlay, row, code, kind)),
+                };
+                if hit {
+                    return Some(row);
+                }
+            }
+            if !full || covered.is_empty() {
+                return None;
+            }
+            at = if forward { covered.end } else { covered.start };
+            if (forward && at >= end) || (!forward && at <= rows.start) {
+                return None;
+            }
+        }
     }
 }
 
-/// An edited row's marks as it reads now, `len` cells long, against the
-/// most common field count `mode`. An edited row is never blank: a blank
-/// line's one cell edited, or a cell past it, gives it a field with bytes
-/// or a second one.
-fn edited_flags(len: usize, edits: &RowEdits, mode: Option<usize>) -> RowFlags {
-    let ragged = mode.is_some_and(|mode| len != mode);
-    RowFlags {
-        marked: ragged || !edits.kinds().is_empty(),
-        ragged,
+/// How unedited rows are marked once columns are inserted or deleted (task
+/// 2.4b): a row's length is its field count's default layout's, and its
+/// inserted cells may hold a NUL, both decided per field count once; its
+/// own flagged fields may have gone with a deleted column, so a flagged row
+/// is read.
+struct FoldedMarks<'c> {
+    columns: &'c Columns,
+    /// The most common field count, folded.
+    mode: Option<usize>,
+    /// For each field count below [`TABLE`]: (ragged, an inserted cell
+    /// holds a NUL).
+    table: Vec<(bool, bool)>,
+    /// Some row's cell put back by value may hold a NUL: rows are read.
+    reads: bool,
+}
+
+impl<'c> FoldedMarks<'c> {
+    fn new(columns: &'c Columns, diagnostics: &Diagnostics) -> FoldedMarks<'c> {
+        let mode = diagnostics
+            .marked_rows_and_mode()
+            .1
+            .map(|mode| columns.fold_fields(mode));
+        let reads = columns
+            .ops()
+            .iter()
+            .any(|op| op.value().is_none() && op.values().any(|value| value.contains('\0')));
+        let mut marks = FoldedMarks {
+            columns,
+            mode,
+            table: Vec::new(),
+            reads,
+        };
+        marks.table = (0..TABLE).map(|n| marks.by_count(n)).collect();
+        marks
+    }
+
+    /// Whether Previous and Next look for `kind`: the field-level kinds and
+    /// ragged rows.
+    fn navigates(kind: DiagnosticKind) -> bool {
+        matches!(
+            kind,
+            DiagnosticKind::RaggedRows
+                | DiagnosticKind::UnterminatedQuote
+                | DiagnosticKind::TextAfterClosingQuote
+                | DiagnosticKind::InvalidEncoding
+                | DiagnosticKind::NulBytes
+        )
+    }
+
+    /// (ragged, an inserted cell holds a NUL) for a non-blank row of `n`
+    /// fields. A cell put back by value holds each row's own value: a row
+    /// that may have a NUL there is read ([`reads`](Self::reads)).
+    fn by_count(&self, n: usize) -> (bool, bool) {
+        if let Some(&entry) = self.table.get(n) {
+            return entry;
+        }
+        let own = EditOwn::original(n, false);
+        let fold = self.columns.fold(own);
+        let ragged = self.mode.is_some_and(|mode| fold.len() != mode);
+        let nul = fold.as_slice().iter().any(|&id| match id {
+            CellId::Inserted(op) => self
+                .columns
+                .op(op)
+                .and_then(|op| op.value())
+                .is_some_and(|value| value.contains('\0')),
+            _ => false,
+        });
+        (ragged, nul)
+    }
+
+    /// Whether a row with `code` may be marked (`kind` none) or have
+    /// `kind`: then it is checked ([`row_is`](Self::row_is)).
+    fn may_be(&self, code: RowCode, kind: Option<DiagnosticKind>) -> bool {
+        let (ragged, nul) = code.fields.map_or((false, false), |n| self.by_count(n));
+        let nul_maybe = nul || self.reads;
+        match kind {
+            None => ragged || nul_maybe || code.flagged,
+            Some(DiagnosticKind::RaggedRows) => ragged,
+            Some(DiagnosticKind::NulBytes) => nul_maybe || code.flagged,
+            Some(_) => code.flagged,
+        }
+    }
+
+    /// Whether unedited physical row `row`, with `code`, is marked
+    /// (`kind` none) or has `kind` now. A flagged row is read.
+    fn row_is(
+        &self,
+        reading: &Reading,
+        overlay: &Overlay,
+        row: usize,
+        code: RowCode,
+        kind: Option<DiagnosticKind>,
+    ) -> bool {
+        let (ragged, nul) = code.fields.map_or((false, false), |n| self.by_count(n));
+        let reads = code.flagged || self.reads;
+        let read =
+            |kind: Option<DiagnosticKind>| reads && Self::read_has(reading, overlay, row, kind);
+        match kind {
+            None => ragged || nul || read(None),
+            Some(DiagnosticKind::RaggedRows) => ragged,
+            Some(DiagnosticKind::NulBytes) => nul || read(Some(DiagnosticKind::NulBytes)),
+            Some(kind) => read(Some(kind)),
+        }
+    }
+
+    /// Unedited physical row `row`'s marks now.
+    fn flags(&self, reading: &Reading, overlay: &Overlay, row: usize, code: RowCode) -> RowFlags {
+        let (ragged, _) = code.fields.map_or((false, false), |n| self.by_count(n));
+        RowFlags {
+            marked: self.row_is(reading, overlay, row, code, None),
+            ragged,
+        }
+    }
+
+    /// Whether row `row`, read, has a field-level kind (`kind`, or any) in
+    /// a cell it still has.
+    fn read_has(
+        reading: &Reading,
+        overlay: &Overlay,
+        row: usize,
+        kind: Option<DiagnosticKind>,
+    ) -> bool {
+        let found = Document::read_physical(reading, overlay, row..row + 1, &mut |view| {
+            let kinds = Kinds::FIELD_KINDS
+                .iter()
+                .filter(|&&(k, _)| kind.is_none_or(|kind| kind == k));
+            kinds
+                .into_iter()
+                .any(|&(k, _)| view.first_with(k).is_some())
+        });
+        found.is_ok_and(|found| found.first().copied().unwrap_or(false))
     }
 }
 
@@ -2292,21 +2581,27 @@ fn estimate_from_head(head_index: &RowIndex, head_rows: usize, head: &[u8], len:
         .max(head_rows)
 }
 
-/// Inserted row `n` and its edits, if it is in the document.
-fn inserted_row(overlay: &Overlay, n: u32) -> Option<(&InsertedRow, Option<&RowEdits>)> {
+/// Inserted row `n` and what lays out its cells, if it is in the document.
+fn inserted_row(overlay: &Overlay, n: u32) -> Option<(&InsertedRow, OverlayRow<'_>)> {
     let row = overlay.inserted(n)?;
-    let edits = overlay.edits(RowId::inserted(n)).map(AsRef::as_ref);
-    Some((row.as_ref(), edits))
+    Some((row.as_ref(), overlay.cells_of(RowId::inserted(n))))
+}
+
+/// The most common field count `mode` as a row of that many fields reads
+/// after the column inserts and deletes: the column count, and what a
+/// row's length is ragged against.
+fn folded(overlay: &Overlay, mode: Option<usize>) -> Option<usize> {
+    mode.map(|mode| overlay.columns().fold_fields(mode))
 }
 
 /// Inserted row `n`'s marks (task 2.4a), from its cells as they read now,
 /// against the most common field count `mode`: ragged if its length
 /// differs, marked if ragged or it holds a NUL.
 fn inserted_flags(reading: &Reading, overlay: &Overlay, n: u32, mode: Option<usize>) -> RowFlags {
-    let Some((row, edits)) = inserted_row(overlay, n) else {
+    let Some((row, cells)) = inserted_row(overlay, n) else {
         return RowFlags::default();
     };
-    let view = RowView::inserted(&reading.parser, row, edits);
+    let view = RowView::inserted(&reading.parser, row, cells);
     let ragged = mode.is_some_and(|mode| view.len() != mode);
     RowFlags {
         marked: ragged || view.first_with(DiagnosticKind::NulBytes).is_some(),
@@ -2323,8 +2618,8 @@ fn inserted_place(
     kind: DiagnosticKind,
     mode: Option<usize>,
 ) -> Option<usize> {
-    let (row, edits) = inserted_row(overlay, n)?;
-    let view = RowView::inserted(&reading.parser, row, edits);
+    let (row, cells) = inserted_row(overlay, n)?;
+    let view = RowView::inserted(&reading.parser, row, cells);
     match kind {
         DiagnosticKind::RaggedRows => {
             let cells = view.len();
@@ -2338,4 +2633,9 @@ fn inserted_place(
 
 fn to_usize(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// Physical row `row`'s id.
+fn original_id(row: usize) -> RowId {
+    RowId::original(u32::try_from(row).unwrap_or(u32::MAX))
 }

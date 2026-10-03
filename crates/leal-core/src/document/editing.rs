@@ -16,8 +16,8 @@ use std::sync::{Arc, PoisonError};
 use super::{Document, Reading, RowBytes, RowView};
 use crate::diagnostics::Mark;
 use crate::edit::{
-    COLUMN_LIMIT, CellChange, Command, Edit, EditError, InsertedRow, Lineage, Overlay, Replay,
-    RowEdits, RowId, Slot,
+    COLUMN_LIMIT, CellChange, CellId, Columns, Command, Edit, EditError, InsertedRow, Layout,
+    Lineage, Overlay, Own as EditOwn, Parts, Replay, RowEdits, RowId, Slot, fresh_appended,
 };
 use crate::index::Status;
 use crate::rows::{ParsedRow, RowParser};
@@ -48,18 +48,64 @@ enum Own<'b> {
     New(Arc<InsertedRow>),
 }
 
-/// A row being changed: its own cells, and its edited cells so far.
+/// A row being changed: its own cells, and its edited cells and layout so
+/// far (task 2.4b: cells by identity, `edit::columns`).
 struct Work<'b> {
     own: Own<'b>,
     id: RowId,
-    cells: Vec<(usize, Arc<str>)>,
+    /// The own field count its edits are made against: the row's as read
+    /// when first edited.
+    fields: usize,
+    /// It is a blank line of the file.
+    blank: bool,
+    cells: Vec<(CellId, Arc<str>)>,
+    /// Its layout, if written out.
+    layout: Option<Vec<CellId>>,
+    columns: Arc<Columns>,
     previous: Option<Arc<RowEdits>>,
     /// The last cell of the row a target changed, for a refusal to name.
     last_column: usize,
 }
 
+impl<'b> Work<'b> {
+    /// Row `id`, with `own` cells (a blank line of the file if `blank`),
+    /// and its edits so far, `previous`, under `overlay`'s columns.
+    fn of(
+        own: Own<'b>,
+        id: RowId,
+        blank: bool,
+        previous: Option<Arc<RowEdits>>,
+        overlay: &Overlay,
+    ) -> Work<'b> {
+        let own_len = match &own {
+            Own::File { parsed, .. } => parsed.fields().len(),
+            Own::New(row) => row.fields().len(),
+        };
+        let (fields, blank, cells, layout) = match &previous {
+            Some(edits) => (
+                edits.fields(),
+                edits.is_blank(),
+                edits.cells().to_vec(),
+                edits.layout().map(<[CellId]>::to_vec),
+            ),
+            None => (own_len, blank, Vec::new(), None),
+        };
+        Work {
+            own,
+            id,
+            fields,
+            blank,
+            cells,
+            layout,
+            columns: Arc::clone(overlay.columns()),
+            previous,
+            last_column: 0,
+        }
+    }
+}
+
 impl Work<'_> {
-    /// How many cells of its own the row has.
+    /// How many cells of its own the row has, as read.
     fn own_len(&self) -> usize {
         match &self.own {
             Own::File { parsed, .. } => parsed.fields().len(),
@@ -67,8 +113,8 @@ impl Work<'_> {
         }
     }
 
-    /// Its own cell `column`'s value, unedited, if it has one.
-    fn own_value(&self, parser: &RowParser, column: usize) -> Option<Cow<'_, str>> {
+    /// Its own cell `k`'s value, unedited, if it has one.
+    fn own_value(&self, parser: &RowParser, k: usize) -> Option<Cow<'_, str>> {
         match &self.own {
             Own::File {
                 bytes,
@@ -76,22 +122,88 @@ impl Work<'_> {
                 parsed,
                 ..
             } => parsed
-                .field(column)
+                .field(k)
                 .map(|field| parser.display_value_in(bytes, *base, field)),
-            Own::New(row) => row.fields().get(column).map(|v| Cow::Borrowed(v.as_ref())),
+            Own::New(row) => row.fields().get(k).map(|v| Cow::Borrowed(v.as_ref())),
+        }
+    }
+
+    /// What the default layout needs to know of the row as read.
+    fn shape(&self) -> EditOwn {
+        match &self.own {
+            Own::File { .. } => EditOwn::original(self.own_len(), self.blank),
+            Own::New(_) => EditOwn::inserted(self.id.inserted_index().unwrap_or(0), self.own_len()),
+        }
+    }
+
+    /// Which cell each logical column is now.
+    fn layout(&self) -> Layout<'_> {
+        let parts = Parts {
+            fields: self.fields,
+            blank: self.blank,
+            cells: &self.cells,
+            layout: self.layout.as_deref(),
+        };
+        Layout::of_parts(&self.columns, self.shape(), Some(parts))
+    }
+
+    /// Cell `id`'s value unedited: `None` for a hatched cell, which is
+    /// missing.
+    fn original(&self, parser: &RowParser, id: CellId) -> Option<Cow<'_, str>> {
+        match id {
+            CellId::Field(k) | CellId::Appended(k) => {
+                self.own_value(parser, usize::try_from(k).ok()?)
+            }
+            CellId::Inserted(op) => self
+                .columns
+                .inserted_value(op, self.id)
+                .map(|value| Cow::Owned(value.to_owned())),
         }
     }
 
     /// Cell `column`'s value now: `None` past the row's end.
     fn value(&self, parser: &RowParser, column: usize) -> Option<Cow<'_, str>> {
-        if let Ok(at) = self.cells.binary_search_by_key(&column, |&(c, _)| c) {
+        let id = self.layout().get(column)?;
+        if let Ok(at) = self.cells.binary_search_by_key(&id, |&(c, _)| c) {
             return Some(Cow::Borrowed(&self.cells[at].1));
         }
-        if let Some(value) = self.own_value(parser, column) {
-            return Some(value);
+        Some(self.original(parser, id).unwrap_or(Cow::Borrowed("")))
+    }
+
+    /// Where the row's open unterminated quote is, if it has one: its own
+    /// last field, unterminated and unedited, still in the row. Only the
+    /// file's last row can have one.
+    fn open_quote(&self) -> Option<usize> {
+        let Own::File { parsed, .. } = &self.own else {
+            return None;
+        };
+        let fields = parsed.fields();
+        let quote = fields.len().checked_sub(1)?;
+        let id = CellId::Field(u32::try_from(quote).ok()?);
+        let open = fields[quote].unterminated()
+            && self.cells.binary_search_by_key(&id, |&(c, _)| c).is_err();
+        if !open {
+            return None;
         }
-        let end = self.cells.last().map_or(0, |&(c, _)| c + 1);
-        (column < end).then_some(Cow::Borrowed(""))
+        let layout = self.layout();
+        (0..layout.len()).find(|&c| layout.get(c) == Some(id))
+    }
+
+    /// Takes the hatched cells at the end of an explicit layout that hold
+    /// nothing: padding is only ever before an edited hatched cell
+    /// (ADR-0005 decision 2, task 2.4b). A default layout's end at its last
+    /// edited hatched cell anyway.
+    fn trim(&mut self) {
+        let Some(layout) = &mut self.layout else {
+            return;
+        };
+        while let Some(&CellId::Appended(j)) = layout.last() {
+            let id = CellId::Appended(j);
+            if self.cells.binary_search_by_key(&id, |&(c, _)| c).is_ok() {
+                break;
+            }
+            layout.pop();
+        }
     }
 }
 
@@ -182,9 +294,15 @@ impl Document {
     /// [`EditError::OtherLineage`] for a command made before the file was
     /// read with another delimiter or encoding, [`EditError::ValueChanged`]
     /// if a cell (or a row) doesn't hold what the command expects, the
-    /// errors of [`set_cell`](Self::set_cell), and for a row insert or
-    /// delete those of [`insert_rows`](Self::insert_rows).
+    /// errors of [`set_cell`](Self::set_cell), for a row insert or delete
+    /// those of [`insert_rows`](Self::insert_rows), and for a column's
+    /// those of [`insert_column`](Self::insert_column).
     pub fn apply(&self, command: &Command) -> Result<(), EditError> {
+        if command.is_column() {
+            return self
+                .apply_column(Some(command.lineage), &command.edit)
+                .map(|_| ());
+        }
         if command.is_structural() {
             return self
                 .apply_rows(Some(command.lineage), &command.edit)
@@ -200,8 +318,8 @@ impl Document {
     /// commands into a freshly opened document of the same file (ADR-0008
     /// decision 5). A command that doesn't apply is skipped, and the rest
     /// are still tried; one that built on it then usually doesn't apply
-    /// either, since its cell doesn't hold the value it expects. Row
-    /// inserts and deletes apply by value (ADR-0014 decision 3).
+    /// either, since its cell doesn't hold the value it expects. Row and
+    /// column inserts and deletes apply by value (ADR-0014 decision 3).
     ///
     /// The commands that applied come back in this document's lineage, for
     /// the app's new undo history (a row insert or delete as a new command
@@ -215,7 +333,9 @@ impl Document {
     pub fn replay(&self, commands: &[Command]) -> Replay {
         let mut replay = Replay::default();
         for (at, command) in commands.iter().enumerate() {
-            let applied = if command.is_structural() {
+            let applied = if command.is_column() {
+                self.apply_column(None, &command.edit)
+            } else if command.is_structural() {
                 self.apply_rows(None, &command.edit)
             } else {
                 self.change(None, &targets(command)).map(|(lineage, _)| {
@@ -249,7 +369,7 @@ impl Document {
         let overlay = reading.edits.overlay();
         let work = Self::work(&reading, &overlay, row)?;
         check_column(&work, row, column)?;
-        if let Some(quote) = open_quote(&work)
+        if let Some(quote) = work.open_quote()
             && column > quote
         {
             return Err(EditError::AfterUnterminatedQuote { row, column });
@@ -356,7 +476,8 @@ impl Document {
                 Ok(Some(RowBytes { bytes, .. })) if hash_of(&bytes) == hash
             );
             if !same {
-                cells.extend(edits.cells().iter().map(|&(column, _)| (logical, column)));
+                let shown = edits.shown(overlay.columns(), None);
+                cells.extend(shown.into_iter().map(|(column, _)| (logical, column)));
             }
         }
         cells.sort_unstable();
@@ -451,8 +572,8 @@ impl Document {
         // or deleted) after its row.
         let rows_now = overlay.map().len();
         for (&row, work) in &rows {
-            if let Some(quote) = open_quote(work) {
-                let past = work.cells.last().is_some_and(|&(c, _)| c > quote);
+            if let Some(quote) = work.open_quote() {
+                let past = quote + 1 < work.layout().len();
                 let not_last = rows_now.is_some_and(|len| row + 1 != len);
                 if past || not_last {
                     let column = work.last_column;
@@ -493,16 +614,13 @@ impl Document {
                 .inserted(n)
                 .ok_or_else(|| missing_row(reading, row))?;
             let previous = overlay.edits(id).cloned();
-            return Ok(Work {
-                own: Own::New(Arc::clone(inserted)),
+            return Ok(Work::of(
+                Own::New(Arc::clone(inserted)),
                 id,
-                cells: previous
-                    .as_ref()
-                    .map(|edits| edits.cells().to_vec())
-                    .unwrap_or_default(),
+                false,
                 previous,
-                last_column: 0,
-            });
+                overlay,
+            ));
         };
         let physical_row = usize::try_from(physical).unwrap_or(usize::MAX);
         // As `Reading::rows_from` decides it.
@@ -519,23 +637,20 @@ impl Document {
             return Err(missing_row(reading, row));
         };
         let previous = overlay.row_arc(physical_row).cloned();
-        let cells = previous
-            .as_ref()
-            .map(|edits| edits.cells().to_vec())
-            .unwrap_or_default();
-        Ok(Work {
-            own: Own::File {
+        let blank = parsed.fields().len() == 1 && parsed.span().is_empty();
+        Ok(Work::of(
+            Own::File {
                 bytes,
                 base,
                 parsed,
                 row: physical_row,
                 from_head,
             },
-            id: RowId::original(physical),
-            cells,
+            RowId::original(physical),
+            blank,
             previous,
-            last_column: 0,
-        })
+            overlay,
+        ))
     }
 }
 
@@ -553,30 +668,13 @@ fn targets(command: &Command) -> Vec<Target<'_>> {
         .collect()
 }
 
-/// The column limit: a cell past the row's fields and past
+/// The column limit: a cell past the row's cells and past
 /// [`COLUMN_LIMIT`] can't be edited.
 fn check_column(work: &Work<'_>, row: usize, column: usize) -> Result<(), EditError> {
-    if column >= work.own_len().max(COLUMN_LIMIT) {
+    if column >= work.layout().len().max(work.own_len()).max(COLUMN_LIMIT) {
         return Err(EditError::TooFarRight { row, column });
     }
     Ok(())
-}
-
-/// The column of the row's unterminated quote, if it has one and it is
-/// still open (unedited). It is always the row's last field, and only the
-/// file's last row can have one.
-fn open_quote(work: &Work<'_>) -> Option<usize> {
-    let Own::File { parsed, .. } = &work.own else {
-        return None;
-    };
-    let fields = parsed.fields();
-    let quote = fields.len().checked_sub(1)?;
-    let open = fields[quote].unterminated()
-        && work
-            .cells
-            .binary_search_by_key(&quote, |&(c, _)| c)
-            .is_err();
-    open.then_some(quote)
 }
 
 /// Whether a cell that reads as `actual` holds what a command means by
@@ -592,10 +690,11 @@ fn holds(actual: Option<&str>, meant: Option<&str>, rebased: bool) -> bool {
 }
 
 /// Sets `work`'s cell `column` to `value`. Back to the original display
-/// value (`""`, or missing, past the row's fields) removes the edit; for an
-/// inserted row, its own value. Only a cell past the row's own cells can be
-/// made missing; once the document is `rebased` (see [`holds`]), making
-/// one of its fields missing empties it.
+/// value (`""`, or missing, for a hatched cell; an inserted cell's value)
+/// removes the edit; for an inserted row, its own value. Only a hatched
+/// cell can be made missing; once the document is `rebased` (see
+/// [`holds`]), making one of its fields missing empties it. Padding left
+/// at the row's end goes (ADR-0005 decision 2).
 fn set(
     work: &mut Work<'_>,
     parser: &RowParser,
@@ -604,17 +703,46 @@ fn set(
     value: Option<&str>,
     rebased: bool,
 ) -> Result<(), EditError> {
+    let layout = work.layout();
+    let Some(id) = layout.get(column) else {
+        // A hatched cell past the row's end: missing, so `""` is no edit.
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        let id = match layout.hatched(column) {
+            Some(id) => id,
+            None => {
+                let mut ids = layout.ids().into_owned();
+                let mut next = fresh_appended(work.fields, &ids, &work.cells);
+                while ids.len() < column {
+                    ids.push(CellId::Appended(next));
+                    next += 1;
+                }
+                let id = CellId::Appended(next);
+                ids.push(id);
+                work.layout = Some(ids);
+                id
+            }
+        };
+        let at = work
+            .cells
+            .binary_search_by_key(&id, |&(c, _)| c)
+            .unwrap_or_else(|at| at);
+        work.cells.insert(at, (id, Arc::from(value)));
+        return Ok(());
+    };
+    let original = work.original(parser, id).map(Cow::into_owned);
     let value = match value {
-        None if rebased && column < work.own_len() => Some(""),
+        None if rebased && original.is_some() => Some(""),
         value => value,
     };
-    let back = match (work.own_value(parser, column), value) {
+    let back = match (original.as_deref(), value) {
         (Some(original), Some(value)) => original == value,
         (Some(_), None) => return Err(EditError::ValueChanged { row, column }),
         (None, Some(value)) => value.is_empty(),
         (None, None) => true,
     };
-    match (work.cells.binary_search_by_key(&column, |&(c, _)| c), back) {
+    match (work.cells.binary_search_by_key(&id, |&(c, _)| c), back) {
         (Ok(at), true) => {
             work.cells.remove(at);
         }
@@ -622,17 +750,23 @@ fn set(
         (Err(_), true) => {}
         (Err(at), false) => work
             .cells
-            .insert(at, (column, Arc::from(value.unwrap_or_default()))),
+            .insert(at, (id, Arc::from(value.unwrap_or_default()))),
     }
+    work.trim();
     Ok(())
 }
 
 /// A changed row's new edits, or `None` if it has none left.
-fn row_edits(reading: &Reading, parser: &RowParser, work: Work<'_>) -> Option<RowEdits> {
-    if work.cells.is_empty() {
+fn row_edits(reading: &Reading, parser: &RowParser, mut work: Work<'_>) -> Option<RowEdits> {
+    // A written-out layout stays while column operations are in effect,
+    // even if it reads as the default one now: an undo that takes out an
+    // operation the row went its own way for restores it (`edit::columns`).
+    if work.cells.is_empty() && work.layout.is_none() {
         return None;
     }
-    let fields = work.own_len();
+    let fields = work.fields;
+    let blank = work.blank;
+    let layout = work.layout.take().map(Arc::from);
     let Own::File {
         bytes,
         base,
@@ -643,7 +777,7 @@ fn row_edits(reading: &Reading, parser: &RowParser, work: Work<'_>) -> Option<Ro
     else {
         // An inserted row's values are text: no diagnostics of their own
         // but a NUL, which the edits' marks check on every value anyway.
-        return Some(RowEdits::new(fields, work.cells, Arc::from([]), None));
+        return Some(RowEdits::new(fields, work.cells, Arc::from([]), None).with_layout(layout));
     };
     // The row's own fields' diagnostics, worked out the first time it is
     // edited: none to look for if its marks say it has none.
@@ -657,7 +791,8 @@ fn row_edits(reading: &Reading, parser: &RowParser, work: Work<'_>) -> Option<Ro
             if unflagged {
                 Arc::from([])
             } else {
-                let view = RowView::new(parser, bytes, *base, parsed, None);
+                let id = RowId::original(u32::try_from(*row).unwrap_or(u32::MAX));
+                let view = RowView::own(parser, bytes, *base, parsed, id);
                 Arc::from(view.flagged_fields())
             }
         }
@@ -666,7 +801,11 @@ fn row_edits(reading: &Reading, parser: &RowParser, work: Work<'_>) -> Option<Ro
         Some(previous) => previous.head_hash(),
         None => from_head.then(|| hash_of(bytes)),
     };
-    Some(RowEdits::new(fields, work.cells, flagged, head_hash))
+    Some(
+        RowEdits::new(fields, work.cells, flagged, head_hash)
+            .blank(blank)
+            .with_layout(layout),
+    )
 }
 
 /// Why logical row `row` can't be edited: it isn't there (the index is

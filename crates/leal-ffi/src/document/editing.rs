@@ -26,6 +26,12 @@
 //! keeps but can't look into beyond [`StructuralEdit`]'s summary. They need the whole
 //! file read, and no save running ([`Document::can_change_rows`]).
 //!
+//! **Columns** (task 2.4b). [`Document::insert_column`] and
+//! [`Document::delete_column`] likewise, their [`StructuralEdit`] holding
+//! the column; they need what row inserts need, and a search starts again
+//! after one ([`Document::can_insert_column`],
+//! [`Document::can_delete_column`]).
+//!
 //! Rows are logical rows: as the document has them now, after any rows
 //! inserted or deleted (the header row, if any, is row 0, and can be
 //! edited). A missing cell (past the end of its row: a hatched cell) is
@@ -75,15 +81,15 @@ pub struct EditCommand {
     /// The cells it changes, in order: one for an edit, several for a
     /// batch (all or nothing). Empty for a row insert or delete.
     pub changes: Vec<ValueChange>,
-    /// The rows it inserts or deletes, for a row insert or delete (and,
-    /// from task 2.4b, the column for a column insert or delete).
+    /// The rows it inserts or deletes, for a row insert or delete, or the
+    /// column, for a column insert or delete.
     pub structural: Option<Arc<StructuralEdit>>,
 }
 
-/// A row insert or delete (task 2.4a; columns are task 2.4b's), inside an
+/// A row insert or delete (task 2.4a), or a column's (task 2.4b), inside an
 /// [`EditCommand`]: opaque to the app, which keeps it for undo and redo,
-/// but for where the rows are. See
-/// `leal_core::edit::Edit::InsertRows`.
+/// but for where the rows or the column are. See
+/// `leal_core::edit::Edit::InsertRows` and `Edit::InsertColumn`.
 #[derive(Debug, PartialEq, Eq, uniffi::Object)]
 pub struct StructuralEdit {
     edit: Edit,
@@ -91,28 +97,53 @@ pub struct StructuralEdit {
 
 #[uniffi::export]
 impl StructuralEdit {
-    /// Whether it inserts rows (its undo deletes them), rather than
-    /// deleting them.
+    /// Whether it inserts rows or a column (its undo deletes them),
+    /// rather than deleting them.
     #[must_use]
     pub fn inserts(&self) -> bool {
-        matches!(self.edit, Edit::InsertRows { .. })
+        matches!(
+            self.edit,
+            Edit::InsertRows { .. } | Edit::InsertColumn { .. }
+        )
     }
 
-    /// The first row's logical row.
+    /// Whether it inserts or deletes a column, rather than rows.
+    #[must_use]
+    pub fn is_column(&self) -> bool {
+        matches!(
+            self.edit,
+            Edit::InsertColumn { .. } | Edit::DeleteColumn { .. }
+        )
+    }
+
+    /// The first row's logical row: 0 for a column.
     #[must_use]
     pub fn first_row(&self) -> u64 {
         match &self.edit {
             Edit::InsertRows { at, .. } | Edit::DeleteRows { at, .. } => to_u64(*at),
-            Edit::SetCell(_) | Edit::SetCells(_) => 0,
+            _ => 0,
         }
     }
 
-    /// How many rows.
+    /// How many rows: those inserted or deleted, or those a column insert
+    /// or delete applied to.
     #[must_use]
     pub fn row_count(&self) -> u64 {
         match &self.edit {
             Edit::InsertRows { rows, .. } | Edit::DeleteRows { rows, .. } => to_u64(rows.len()),
+            Edit::InsertColumn { column, .. } | Edit::DeleteColumn { column, .. } => {
+                to_u64(column.rows())
+            }
             Edit::SetCell(_) | Edit::SetCells(_) => 0,
+        }
+    }
+
+    /// The logical column, for a column insert or delete.
+    #[must_use]
+    pub fn column(&self) -> Option<u32> {
+        match &self.edit {
+            Edit::InsertColumn { at, .. } | Edit::DeleteColumn { at, .. } => Some(to_u32(*at)),
+            _ => None,
         }
     }
 }
@@ -157,13 +188,16 @@ pub enum EditRefusal {
     /// The command was made before the file was read with another
     /// delimiter or encoding.
     OtherLineage,
-    /// Rows can't be inserted or deleted until the whole file has been
-    /// read (ADR-0014 decision 1): disable Insert and Delete Row, saying
-    /// so, and try again once the index is complete.
+    /// Rows and columns can't be inserted or deleted until the whole file
+    /// has been read (ADR-0014 decision 1): disable Insert and Delete Row
+    /// and Column, saying so, and try again once the index is complete.
     StillReading,
-    /// Rows can't be inserted or deleted, nor such a command undone or
-    /// redone, while a save runs (ADR-0014 decision 1).
+    /// Rows and columns can't be inserted or deleted, nor such a command
+    /// undone or redone, while a save runs (ADR-0014 decision 1).
     Saving,
+    /// No row has the column: a column is inserted at most just past the
+    /// widest row, and deleted only where a row has it.
+    NoSuchColumn,
     /// The row couldn't be read (its drive or share went away).
     Unreadable,
 }
@@ -192,9 +226,10 @@ impl From<Command> for EditCommand {
         let (changes, structural) = match command.edit {
             Edit::SetCell(change) => (vec![change], None),
             Edit::SetCells(changes) => (changes, None),
-            edit @ (Edit::InsertRows { .. } | Edit::DeleteRows { .. }) => {
-                (Vec::new(), Some(Arc::new(StructuralEdit { edit })))
-            }
+            edit @ (Edit::InsertRows { .. }
+            | Edit::DeleteRows { .. }
+            | Edit::InsertColumn { .. }
+            | Edit::DeleteColumn { .. }) => (Vec::new(), Some(Arc::new(StructuralEdit { edit }))),
         };
         EditCommand {
             lineage: command.lineage.get(),
@@ -259,6 +294,7 @@ fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
         EditError::OtherLineage => (EditRefusal::OtherLineage, None, None),
         EditError::StillReading => (EditRefusal::StillReading, None, None),
         EditError::Saving => (EditRefusal::Saving, None, None),
+        EditError::NoSuchColumn { column } => (EditRefusal::NoSuchColumn, None, Some(column)),
         EditError::Read { row, .. } => (EditRefusal::Unreadable, Some(row), None),
     }
 }
@@ -416,6 +452,79 @@ impl Document {
             Ok(self
                 .document
                 .can_insert_rows(to_index(at))
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// Inserts a column before logical column `at`, each new cell holding
+    /// `value`, in every row with at least `at` cells (a shorter row or a
+    /// blank line is left as it is), as one command for the undo manager.
+    /// `at` may be the widest row's length. A search starts again. It
+    /// reads no row (about a millisecond per million rows).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::EditRefused`] with [`EditRefusal::StillReading`],
+    /// [`EditRefusal::Saving`], [`EditRefusal::NoSuchColumn`] or
+    /// [`EditRefusal::AfterUnterminatedQuote`], with the document
+    /// unchanged; [`LealError::DocumentFailed`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "UniFFI passes a string from Swift by value"
+    )]
+    pub fn insert_column(&self, at: u32, value: String) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .insert_column(to_usize(at), &value)
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Deletes logical column `at` from every row that has it, as one
+    /// command for the undo manager: undo puts the same cells back, their
+    /// original bytes and edits included.
+    ///
+    /// # Errors
+    ///
+    /// As for [`insert_column`](Self::insert_column).
+    pub fn delete_column(&self, at: u32) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .delete_column(to_usize(at))
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Whether a column can be inserted before logical column `at` now,
+    /// for enabling **Insert Column**: `nil` if it can, otherwise why not.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_insert_column(&self, at: u32) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_insert_column(to_usize(at))
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// Whether logical column `at` can be deleted now, for enabling
+    /// **Delete Column**: `nil` if it can, otherwise why not.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_delete_column(&self, at: u32) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_delete_column(to_usize(at))
                 .err()
                 .map(|error| refusal(&error).0))
         })

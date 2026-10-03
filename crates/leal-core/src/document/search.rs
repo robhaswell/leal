@@ -66,7 +66,9 @@ use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::task::Poll;
 
 use super::{Document, Place, Reading, RowView, bytes_in};
-use crate::edit::{InsertedRow, Overlay, RowEdits, RowId, RowMap, Segment, Slot};
+use crate::edit::{
+    Columns, InsertedRow, Overlay, OverlayRow, RowEdits, RowId, RowMap, Segment, Slot,
+};
 use crate::find::{FindError, Matcher, Query};
 use crate::index::{RowIndex, Status};
 use crate::rows::RowParser;
@@ -193,6 +195,11 @@ struct SearchState {
     catch_up_job: Mutex<Option<JobHandle<()>>>,
     /// The search was dropped: no more catch-up jobs.
     dropped: AtomicBool,
+    /// The search's job (or a catch-up job, once it has finished) is
+    /// searching the file's rows: after the search starts again because of
+    /// a column insert or delete, a catch-up job searches them if the
+    /// search's own job has finished.
+    turning: AtomicBool,
     /// Run once by the next step, between its look at the matches and its
     /// look at whether the search is complete: a test makes the search
     /// finish there.
@@ -265,6 +272,15 @@ struct Found {
     /// The counts are right for the edits up to this version of the
     /// document's edits (`EditStore::since`).
     synced: usize,
+    /// The column inserts and deletes the counts are right for, by their
+    /// generation: when it changes, the search starts again (ADR-0014
+    /// decision 2).
+    generation: u64,
+    /// How many times the search has started again: a chunk searched
+    /// before the latest start is dropped.
+    epoch: u64,
+    /// It started again and hasn't finished since.
+    restarted: bool,
 }
 
 impl Found {
@@ -538,10 +554,11 @@ impl Document {
         let matcher = Matcher::new(query, reading.detection.encoding)?;
         let header = reading.detection.header;
         // A search starts from the edits as they are when it starts.
-        let (overlay, synced) = reading.edits.snapshot();
+        let (overlay, synced, generation) = reading.edits.snapshot_columns();
         let mut found = Found {
             header,
             synced,
+            generation,
             ..Found::default()
         };
         let counts = inserted_counts(&reading.parser, &matcher, &overlay);
@@ -558,6 +575,7 @@ impl Document {
             catch_up_started: AtomicBool::new(false),
             catch_up_job: Mutex::default(),
             dropped: AtomicBool::new(false),
+            turning: AtomicBool::new(true),
             #[cfg(test)]
             before_settling: Mutex::default(),
             #[cfg(test)]
@@ -591,8 +609,8 @@ fn inserted_counts(
             let Some(row) = overlay.inserted(n) else {
                 continue;
             };
-            let edits = overlay.edits(RowId::inserted(n)).map(AsRef::as_ref);
-            let cells = inserted_cells_matching(parser, matcher, row, edits);
+            let cells =
+                inserted_cells_matching(parser, matcher, row, overlay.cells_of(RowId::inserted(n)));
             if cells > 0 {
                 counts.push((n, row.gap(), cells));
             }
@@ -601,20 +619,25 @@ fn inserted_counts(
     counts
 }
 
-/// How many of an inserted row's cells match, as it reads with `edits`.
-fn inserted_cells_matching(
-    parser: &RowParser,
-    matcher: &Matcher,
-    row: &InsertedRow,
-    edits: Option<&RowEdits>,
-) -> u64 {
-    let view = RowView::inserted(parser, row, edits);
+/// How many of a row's cells match, as it reads.
+fn count_matching(view: &RowView<'_>, matcher: &Matcher) -> u32 {
     let matching = view
         .filled()
         .into_iter()
         .filter(|&(_, cell)| matcher.is_match(&view.value_of(cell)))
         .count();
-    to_u64(matching)
+    u32::try_from(matching).unwrap_or(u32::MAX)
+}
+
+/// How many of an inserted row's cells match, as it reads with `cells`.
+fn inserted_cells_matching(
+    parser: &RowParser,
+    matcher: &Matcher,
+    row: &InsertedRow,
+    cells: OverlayRow<'_>,
+) -> u64 {
+    let view = RowView::inserted(parser, row, cells);
+    u64::from(count_matching(&view, matcher))
 }
 
 impl Search {
@@ -970,76 +993,141 @@ impl SearchState {
     /// copy's rows only: a search never finishes with matches from both
     /// versions of the file (p1-review fid-2).
     fn turn(&self, job: &Job) -> Poll<Result<SearchSummary, JobError>> {
+        let polled = self.search_on(job);
+        if polled.is_ready() {
+            self.turning.store(false, Ordering::Release);
+        }
+        polled
+    }
+
+    /// [`turn`](Self::turn)'s search, until the rows that can be read have
+    /// been.
+    fn search_on(&self, job: &Job) -> Poll<Result<SearchSummary, JobError>> {
         loop {
-            job.checkpoint()?;
-            let stale = self.source.changed_on_disk();
-            let next = {
-                let mut found = self.lock();
-                if stale && found.used_head {
-                    found.rows.clear();
-                    found.ends.clear();
-                    found.searched = 0;
-                    found.used_head = false;
-                }
-                found.searched
-            };
-            let indexed = self.reading.index.row_count();
-            let (index, available) = self.rows_index(stale);
-            if next >= available {
-                let control = self.reading.index_job.control();
-                match more_rows(&self.reading.index, control, indexed, job)? {
-                    Settled::Done => {
-                        // No more rows will come. Finished, unless the
-                        // index or the file moved on since this step looked.
-                        let now = self.source.changed_on_disk();
-                        if now == stale && next >= self.rows_index(now).1 {
-                            break;
-                        }
-                        continue;
+            loop {
+                job.checkpoint()?;
+                self.restart_if_columns_changed();
+                let stale = self.source.changed_on_disk();
+                let (next, epoch) = {
+                    let mut found = self.lock();
+                    if stale && found.used_head {
+                        found.rows.clear();
+                        found.ends.clear();
+                        found.searched = 0;
+                        found.used_head = false;
                     }
-                    Settled::Waiting => return Poll::Pending,
+                    (found.searched, found.epoch)
+                };
+                let indexed = self.reading.index.row_count();
+                let (index, available) = self.rows_index(stale);
+                if next >= available {
+                    let control = self.reading.index_job.control();
+                    match more_rows(&self.reading.index, control, indexed, job)? {
+                        Settled::Done => {
+                            // No more rows will come. Finished, unless the
+                            // index or the file moved on since this step
+                            // looked.
+                            let now = self.source.changed_on_disk();
+                            if now == stale && next >= self.rows_index(now).1 {
+                                break;
+                            }
+                            continue;
+                        }
+                        Settled::Waiting => return Poll::Pending,
+                    }
                 }
+                let end = chunk_end(index, next, available);
+                // The chunk is searched with its rows' edits, which of them
+                // are still in the document and the column operations, as
+                // they are now, without holding the rest of the overlay (so
+                // an edit meanwhile doesn't copy it); any made meanwhile
+                // are caught up as it is added.
+                let chunk = self.reading.edits.rows_in(next..end);
+                let (hits, from_head) = self.search_rows(
+                    index,
+                    next..end,
+                    stale,
+                    &chunk.edited,
+                    &chunk.live,
+                    &chunk.columns,
+                )?;
+                let version = chunk.version;
+                let generation = chunk.column_generation;
+                drop(chunk);
+                self.in_chunk();
+                let mut found = self.lock();
+                if found.epoch != epoch || found.generation != generation {
+                    // Started again meanwhile, or about to: not these rows.
+                    continue;
+                }
+                for (row, cells) in hits {
+                    let total = found.ends.last().copied().unwrap_or(0) + u64::from(cells);
+                    found.rows.push(u32::try_from(row).unwrap_or(u32::MAX));
+                    found.ends.push(total);
+                }
+                found.searched = end;
+                found.used_head |= from_head;
+                // The chunk's rows are right as of `version`: anything
+                // edited since is recounted.
+                found.synced = found.synced.min(version);
+                drop(found);
+                self.catch_up(CatchUp::Job(job))?;
             }
-            let end = chunk_end(index, next, available);
-            // The chunk is searched with its rows' edits, and which of them
-            // are still in the document, as they are now, without holding
-            // the rest of the overlay (so an edit meanwhile doesn't copy
-            // it); any made meanwhile are caught up as it is added.
-            let chunk = self.reading.edits.rows_in(next..end);
-            let (hits, from_head) =
-                self.search_rows(index, next..end, stale, &chunk.edited, &chunk.live)?;
-            let version = chunk.version;
-            drop(chunk);
-            self.in_chunk();
+            let epoch = self.lock().epoch;
+            if !self.catch_up(CatchUp::Job(job))? {
+                // Cancelled part-way.
+                return Poll::Ready(Err(JobError::Cancelled));
+            }
+            let available = self.rows_index(self.source.changed_on_disk()).1;
             let mut found = self.lock();
-            for (row, cells) in hits {
-                let total = found.ends.last().copied().unwrap_or(0) + u64::from(cells);
-                found.rows.push(u32::try_from(row).unwrap_or(u32::MAX));
-                found.ends.push(total);
+            if found.epoch != epoch {
+                // A column insert or delete started it again.
+                continue;
             }
-            found.searched = end;
-            found.used_head |= from_head;
-            // The chunk's rows are right as of `version`: anything edited
-            // since is recounted.
-            found.synced = found.synced.min(version);
-            drop(found);
-            self.catch_up(CatchUp::Job(job))?;
+            found.complete = true;
+            found.restarted = false;
+            found.searched = found.searched.max(available);
+            // The header row is searched like any row, but left out of the
+            // answers, so it isn't counted.
+            let header_row = usize::from(found.header_cells() > 0);
+            return Poll::Ready(Ok(SearchSummary {
+                matches: found.total(),
+                rows: (found.rows.len() + found.inserted.len()).saturating_sub(header_row),
+            }));
         }
-        if !self.catch_up(CatchUp::Job(job))? {
-            // Cancelled part-way.
-            return Poll::Ready(Err(JobError::Cancelled));
+    }
+
+    /// Starts the search again if a column has been inserted or deleted
+    /// since its counts were made (ADR-0014 decision 2): every row's
+    /// matches may have changed. The inserted rows are counted at once, as
+    /// when it starts; the file's rows are searched again by the search's
+    /// job, or a catch-up job once that has finished.
+    fn restart_if_columns_changed(&self) {
+        let (generation, epoch) = {
+            let found = self.lock();
+            (found.generation, found.epoch)
+        };
+        if self.reading.edits.column_generation() == generation {
+            return;
         }
-        let available = self.rows_index(self.source.changed_on_disk()).1;
+        let (overlay, synced, generation) = self.reading.edits.snapshot_columns();
+        let counts = inserted_counts(&self.reading.parser, &self.matcher, &overlay);
         let mut found = self.lock();
-        found.complete = true;
-        found.searched = found.searched.max(available);
-        // The header row is searched like any row, but left out of the
-        // answers, so it isn't counted.
-        let header_row = usize::from(found.header_cells() > 0);
-        Poll::Ready(Ok(SearchSummary {
-            matches: found.total(),
-            rows: (found.rows.len() + found.inserted.len()).saturating_sub(header_row),
-        }))
+        if found.epoch != epoch {
+            return; // another restart got there first
+        }
+        found.rows.clear();
+        found.ends.clear();
+        found.inserted.clear();
+        found.inserted_ends.clear();
+        found.searched = 0;
+        found.complete = false;
+        found.used_head = false;
+        found.synced = synced;
+        found.generation = generation;
+        found.epoch += 1;
+        found.restarted = true;
+        found.merge_inserted(&counts, overlay.map().clone());
     }
 
     /// The rows of `rows` (in `index`) with matches, how many cells of
@@ -1053,6 +1141,7 @@ impl SearchState {
         head_stale: bool,
         edits: &[(usize, Arc<RowEdits>)],
         live: &[Range<usize>],
+        columns: &Columns,
     ) -> Result<(Vec<(usize, u32)>, bool), JobError> {
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok((Vec::new(), false));
@@ -1071,9 +1160,25 @@ impl SearchState {
             }
         };
         let mut hits = Vec::new();
+        // Once a column insert's value matches (task 2.4b), a row can match
+        // with nothing in its own bytes: every row is read.
+        let every_row = columns
+            .ops()
+            .iter()
+            .any(|op| op.values().any(|value| self.matcher.is_match(value)));
+        if every_row {
+            for row in rows.clone() {
+                if !edited(row) && is_live(row) {
+                    let cells = self.unedited_matching(index, row, &bytes, base, columns);
+                    if cells > 0 {
+                        hits.push((row, cells));
+                    }
+                }
+            }
+        }
         // `at` is where `row` starts, in `bytes`.
         let mut at = 0;
-        let mut row = rows.start;
+        let mut row = if every_row { rows.end } else { rows.start };
         while row < rows.end {
             let Some(candidate) = self.matcher.raw_candidates(&bytes, at) else {
                 break;
@@ -1087,7 +1192,7 @@ impl SearchState {
                 break;
             }
             if !edited(holder) && is_live(holder) {
-                let cells = self.cells_matching(index, holder, &bytes, base);
+                let cells = self.unedited_matching(index, holder, &bytes, base, columns);
                 if cells > 0 {
                     hits.push((holder, cells));
                 }
@@ -1100,7 +1205,8 @@ impl SearchState {
         }
         if !edits.is_empty() {
             for (row, row_edits) in edits {
-                let cells = self.edited_cells_matching(index, *row, &bytes, base, Some(row_edits));
+                let cells =
+                    self.edited_cells_matching(index, *row, &bytes, base, Some(row_edits), columns);
                 if cells > 0 {
                     hits.push((*row, cells));
                 }
@@ -1121,14 +1227,26 @@ impl SearchState {
         bytes: &[u8],
         base: usize,
         edits: Option<&RowEdits>,
+        columns: &Columns,
     ) -> u32 {
         let Some(edits) = edits else {
-            return self.cells_matching(index, row, bytes, base);
+            return self.unedited_matching(index, row, bytes, base, columns);
         };
         let parser = &self.reading.parser;
         let Some(parsed) = parser.parse_row_in(index, row, bytes, base) else {
             return 0;
         };
+        let id = RowId::original(u32::try_from(row).unwrap_or(u32::MAX));
+        let cells = OverlayRow {
+            id,
+            edits: Some(edits),
+            columns,
+        };
+        if !columns.is_empty() {
+            // Laid out by the column operations: every cell as it reads.
+            let view = RowView::new(parser, bytes, base, &parsed, cells);
+            return count_matching(&view, &self.matcher);
+        }
         let span = parsed.span();
         let own = bytes
             .get(..span.end.saturating_sub(base))
@@ -1137,20 +1255,44 @@ impl SearchState {
             .matcher
             .raw_candidates(own, span.start.saturating_sub(base))
             .is_some();
-        let matching = if anywhere {
-            let view = RowView::new(parser, bytes, base, &parsed, Some(edits));
-            view.filled()
-                .into_iter()
-                .filter(|&(_, cell)| self.matcher.is_match(&view.value_of(cell)))
-                .count()
-        } else {
-            edits
-                .cells()
-                .iter()
-                .filter(|(_, value)| self.matcher.is_match(value))
-                .count()
-        };
+        if anywhere {
+            let view = RowView::new(parser, bytes, base, &parsed, cells);
+            return count_matching(&view, &self.matcher);
+        }
+        let matching = edits
+            .shown(columns, None)
+            .into_iter()
+            .filter(|(_, value)| self.matcher.is_match(value))
+            .count();
         u32::try_from(matching).unwrap_or(u32::MAX)
+    }
+
+    /// How many of unedited row `row`'s cells match, laid out by `columns`
+    /// ([`cells_matching`](Self::cells_matching) with none).
+    fn unedited_matching(
+        &self,
+        index: &RowIndex,
+        row: usize,
+        bytes: &[u8],
+        base: usize,
+        columns: &Columns,
+    ) -> u32 {
+        if columns.is_empty() {
+            return self.cells_matching(index, row, bytes, base);
+        }
+        let parser = &self.reading.parser;
+        let Some(parsed) = parser.parse_row_in(index, row, bytes, base) else {
+            return 0;
+        };
+        let cells = OverlayRow {
+            id: RowId::original(u32::try_from(row).unwrap_or(u32::MAX)),
+            edits: None,
+            columns,
+        };
+        count_matching(
+            &RowView::new(parser, bytes, base, &parsed, cells),
+            &self.matcher,
+        )
     }
 
     /// Catches the counts up with the edits made since they were last right
@@ -1171,6 +1313,19 @@ impl SearchState {
     /// returns `false` without moving the counts on.
     fn catch_up(&self, how: CatchUp<'_>) -> Result<bool, ReadError> {
         let inline = matches!(how, CatchUp::Inline);
+        self.restart_if_columns_changed();
+        if !self.turning.load(Ordering::Acquire) && self.lock().restarted {
+            // Started again after its job finished: a catch-up job
+            // searches the rows (and catches up as it goes).
+            let CatchUp::Job(job) = how else {
+                return Ok(false);
+            };
+            self.turning.store(true, Ordering::Release);
+            let polled = self.search_on(job);
+            self.turning.store(false, Ordering::Release);
+            // A row that couldn't be read is searched again next time.
+            return Ok(matches!(polled, Poll::Ready(Ok(_))));
+        }
         let version = self.reading.edits.version();
         {
             let found = self.lock();
@@ -1194,11 +1349,18 @@ impl SearchState {
                 .unwrap_or_else(PoisonError::into_inner)
         };
         loop {
-            let (synced, searched, matching) = {
+            self.restart_if_columns_changed();
+            let (synced, searched, matching, generation) = {
                 let found = self.lock();
-                (found.synced, found.searched, found.rows.len())
+                (
+                    found.synced,
+                    found.searched,
+                    found.rows.len(),
+                    found.generation,
+                )
             };
             let (touched, map, version) = self.reading.edits.since(synced);
+            let columns = self.reading.edits.columns();
             let mut originals: Vec<(usize, Option<Arc<RowEdits>>)> = Vec::new();
             let mut inserted: Vec<(u32, InsertedNow)> = Vec::new();
 
@@ -1234,9 +1396,14 @@ impl SearchState {
                     0
                 } else {
                     match self.row_bytes(row)? {
-                        Some(RowRead { bytes, base, index }) => {
-                            self.edited_cells_matching(index, row, &bytes, base, edits.as_deref())
-                        }
+                        Some(RowRead { bytes, base, index }) => self.edited_cells_matching(
+                            index,
+                            row,
+                            &bytes,
+                            base,
+                            edits.as_deref(),
+                            &columns,
+                        ),
                         None => 0,
                     }
                 };
@@ -1246,16 +1413,21 @@ impl SearchState {
             let inserted_counts: Vec<(u32, u32, u64)> = inserted
                 .into_iter()
                 .map(|(n, now)| match now {
-                    Some((row, edits)) => (
-                        n,
-                        row.gap(),
-                        inserted_cells_matching(parser, &self.matcher, &row, edits.as_deref()),
-                    ),
+                    Some((row, edits)) => {
+                        let cells = OverlayRow {
+                            id: RowId::inserted(n),
+                            edits: edits.as_deref(),
+                            columns: &columns,
+                        };
+                        let matching = inserted_cells_matching(parser, &self.matcher, &row, cells);
+                        (n, row.gap(), matching)
+                    }
                     None => (n, 0, 0),
                 })
                 .collect();
             let mut found = self.lock();
-            if found.synced != synced || found.searched != searched {
+            let moved = self.reading.edits.column_generation() != generation;
+            if found.synced != synced || found.searched != searched || moved {
                 // A chunk was added (or the search started again) meanwhile.
                 continue;
             }
@@ -1398,18 +1570,20 @@ impl SearchState {
                 let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
                     return Ok(());
                 };
-                let edits = self.reading.edits.row(row);
+                let overlay = self.reading.edits.overlay();
                 each(&RowView::new(
                     parser,
                     &bytes,
                     base,
                     &parsed,
-                    edits.as_deref(),
+                    overlay.physical(row),
                 ));
             }
             Slot::Inserted(n) => {
-                if let Some((row, edits)) = self.reading.edits.inserted(n) {
-                    each(&RowView::inserted(parser, &row, edits.as_deref()));
+                let overlay = self.reading.edits.overlay();
+                if let Some(row) = overlay.inserted(n) {
+                    let cells = overlay.cells_of(RowId::inserted(n));
+                    each(&RowView::inserted(parser, row, cells));
                 }
             }
         }

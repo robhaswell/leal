@@ -161,7 +161,7 @@ fn an_edit_copies_the_overlay_only_while_a_reader_holds_it() {
     set(&document, 1, 1, "e");
     assert_eq!(store.copies(), 1, "copied for the reader");
     assert_eq!(
-        held.row(1).unwrap().get(1),
+        held.row(1).unwrap().get(crate::edit::CellId::Field(1)),
         Some("a"),
         "which keeps its own"
     );

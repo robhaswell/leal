@@ -13,8 +13,8 @@ use std::sync::{Arc, PoisonError};
 
 use super::{Document, Reading};
 use crate::edit::{
-    Command, Edit, EditError, InsertedRow, Lineage, Overlay, Piece, RowChange, RowEdits, RowId,
-    RowMap, RowSource, Rows,
+    CellId, Command, Edit, EditError, InsertedRow, Lineage, Overlay, Own as EditOwn, Piece,
+    RowChange, RowEdits, RowId, RowMap, RowSource, Rows,
 };
 use crate::index::Status;
 use crate::source::{ReadError, Storage};
@@ -43,7 +43,7 @@ impl Document {
         at: usize,
         rows: &[Vec<String>],
     ) -> Result<Option<Command>, EditError> {
-        self.change_rows(|reading| insert_new(reading, at, rows))
+        self.change_rows(|reading| insert_new(reading, at, rows, false))
     }
 
     /// Deletes logical rows `at..at + count`, as one command (undo puts
@@ -114,7 +114,10 @@ impl Document {
             let (insert, at, rows) = match edit {
                 Edit::InsertRows { at, rows } => (true, *at, rows),
                 Edit::DeleteRows { at, rows } => (false, *at, rows),
-                Edit::SetCell(_) | Edit::SetCells(_) => return Ok(None),
+                Edit::SetCell(_)
+                | Edit::SetCells(_)
+                | Edit::InsertColumn { .. }
+                | Edit::DeleteColumn { .. } => return Ok(None),
             };
             if rows.base == store.base() {
                 // The same rows, by identity: their original bytes come
@@ -133,7 +136,7 @@ impl Document {
                 return Err(EditError::ValueChanged { row: at, column: 0 });
             }
             if insert {
-                return insert_new(reading, at, &values);
+                return insert_new(reading, at, &values, true);
             }
             let now = values_of(reading, at..at + rows.len())?;
             for (i, expected) in values.iter().enumerate() {
@@ -158,7 +161,7 @@ impl Document {
 
     /// Runs `change` on the current reading, one change at a time, once
     /// rows may be inserted or deleted.
-    fn change_rows(
+    pub(super) fn change_rows(
         &self,
         change: impl FnOnce(&Arc<Reading>) -> Result<Option<Command>, EditError>,
     ) -> Result<Option<Command>, EditError> {
@@ -177,7 +180,7 @@ impl Document {
 /// [`EditError::StillReading`] unless the whole file has been read, and
 /// copied if it is on a removable drive or a share, and can be trusted
 /// (ADR-0014 decision 1).
-fn whole_file(reading: &Reading) -> Result<(), EditError> {
+pub(super) fn whole_file(reading: &Reading) -> Result<(), EditError> {
     let complete = reading.index.status() == Status::Complete
         && reading.source.storage() != Storage::Reading
         && !reading.head_is_stale();
@@ -201,11 +204,14 @@ fn begun(reading: &Reading, overlay: &Overlay) -> RowMap {
     map
 }
 
-/// Inserts new rows of `values` at `at`.
+/// Inserts new rows of `values` at `at`. A row of no values has one empty
+/// cell, as a blank line reads, unless `exact` (rows put back by value,
+/// which column deletes may have left with none, task 2.4b).
 fn insert_new(
     reading: &Arc<Reading>,
     at: usize,
     values: &[Vec<String>],
+    exact: bool,
 ) -> Result<Option<Command>, EditError> {
     if values.is_empty() {
         return Ok(None);
@@ -233,7 +239,14 @@ fn insert_new(
     check_quote(reading, &overlay, &map, &[], at)?;
     let inserted: Vec<(u32, Arc<InsertedRow>)> = (first..next)
         .zip(values)
-        .map(|(n, values)| (n, Arc::new(InsertedRow::new(gap, values))))
+        .map(|(n, values)| {
+            let row = if exact {
+                InsertedRow::exactly(gap, values)
+            } else {
+                InsertedRow::new(gap, values)
+            };
+            (n, Arc::new(row))
+        })
         .collect();
     drop(overlay);
     store.change_rows(RowChange {
@@ -257,6 +270,7 @@ fn insert_new(
                 inserted,
                 edits: Vec::new(),
                 origin: None,
+                columns: store.columns(),
             }),
         },
     }))
@@ -332,6 +346,7 @@ fn delete_at(
                 inserted,
                 edits,
                 origin,
+                columns: store.columns(),
             }),
         },
     }))
@@ -391,6 +406,7 @@ fn restore(reading: &Arc<Reading>, at: usize, rows: &Rows) -> Result<Option<Comm
                 inserted: rows.inserted.clone(),
                 edits: rows.edits.clone(),
                 origin: rows.origin.clone(),
+                columns: Arc::clone(&rows.columns),
             }),
         },
     }))
@@ -407,7 +423,7 @@ fn same_rows<K: PartialEq, V: PartialEq>(a: &[(K, Arc<V>)], b: &[(K, Arc<V>)]) -
 /// The physical row of the file's unterminated quote, if it has one and it
 /// is still open (its field unedited), with `restored` edits (coming back
 /// with rows) taken first.
-fn open_quote_row(
+pub(super) fn open_quote_row(
     reading: &Reading,
     overlay: &Overlay,
     restored: &[(RowId, Arc<RowEdits>)],
@@ -420,14 +436,43 @@ fn open_quote_row(
         .find(|(row, _)| *row == id)
         .map(|(_, edits)| edits)
         .or_else(|| overlay.edits(id));
-    // The quote is the row's last field, unless it is edited.
-    let open = edits.is_none_or(|edits| {
-        edits
-            .fields()
-            .checked_sub(1)
-            .is_some_and(|quote| edits.get(quote).is_none())
-    });
+    // The quote is the row's last field, unless it is edited or a column
+    // delete took it (task 2.4b).
+    let columns = overlay.columns();
+    let open = match edits {
+        Some(edits) => {
+            let quote = last_field(edits.fields())?;
+            edits.get(quote).is_none()
+                && (columns.is_empty() || edits.layout_in(columns, None).ids().contains(&quote))
+        }
+        None => {
+            columns.is_empty() || {
+                let code = reading
+                    .diagnostics
+                    .get()
+                    .and_then(|d| d.code_of(to_usize(last)));
+                match code.and_then(|code| code.fields) {
+                    Some(fields) => {
+                        let quote = last_field(fields)?;
+                        let own = EditOwn::original(fields, false);
+                        columns.fold(own).as_slice().contains(&quote)
+                    }
+                    None => true,
+                }
+            }
+        }
+    };
     open.then_some(last)
+}
+
+/// The id of the last of `fields` fields.
+fn last_field(fields: usize) -> Option<CellId> {
+    let last = fields.checked_sub(1)?;
+    Some(CellId::Field(u32::try_from(last).ok()?))
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// ADR-0004 decision 8 after a row insert or delete (§7): an open

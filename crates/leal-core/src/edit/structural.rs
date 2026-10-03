@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::columns::{CellId, ColumnOp, Columns, Layout, Own};
 use super::overlay::{InsertedRow, Overlay, RowEdits};
 use super::rows::{Piece, RowId};
 use crate::source::ReadError;
@@ -51,6 +52,9 @@ pub struct Rows {
     pub(crate) edits: Vec<(RowId, Arc<RowEdits>)>,
     /// Where the original rows among them are read from, if there are any.
     pub(crate) origin: Option<Arc<dyn RowSource>>,
+    /// The column operations when the rows were deleted, which their
+    /// edits were laid out under (task 2.4b).
+    pub(crate) columns: Arc<Columns>,
 }
 
 impl Rows {
@@ -89,6 +93,7 @@ impl Rows {
                         edits
                             .range(ids)
                             .map(|(&id, &edits)| (id, Arc::clone(edits))),
+                        Arc::clone(&self.columns),
                     );
                     if let Some(origin) = &self.origin {
                         values.extend(origin.values(start..start + len, &originals)?);
@@ -98,7 +103,7 @@ impl Rows {
                     for n in first..first + len {
                         if let Some(row) = inserted.get(&n) {
                             let edits = edits.get(&RowId::inserted(n)).map(|e| e.as_ref());
-                            values.push(inserted_values(row, edits));
+                            values.push(inserted_values(n, row, edits, &self.columns));
                         }
                     }
                 }
@@ -109,18 +114,131 @@ impl Rows {
 }
 
 /// An inserted row's cells as it reads with `edits`.
-pub(crate) fn inserted_values(row: &InsertedRow, edits: Option<&RowEdits>) -> Vec<String> {
+/// Inserted row `n`'s values as it reads with `edits` under `columns`.
+pub(crate) fn inserted_values(
+    n: u32,
+    row: &InsertedRow,
+    edits: Option<&RowEdits>,
+    columns: &Columns,
+) -> Vec<String> {
     let fields = row.fields();
-    let len = edits.map_or(fields.len(), |edits| fields.len().max(edits.end()));
-    (0..len)
-        .map(|column| {
-            edits
-                .and_then(|edits| edits.get(column))
-                .or_else(|| fields.get(column).map(AsRef::as_ref))
-                .unwrap_or("")
-                .to_owned()
+    let layout = Layout::of(columns, Own::inserted(n, fields.len()), edits);
+    layout
+        .ids()
+        .iter()
+        .map(|&id| {
+            let edited = edits.and_then(|edits| edits.get(id));
+            let own = match id {
+                CellId::Field(k) => fields
+                    .get(usize::try_from(k).unwrap_or(usize::MAX))
+                    .map(AsRef::as_ref),
+                CellId::Inserted(op) => columns.inserted_value(op, RowId::inserted(n)),
+                CellId::Appended(_) => None,
+            };
+            edited.or(own).unwrap_or("").to_owned()
         })
         .collect()
+}
+
+/// A way to read the cells a column delete took, as they read before it
+/// (ADR-0014 decision 3): the reading it was made in, and its edits then.
+pub(crate) trait ColumnSource: Send + Sync {
+    /// Cell `at` of each of logical rows `rows`, in order.
+    fn values(&self, rows: &[Range<u32>], at: usize) -> Result<Vec<String>, ReadError>;
+}
+
+/// A row whose edits a column operation changed: its id, and its edits
+/// before and after (`None`: none).
+pub(crate) type Changed = (RowId, Option<Arc<RowEdits>>, Option<Arc<RowEdits>>);
+
+/// What a column insert or delete command carries (task 2.4b,
+/// `docs/tasks/2.4.md` §4): the operation and the rows whose edits it
+/// changed, before and after, for an undo or redo by identity in the same
+/// edits; and, for one in other edits (after a save, or in a replay), the
+/// logical rows it applied to and, for a delete, a way to read the cells it
+/// took. Opaque outside the core.
+pub struct Column {
+    pub(crate) base: BaseId,
+    pub(crate) op: ColumnOp,
+    /// The operations before it, and with it.
+    pub(crate) before: Arc<Columns>,
+    pub(crate) after: Arc<Columns>,
+    /// Each row whose edits it changed: (row, edits before, edits after).
+    pub(crate) rows: Vec<Changed>,
+    /// The logical rows it applied to, as runs.
+    pub(crate) applied: Vec<Range<u32>>,
+    /// For a delete: the cells it took, read lazily.
+    pub(crate) origin: Option<Arc<dyn ColumnSource>>,
+    /// For cells put back by value: their values, in the rows' order.
+    pub(crate) restored: Option<Arc<[String]>>,
+}
+
+impl Column {
+    /// The logical column.
+    #[must_use]
+    pub fn at(&self) -> usize {
+        self.op.at
+    }
+
+    /// Whether the operation inserts a column (rather than deleting one).
+    #[must_use]
+    pub fn inserts(&self) -> bool {
+        self.op.inserts()
+    }
+
+    /// How many rows it applied to.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.applied
+            .iter()
+            .map(|run| usize::try_from(run.end - run.start).unwrap_or(usize::MAX))
+            .sum()
+    }
+
+    /// The cells it takes or puts back, by value: the inserted value in
+    /// each row it applied to, or the deleted cells as they read then.
+    pub(crate) fn values(&self) -> Result<Vec<String>, ReadError> {
+        if let Some(value) = self.op.value() {
+            return Ok(vec![value.to_string(); self.rows()]);
+        }
+        if let Some(values) = &self.restored {
+            return Ok(values.to_vec());
+        }
+        match &self.origin {
+            Some(origin) => origin.values(&self.applied, self.op.at),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+impl PartialEq for Column {
+    fn eq(&self, other: &Column) -> bool {
+        self.base == other.base
+            && self.op == other.op
+            && Arc::ptr_eq(&self.before, &other.before)
+            && Arc::ptr_eq(&self.after, &other.after)
+    }
+}
+
+impl Eq for Column {}
+
+impl Hash for Column {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.base.hash(state);
+        self.op.id.hash(state);
+        self.op.at.hash(state);
+    }
+}
+
+impl fmt::Debug for Column {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Column")
+            .field("base", &self.base)
+            .field("op", &self.op)
+            .field("rows", &self.rows.len())
+            .field("applied", &self.applied)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for Rows {

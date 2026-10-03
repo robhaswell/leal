@@ -46,6 +46,20 @@
 //! rows and their original bytes; in other edits (after a save, or in a
 //! replay) a row command works by value instead (ADR-0014 decision 3).
 //!
+//! **Columns** (`columns.rs`, task 2.4b, `docs/tasks/2.4.md` §3). Every
+//! cell has an identity for life (`CellId`: one of the row's own fields,
+//! the cell a column insert gave it, or a hatched cell), and edits are kept
+//! by it, so a column insert ([`Edit::InsertColumn`]) or delete
+//! ([`Edit::DeleteColumn`]) moves cells without rewriting any edit. Which
+//! cell each logical column of a row is, is its layout: by default, its own
+//! fields with each operation applied where oracle rule 6 says (ADR-0004
+//! decision 5), which depends only on its field count; an edited row the
+//! rule decides otherwise for keeps its layout written out. So an operation
+//! costs a look at each edited row, never one per row. Column inserts and
+//! deletes need the whole file read, and restart Find (ADR-0014 decisions
+//! 1 and 2); their undo works as for rows, by identity in the same edits,
+//! by value in others.
+//!
 //! **The overlay** (`overlay.rs`, crate-private) maps each edited row, by
 //! id, to its edited cells, plus what the diagnostics need to know about
 //! the row as it reads now; it also holds the inserted rows and the piece
@@ -60,14 +74,20 @@
 //! [`Document::apply`]: crate::document::Document::apply
 //! [`Document::replay`]: crate::document::Document::replay
 
+mod columns;
 mod command;
 mod overlay;
 mod rows;
 mod structural;
 
+pub(crate) use columns::{
+    CellId, ColumnOp, Columns, Fold, Layout, OpId, OpKind, Own, Parts, TABLE, fresh_appended,
+};
 pub use command::{COLUMN_LIMIT, CellChange, Command, Edit, EditError, Lineage, Replay};
-pub(crate) use overlay::{EditStore, InsertedRow, Kinds, Overlay, RowChange, RowEdits};
+pub(crate) use overlay::{
+    ColumnChange, EditStore, InsertedRow, Kinds, Overlay, OverlayRow, RowChange, RowEdits,
+};
 pub use rows::RowId;
 pub(crate) use rows::{Piece, RowMap, Segment, Slot};
-pub(crate) use structural::RowSource;
-pub use structural::Rows;
+pub(crate) use structural::{Changed, ColumnSource, RowSource};
+pub use structural::{Column, Rows};

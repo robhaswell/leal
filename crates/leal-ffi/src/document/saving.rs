@@ -259,7 +259,7 @@ pub enum SaveFailure {
         /// English, for logs.
         message: String,
     },
-    /// Rows were inserted or deleted, which Leal can't save yet (task
+    /// Rows or columns were inserted or deleted, which Leal can't save yet (task
     /// 2.4c): nothing was written.
     RowsChanged,
     /// The save was cancelled.

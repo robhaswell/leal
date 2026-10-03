@@ -1,14 +1,15 @@
-//! The edit property (tasks 2.1 and 2.4a): random cell edits, row inserts
-//! and deletes, undos and redos on generated files, with every reader of
-//! the document checked against the testkit's save oracle's edited view
-//! (`leal_testkit::save::Document`), which never sees leal-core's code.
+//! The edit property (tasks 2.1, 2.4a and 2.4b): random cell edits, row
+//! and column inserts and deletes, undos and redos on generated files, with
+//! every reader of the document checked against the testkit's save
+//! oracle's edited view (`leal_testkit::save::Document`), which never sees
+//! leal-core's code.
 //!
 //! The edits come from the testkit's edit strategy, hatched cells and
-//! edits past an unterminated quote included, and runs of several rows
-//! inserted or deleted at once. Its column inserts and deletes are task
-//! 2.4b's, so they are left out; the later edits' coordinates were resolved
-//! with them in place, so some now name a row or cell that isn't there,
-//! which both must refuse.
+//! edits past an unterminated quote included, runs of several rows
+//! inserted or deleted at once, and columns inserted or deleted at places
+//! among those there are then. A step may come after an undo the strategy
+//! didn't expect, so some edits name a row or cell that isn't there, which
+//! both must refuse.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -26,13 +27,16 @@ use super::*;
 use crate::rows::{NUMBER_MAX_CHARS, NumericColumns};
 
 /// One step of the user's: the strategy's next edit (a cell's, or a row
-/// inserted or deleted), a run of rows inserted or deleted at once (at a
-/// place among the rows there are then), ⌘Z or ⇧⌘Z.
+/// or a column inserted or deleted), a run of rows inserted or deleted at
+/// once (at a place among the rows there are then), a column inserted or
+/// deleted (at a place among the columns there are then), ⌘Z or ⇧⌘Z.
 #[derive(Clone, Copy, Debug)]
 enum Step {
     Edit,
     InsertRun(Index, usize),
     DeleteRun(Index, usize),
+    InsertColumn(Index, Index),
+    DeleteColumn(Index),
     Undo,
     Redo,
 }
@@ -43,6 +47,8 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
             4 => Just(Step::Edit),
             1 => (any::<Index>(), 1..4_usize).prop_map(|(at, n)| Step::InsertRun(at, n)),
             1 => (any::<Index>(), 1..5_usize).prop_map(|(at, n)| Step::DeleteRun(at, n)),
+            1 => (any::<Index>(), any::<Index>()).prop_map(|(at, v)| Step::InsertColumn(at, v)),
+            1 => any::<Index>().prop_map(Step::DeleteColumn),
             2 => Just(Step::Undo),
             1 => Just(Step::Redo),
         ],
@@ -90,65 +96,88 @@ fn open_case(file: &GeneratedCsv, header: bool) -> Document {
     document
 }
 
-/// The case's edits but its column inserts and deletes (task 2.4b's), in
-/// the order the strategy tried them, the ones the oracle refused
-/// (ADR-0004 decision 8) included at their places.
-fn row_and_cell_edits(case: &EditCase) -> Vec<OracleEdit> {
-    let keep = |edit: &&OracleEdit| {
-        !matches!(
-            edit,
-            OracleEdit::InsertColumn { .. } | OracleEdit::DeleteColumn { .. }
-        )
-    };
+/// The case's edits in the order the strategy tried them, the ones the
+/// oracle refused (ADR-0004 decision 8) included at their places.
+fn strategy_edits(case: &EditCase) -> Vec<OracleEdit> {
     let mut all = Vec::new();
     let mut refused = case.refused.iter().peekable();
     for (at, edit) in case.edits.iter().enumerate() {
         while let Some((_, edit)) = refused.next_if(|(place, _)| *place == at) {
-            all.extend(Some(edit).filter(keep).cloned());
+            all.push(edit.clone());
         }
-        all.extend(Some(edit).filter(keep).cloned());
+        all.push(edit.clone());
     }
-    all.extend(refused.map(|(_, edit)| edit).filter(keep).cloned());
+    all.extend(refused.map(|(_, edit)| edit.clone()));
     all
 }
 
-/// A command made, with the oracle before and after it if it inserts or
-/// deletes rows: undo and redo of those set the oracle back as it was
-/// (the oracle's own insert would make new rows, not bring back the file's).
-struct Done<'a> {
-    command: Command,
-    rows: Option<(Oracle<'a>, Oracle<'a>)>,
+/// A column insert (`true`) or delete at a column, in effect: for the
+/// marks' most common field count (oracle rule 6).
+type ColumnOp = (bool, usize);
+
+/// The oracle and the column operations in effect.
+#[derive(Clone)]
+struct State<'a> {
+    oracle: Oracle<'a>,
+    columns: Vec<ColumnOp>,
 }
 
-/// The document's row insert or delete (`got`) against the oracle's
-/// (`expected`, made from `before`): the same accepted or refused.
-fn row_step<'a>(
+/// A command made, with the state before and after it if it inserts or
+/// deletes rows or a column: undo and redo of those set the oracle back as
+/// it was (the oracle's own insert would make new rows, not bring back the
+/// file's).
+struct Done<'a> {
+    command: Command,
+    states: Option<(State<'a>, State<'a>)>,
+}
+
+/// The document's row or column insert or delete (`got`) against the
+/// oracle's (`expected`, made from `before`): the same accepted or refused.
+fn structural_step<'a>(
     expected: Result<(), SaveError>,
     got: Result<Option<Command>, EditError>,
-    before: Oracle<'a>,
-    oracle: &mut Oracle<'a>,
+    before: State<'a>,
+    state: &mut State<'a>,
     done: &mut Vec<Done<'a>>,
     undone: &mut Vec<Done<'a>>,
 ) -> Result<(), TestCaseError> {
     match (expected, got) {
         (Ok(()), Ok(Some(command))) => {
             prop_assert!(command.is_structural());
+            if let Edit::InsertColumn { at, .. } | Edit::DeleteColumn { at, .. } = command.edit {
+                let insert = matches!(command.edit, Edit::InsertColumn { .. });
+                state.columns.push((insert, at));
+            }
             done.push(Done {
                 command,
-                rows: Some((before, oracle.clone())),
+                states: Some((before, state.clone())),
             });
             undone.clear();
         }
-        (Err(SaveError::InvalidEdit(_)), Err(EditError::NoSuchRow { .. }))
+        (
+            Err(SaveError::InvalidEdit(_)),
+            Err(EditError::NoSuchRow { .. } | EditError::NoSuchColumn { .. }),
+        )
         | (
             Err(SaveError::AfterUnterminatedQuote(_)),
             Err(EditError::AfterUnterminatedQuote { .. }),
-        ) => *oracle = before,
+        ) => *state = before,
         (expected, got) => {
             prop_assert!(false, "oracle {:?}, document {:?}", expected, got);
         }
     }
     Ok(())
+}
+
+/// A row of `fields` fields' length after `columns` (oracle rule 6).
+fn folded(fields: usize, columns: &[ColumnOp]) -> usize {
+    columns
+        .iter()
+        .fold(fields, |len, &(insert, at)| match (insert, len) {
+            (true, len) if len >= at => len + 1,
+            (false, len) if len > at => len - 1,
+            (_, len) => len,
+        })
 }
 
 fn edit_of(edit: &OracleEdit) -> Option<(usize, usize, String)> {
@@ -202,21 +231,23 @@ fn set_oracle(oracle: &mut Oracle<'_>, change: &CellChange, value: Option<&Strin
 
 /// Runs `steps` on both, checking that they accept and refuse the same
 /// edits, that each cell command says what the oracle's cell held before
-/// and holds after, and that undo and redo of a row command bring back
-/// the rows the oracle had.
+/// and holds after, and that undo and redo of a row or column command
+/// bring back the rows the oracle had.
 fn run<'a>(
     document: &Document,
-    oracle: &mut Oracle<'a>,
+    state: &mut State<'a>,
     case: &EditCase,
     steps: &[Step],
 ) -> Result<(), TestCaseError> {
-    let mut edits = row_and_cell_edits(case).into_iter();
+    let mut edits = strategy_edits(case).into_iter();
     let mut done: Vec<Done<'a>> = Vec::new();
     let mut undone: Vec<Done<'a>> = Vec::new();
     for step in steps {
+        let before = state.clone();
         match *step {
             Step::Edit => match edits.next() {
                 Some(OracleEdit::SetCell { row, column, value }) => {
+                    let oracle = &mut state.oracle;
                     let new = value;
                     let old = cell(oracle, row, column);
                     let expected = oracle.apply(&set(row, column, &new));
@@ -231,7 +262,7 @@ fn run<'a>(
                             prop_assert_eq!(&change.new, &cell(oracle, row, column));
                             done.push(Done {
                                 command,
-                                rows: None,
+                                states: None,
                             });
                             undone.clear();
                         }
@@ -252,60 +283,75 @@ fn run<'a>(
                         }
                     }
                 }
-                Some(OracleEdit::InsertRow { at, values }) => {
-                    let before = oracle.clone();
-                    let expected = oracle.apply(&OracleEdit::InsertRow {
-                        at,
-                        values: values.clone(),
-                    });
-                    let got = document.insert_rows(at, &[values]);
-                    row_step(expected, got, before, oracle, &mut done, &mut undone)?;
+                Some(edit) => {
+                    let expected = state.oracle.apply(&edit);
+                    let got = match edit {
+                        OracleEdit::InsertRow { at, values } => document.insert_rows(at, &[values]),
+                        OracleEdit::DeleteRow { row } => document.delete_rows(row, 1),
+                        OracleEdit::InsertColumn { at, value } => {
+                            document.insert_column(at, &value)
+                        }
+                        OracleEdit::DeleteColumn { column } => document.delete_column(column),
+                        OracleEdit::SetCell { .. } => unreachable!(),
+                    };
+                    structural_step(expected, got, before, state, &mut done, &mut undone)?;
                 }
-                Some(OracleEdit::DeleteRow { row }) => {
-                    let before = oracle.clone();
-                    let expected = oracle.apply(&OracleEdit::DeleteRow { row });
-                    let got = document.delete_rows(row, 1);
-                    row_step(expected, got, before, oracle, &mut done, &mut undone)?;
-                }
-                _ => {}
+                None => {}
             },
             Step::InsertRun(at, count) => {
-                let at = at.index(oracle.row_count() + 1);
+                let at = at.index(state.oracle.row_count() + 1);
                 let rows: Vec<Vec<String>> = (0..count)
                     .map(|k| {
                         let value = EDIT_VALUES[(at + 7 * k) % EDIT_VALUES.len()];
                         vec![value.to_owned(); 1 + (at + k) % 3]
                     })
                     .collect();
-                let before = oracle.clone();
                 let expected = rows.iter().enumerate().try_for_each(|(k, values)| {
-                    oracle.apply(&OracleEdit::InsertRow {
+                    state.oracle.apply(&OracleEdit::InsertRow {
                         at: at + k,
                         values: values.clone(),
                     })
                 });
                 let got = document.insert_rows(at, &rows);
-                row_step(expected, got, before, oracle, &mut done, &mut undone)?;
+                structural_step(expected, got, before, state, &mut done, &mut undone)?;
             }
             Step::DeleteRun(at, count) => {
-                let len = oracle.row_count();
+                let len = state.oracle.row_count();
                 if len == 0 {
                     continue;
                 }
                 let at = at.index(len);
                 let count = count.min(len - at);
-                let before = oracle.clone();
-                let expected =
-                    (0..count).try_for_each(|_| oracle.apply(&OracleEdit::DeleteRow { row: at }));
+                let expected = (0..count)
+                    .try_for_each(|_| state.oracle.apply(&OracleEdit::DeleteRow { row: at }));
                 let got = document.delete_rows(at, count);
-                row_step(expected, got, before, oracle, &mut done, &mut undone)?;
+                structural_step(expected, got, before, state, &mut done, &mut undone)?;
+            }
+            Step::InsertColumn(at, value) => {
+                // Up to one past the widest row, which is refused.
+                let at = at.index(state.oracle.max_row_len() + 2);
+                let value = EDIT_VALUES[value.index(EDIT_VALUES.len())].to_owned();
+                let expected = state.oracle.apply(&OracleEdit::InsertColumn {
+                    at,
+                    value: value.clone(),
+                });
+                let got = document.insert_column(at, &value);
+                structural_step(expected, got, before, state, &mut done, &mut undone)?;
+            }
+            Step::DeleteColumn(column) => {
+                // Up to the widest row's length, which is refused.
+                let column = column.index(state.oracle.max_row_len() + 1);
+                let expected = state.oracle.apply(&OracleEdit::DeleteColumn { column });
+                let got = document.delete_column(column);
+                structural_step(expected, got, before, state, &mut done, &mut undone)?;
             }
             Step::Undo => {
                 if let Some(entry) = done.pop() {
                     document.apply(&entry.command.inverse()).unwrap();
-                    match &entry.rows {
-                        Some((before, _)) => *oracle = before.clone(),
+                    match &entry.states {
+                        Some((before, _)) => *state = before.clone(),
                         None => {
+                            let oracle = &mut state.oracle;
                             let change = &entry.command.changes()[0];
                             set_oracle(oracle, change, change.old.as_ref());
                             prop_assert_eq!(&cell(oracle, change.row, change.column), &change.old);
@@ -317,9 +363,10 @@ fn run<'a>(
             Step::Redo => {
                 if let Some(entry) = undone.pop() {
                     document.apply(&entry.command).unwrap();
-                    match &entry.rows {
-                        Some((_, after)) => *oracle = after.clone(),
+                    match &entry.states {
+                        Some((_, after)) => *state = after.clone(),
                         None => {
+                            let oracle = &mut state.oracle;
                             let change = &entry.command.changes()[0];
                             set_oracle(oracle, change, change.new.as_ref());
                             prop_assert_eq!(&cell(oracle, change.row, change.column), &change.new);
@@ -366,13 +413,15 @@ fn flagged_kind(kind: TkKind) -> Option<DiagnosticKind> {
 /// What the marks must say as the oracle's cells read now: each original
 /// field's kinds from the testkit's own diagnostics, each edited value on
 /// the value (only a NUL can be in one), and ragged against the file's
-/// most common field count.
+/// most common field count, as a row of that many fields reads after the
+/// column inserts and deletes in effect (the column count).
 struct Expected {
     flags: Vec<RowFlags>,
     places: BTreeMap<DiagnosticKind, Vec<Place>>,
 }
 
-fn expected_marks(file: &GeneratedCsv, oracle: &Oracle<'_>) -> Option<Expected> {
+fn expected_marks(file: &GeneratedCsv, state: &State<'_>) -> Option<Expected> {
+    let oracle = &state.oracle;
     let mut field_kinds: BTreeMap<(usize, usize), Vec<DiagnosticKind>> = BTreeMap::new();
     for diagnostic in &file.diagnostics {
         let Some(kind) = flagged_kind(diagnostic.kind) else {
@@ -386,7 +435,10 @@ fn expected_marks(file: &GeneratedCsv, oracle: &Oracle<'_>) -> Option<Expected> 
             field_kinds.entry(field).or_default().push(kind);
         }
     }
-    let mode = file.layout.field_count_mode();
+    let mode = file
+        .layout
+        .field_count_mode()
+        .map(|mode| folded(mode, &state.columns));
     let mut flags = Vec::new();
     let mut places: BTreeMap<DiagnosticKind, Vec<Place>> = BTreeMap::new();
     for row in 0..oracle.row_count() {
@@ -448,15 +500,23 @@ fn expected_matches(values: &[Vec<String>], header: bool, query: &str) -> Vec<Pl
 /// Every reader of `document` against the oracle.
 fn check_readers(
     document: &Document,
-    oracle: &Oracle<'_>,
+    state: &State<'_>,
     file: &GeneratedCsv,
     header: bool,
     query: &str,
     early: &Search,
 ) -> Result<(), TestCaseError> {
+    let oracle = &state.oracle;
     let values = oracle_values(oracle);
     let rows = values.len();
     prop_assert_eq!(document.row_count(), rows);
+    let mode = file.layout.field_count_mode();
+    let columns = if rows == 0 {
+        0
+    } else {
+        mode.map_or(0, |mode| folded(mode, &state.columns))
+    };
+    prop_assert_eq!(document.column_count(), columns);
     let widest = values.iter().map(Vec::len).max().unwrap_or(0);
 
     // The grid, and a window of it.
@@ -536,6 +596,14 @@ fn check_readers(
         .collect();
     let fresh = search(document, query);
     for found in [early, &fresh] {
+        // A search started before a column insert or delete starts again
+        // (ADR-0014 decision 2): once its own job has finished, a catch-up
+        // job searches the rows again.
+        while found.progress().catching_up {
+            if let Some(job) = found.catch_up_job() {
+                let _ = job.control().wait_timeout(LONG);
+            }
+        }
         prop_assert_eq!(found.progress().matches, expected.len() as u64);
         prop_assert_eq!(&matches(found), &expected);
         let mut highlights: Vec<Place> = found
@@ -553,7 +621,7 @@ fn check_readers(
     }
 
     // The diagnostics marks, and each kind's Previous and Next.
-    if let Some(marks) = expected_marks(file, oracle) {
+    if let Some(marks) = expected_marks(file, state) {
         prop_assert_eq!(&document.row_flags(0..rows), &marks.flags);
         let marked: Vec<usize> = (0..rows).filter(|&r| marks.flags[r].marked).collect();
         let mut next = Vec::new();
@@ -632,16 +700,21 @@ fn every_reader_agrees(
     (case, steps, header, query): (EditCase, Vec<Step>, bool, &str),
 ) -> Result<(), TestCaseError> {
     let document = open_case(&case.file, header);
-    let mut oracle = case.file.document();
+    let mut state = State {
+        oracle: case.file.document(),
+        columns: Vec::new(),
+    };
     let early = search(&document, query);
-    run(&document, &mut oracle, &case, &steps)?;
-    check_readers(&document, &oracle, &case.file, header, query, &early)?;
-    // With the file's rows as they were, the document has unsaved edits
-    // exactly when saving would change the file's bytes. With rows
-    // inserted or deleted, it has them even if a new row reads as a
-    // deleted one did.
+    run(&document, &mut state, &case, &steps)?;
+    check_readers(&document, &state, &case.file, header, query, &early)?;
+    // With the file's rows and columns as they were, the document has
+    // unsaved edits exactly when saving would change the file's bytes.
+    // With rows or columns inserted or deleted, it has them even if what
+    // was inserted reads as what was deleted did.
+    let oracle = &state.oracle;
     let rows_as_read = oracle.row_count() == case.file.layout.rows.len()
-        && (0..oracle.row_count()).all(|row| oracle.source_row(row) == Some(row));
+        && (0..oracle.row_count()).all(|row| oracle.source_row(row) == Some(row))
+        && state.columns.is_empty();
     if !rows_as_read {
         prop_assert!(document.has_edits());
         return Ok(());
@@ -700,21 +773,36 @@ fn every_reader_agrees_with_the_oracle_on_larger_files() {
 /// row inserts and deletes by value (ADR-0014 decision 3).
 #[test]
 fn replaying_the_history_into_a_fresh_document_gives_the_same_cells() {
-    let strategy = (edit_case(CsvConfig::messy()), any::<bool>());
-    run_scaled(SMALL, &strategy, |(case, header)| {
+    let strategy = (
+        edit_case(CsvConfig::messy()),
+        any::<bool>(),
+        vec(0..4_u8, 0..40),
+    );
+    run_scaled(SMALL, &strategy, |(case, header, undos)| {
         let document = open_case(&case.file, header);
         let mut history = Vec::new();
-        for edit in row_and_cell_edits(&case) {
+        let mut undos = undos.into_iter();
+        for edit in strategy_edits(&case) {
             let made = match edit {
                 OracleEdit::SetCell { row, column, value } => {
                     document.set_cell(row, column, &value)
                 }
                 OracleEdit::InsertRow { at, values } => document.insert_rows(at, &[values]),
                 OracleEdit::DeleteRow { row } => document.delete_rows(row, 1),
-                _ => continue,
+                OracleEdit::InsertColumn { at, value } => document.insert_column(at, &value),
+                OracleEdit::DeleteColumn { column } => document.delete_column(column),
             };
-            if let Ok(Some(command)) = made {
-                history.push(command);
+            let Ok(Some(command)) = made else { continue };
+            history.push(command.clone());
+            // Sometimes undone at once (the journal has the inverse, which
+            // a replay applies by value), and sometimes redone after.
+            if command.is_structural() && undos.next().unwrap_or(0) > 1 {
+                document.apply(&command.inverse()).unwrap();
+                history.push(command.inverse());
+                if undos.next().unwrap_or(0) > 1 {
+                    document.apply(&command).unwrap();
+                    history.push(command);
+                }
             }
         }
         let fresh = open_case(&case.file, header);
@@ -722,6 +810,7 @@ fn replaying_the_history_into_a_fresh_document_gives_the_same_cells() {
         prop_assert_eq!(replay.commands.len(), history.len());
         prop_assert!(replay.refused.is_empty());
         let rows = document.row_count();
+        prop_assert_eq!(fresh.row_count(), rows);
         prop_assert_eq!(
             fresh.rows(0..rows, 1000).unwrap(),
             document.rows(0..rows, 1000).unwrap()

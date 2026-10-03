@@ -68,7 +68,7 @@ use std::time::Duration;
 use super::{Context, Document, FirstScreen, Reading, Restarted, read_first_paint, start_jobs};
 use crate::detect::{CensusStream, Choices, FIRST_PAINT_BYTES};
 use crate::dialect::{Bom, Encoding};
-use crate::edit::{EditStore, Overlay};
+use crate::edit::{CellId, EditStore, Overlay};
 use crate::index::{MAX_FILE_BYTES, RowIndex, Status};
 use crate::save::{
     AttributeFacts, AttributePlan, EditedRow, Fix, MAX_NAMED_CELLS, Placed, RowRules, SaveError,
@@ -997,13 +997,13 @@ fn touched_cells(old: &Reading, written: &Overlay, version: usize) -> Vec<(usize
             let mut columns: Vec<usize> = touched
                 .edits
                 .iter()
-                .flat_map(|edits| edits.cells().iter().map(|&(column, _)| column))
+                .flat_map(|edits| edits.base_cells().into_iter().map(|(column, _)| column))
                 .collect();
             columns.extend(
                 written
                     .row(row)
                     .into_iter()
-                    .flat_map(|edits| edits.cells().iter().map(|&(column, _)| column)),
+                    .flat_map(|edits| edits.base_cells().into_iter().map(|(column, _)| column)),
             );
             columns.sort_unstable();
             columns.dedup();
@@ -1130,7 +1130,12 @@ fn resolve_link(path: &Path) -> PathBuf {
 fn skipped_edits(overlay: &Overlay, rows: usize) -> Vec<(usize, usize)> {
     overlay
         .rows_in(rows..usize::MAX)
-        .flat_map(|(row, edits)| edits.cells().iter().map(move |&(column, _)| (row, column)))
+        .flat_map(|(row, edits)| {
+            edits
+                .base_cells()
+                .into_iter()
+                .map(move |(column, _)| (row, column))
+        })
         .collect()
 }
 
@@ -1176,7 +1181,7 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
 /// Until task 2.4c, a save with rows inserted or deleted is refused before
 /// anything is written: the writer doesn't walk the piece list yet.
 fn check_rows(overlay: &Overlay) -> Result<(), SaveError> {
-    if overlay.map().is_identity() {
+    if overlay.map().is_identity() && overlay.columns().is_empty() {
         Ok(())
     } else {
         Err(SaveError::RowsChanged)
@@ -1191,10 +1196,10 @@ fn check_encodable(overlay: &Overlay, extent: &Extent<'_>) -> Result<(), SaveErr
         .rows_in(0..extent.rows)
         .flat_map(|(row, edits)| {
             edits
-                .cells()
-                .iter()
+                .base_cells()
+                .into_iter()
                 .filter(|(_, value)| encode(value, encoding).is_err())
-                .map(move |&(column, _)| (row, column))
+                .map(move |(column, _)| (row, column))
         })
         .collect();
     if cells.is_empty() {
@@ -1268,7 +1273,7 @@ fn stream(
         // no quoting of its own: a hatched cell, or a blank line's one
         // field (a file that quotes every field quotes every other one
         // already). Finding it out reads every row, so only then, once.
-        let unquoted = edits.end() > parsed.fields().len() || parsed.span().is_empty();
+        let unquoted = edits.base_end() > parsed.fields().len() || parsed.span().is_empty();
         let quote_all = match (unquoted, quote_all) {
             (false, _) => false,
             (true, Some(known)) => known,
@@ -1284,6 +1289,7 @@ fn stream(
             delimiter: detection.delimiter.byte(),
             quote_all,
         };
+        let cells = edits.base_cells();
         let edited = EditedRow {
             row,
             bytes: &bytes.bytes,
@@ -1291,7 +1297,7 @@ fn stream(
             span: parsed.span(),
             line_ending,
             fields: parsed.fields(),
-            cells: edits.cells(),
+            cells: &cells,
             first_without_bom: row == 0 && detection.bom.is_empty(),
         };
         // The old file's open quote, if it is in this row: its field edited,
@@ -1304,7 +1310,7 @@ fn stream(
                 .fields()
                 .iter()
                 .position(|field| field.start() == q)
-                .is_some_and(|column| edits.get(column).is_some())
+                .is_some_and(|column| edits.get(CellId::base(column, edits.fields())).is_some())
         });
         let mut splices = Vec::new();
         if let Err(columns) = row_splices(&edited, rules, &mut splices, &mut streamed.fixes) {

@@ -24,6 +24,8 @@
 //!
 //! That is 1 MB per million rows, a quarter of the row index's 4 MB.
 
+use std::ops::Range;
+
 /// Bit 7 of a row's code: a field-level warning or the unterminated quote.
 const FLAG: u8 = 0x80;
 
@@ -52,6 +54,30 @@ pub(crate) fn code(fields: usize, blank: bool, flagged: bool) -> u8 {
         u8::try_from(fields).map_or(WIDE, |n| n.min(WIDE))
     };
     count | if flagged { FLAG } else { 0 }
+}
+
+/// A row's code, read ([`RowMarks::code_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowCode {
+    /// Its field count, or `None` for a blank line.
+    pub(crate) fields: Option<usize>,
+    /// It has a field-level warning or the unterminated quote.
+    pub(crate) flagged: bool,
+}
+
+impl RowCode {
+    /// `code`, with a [`WIDE`] row's exact field count `wide`.
+    fn read(code: u8, wide: Option<usize>) -> RowCode {
+        let fields = match code & !FLAG {
+            0 => None,
+            WIDE => wide,
+            n => Some(usize::from(n)),
+        };
+        RowCode {
+            fields,
+            flagged: code & FLAG != 0,
+        }
+    }
 }
 
 /// Every row's code, and the field counts of wide rows.
@@ -114,6 +140,79 @@ impl RowMarks {
             self.wide.shrink_to_fit();
         }
         old
+    }
+
+    /// Row `row`'s code, read, or `None` if it isn't indexed yet.
+    pub(crate) fn code_of(&self, row: usize) -> Option<RowCode> {
+        let &code = self.codes.get(row)?;
+        let wide = if code & !FLAG == WIDE {
+            self.wide_fields(row)
+        } else {
+            None
+        };
+        Some(RowCode::read(code, wide))
+    }
+
+    /// Hands each of rows `rows`' codes to `each`, in order (those indexed).
+    pub(crate) fn for_each_code(&self, rows: Range<usize>, each: &mut dyn FnMut(usize, RowCode)) {
+        let end = rows.end.min(self.codes.len());
+        let Some(codes) = self.codes.get(rows.start..end) else {
+            return;
+        };
+        let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < rows.start);
+        for (row, &code) in (rows.start..).zip(codes) {
+            let wide = self.step_wide(code, &mut w, row);
+            each(row, RowCode::read(code, wide));
+        }
+    }
+
+    /// Up to `max` rows `pick` picks by their codes: from `at` on, in
+    /// order, if `forward`, else before `at`, nearest first. For marks that
+    /// depend on more than the code: a row's field count after column
+    /// inserts and deletes (task 2.4b). One step per row.
+    pub(crate) fn rows_picked(
+        &self,
+        at: usize,
+        forward: bool,
+        max: usize,
+        pick: &dyn Fn(RowCode) -> bool,
+    ) -> Vec<(usize, RowCode)> {
+        let mut rows = Vec::new();
+        if forward {
+            let Some(tail) = self.codes.get(at..) else {
+                return rows;
+            };
+            let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < at);
+            for (row, &code) in (at..).zip(tail) {
+                let wide = self.step_wide(code, &mut w, row);
+                let read = RowCode::read(code, wide);
+                if pick(read) {
+                    rows.push((row, read));
+                    if rows.len() >= max {
+                        break;
+                    }
+                }
+            }
+        } else {
+            let head = &self.codes[..at.min(self.codes.len())];
+            let mut w = self.wide.partition_point(|&(r, _)| row_of(r) < head.len());
+            for (row, &code) in head.iter().enumerate().rev() {
+                let wide = if code & !FLAG == WIDE {
+                    w = w.saturating_sub(1);
+                    self.wide_entry(w, row)
+                } else {
+                    None
+                };
+                let read = RowCode::read(code, wide);
+                if pick(read) {
+                    rows.push((row, read));
+                    if rows.len() >= max {
+                        break;
+                    }
+                }
+            }
+        }
+        rows
     }
 
     /// How many bytes the lists hold room for, for tests.

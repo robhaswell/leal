@@ -192,11 +192,9 @@ impl Document {
         if !overlay.map().is_identity() {
             return estimated_logical_copy_bytes(&reading, &overlay, rows, &columns);
         }
-        let edited: usize = reading
-            .edits
-            .overlay()
+        let edited: usize = overlay
             .rows_in(rows.clone())
-            .flat_map(|(_, edits)| edits.cells())
+            .flat_map(|(_, edits)| edits.shown(overlay.columns(), None))
             .filter(|(column, _)| columns.contains(column))
             .map(|(_, value)| value.len())
             .sum();
@@ -414,8 +412,7 @@ fn append_rows(
                     }
                     let row = edits.inserted(n);
                     let view = row.map(|row| {
-                        let row_edits = edits.edits(RowId::inserted(n)).map(AsRef::as_ref);
-                        RowView::inserted(&reading.parser, row, row_edits)
+                        RowView::inserted(&reading.parser, row, edits.cells_of(RowId::inserted(n)))
                     });
                     append_cells(view.as_ref(), columns, out);
                     logical += 1;
@@ -459,7 +456,7 @@ fn append_physical(
                 &bytes,
                 extent.start,
                 parsed,
-                edits.row(row),
+                edits.physical(row),
             )
         });
         append_cells(view.as_ref(), columns, out);
@@ -493,7 +490,7 @@ fn estimated_logical_copy_bytes(
     let index = &reading.index;
     let mut file_bytes: usize = 0;
     let mut edited: usize = 0;
-    let in_columns = |cells: &[(usize, Arc<str>)]| -> usize {
+    let in_columns = |cells: Vec<(usize, &Arc<str>)>| -> usize {
         cells
             .iter()
             .filter(|(column, _)| columns.contains(column))
@@ -510,7 +507,7 @@ fn estimated_logical_copy_bytes(
                     .map_or(0, |extent| extent.len());
                 edited += overlay
                     .rows_in(range)
-                    .map(|(_, edits)| in_columns(edits.cells()))
+                    .map(|(_, edits)| in_columns(edits.shown(overlay.columns(), None)))
                     .sum::<usize>();
             }
             Segment::Inserted(range) => {
@@ -525,7 +522,7 @@ fn estimated_logical_copy_bytes(
                             .sum::<usize>();
                     }
                     if let Some(edits) = overlay.edits(RowId::inserted(n)) {
-                        edited += in_columns(edits.cells());
+                        edited += in_columns(edits.shown(overlay.columns(), Some(n)));
                     }
                 }
             }

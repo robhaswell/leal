@@ -79,6 +79,12 @@ harness = false
 name = "row_edits"
 harness = false
 
+# Column inserts and deletes: reads with 10 of them, and one insert and one
+# delete with 100,000 rows edited (PLAN 2.4b).
+[[bench]]
+name = "column_edits"
+harness = false
+
 # Saving the reference file after one edit (PLAN 2.2, budget DESIGN §1).
 [[bench]]
 name = "save"

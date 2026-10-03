@@ -71,6 +71,7 @@
 
 mod attributes;
 mod encode;
+mod quoting;
 #[cfg(test)]
 mod tests;
 
@@ -78,6 +79,7 @@ pub use attributes::AttributePlan;
 pub(crate) use attributes::{AttributeFacts, needs_census};
 pub(crate) use encode::Transcoder;
 pub use encode::{Unencodable, encode};
+pub(crate) use quoting::ColumnQuoting;
 
 use std::borrow::Cow;
 use std::fmt;
@@ -457,8 +459,8 @@ pub enum SaveError {
         /// The error, with its errno.
         error: io::Error,
     },
-    /// Rows have been inserted or deleted, which Leal can't save yet (task
-    /// 2.4c): nothing was written. The app keeps the edits.
+    /// Rows or columns have been inserted or deleted, which Leal can't
+    /// save yet (task 2.4c): nothing was written. The app keeps the edits.
     RowsChanged,
     /// The save was cancelled.
     Cancelled,
@@ -502,7 +504,7 @@ impl fmt::Display for SaveError {
             SaveError::Read(error) => error.fmt(f),
             SaveError::Write { step, error } => write!(f, "{step}: {error}"),
             SaveError::RowsChanged => {
-                f.write_str("rows were inserted or deleted, which can't be saved yet")
+                f.write_str("rows or columns were inserted or deleted, which can't be saved yet")
             }
             SaveError::Cancelled => f.write_str("the save was cancelled"),
             SaveError::Failed(message) => f.write_str(message),

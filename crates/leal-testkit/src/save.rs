@@ -66,8 +66,12 @@
 //!     the cells in between have no bytes at all. A blank line edited in
 //!     column *c* becomes a row of *c* + 1 fields. A hatched cell's value
 //!     is empty, so setting one to `""` is no edit, and setting it back to
-//!     `""` removes the edit and the row's padding with it (F3). Past an
-//!     unterminated quote, rule 10 refuses it.
+//!     `""` removes the edit and the row's padding with it (F3). Padding
+//!     is only ever before an edited hatched cell, so a column delete that
+//!     takes a row's last one takes the padding left at the row's end too
+//!     (task 2.4b): the row's own bytes come back, as if the hatched cell
+//!     had been set back to `""`. Past an unterminated quote, rule 10
+//!     refuses it.
 //!
 //! Rules 8, 9 and 11 are the "smallest extra change next to the edit" that
 //! keeps ADR-0004 decision 10: reopening the saved file gives the same
@@ -613,6 +617,11 @@ impl<'a> Document<'a> {
                 for r in &mut self.rows {
                     if r.cells.len() > *column && !r.is_blank_line(layout) {
                         r.cells.remove(*column);
+                        // Rule 12: padding is only before an edited
+                        // hatched cell.
+                        while r.cells.last() == Some(&Cell::Appended(None)) {
+                            r.cells.pop();
+                        }
                     }
                 }
             }

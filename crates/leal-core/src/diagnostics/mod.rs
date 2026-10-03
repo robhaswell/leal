@@ -105,8 +105,8 @@ pub(crate) use collect::Collector;
 pub(crate) use find::{
     Hit, decided_by_bytes, field_has, field_with, has_invalid, next_hit, row_may_have, value_has,
 };
-pub(crate) use marks::Mark;
 use marks::RowMarks;
+pub(crate) use marks::{Mark, RowCode};
 
 #[cfg(test)]
 thread_local! {
@@ -457,6 +457,28 @@ impl Diagnostics {
             at = if forward { row + 1 } else { row };
         }
         rows
+    }
+
+    /// Row `row`'s code: its field count and whether it is flagged.
+    pub(crate) fn code_of(&self, row: usize) -> Option<RowCode> {
+        self.read().marks.code_of(row)
+    }
+
+    /// Hands each of rows `rows`' codes to `each`, in order, under one lock.
+    pub(crate) fn for_each_code(&self, rows: Range<usize>, each: &mut dyn FnMut(usize, RowCode)) {
+        self.read().marks.for_each_code(rows, each);
+    }
+
+    /// Up to `max` rows `pick` picks by their codes, under one lock: from
+    /// `at` on in file order if `forward`, else before `at`, nearest first.
+    pub(crate) fn rows_picked(
+        &self,
+        at: usize,
+        forward: bool,
+        max: usize,
+        pick: &dyn Fn(RowCode) -> bool,
+    ) -> Vec<(usize, RowCode)> {
+        self.read().marks.rows_picked(at, forward, max, pick)
     }
 
     /// Whether row `row` is marked as `which` says.

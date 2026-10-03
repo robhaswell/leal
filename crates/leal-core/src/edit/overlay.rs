@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::Lineage;
+use super::columns::{CellId, Columns, Fold, Layout, Own, Parts, base_end};
 #[cfg(test)]
 use super::rows::Piece;
 use super::rows::{RowId, RowMap};
@@ -57,23 +58,32 @@ impl Kinds {
     }
 }
 
-/// One edited row: its new cell values, and what its diagnostics are now.
+/// One edited row: its new cell values, by [`CellId`], how its cells are
+/// laid out if not by default, and what its diagnostics are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RowEdits {
     /// How many fields the row has in the file (as it was read when the
-    /// row was first edited).
+    /// row was first edited), or an inserted row's values.
     fields: usize,
-    /// The edited cells, sorted by column: new values for some of the
-    /// row's fields, or for cells past its end. Never empty.
-    cells: Vec<(usize, Arc<str>)>,
+    /// The row is a blank line of the file: its default layout never
+    /// changes (ADR-0004 decision 5).
+    blank: bool,
+    /// The edited cells, sorted by id: new values for some of the row's
+    /// cells, which may be hidden (a deleted column's, kept for its undo).
+    /// Empty only with an explicit layout.
+    cells: Vec<(CellId, Arc<str>)>,
+    /// The row's layout, if a column operation decided otherwise for it
+    /// than its default layout would (`edit::columns`).
+    layout: Option<Arc<[CellId]>>,
     /// The row's own fields that have field-level diagnostics, worked out
     /// from their bytes once, when the row was first edited, and shared by
     /// every later version of its edits: so an edit costs what its cells
     /// do, not the whole row (usually empty).
     flagged: Arc<[(usize, Kinds)]>,
-    /// The field-level diagnostics of the row as it reads now: each
-    /// unedited field's from `flagged`, each edited cell on its new value
-    /// (ADR-0008 decision 2).
+    /// The field-level diagnostics of the row as it reads with no column
+    /// operation: each unedited field's from `flagged`, each edited cell
+    /// on its new value (ADR-0008 decision 2). With column operations,
+    /// [`kinds_in`](Self::kinds_in) works them out.
     kinds: Kinds,
     /// A hash of the row's bytes, if it was read from the first 64 KB kept
     /// in memory: if those turn out to be a different version of the file
@@ -84,18 +94,20 @@ pub(crate) struct RowEdits {
 
 impl RowEdits {
     /// A row of `fields` fields in the file, with `cells` edited (sorted by
-    /// column, not empty) and its own fields' diagnostics `flagged`.
+    /// id) and its own fields' diagnostics `flagged`, laid out by default.
     pub(crate) fn new(
         fields: usize,
-        cells: Vec<(usize, Arc<str>)>,
+        cells: Vec<(CellId, Arc<str>)>,
         flagged: Arc<[(usize, Kinds)]>,
         head_hash: Option<u64>,
     ) -> RowEdits {
-        debug_assert!(!cells.is_empty());
         debug_assert!(cells.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let mut kinds = Kinds::default();
-        for &(column, bits) in flagged.iter() {
-            if cells.binary_search_by_key(&column, |&(c, _)| c).is_err() {
+        for &(field, bits) in flagged.iter() {
+            if cells
+                .binary_search_by_key(&field_id(field), |&(id, _)| id)
+                .is_err()
+            {
                 kinds.insert(bits);
             }
         }
@@ -104,11 +116,27 @@ impl RowEdits {
         }
         RowEdits {
             fields,
+            blank: false,
             cells,
+            layout: None,
             flagged,
             kinds,
             head_hash,
         }
+    }
+
+    /// The same, of a blank line of the file.
+    #[must_use]
+    pub(crate) fn blank(mut self, blank: bool) -> RowEdits {
+        self.blank = blank;
+        self
+    }
+
+    /// The same, laid out as `layout` says (`None`: by default).
+    #[must_use]
+    pub(crate) fn with_layout(mut self, layout: Option<Arc<[CellId]>>) -> RowEdits {
+        self.layout = layout;
+        self
     }
 
     /// How many fields of its own the row had when it was first edited.
@@ -116,26 +144,40 @@ impl RowEdits {
         self.fields
     }
 
-    /// One past the last edited cell.
-    pub(crate) fn end(&self) -> usize {
-        self.cells.last().map_or(0, |&(column, _)| column + 1)
+    /// Whether the row is a blank line of the file.
+    pub(crate) fn is_blank(&self) -> bool {
+        self.blank
     }
 
-    /// How many cells the row has now, against the field count it had when
-    /// it was first edited (the marks use it; readers count the row's own
-    /// fields as they read them, `RowView::len`).
-    pub(crate) fn len(&self) -> usize {
-        self.fields.max(self.end())
+    /// The explicit layout, if it has one.
+    pub(crate) fn layout(&self) -> Option<&[CellId]> {
+        self.layout.as_deref()
     }
 
-    /// The new value of cell `column`, if it is edited.
-    pub(crate) fn get(&self, column: usize) -> Option<&str> {
-        let at = self.cells.binary_search_by_key(&column, |&(c, _)| c).ok()?;
+    /// One past the last base position edited (a field's or a hatched
+    /// cell's): with no column operation, the row is at least this long.
+    pub(crate) fn base_end(&self) -> usize {
+        base_end(&self.cells)
+    }
+
+    /// The parts a layout is made from.
+    pub(crate) fn parts(&self) -> Parts<'_> {
+        Parts {
+            fields: self.fields,
+            blank: self.blank,
+            cells: &self.cells,
+            layout: self.layout.as_deref(),
+        }
+    }
+
+    /// The new value of cell `id`, if it is edited.
+    pub(crate) fn get(&self, id: CellId) -> Option<&str> {
+        let at = self.cells.binary_search_by_key(&id, |&(c, _)| c).ok()?;
         Some(&self.cells[at].1)
     }
 
-    /// The edited cells, sorted by column.
-    pub(crate) fn cells(&self) -> &[(usize, Arc<str>)] {
+    /// The edited cells, sorted by id.
+    pub(crate) fn cells(&self) -> &[(CellId, Arc<str>)] {
         &self.cells
     }
 
@@ -143,13 +185,200 @@ impl RowEdits {
         &self.flagged
     }
 
-    pub(crate) fn kinds(&self) -> Kinds {
-        self.kinds
-    }
-
     pub(crate) fn head_hash(&self) -> Option<u64> {
         self.head_hash
     }
+
+    /// What the default layout needs to know of the row, inserted row `n`
+    /// if `inserted`.
+    pub(crate) fn own(&self, inserted: Option<u32>) -> Own {
+        Own {
+            fields: self.fields,
+            blank: self.blank,
+            inserted,
+        }
+    }
+
+    /// The row's layout under `columns` (inserted row `n` if `inserted`),
+    /// as its edits were made.
+    pub(crate) fn layout_in<'a>(
+        &'a self,
+        columns: &'a Columns,
+        inserted: Option<u32>,
+    ) -> Layout<'a> {
+        Layout::of(columns, self.own(inserted), Some(self))
+    }
+
+    /// How many cells the row has under `columns`, as its edits were made
+    /// (the marks use it; readers count the row's own fields as they read
+    /// them, `RowView::len`).
+    pub(crate) fn len_in(&self, columns: &Columns, inserted: Option<u32>) -> usize {
+        self.layout_in(columns, inserted).len()
+    }
+
+    /// Row `row`'s field-level diagnostics under `columns`, these being its
+    /// edits: each of its own fields still there and unedited by
+    /// `flagged`, each edited cell still there, and each inserted cell, by
+    /// its value (only a NUL can be in one).
+    pub(crate) fn kinds_in(&self, columns: &Columns, row: RowId) -> Kinds {
+        if columns.is_empty() && self.layout.is_none() {
+            return self.kinds;
+        }
+        let layout = self.layout_in(columns, row.inserted_index());
+        let mut kinds = Kinds::default();
+        let mut add = |id: CellId| match self.get(id) {
+            Some(value) => {
+                if value.contains('\0') {
+                    kinds.insert(Kinds::NUL_BYTES);
+                }
+            }
+            None => match id {
+                CellId::Field(k) => {
+                    let k = to_usize(k);
+                    if let Ok(i) = self.flagged.binary_search_by_key(&k, |&(f, _)| f) {
+                        kinds.insert(self.flagged[i].1);
+                    }
+                }
+                CellId::Inserted(op) => {
+                    if columns
+                        .inserted_value(op, row)
+                        .is_some_and(|v| v.contains('\0'))
+                    {
+                        kinds.insert(Kinds::NUL_BYTES);
+                    }
+                }
+                CellId::Appended(_) => {}
+            },
+        };
+        match &layout {
+            // Only the hatched cells edited can hold anything.
+            Layout::Default { fold, .. } => {
+                for c in 0..fold.len() {
+                    if let Some(id) = fold.get(c) {
+                        add(id);
+                    }
+                }
+                for &(id, _) in &self.cells {
+                    if matches!(id, CellId::Appended(_)) {
+                        add(id);
+                    }
+                }
+            }
+            Layout::Explicit(ids) => ids.iter().for_each(|&id| add(id)),
+        }
+        kinds
+    }
+
+    /// Whether the row is a blank line under `columns`: a blank line of the
+    /// file whose one cell is its own field, unedited (a column delete can
+    /// make an edited blank line one again).
+    pub(crate) fn is_blank_in(&self, columns: &Columns, inserted: Option<u32>) -> bool {
+        let field = CellId::Field(0);
+        self.blank && self.get(field).is_none() && {
+            let layout = self.layout_in(columns, inserted);
+            layout.len() == 1 && layout.get(0) == Some(field)
+        }
+    }
+
+    /// The edited cells by position with no column operation, which is
+    /// their column then (the writer before task 2.4c: saving refuses
+    /// column operations until then).
+    pub(crate) fn base_cells(&self) -> Vec<(usize, Arc<str>)> {
+        self.cells
+            .iter()
+            .filter_map(|(id, value)| match *id {
+                CellId::Field(k) | CellId::Appended(k) => Some((to_usize(k), Arc::clone(value))),
+                CellId::Inserted(_) => None,
+            })
+            .collect()
+    }
+
+    /// The edited cells the row shows under `columns` (inserted row `n` if
+    /// `inserted`), with their logical columns, in column order: not the
+    /// hidden ones a column delete took.
+    pub(crate) fn shown(
+        &self,
+        columns: &Columns,
+        inserted: Option<u32>,
+    ) -> Vec<(usize, &Arc<str>)> {
+        let layout = self.layout_in(columns, inserted);
+        let mut shown: Vec<(usize, &Arc<str>)> = match &layout {
+            Layout::Default {
+                fold: Fold::Identity { .. },
+                ..
+            } => self
+                .cells
+                .iter()
+                .filter_map(|(id, value)| match *id {
+                    CellId::Field(k) | CellId::Appended(k) => Some((to_usize(k), value)),
+                    CellId::Inserted(_) => None,
+                })
+                .collect(),
+            Layout::Default { fold, .. } => {
+                let folded = fold.as_slice();
+                self.cells
+                    .iter()
+                    .filter_map(|(id, value)| {
+                        let column = match *id {
+                            CellId::Appended(j) => layout.tail_position(to_usize(j)),
+                            id => folded.iter().position(|&f| f == id),
+                        };
+                        Some((column?, value))
+                    })
+                    .collect()
+            }
+            Layout::Explicit(ids) => ids
+                .iter()
+                .enumerate()
+                .filter_map(|(c, &id)| {
+                    let at = self.cells.binary_search_by_key(&id, |&(c, _)| c).ok()?;
+                    Some((c, &self.cells[at].1))
+                })
+                .collect(),
+        };
+        shown.sort_unstable_by_key(|&(column, _)| column);
+        shown
+    }
+
+    /// Whether these edits read the same as `other`'s under `columns`: the
+    /// same cells in the same places, with the same values, hidden ones
+    /// included, though hatched cells may have other ids (an undo by value
+    /// gives new ones).
+    pub(crate) fn reads_as(
+        &self,
+        other: &RowEdits,
+        columns: &Columns,
+        inserted: Option<u32>,
+    ) -> bool {
+        if self == other {
+            return true;
+        }
+        let (a, b) = (
+            self.layout_in(columns, inserted),
+            other.layout_in(columns, inserted),
+        );
+        let (a, b) = (a.ids(), b.ids());
+        let same_cell = |x: CellId, y: CellId| match (x, y) {
+            (CellId::Appended(_), CellId::Appended(_)) => self.get(x) == other.get(y),
+            _ => x == y && self.get(x) == other.get(y),
+        };
+        let hidden = |edits: &RowEdits, shown: &[CellId]| -> Vec<(CellId, Arc<str>)> {
+            edits
+                .cells
+                .iter()
+                .filter(|(id, _)| !shown.contains(id))
+                .cloned()
+                .collect()
+        };
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(&x, &y)| same_cell(x, y))
+            && hidden(self, &a) == hidden(other, &b)
+    }
+}
+
+/// Field `k`'s id.
+fn field_id(k: usize) -> CellId {
+    CellId::Field(u32::try_from(k).unwrap_or(u32::MAX))
 }
 
 /// An inserted row (task 2.4a): its own values, and the gap it was
@@ -159,7 +388,7 @@ pub(crate) struct InsertedRow {
     /// The physical row it was inserted before (the file's row count at
     /// the end).
     gap: u32,
-    /// Its values, at least one.
+    /// Its values: at least one, unless put back by value.
     fields: Vec<Arc<str>>,
 }
 
@@ -171,6 +400,13 @@ impl InsertedRow {
         if fields.is_empty() {
             fields.push(Arc::from(""));
         }
+        InsertedRow { gap, fields }
+    }
+
+    /// A row of exactly `values`, inserted before physical row `gap`: a
+    /// row put back by value, which column deletes may have left with none.
+    pub(crate) fn exactly(gap: u32, values: &[String]) -> InsertedRow {
+        let fields = values.iter().map(|v| Arc::from(v.as_str())).collect();
         InsertedRow { gap, fields }
     }
 
@@ -201,21 +437,57 @@ pub(crate) struct Overlay {
     rows: BTreeMap<RowId, Arc<RowEdits>>,
     inserted: BTreeMap<u32, Arc<InsertedRow>>,
     map: RowMap,
+    /// The column inserts and deletes in effect (task 2.4b).
+    columns: Arc<Columns>,
+}
+
+/// What a reader needs to lay out one row's cells: its id, its edits and
+/// the column operations ([`Overlay::cells_of`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverlayRow<'a> {
+    pub(crate) id: RowId,
+    pub(crate) edits: Option<&'a RowEdits>,
+    pub(crate) columns: &'a Columns,
 }
 
 impl Overlay {
     /// An overlay of `rows`' edits alone, to read original rows with edits
     /// a command holds (`Rows::values`).
-    pub(crate) fn of_rows(rows: impl IntoIterator<Item = (RowId, Arc<RowEdits>)>) -> Overlay {
+    pub(crate) fn of_rows(
+        rows: impl IntoIterator<Item = (RowId, Arc<RowEdits>)>,
+        columns: Arc<Columns>,
+    ) -> Overlay {
         Overlay {
             rows: rows.into_iter().collect(),
+            columns,
             ..Overlay::default()
         }
     }
 
-    /// True if nothing is edited: no cell, and no row inserted or deleted.
+    /// True if nothing is edited: no cell, no row inserted or deleted, and
+    /// no column.
     pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.map.is_identity()
+        self.rows.is_empty() && self.map.is_identity() && self.columns.is_empty()
+    }
+
+    /// The column inserts and deletes in effect.
+    pub(crate) fn columns(&self) -> &Arc<Columns> {
+        &self.columns
+    }
+
+    /// Row `id`'s edits and the column operations, for a `RowView`.
+    pub(crate) fn cells_of(&self, id: RowId) -> OverlayRow<'_> {
+        OverlayRow {
+            id,
+            edits: self.edits(id).map(AsRef::as_ref),
+            columns: &self.columns,
+        }
+    }
+
+    /// Physical row `row`'s, as [`cells_of`](Self::cells_of).
+    pub(crate) fn physical(&self, row: usize) -> OverlayRow<'_> {
+        let id = RowId::original(u32::try_from(row).unwrap_or(u32::MAX));
+        self.cells_of(id)
     }
 
     /// Which row each logical row is.
@@ -308,6 +580,14 @@ pub(crate) struct RowChange {
     pub(crate) next_inserted: u32,
 }
 
+/// A column insert or delete, made or undone ([`EditStore::change_columns`]):
+/// the operations afterwards, and the rows whose edits change with it.
+#[derive(Debug)]
+pub(crate) struct ColumnChange {
+    pub(crate) columns: Arc<Columns>,
+    pub(crate) edits: Vec<(RowId, Option<Arc<RowEdits>>)>,
+}
+
 /// A document's edits, in one [`Lineage`], shared by its readings while
 /// they split the file the same way (the header toggle and a drive
 /// reconnecting keep them, ADR-0008 decision 4), and by the jobs reading
@@ -364,6 +644,11 @@ struct EditState {
     cells: usize,
     /// The next inserted row's number.
     next_inserted: u32,
+    /// The next column operation's number.
+    next_op: u32,
+    /// How many column inserts and deletes have been made or undone: a
+    /// search starts again when it changes (ADR-0014 decision 2).
+    column_generation: u64,
 }
 
 impl EditState {
@@ -465,9 +750,35 @@ impl EditStore {
         (Arc::clone(&state.overlay), state.version())
     }
 
+    /// [`snapshot`](Self::snapshot), and the column generation, in one
+    /// look: where a search starts (again) from.
+    pub(crate) fn snapshot_columns(&self) -> (Arc<Overlay>, usize, u64) {
+        let state = self.read();
+        (
+            Arc::clone(&state.overlay),
+            state.version(),
+            state.column_generation,
+        )
+    }
+
     /// How many edits have been made: the version the edits are.
     pub(crate) fn version(&self) -> usize {
         self.read().version()
+    }
+
+    /// The next column operation's number.
+    pub(crate) fn next_op(&self) -> u32 {
+        self.read().next_op
+    }
+
+    /// How many column inserts and deletes have been made or undone.
+    pub(crate) fn column_generation(&self) -> u64 {
+        self.read().column_generation
+    }
+
+    /// The column operations now.
+    pub(crate) fn columns(&self) -> Arc<Columns> {
+        Arc::clone(&self.read().overlay.columns)
     }
 
     /// The next inserted row's number.
@@ -482,19 +793,6 @@ impl EditStore {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         let logged = state.ends.last().copied().unwrap_or(0);
         state.start = version.saturating_sub(logged);
-    }
-
-    /// Physical row `row`'s edits now, if it has any.
-    pub(crate) fn row(&self, row: usize) -> Option<Arc<RowEdits>> {
-        self.read().overlay.row_arc(row).cloned()
-    }
-
-    /// Inserted row `n` now, if it is in the document, with its edits.
-    pub(crate) fn inserted(&self, n: u32) -> Option<(Arc<InsertedRow>, Option<Arc<RowEdits>>)> {
-        let state = self.read();
-        let row = Arc::clone(state.overlay.inserted(n)?);
-        let edits = state.overlay.edits(RowId::inserted(n)).cloned();
-        Some((row, edits))
     }
 
     /// The edited original rows among physical rows `rows` now, the
@@ -520,6 +818,8 @@ impl EditStore {
             edited,
             live,
             version: state.version(),
+            columns: Arc::clone(&state.overlay.columns),
+            column_generation: state.column_generation,
         }
     }
 
@@ -584,6 +884,32 @@ impl EditStore {
     }
 
     /// Makes a row insert or delete (task 2.4a), as one edit.
+    /// Makes a column insert or delete, or undoes one: the operations
+    /// become `change.columns` and the rows' edits change. The rows are
+    /// logged (one, row 0, if none changed, so the version goes up); a
+    /// search starts again anyway.
+    pub(crate) fn change_columns(&self, change: ColumnChange, next_op: u32) {
+        let mut state = self.write();
+        let mut cells = state.cells;
+        let overlay = Arc::make_mut(&mut state.overlay);
+        overlay.columns = change.columns;
+        let mut touched = Vec::with_capacity(change.edits.len());
+        for (id, edits) in change.edits {
+            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
+            overlay.set(id, edits);
+            touched.push(id);
+        }
+        state.cells = cells;
+        if touched.is_empty() {
+            touched.push(RowId::original(0));
+        }
+        for id in touched {
+            state.log(id, 1);
+        }
+        state.next_op = state.next_op.max(next_op);
+        state.column_generation += 1;
+    }
+
     pub(crate) fn change_rows(&self, change: RowChange) {
         let mut state = self.write();
         let mut cells = state.cells;
@@ -643,6 +969,9 @@ pub(crate) struct RowsIn {
     /// The stretches of physical rows still in the document, in order.
     pub(crate) live: Vec<Range<usize>>,
     pub(crate) version: usize,
+    /// The column operations, and their generation.
+    pub(crate) columns: Arc<Columns>,
+    pub(crate) column_generation: u64,
 }
 
 fn to_usize(n: u32) -> usize {
@@ -653,8 +982,16 @@ fn to_usize(n: u32) -> usize {
 mod tests {
     use super::*;
 
+    /// Cell `c` of a row of `fields` fields with no column operation.
+    fn at(c: usize, fields: usize) -> CellId {
+        CellId::base(c, fields)
+    }
+
     fn edits(fields: usize, cells: &[(usize, &str)]) -> RowEdits {
-        let cells = cells.iter().map(|&(c, v)| (c, Arc::from(v))).collect();
+        let cells = cells
+            .iter()
+            .map(|&(c, v)| (at(c, fields), Arc::from(v)))
+            .collect();
         RowEdits::new(fields, cells, Arc::new([]), None)
     }
 
@@ -664,13 +1001,16 @@ mod tests {
 
     #[test]
     fn a_row_is_as_long_as_its_last_edited_cell() {
-        assert_eq!(edits(3, &[(1, "x")]).len(), 3);
-        assert_eq!(edits(1, &[(4, "x")]).len(), 5);
-        assert_eq!(edits(1, &[(4, "x")]).end(), 5);
+        let none = Columns::default();
+        assert_eq!(edits(3, &[(1, "x")]).len_in(&none, None), 3);
+        assert_eq!(edits(1, &[(4, "x")]).len_in(&none, None), 5);
+        assert_eq!(edits(1, &[(4, "x")]).base_end(), 5);
         let row = edits(2, &[(0, "a"), (5, "b")]);
-        assert_eq!(row.get(0), Some("a"));
-        assert_eq!(row.get(5), Some("b"));
-        assert_eq!(row.get(1), None);
+        assert_eq!(row.get(at(0, 2)), Some("a"));
+        assert_eq!(row.get(at(5, 2)), Some("b"));
+        assert_eq!(row.get(at(1, 2)), None);
+        let shown: Vec<usize> = row.shown(&none, None).iter().map(|&(c, _)| c).collect();
+        assert_eq!(shown, [0, 5]);
     }
 
     /// An edited field's own diagnostics go; the others stay; a NUL in an
@@ -680,8 +1020,12 @@ mod tests {
         let flagged: Arc<[(usize, Kinds)]> =
             Arc::new([(0, Kinds::INVALID_ENCODING), (2, Kinds::NUL_BYTES)]);
         let row = |cells: &[(usize, &str)]| {
-            let cells = cells.iter().map(|&(c, v)| (c, Arc::from(v))).collect();
-            RowEdits::new(3, cells, Arc::clone(&flagged), None).kinds()
+            let cells = cells
+                .iter()
+                .map(|&(c, v)| (at(c, 3), Arc::from(v)))
+                .collect();
+            RowEdits::new(3, cells, Arc::clone(&flagged), None)
+                .kinds_in(&Columns::default(), RowId::original(0))
         };
         let both = row(&[(1, "x")]);
         assert!(both.contains(Kinds::INVALID_ENCODING) && both.contains(Kinds::NUL_BYTES));
@@ -712,7 +1056,8 @@ mod tests {
         assert!(before.is_empty(), "a snapshot doesn't change");
         assert_eq!(store.version(), 3);
         assert_eq!(store.cells(), 1);
-        assert!(store.row(2).is_some() && store.row(7).is_none());
+        let overlay = store.overlay();
+        assert!(overlay.row(2).is_some() && overlay.row(7).is_none());
         let (rows, _, version) = store.since(1);
         let rows: Vec<(RowId, bool)> = rows
             .into_iter()
@@ -811,7 +1156,7 @@ mod tests {
             next_inserted: 1,
         });
         assert_eq!(store.next_inserted(), 1);
-        assert!(store.inserted(0).is_some());
+        assert!(store.overlay().inserted(0).is_some());
         let (touched, _, _) = store.since(0);
         assert!(touched[0].inserted.is_some());
     }

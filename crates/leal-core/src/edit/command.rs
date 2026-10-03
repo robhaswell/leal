@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::Rows;
+use super::{Column, Rows};
 use crate::source::ReadError;
 
 /// The furthest a hatched-cell edit may reach: column `COLUMN_LIMIT - 1`,
@@ -107,11 +107,29 @@ pub enum Edit {
         /// The rows.
         rows: Arc<Rows>,
     },
+    /// A column inserted before logical column `at` (task 2.4b): a cell
+    /// in every row long enough (oracle rule 6: at least `at` cells, not a
+    /// blank line), or, as the inverse of a column delete, the cells it
+    /// took put back.
+    InsertColumn {
+        /// The column.
+        at: usize,
+        /// The operation and the rows it applied to.
+        column: Arc<Column>,
+    },
+    /// Logical column `at` deleted from every row that has it (task 2.4b),
+    /// or, as the inverse of a column insert, the cells it gave taken out.
+    DeleteColumn {
+        /// The column.
+        at: usize,
+        /// The operation and the rows it applied to.
+        column: Arc<Column>,
+    },
 }
 
 /// A change to a document, with what it replaced, so it can be undone,
-/// redone and replayed (DESIGN §3.6): cell edits, and row inserts and
-/// deletes (task 2.4a; columns are task 2.4b's).
+/// redone and replayed (DESIGN §3.6): cell edits, row inserts and deletes
+/// (task 2.4a) and column inserts and deletes (task 2.4b).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Command {
     /// The edits it belongs to.
@@ -143,6 +161,8 @@ impl Command {
             ),
             Edit::InsertRows { at, rows } => Edit::DeleteRows { at, rows },
             Edit::DeleteRows { at, rows } => Edit::InsertRows { at, rows },
+            Edit::InsertColumn { at, column } => Edit::DeleteColumn { at, column },
+            Edit::DeleteColumn { at, column } => Edit::InsertColumn { at, column },
         };
         Command {
             lineage: self.lineage,
@@ -156,14 +176,26 @@ impl Command {
         match &self.edit {
             Edit::SetCell(change) => std::slice::from_ref(change),
             Edit::SetCells(changes) => changes,
-            Edit::InsertRows { .. } | Edit::DeleteRows { .. } => &[],
+            Edit::InsertRows { .. }
+            | Edit::DeleteRows { .. }
+            | Edit::InsertColumn { .. }
+            | Edit::DeleteColumn { .. } => &[],
         }
     }
 
-    /// Whether it inserts or deletes rows.
+    /// Whether it inserts or deletes rows or a column.
     #[must_use]
     pub fn is_structural(&self) -> bool {
-        matches!(self.edit, Edit::InsertRows { .. } | Edit::DeleteRows { .. })
+        !matches!(self.edit, Edit::SetCell(_) | Edit::SetCells(_))
+    }
+
+    /// Whether it inserts or deletes a column.
+    #[must_use]
+    pub fn is_column(&self) -> bool {
+        matches!(
+            self.edit,
+            Edit::InsertColumn { .. } | Edit::DeleteColumn { .. }
+        )
     }
 }
 
@@ -211,14 +243,21 @@ pub enum EditError {
     /// The command belongs to another [`Lineage`]: it was made before the
     /// file was read with another delimiter or encoding.
     OtherLineage,
-    /// Rows can't be inserted or deleted until the whole file has been
-    /// read (and, on a removable drive or a share, copied) and can be
-    /// trusted (ADR-0014 decision 1). Ask again once the index is complete.
+    /// Rows and columns can't be inserted or deleted until the whole file
+    /// has been read (and, on a removable drive or a share, copied) and
+    /// can be trusted (ADR-0014 decision 1). Ask again once the index is
+    /// complete.
     StillReading,
-    /// Rows can't be inserted or deleted while a save runs (ADR-0014
-    /// decision 1); that includes undoing or redoing a row insert or
-    /// delete. Ask again once it has finished.
+    /// Rows and columns can't be inserted or deleted while a save runs
+    /// (ADR-0014 decision 1); that includes undoing or redoing such a
+    /// command. Ask again once it has finished.
     Saving,
+    /// No row has that column: a column is inserted at most just past the
+    /// widest row, and deleted only where some row has it (task 2.4b).
+    NoSuchColumn {
+        /// The column.
+        column: usize,
+    },
     /// The row couldn't be read (see `Document::rows`).
     Read {
         /// The row.
@@ -248,10 +287,13 @@ impl fmt::Display for EditError {
             EditError::OtherLineage => {
                 f.write_str("the edit was made before the file was read another way")
             }
-            EditError::StillReading => {
-                f.write_str("rows can't be inserted or deleted until the whole file is read")
+            EditError::StillReading => f.write_str(
+                "rows and columns can't be inserted or deleted until the whole file is read",
+            ),
+            EditError::Saving => {
+                f.write_str("rows and columns can't be inserted or deleted while saving")
             }
-            EditError::Saving => f.write_str("rows can't be inserted or deleted while saving"),
+            EditError::NoSuchColumn { column } => write!(f, "no row has column {column}"),
             EditError::Read { row, error } => write!(f, "row {row} couldn't be read: {error}"),
         }
     }

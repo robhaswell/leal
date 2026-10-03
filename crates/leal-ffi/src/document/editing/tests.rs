@@ -303,3 +303,58 @@ fn rows_inserted_and_deleted_undo_redo_and_replay() {
     }
     assert!(!fresh.has_unsaved_edits().unwrap());
 }
+
+/// Column inserts and deletes (task 2.4b): commands Swift undoes and redoes
+/// like any other, and the refusals.
+#[test]
+fn columns_inserted_and_deleted_undo_redo_and_replay() {
+    let dir = TempDir::new("edit-columns");
+    let scheduler = Scheduler::new().unwrap();
+    let document = open(&dir, &scheduler, "a.csv");
+    let path = dir.file("a.csv", FILE);
+    assert_eq!(document.can_insert_column(1).unwrap(), None);
+
+    let insert = document.insert_column(1, "x".into()).unwrap().unwrap();
+    assert!(insert.changes.is_empty());
+    let column = insert.structural.clone().unwrap();
+    assert!(column.inserts() && column.is_column());
+    // Every row with at least one cell: all four.
+    assert_eq!((column.column(), column.row_count()), (Some(1), 4));
+    assert_eq!(name(&document, 1), ["1", "x", "Marlow"]);
+    assert_eq!(name(&document, 2), ["2", "x"]);
+    // After the open quote, in its row: refused (ADR-0004 decision 8).
+    assert_eq!(
+        document.can_insert_column(3).unwrap(),
+        Some(EditRefusal::AfterUnterminatedQuote)
+    );
+    assert_eq!(
+        document.insert_column(4, "y".into()),
+        Err(refused(&path, EditRefusal::NoSuchColumn, None, Some(4)))
+    );
+    assert_eq!(
+        document.can_delete_column(3).unwrap(),
+        Some(EditRefusal::NoSuchColumn)
+    );
+    let delete = document.delete_column(0).unwrap().unwrap();
+    assert!(!delete.structural.clone().unwrap().inserts());
+    assert_eq!(name(&document, 1), ["x", "Marlow"]);
+
+    document.undo(delete.clone()).unwrap();
+    document.undo(insert.clone()).unwrap();
+    assert!(!document.has_unsaved_edits().unwrap());
+    document.redo(insert.clone()).unwrap();
+    document.redo(delete.clone()).unwrap();
+    assert_eq!(name(&document, 2), ["x"]);
+
+    // Replayed into a fresh document, by value: the same cells.
+    let fresh = open(&dir, &scheduler, "b.csv");
+    let report = fresh.replay(vec![insert, delete]).unwrap();
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    for row in 0..4 {
+        assert_eq!(name(&fresh, row), name(&document, row));
+    }
+    for command in report.applied.into_iter().rev() {
+        fresh.undo(command).unwrap();
+    }
+    assert!(!fresh.has_unsaved_edits().unwrap());
+}
