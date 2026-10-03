@@ -492,7 +492,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     everything below (piece list and row ids, `RowMap`, column map and
     per-row applied flags, cell identities, the base epoch, Find, the
     writer and the rebase), so the parts fit. An ADR if it changes DESIGN.
-  - [ ] **2.4a Rows.** Insert and delete rows in the core: the piece list,
+  - [x] **2.4a Rows.** Insert and delete rows in the core: the piece list,
     stable row ids, the `RowMap` seam in every row walk, Find remapping,
     undo and redo. Not saved yet.
   - [ ] **2.4b Columns.** Insert and delete columns: the column map, per-row
