@@ -108,4 +108,11 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 1.0,
         source: "DESIGN §3.9",
     },
+    // "Save after one edit: < 500 ms": the reference file, one cell edited,
+    // saved over itself (PLAN 2.2).
+    Budget {
+        id: "save/one_edit",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
 ];

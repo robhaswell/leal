@@ -73,6 +73,11 @@ harness = false
 name = "edits"
 harness = false
 
+# Saving the reference file after one edit (PLAN 2.2, budget DESIGN §1).
+[[bench]]
+name = "save"
+harness = false
+
 [dependencies]
 # Reads criterion's `estimates.json` and `benchmark.json` (bench-report).
 # Criterion already depends on it, so it adds nothing to the build.

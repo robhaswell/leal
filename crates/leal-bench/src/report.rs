@@ -233,12 +233,15 @@ pub fn group_of(id: &str) -> &str {
 /// because shared runners make them too noisy to compare: the simulated
 /// removable open reads through `pread` under background load, and its
 /// 95% interval spans tens of percent between identical commits. The
-/// simulated network share's open (task 2.0) reads the same way.
-pub const BUDGET_ONLY: [&str; 4] = [
+/// simulated network share's open (task 2.0) reads the same way. A save
+/// (task 2.2) writes the whole reference file and flushes it to the disk
+/// (`F_FULLFSYNC`), so its time is the runner's disk's.
+pub const BUDGET_ONLY: [&str; 5] = [
     "open/first_paint_removable_under_load",
     "open/first_paint_share_under_load",
     "open/first_paint_slow_share_small",
     "open/first_paint_slow_share",
+    "save/one_edit",
 ];
 
 /// True if `id` is gated on its budget only (see [`BUDGET_ONLY`]).
