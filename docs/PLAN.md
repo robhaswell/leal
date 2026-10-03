@@ -670,8 +670,9 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     edit. This narrows ADR-0005 decision 2's literal text; explicitly
     padding a short row would be a future "Fill missing cells" command.
     (2.1 notes, "Decisions and interpretations")
-  - For the phase 2 gate, for the record (already accepted by Rob with
-    ADR-0012): the save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`,
+  - For the phase 2 gate, Rob to confirm (he was told of it when he
+    accepted ADR-0012, 2026-10-03, but the ADR doesn't record it): the
+    save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`,
     so a power cut within about a second of a save can give back the old
     file, never a mix of the two. (2.2 notes, "Decisions and
     interpretations"; DESIGN §3.7)

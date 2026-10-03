@@ -54,13 +54,18 @@ The other option is to keep NSDocument's swap. The core would then need a
 the watcher reporting AppKit's swap as an outside change. It is more code,
 and the gap above stays.
 
-**2. Output of 4 GiB or more is refused before anything is written.**
+**2. Output of 4 GiB or more is refused before anything is replaced.**
 
 Leal can't open files that large (DESIGN §1 non-goal, 32-bit offsets), so
 the reopen guarantee (ADR-0004 decision 10) can't hold. F5 says a save
 either succeeds exactly or stops with an explanation. The save computes
 the output length first and refuses with "too large". The other option is
 to write the file anyway and refuse only to reopen it.
+
+As built (task 2.2), the save streams, so it refuses as soon as the
+output passes 4 GiB while writing the new file, before the new file
+replaces anything. The new file is then deleted and the original is
+untouched.
 
 **3. A BOM file that already has `com.apple.TextEncoding` keeps it,
 updated.**
