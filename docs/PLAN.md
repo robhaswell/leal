@@ -663,6 +663,14 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - The whole-file delimiter review's part of ADR-0008 decision 8
       (`SEAM(2.5)`): write the interpretation attribute when the rebased
       reading's review suggests another delimiter.
+  - UTF-16 documents are editable with Save off; Save As UTF-8 is the
+    only save. (ADR-0013 decision 1)
+  - Edits run the core's `unencodable(value:)` check before commit.
+    Windows-1258 refuses precomposed Vietnamese, so the warning should
+    point to Save As UTF-8. (docs/tasks/2.3.md)
+  - Save As UTF-8 needs a progress display (the `SEAM(2.5)` in
+    `DocumentViewController`), and adopting the core's rebased reading
+    should replace the app's reload after Save As UTF-8.
   - Screenshots next to mockups 05a and 05b.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
@@ -679,6 +687,18 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     edit to row 0 widens the grid through the first screen's column count
     and titles. Handle both before a paste can reach far columns. (2.1
     notes, "Left for later")
+- [ ] **2.6a Tidy-up** — nits collected from reviews (CLAUDE.md, token budget).
+  - The `snapshot` test helper's 5 ms run-loop wait in `GridStripsTests`
+    (make the deferred flush deterministic).
+  - `testANewReadingRedrawsEverythingWhateverTheChange` uses a 100 ms sleep.
+  - The read-ahead's wanted range is reset per strip during full redraws
+    (performance).
+  - Per-edit `updateBanners` / `statusBar.show` cost.
+  - The queued single alert in `DocumentViewController` replaces an earlier
+    one.
+  - `own_encoding_tag` is true even when the tag decodes.
+  - Investigate the occasional slow launch (433 and 479 ms, against a
+    median of about 160 ms; probably the first launch after a build).
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
@@ -691,6 +711,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     so a power cut within about a second of a save can give back the old
     file, never a mix of the two. (2.2 notes, "Decisions and
     interpretations"; DESIGN §3.7)
+  - For the phase 2 gate: should "no dropped frames" allow a tolerance,
+    e.g. at most 0.05% late frames? With strips (2.0b), 1 late frame in
+    about 7,560 appeared in one of three runs after indexing, which the
+    budget as written counts as a fail. (docs/perf.md)
 
 ## Phase 3 — Filter and sort
 

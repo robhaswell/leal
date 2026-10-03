@@ -13,88 +13,104 @@ during the beta.
 
 ## Results
 
-Rob's run, 2 October 2026, screen **unlocked**, 3 runs of each, on `main`
-at the phase 1 gate (product code as of `09664f9`). The full output is in
-[`perf-runs/2026-10-02-m5pro-unlocked.md`](perf-runs/2026-10-02-m5pro-unlocked.md);
-the verdicts below are `just perf`'s current ones, from that run's
-numbers (`leal-perf --report`).
+Rob's run of 3 October 2026, task 2.0b (strips), screen **unlocked**, 3 runs
+of each, on branch `task/2.0b` rebased on `a40851a`, with the Mac idle. The
+full output, with every scroll run and the strips-against-AppKit table, is
+in [`perf-runs/2026-10-03-m5pro-unlocked-2.0b.md`](perf-runs/2026-10-03-m5pro-unlocked-2.0b.md).
 
 - **Machine:** MacBook Pro `Mac17,8`, Apple M5 Pro (6 performance + 12
   efficiency cores), 48 GB, macOS 27.0. **Not the reference machine** (a
   base M1 MacBook Air: 4 + 4 cores, 8 GB, 60 Hz display).
-- **Displays:** the built-in Liquid Retina XDR (ProMotion, 120 Hz, main
-  display) and a 2560 × 1440 display at 60 Hz. The scroll benchmark's
-  window was on the built-in display at 120 Hz in every run.
+- **Display:** the built-in Liquid Retina XDR (ProMotion, 120 Hz, main
+  display), which the scroll benchmark's window was on in every run.
 - **Power:** on AC (`powermode 0`).
-- **Load:** load average 5.3 / 4.2 / 3.2 at the start, about 1,090
-  processes.
+- **Load:** load average 9.25 / 4.86 / 3.49 at the start, 980 processes.
 - **Screen:** unlocked, with Leal in front.
+
 
 | Budget (DESIGN §1) | Measured on this Mac | How | Verdict |
 |---|---|---|---|
-| Launch < 300 ms | 159 ms (133–433) | process start to the end of `applicationDidFinishLaunching` ("Launched" signpost). Leal opens no empty window | mixed: one run took 433 ms (see "To watch") |
-| Launched with a file, to its first rows < 450 ms | 313 ms (312–355) | process start to the grid's first draw with rows, the reference file: the cold open, judged as part of launch | pass |
-| Open to first rows < 150 ms | 39 ms (34–47, 15 opens) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), the reference file, closed and opened again in the running app: the warm open | pass |
-| Full index < 500 ms | 170 ms (163–215) | the core's "Index" signpost in the app, the reference file, with diagnostics | pass |
-| Scrolling: no dropped frames at 120 Hz | 4, 3 and 6 late of about 7,550 (0.04–0.08%); main-thread work per frame p50 2.8–3.6 ms, p99 5.8–6.8 ms | the scroll benchmark's flings on the reference file after indexing; the 3× rule | **fail** (late frames; 3× rule) |
-| … including while background work runs | 4, 4 and 2 late of about 7,555 (0.03–0.05%); p50 2.7–3.1 ms, p99 6.5–7.0 ms | the same from the first rows, while the index and review run, with a search for `SKU-` (every row) running and highlighted throughout | **fail** (late frames; 3× rule) |
-| … stress: background work not pausing | 8 and 5 late of about 7,550 (0.07–0.11%) in runs 2 and 3; run 1 ignored | the 1 GB variant from the first rows: index, review and search all running at full speed; late frames only | **fail** |
-| Leal's own heap, reference file < 40 MB | 8.7 MB after opening; settled after scrolling, 7.6–14.3 MB without a search and 19.4–19.7 MB with a search's results held | every malloc zone minus the per-window AppKit baseline (21 MB) | pass |
-| Idle app, no document < 30 MB footprint | 17.1 MB | `heap -s`'s physical footprint, 5 s after launch | pass |
+| Launch < 300 ms | 170.4 ms (156.4–479.0, 3 runs) | process start to the end of `applicationDidFinishLaunching` ("Launched" signpost); Leal opens no empty window | mixed |
+| Launched with a file, to its first rows < 450 ms | 364.0 ms (334.8–369.9, 3 runs) | process start to the grid's first draw with rows, reference file: the cold open, judged as part of launch against the launch and open budgets together | pass |
+| Open to first rows < 150 ms | 47.6 ms (41.2–51.8, 15 runs) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), reference file, closed and opened again in the running app: the warm open (bench build, `-LealReopen`) | pass |
+| Full index < 500 ms | 141.1 ms (140.7–155.9, 3 runs) | the core's "Index" signpost in the app, reference file, with diagnostics | pass |
+| Scrolling: no dropped frames at 120 Hz | 1 of 7,559 late (0.01%); 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); main-thread work per frame p50 1.2 ms, p99 2.0 ms | `ScrollBench` flings, reference file, after indexing; late = missed a refresh; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | fail (late frames) |
+| … including while background work runs | 0 of 7,559 late (0.00%); 0 of 7,559 late (0.00%); 0 of 7,556 late (0.00%); main-thread work per frame p50 1.0–1.1 ms, p99 2.0–2.1 ms | the same from the first rows, while the index and review run, with a search running throughout; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | pass |
+| … stress: background work not pausing (beyond the budget) | 0 of 7,557 late (0.00%); 4 of 7,556 late (0.05%); 2 of 7,556 late (0.03%); main-thread work per frame p50 0.5 ms, p99 1.8 ms | 1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input; judged on late frames only | fail |
+| Leal's heap, reference file < 40 MB | 10.7 MB (10.6–10.9, 3 runs) after opening; settled after scrolling, 9.5 MB (9.3–11.3, 3 runs) without a search and 11.7 MB (10.5–22.3, 3 runs) with a search's results held. Not judged, all zones: 31.7 MB (31.6–31.9, 3 runs) after opening; peak while scrolling 37.9 MB (32.7–43.5, 6 runs) | all malloc zones minus the per-window AppKit baseline (21 MB, a two-row file open: docs/tasks/1.10.md): `heap -s` after the review finished, and the bench's `malloc_zone_statistics` once settled after scrolling; AppKit's drawing peaks are left out | pass |
+| Idle app, no document < 30 MB footprint | 17.0 MB (16.9–17.0, 3 runs) footprint. Not judged: resident size 80.5 MB (77.4–80.6, 3 runs) | `heap -s` physical footprint (Activity Monitor's Memory) after the app settles; the resident size (RSS) also counts shared system libraries | pass |
 
-**Scrolling fails the 3× rule.** Main-thread work per frame is p50
-2.7–3.6 ms and p99 5.8–7.0 ms on the reference file, against about
-2.8 ms. About half of each frame is AppKit rebuilding the whole visible
-content layer on every scroll step (1.6a, docs/tasks/1.10.md). Normal
-scrolling ran at about 2.4 GHz (2.24–2.44 GHz). PLAN task 2.0a, "Scrolling
-headroom", takes this on.
+**Scrolling meets the 3× rule with strips (2.0b).** Main-thread work per
+frame on the reference file is p50 1.0–1.2 ms and p99 1.95–2.1 ms, against
+about 2.8 ms, after indexing and with a search running, at the M5 Pro's
+normal 2.0–2.2 GHz (the clock of the earlier runs). That is 2.5–2.6 M
+instructions a frame after indexing and 3.1–3.2 M with a search, against
+13.0–18.5 M before 2.0a. AppKit's drawing on its own (2.0a, the
+`--compare-drawing` runs) gives p50 1.7–1.8 ms and p99 2.5–3.0 ms: it
+passed after indexing but not with a search running (2.89–2.99 ms), so the
+provisional wording about 2.0a is settled: strips were needed, and they
+pass. ADR-0011's conditions are met.
 
-**After 2.0a it passes on this Mac, provisionally** (`just perf`, 2
-October 2026, unlocked, a loaded machine:
-[`perf-runs/2026-10-02-m5pro-unlocked-2.0a.md`](perf-runs/2026-10-02-m5pro-unlocked-2.0a.md)):
-p50 1.4–1.6 ms and p99 2.2–2.6 ms in all six reference-file runs, 5.2–6.4 M
-instructions a frame against 13.0–18.5 M, 0–2 late frames a run, and a
-lower footprint peak. The main thread ran at 2.6–3.1 GHz, higher than in
-Rob's run, and `main` measured in the same session was 1.25–1.5× faster
-than in Rob's run; scaled the same way, the p99 would be about 2.75–3.6 ms
-after indexing and 3.1–3.9 ms with a search. So p50 most likely passes, and
-p99 is likely over 2.8 ms: unproven until an unloaded run. Text layout and core reads now happen
-ahead of the scroll, off the main thread; what is left is mostly AppKit's
-rebuild of the visible layers, which ADR-0011 (accepted, conditional on
-tests and an on-screen check) removes in a follow-up task.
-docs/tasks/2.0a.md has the breakdown.
+**Late frames fail "no dropped frames".** After indexing, 1 frame in about
+7,560 was late in one of three runs (0.01%); the other two runs and all
+three runs with a search had none. The budget allows none, so the verdict
+reads "fail", and the question of a tolerance is on the phase 2 gate list
+(PLAN 2.7). The stress runs (background work not pausing) had 0, 4 and 2
+late frames (up to 0.05%) and also fail; AppKit's drawing had 0–3 a run.
 
-The late frames are few (2–6 in a run of about 7,550, against 7–59 on the
-locked screen), but the budget is no dropped frames, so they still fail.
+**Memory.** Strips add about 20 MB to the footprint peak while scrolling
+on the reference file (233–238 MB after indexing, 241–252 MB with a
+search, against 213 MB and 224–230 MB with AppKit's drawing); the heap is
+unchanged and passes.
 
-Also measured:
+**One launch took 479 ms**, against a median of 170 ms (the three launches:
+156–479 ms). The 2 October run had the same: 433 ms against 159 ms. The
+first launch after a build is the likely cause. It is over the 300 ms
+budget, so the launch row says "mixed", and PLAN 2.6a has a task to look
+into it.
 
-- **The cold open on its own:** 96 ms (95–115), `read(from:)` to the first
-  rows with the app launched with the file. It is judged as part of launch
-  (the table's second row). `open` to "Launched": 176 ms (144–454).
-- **First paint in the core** (P0): 1.9 ms. Most of the cold open is
+### Earlier runs
+
+- **2 October, after 2.0a** (AppKit's drawing alone, a loaded machine;
+  [`perf-runs/2026-10-02-m5pro-unlocked-2.0a.md`](perf-runs/2026-10-02-m5pro-unlocked-2.0a.md)):
+  p50 1.4–1.6 ms and p99 2.2–2.6 ms after indexing, 5.2–6.4 M instructions
+  a frame against 13.0–18.5 M, 0–2 late frames a run. It was provisional
+  then, since the main thread ran faster than in Rob's run and the p99 with
+  a search was likely over 2.8 ms. The 2.0b run settles it: it was.
+  docs/tasks/2.0a.md has the breakdown.
+- **2 October, the phase 1 gate** (`main` at `09664f9`;
+  [`perf-runs/2026-10-02-m5pro-unlocked.md`](perf-runs/2026-10-02-m5pro-unlocked.md)):
+  scrolling failed the 3× rule, p50 2.7–3.6 ms and p99 5.8–7.0 ms, with
+  3–8 late frames a run. About half of each frame was AppKit rebuilding the
+  whole visible content layer on every scroll step (1.6a,
+  docs/tasks/1.10.md), which is what 2.0a and 2.0b took on. Launch 159 ms
+  (133–433), the cold open 96 ms, the index 170 ms, the heap 8.7 MB after
+  opening, idle footprint 17.1 MB.
+
+Also measured in the 2.0b run:
+
+- **The cold open on its own:** 115.0 ms (112.4–124.2), `read(from:)` to
+  the first rows with the app launched with the file. It is judged as part
+  of launch (the table's second row). `open` to "Launched": 183.8 ms
+  (168.0–501.5).
+- **First paint in the core** (P0): 1.8 ms. Most of the cold open is
   AppKit's first window (see "Where the cold open goes").
-- **Idle heap:** 9.6 MB. **Footprint with the reference file open:** 59
+- **Idle heap:** 9.6 MB. **Footprint with the reference file open:** 63.6
   MB (it counts graphics surfaces; mapped file pages are clean and not in
-  it). The idle footprint's resident size (RSS) is 80 MB, not judged.
-- **The heap, every zone:** 29.7 MB after opening; peaks while scrolling
-  39.7–52.9 MB, which are AppKit's drawing and aren't judged. Settled after
-  scrolling, every zone, 28.6–35.3 MB without a search and 40.4–40.7 MB
-  with one.
-- **Scroll work per frame** (main thread, reference file): 13.0–18.5 M
-  instructions a frame at 2.24–2.44 GHz; 12–42 frames a run whose
-  main-thread work took longer than 8.3 ms.
-- **The stress runs** ran at 4.25 GHz, raised by the busy background
-  threads: p50 1.4–1.5 ms and p99 3.3–4.7 ms a frame.
+  it). The idle footprint's resident size (RSS) is 80.5 MB, not judged.
+- **The heap, every zone:** 31.7 MB after opening; peaks while scrolling
+  37.9 MB (32.7–43.5), which aren't judged.
+- **The stress runs** ran at 4.23 GHz, raised by the busy background
+  threads: p50 0.5 ms and p99 1.8 ms a frame with strips.
 
 ### To watch
 
-- **One launch took 433 ms** (the first of three; median 159 ms). It is
-  one run, but it is over the 300 ms budget, so watch for it in the next
-  runs.
-- **The `bigFileNoPause` run 1 outlier is ignored** (2,048 of 5,455 late,
-  37.5%). Rob was using the Mac and moving windows around during it. Runs
-  2 and 3 are representative.
+- **Slow launches:** 433 ms (2 October) and 479 ms (3 October), each the
+  first of three, against medians of 159 and 170 ms. Probably the first
+  launch after a build; PLAN 2.6a investigates.
+- **The `bigFileNoPause` run 1 outlier of 2 October is ignored** (2,048 of
+  5,455 late, 37.5%). Rob was using the Mac and moving windows around
+  during it. The 3 October runs had no such outlier.
 - **The per-window AppKit baseline** (21 MB) was measured on the locked
   screen in 1.10. The idle heap is higher unlocked (9.6 MB against
   2.5 MB), so the baseline may be too. `leal-perf` doesn't measure it
@@ -122,9 +138,9 @@ That is why the scrolling verdicts needed Rob's unlocked run.
 
 - **This isn't the reference machine.** The 1.3 notes expect a base M1
   Air to be 2–3× slower than the M5 Pro. Hence the 3× rule for scrolling.
-  At that rate the full index (170 ms) and the warm open (39 ms) would
-  still pass, launch (159 ms, so 320–480 ms) would be borderline, and
-  launch with a file (313 ms, so 630–940 ms) would fail. That is a guess,
+  At that rate the full index (141 ms) and the warm open (48 ms) would
+  still pass, launch (170 ms, so 340–510 ms) would be borderline, and
+  launch with a file (364 ms, so 730–1,090 ms) would fail. That is a guess,
   not a measurement. Memory doesn't depend on the core,
   so the heap and idle numbers carry over.
 - **The reference machine's display is 60 Hz.** A base M1 Air can't show
@@ -142,8 +158,8 @@ That is why the scrolling verdicts needed Rob's unlocked run.
 - **On a base M1 Air the 3× rule doesn't apply.** It stands in for the
   Air, so `just perf` leaves it out when the machine is a `MacBookAir10,1`
   and says so in the row.
-- **Runs vary.** The after-load scroll gave 3, 4 and 6 late frames; the
-  launch 133–433 ms.
+- **Runs vary.** The after-load scroll gave 1, 0 and 0 late frames with
+  strips (0, 2 and 0 with AppKit's drawing); the launch 156–479 ms.
 - **`just perf --no-scroll`** measures the heap only after opening, with no
   search's results held, so its heap row says "pass (search results
   untested)" rather than "pass". So does a saved run from before the
@@ -193,7 +209,7 @@ Decided by Rob at the phase 1 gate, 2 October 2026
 - **The 3× rule.** The base M1 Air stays the design target. None is
   available, so the M5 Pro must show about 3× headroom (main-thread work
   per scroll frame ≤ about 2.8 ms), and an Air is checked during the beta.
-  `just perf` checks it at p50 and p99. Scrolling fails it today: PLAN 2.0a.
+  `just perf` checks it at p50 and p99. Scrolling failed it then; 2.0a and 2.0b fixed it ("Results").
 
 ## Commands
 

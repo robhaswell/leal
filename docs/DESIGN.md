@@ -827,7 +827,9 @@ to run concurrently and asserts first paint is still under 150 ms.
   header row, columns auto-sized (with a maximum width) from the first
   screen of rows at first paint and then from the first 1,000 rows as P2
   work (§3.10), numbers right-aligned, subtle alternate row shading,
-  optional monospaced font.
+  optional monospaced font. The grid and the gutter draw into strips of
+  rows that scrolling moves instead of redrawing, and grids wider than 1.5×
+  the visible width use AppKit's own drawing (ADR-0011).
 - **Filter bar:** hidden until used (⌘F for find, ⌥⌘F for filters).
 - **Cell inspector:** a bottom pane for long or multiline values, with editing.
 - **Status bar:** `1,000,000 rows × 12 columns · Comma · CRLF · UTF-8 (BOM)`,
