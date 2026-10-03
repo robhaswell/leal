@@ -60,6 +60,9 @@ proptest! {
             .map(|r| r.fields.iter().map(|f| decode_value(&f.value, case.file.encoding)).collect())
             .collect();
         prop_assert_eq!(got, values);
+        // The saved file's layout, for editing it in its turn, is what a
+        // parse finds.
+        prop_assert_eq!(saved.layout.as_ref(), Some(&parsed.layout));
         // Clean files stay clean: no text after quotes, no unterminated quote.
         let clean = parsed
             .layout
@@ -80,6 +83,16 @@ proptest! {
                 if case.edits.is_empty() {
                     check_identical(&case.file.bytes, &saved.bytes)?;
                 }
+                // The saved file's layout is what a parse finds, so it can
+                // be edited in its turn: saved again unedited, it is the
+                // same bytes.
+                let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), case.file.encoding);
+                let layout = saved.layout.as_ref().unwrap();
+                prop_assert_eq!(layout, &parsed.layout);
+                let again = Document::new(&saved.bytes, layout, case.file.delimiter(), case.file.encoding)
+                    .save()
+                    .unwrap();
+                prop_assert_eq!(&again.bytes, &saved.bytes);
             }
             Err(SaveError::Unencodable(cells)) => {
                 prop_assert_eq!(case.file.encoding, Encoding::Windows1252);

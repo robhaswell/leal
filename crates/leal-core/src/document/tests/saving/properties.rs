@@ -31,12 +31,19 @@
 //!   Or the cells that can't be converted, named as the oracle names them,
 //!   and nothing written.
 //!
+//! - **Rows inserted and deleted** (task 2.4c, F6): the strategy's row
+//!   inserts and deletes are replayed with its cell edits, and saved splice
+//!   for splice; the new reading's index, built from the save's plan,
+//!   is the saved file's.
+//! - **Undo after a save** (ADR-0012 decision 4, ADR-0014 decision 3): every
+//!   command undone afterwards, by value, saves as the oracle saves the
+//!   same undos made on the saved file.
+//!
 //! The case's existing encoding hint is passed through as a real
-//! `com.apple.TextEncoding` on the file before it is opened. The edit
-//! strategy also makes row and column inserts and deletes, which are task
-//! 2.4's; only its cell edits are replayed (as in task 2.1), with the oracle
-//! replaying the same ones, so some name a row that isn't there and both
-//! refuse them.
+//! `com.apple.TextEncoding` on the file before it is opened. TODO(2.4b): the
+//! strategy's column inserts and deletes are left out until task 2.4b; the
+//! later edits' coordinates were resolved with them in place, so some name
+//! a row or cell that isn't there, and both refuse them.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,6 +103,7 @@ fn tk_line_ending(l: crate::dialect::LineEnding) -> tk::LineEnding {
 fn tk_fix(fix: Fix) -> OracleFix {
     match fix {
         Fix::EmptyRowQuoted { row } => OracleFix::EmptyRowQuoted { row },
+        Fix::CrSplit { row } => OracleFix::CrSplit { row },
         Fix::BomLikeQuoted => OracleFix::BomLikeQuoted,
     }
 }
@@ -158,46 +166,140 @@ fn set(row: usize, column: usize, value: &str) -> OracleEdit {
     }
 }
 
-/// The case's cell edits in the order the strategy tried them, the ones
-/// the oracle refused (ADR-0004 decision 8) included at their places.
-fn cell_edits(case: &EditCase) -> Vec<(usize, usize, String)> {
-    let cell = |edit: &OracleEdit| match edit {
-        OracleEdit::SetCell { row, column, value } => Some((*row, *column, value.clone())),
-        _ => None,
+/// The case's cell edits and row inserts and deletes, in the order the
+/// strategy tried them, the ones the oracle refused (ADR-0004 decision 8)
+/// included at their places. TODO(2.4b): column inserts and deletes too.
+fn case_edits(case: &EditCase) -> Vec<OracleEdit> {
+    let keep = |edit: &&OracleEdit| {
+        !matches!(
+            edit,
+            OracleEdit::InsertColumn { .. } | OracleEdit::DeleteColumn { .. }
+        )
     };
     let mut all = Vec::new();
     let mut refused = case.refused.iter().peekable();
     for (at, edit) in case.edits.iter().enumerate() {
         while let Some((_, edit)) = refused.next_if(|(place, _)| *place == at) {
-            all.extend(cell(edit));
+            all.extend(Some(edit).filter(keep).cloned());
         }
-        all.extend(cell(edit));
+        all.extend(Some(edit).filter(keep).cloned());
     }
-    all.extend(refused.filter_map(|(_, edit)| cell(edit)));
+    all.extend(refused.map(|(_, edit)| edit).filter(keep).cloned());
     all
 }
 
-/// Opens `case`'s file ([`open_case`]) and replays its cell edits on the
+/// A command the document made, and the oracle edits that undo it by
+/// value, on the file a save wrote.
+struct Made {
+    command: Command,
+    undo: Vec<OracleEdit>,
+}
+
+/// Opens `case`'s file ([`open_case`]) and replays its edits on the
 /// document and on the oracle, which must accept and refuse the same.
+#[expect(clippy::type_complexity, reason = "what a case starts from")]
 fn open_and_edit(
     case: &EditCase,
-) -> Result<(Arc<Document>, PathBuf, bool, Oracle<'_>), TestCaseError> {
+) -> Result<(Arc<Document>, PathBuf, bool, Oracle<'_>, Vec<Made>), TestCaseError> {
     let (document, opened, chosen_encoding) = open_case(case);
     let mut oracle = case.file.document().with_existing_hint(case.existing_hint);
-    for (row, column, value) in cell_edits(case) {
-        let expected = oracle.apply(&set(row, column, &value));
-        let got = document.set_cell(row, column, &value);
-        match (&expected, &got) {
-            (Ok(()), Ok(_))
+    let mut made = Vec::new();
+    for edit in case_edits(case) {
+        let before = oracle.clone();
+        let expected = oracle.apply(&edit);
+        let (got, undo) = match &edit {
+            OracleEdit::SetCell { row, column, value } => {
+                let old = before.value(*row, *column).unwrap_or_default();
+                (
+                    document.set_cell(*row, *column, value),
+                    vec![set(*row, *column, &old)],
+                )
+            }
+            OracleEdit::InsertRow { at, values } => (
+                document.insert_rows(*at, std::slice::from_ref(values)),
+                vec![OracleEdit::DeleteRow { row: *at }],
+            ),
+            OracleEdit::DeleteRow { row } => {
+                let values = (0..before.row_len(*row))
+                    .map(|column| before.value(*row, column).unwrap_or_default())
+                    .collect();
+                (
+                    document.delete_rows(*row, 1),
+                    vec![OracleEdit::InsertRow { at: *row, values }],
+                )
+            }
+            OracleEdit::InsertColumn { .. } | OracleEdit::DeleteColumn { .. } => unreachable!(),
+        };
+        match (&expected, got) {
+            (Ok(()), Ok(Some(command))) => made.push(Made { command, undo }),
+            (Ok(()), Ok(None))
             | (Err(OracleError::InvalidEdit(_)), Err(EditError::NoSuchRow { .. }))
             | (
                 Err(OracleError::AfterUnterminatedQuote(_)),
                 Err(EditError::AfterUnterminatedQuote { .. }),
             ) => {}
-            _ => prop_assert!(false, "oracle {:?}, document {:?}", expected, got),
+            (_, got) => prop_assert!(
+                false,
+                "{:?}: oracle {:?}, document {:?}",
+                edit,
+                expected,
+                got
+            ),
         }
     }
-    Ok((document, opened, chosen_encoding, oracle))
+    Ok((document, opened, chosen_encoding, oracle, made))
+}
+
+/// Undoes every command in `made` after the save that wrote `saved`, by
+/// value, and the same undos on an oracle of the saved file: the next
+/// save is the same, splice for splice (ADR-0012 decision 4, ADR-0014
+/// decision 3). Returns whether a row command was undone.
+fn check_undo_after_save(
+    document: &Document,
+    case: &EditCase,
+    saved: &SavedFile,
+    made: &[Made],
+) -> Result<bool, TestCaseError> {
+    let layout = saved.layout.as_ref().unwrap();
+    let mut oracle = Oracle::new(
+        &saved.bytes,
+        layout,
+        case.file.delimiter(),
+        case.file.encoding,
+    );
+    for made in made.iter().rev() {
+        let got = document.apply(&made.command.inverse());
+        let expected = made.undo.iter().try_for_each(|edit| oracle.apply(edit));
+        match (&expected, &got) {
+            (Ok(()), Ok(_)) => {}
+            _ => prop_assert!(
+                false,
+                "undo {:?}: oracle {:?}, document {:?}",
+                made.undo,
+                expected,
+                got
+            ),
+        }
+    }
+    let plan = document.save_plan(SaveKind::Save);
+    match (oracle.save(), plan) {
+        (Ok(expected), Ok(plan)) => {
+            let splices: Vec<Change> = plan
+                .splices()
+                .iter()
+                .map(|s| Change::replace(s.range.clone(), s.bytes.clone()))
+                .collect();
+            prop_assert_eq!(&splices, &expected.changes);
+            let fixes: Vec<OracleFix> = plan.fixes().iter().copied().map(tk_fix).collect();
+            prop_assert_eq!(&fixes, &expected.fixes);
+            prop_assert_eq!(plan.rows(), oracle.row_count());
+        }
+        (Err(OracleError::Unencodable(cells)), Err(SaveError::Unencodable { cells: got, .. })) => {
+            prop_assert_eq!(got, cells);
+        }
+        (expected, plan) => prop_assert!(false, "oracle {:?}, plan {:?}", expected, plan),
+    }
+    Ok(made.iter().any(|made| made.command.is_structural()))
 }
 
 /// How a case is saved: Save over the file; Save over it after another
@@ -231,6 +333,8 @@ struct Covered {
     /// A single-byte file whose save wrote bytes 0x80–0xFF in a splice:
     /// characters other than ASCII, in that encoding.
     high_bytes: bool,
+    /// Rows inserted or deleted, saved, and undone after the save.
+    rows: bool,
 }
 
 /// How a case went, for the coverage test.
@@ -251,7 +355,7 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
     // Tiny write chunks (61 bytes, prime), so the writer's copies between
     // splices cross chunk boundaries everywhere, inside rows and fields.
     crate::document::saving::TEST_CHUNK_BYTES.store(61, Ordering::Relaxed);
-    let (document, opened, chosen_encoding, oracle) = open_and_edit(case)?;
+    let (document, opened, chosen_encoding, oracle, made) = open_and_edit(case)?;
     let lineage = document.lineage();
     let expected = oracle.save();
     let kind = if mode == Mode::SaveAs {
@@ -290,7 +394,7 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
     }
     let encoding = document.detection().encoding;
 
-    let covered;
+    let mut covered;
     let saved = match (expected, plan, result) {
         (Ok(saved), Ok(plan), Ok(done)) => {
             covered = Covered {
@@ -313,6 +417,7 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
                         .splices()
                         .iter()
                         .any(|s| s.bytes.iter().any(|&b| b >= 0x80)),
+                rows: false,
             };
             prop_assert!(done.edits_during_save.is_empty());
             prop_assert_eq!(
@@ -391,28 +496,31 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
     prop_assert!(!document.has_edits());
     prop_assert_eq!(document.lineage(), lineage);
     prop_assert!(!document.original().diverged);
-    // The new reading's first rows come from the old index shifted by the
-    // splices: the same rows as the saved bytes indexed afresh.
-    {
-        let reading = document.current();
-        let built = RowIndex::build(&on_disk, reading.parser.dialect()).unwrap();
-        prop_assert_eq!(reading.head_rows, built.row_count());
-        for row in 0..reading.head_rows {
-            prop_assert_eq!(
-                reading.head_index.row_extent(row),
-                built.row_extent(row),
-                "row {}",
-                row
-            );
-        }
+    // The new reading's index is built from the save's plan, complete at
+    // once: the same rows as the saved bytes indexed afresh, and once its
+    // index pass ends, the same field count mode.
+    let reading = document.current();
+    let built = RowIndex::build(&on_disk, reading.parser.dialect()).unwrap();
+    prop_assert_eq!(reading.index.status(), crate::index::Status::Complete);
+    prop_assert_eq!(reading.index.row_count(), built.row_count());
+    for row in 0..=built.row_count() {
         prop_assert_eq!(
-            reading.head_index.unterminated_quote(),
-            built.unterminated_quote()
+            reading.index.row_extent(row),
+            built.row_extent(row),
+            "row {}",
+            row
         );
     }
+    prop_assert_eq!(
+        reading.index.unterminated_quote(),
+        built.unterminated_quote()
+    );
     wait_for_index(&document);
+    prop_assert_eq!(reading.index.field_count_mode(), built.field_count_mode());
+    drop(reading);
     check_rows(&document, &oracle, &saved)?;
     check_reopen(&document, &path, &oracle, &saved, encoding)?;
+    covered.rows = check_undo_after_save(&document, case, &saved, &made)?;
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&opened);
     Ok(Outcome::Compared(covered))
@@ -513,7 +621,7 @@ enum Converted {
 /// a new place, against the oracle's `save_as_utf8` (see the module docs).
 fn save_as_utf8_matches_the_oracle(case: &EditCase) -> Result<Converted, TestCaseError> {
     crate::document::saving::TEST_CHUNK_BYTES.store(61, Ordering::Relaxed);
-    let (document, opened, _, oracle) = open_and_edit(case)?;
+    let (document, opened, _, oracle, _) = open_and_edit(case)?;
     let lineage = document.lineage();
     let before = document.detection();
     let expected = oracle.save_as_utf8();
@@ -720,7 +828,7 @@ fn the_save_properties_compare_most_cases() {
     );
     let strategy = (cases(), modes());
     let (mut compared, mut unencodable) = (0, 0);
-    let (mut hatched, mut fixed, mut quote_all, mut high_bytes) = (0, 0, 0, 0);
+    let (mut hatched, mut fixed, mut quote_all, mut high_bytes, mut rows) = (0, 0, 0, 0, 0);
     for _ in 0..400 {
         let (case, mode) = strategy.new_tree(&mut runner).unwrap().current();
         match save_matches_the_oracle(&case, mode).unwrap() {
@@ -730,6 +838,7 @@ fn the_save_properties_compare_most_cases() {
                 fixed += usize::from(covered.fixed);
                 quote_all += usize::from(covered.quote_all);
                 high_bytes += usize::from(covered.high_bytes);
+                rows += usize::from(covered.rows);
             }
             Outcome::Unencodable => unencodable += 1,
             Outcome::ReadOnly => {}
@@ -749,7 +858,7 @@ fn the_save_properties_compare_most_cases() {
         }
     }
     eprintln!(
-        "saves: {compared} compared ({hatched} hatched, {fixed} fixed, {quote_all} quoting every field, {high_bytes} writing high bytes), {unencodable} unencodable; Save As UTF-8 written from {} encodings, refused {refused_single} single-byte, {refused_utf16} UTF-16",
+        "saves: {compared} compared ({hatched} hatched, {fixed} fixed, {quote_all} quoting every field, {high_bytes} writing high bytes, {rows} with rows changed), {unencodable} unencodable; Save As UTF-8 written from {} encodings, refused {refused_single} single-byte, {refused_utf16} UTF-16",
         written.len()
     );
     assert!(
@@ -767,6 +876,7 @@ fn the_save_properties_compare_most_cases() {
         "{high_bytes} writing high bytes"
     );
     assert!(unencodable >= MIN_UNENCODABLE, "{unencodable} unencodable");
+    assert!(rows >= MIN_ROWS, "{rows} with rows changed");
     assert!(written.contains(&Encoding::Utf16Le) || written.contains(&Encoding::Utf16Be));
     assert!(written.len() >= 10, "written from {written:?}");
     assert!(
@@ -791,5 +901,7 @@ const MIN_FIXED: usize = 23;
 const MIN_QUOTE_ALL: usize = 10;
 const MIN_HIGH_BYTES: usize = 36;
 const MIN_UNENCODABLE: usize = 17;
+/// About half of what the fixed seed gives (115 when written, task 2.4c).
+const MIN_ROWS: usize = 57;
 const MIN_REFUSED_SINGLE_BYTE: usize = 2;
 const MIN_REFUSED_UTF16: usize = 31;

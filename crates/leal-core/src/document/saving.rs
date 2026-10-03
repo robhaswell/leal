@@ -18,8 +18,10 @@
 //! 3. for Save, checks the user's file afresh: still the one Leal opened or
 //!    last saved (ADR-0008 decision 9), writable, and not locked (ADR-0012
 //!    decision 1);
-//! 4. writes the new file next to the destination ([`Staged`]), in file
-//!    order, making each edited row's splices as it reaches it: the
+//! 4. writes the new file next to the destination ([`Staged`]), walking
+//!    the rows in order through the piece list (task 2.4c), making each
+//!    row's splices as it reaches it (edited rows, deleted rows, inserted
+//!    rows, and rows whose neighbours changed): the
 //!    snapshot's bytes a chunk at a time with a checkpoint between chunks
 //!    (ADR-0005 decision 6). On a volume that can vanish it also tees the
 //!    bytes to a copy on the internal disk. Save As UTF-8 (task 2.3)
@@ -35,10 +37,12 @@
 //!    replaced, and copies the metadata again), and puts the new one in
 //!    place: swapped, and the one swapped out checked, where the volume
 //!    can swap; renamed over it where it can't ([`Placed`]);
-//! 7. rebases: makes the new reading with no lock held, its index the old
-//!    one shifted by the splices (cell edits never move a row boundary), so
-//!    every row reads at once; the index pass runs again in the background
-//!    only for the diagnostics and the review. A file converted to UTF-8
+//! 7. rebases: makes the new reading with no lock held, its index built
+//!    from the plan (each row's start in the new file, noted as it was
+//!    written, task 2.4c), so every row reads at once and rows can be
+//!    inserted and deleted again at once; the index pass runs again in the
+//!    background only for the diagnostics, the field count mode and the
+//!    review. A file converted to UTF-8
 //!    moved every byte, so its new reading waits for that pass instead
 //!    (about 60 ms per 100 MB), before it is current. Then, under the
 //!    writer lock, carries the edits made during the save (after step 2)
@@ -56,6 +60,7 @@
 //!
 //! [`EditStore::rebased`]: crate::edit::EditStore::rebased
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -65,15 +70,20 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::Duration;
 
-use super::{Context, Document, FirstScreen, Reading, Restarted, read_first_paint, start_jobs};
+use super::view::{RowView, ViewCell};
+use super::{
+    Context, Document, FirstScreen, Reading, Restarted, RowBytes, inserted_row, read_first_paint,
+    start_jobs, to_usize,
+};
 use crate::detect::{CensusStream, Choices, FIRST_PAINT_BYTES};
-use crate::dialect::{Bom, Encoding};
-use crate::edit::{CellId, EditStore, Overlay};
+use crate::dialect::{Bom, Encoding, LineEnding};
+use crate::edit::{CellId, EditStore, Overlay, RowEdits, RowId, RowMap, Segment};
 use crate::index::{MAX_FILE_BYTES, RowIndex, Status};
+use crate::rows::{FieldSpan, ParsedRow};
 use crate::save::{
-    AttributeFacts, AttributePlan, EditedRow, Fix, MAX_NAMED_CELLS, Placed, RowRules, SaveError,
-    SaveKind, SavePhase, SaveProgress, SaveRequest, Saved, Splice, Transcoder, checked_len, encode,
-    needs_census, row_splices,
+    AttributeFacts, AttributePlan, ColumnQuoting, EditedRow, Fix, MAX_NAMED_CELLS, NewCell, Placed,
+    RowRules, SaveError, SaveKind, SavePhase, SaveProgress, SaveRequest, Saved, Splice, Transcoder,
+    WholeRow, checked_len, encode, needs_census, row_splices, whole_row_bytes,
 };
 use crate::schedule::{Interval, JobError, JobHandle, Priority};
 use crate::source::{
@@ -291,8 +301,11 @@ impl Extent<'_> {
 #[derive(Debug, Default)]
 struct Streamed {
     fixes: Vec<Fix>,
-    /// Each edited row, and how many bytes longer it became.
-    deltas: Vec<(usize, i64)>,
+    /// The logical rows written.
+    rows: usize,
+    /// Each row's start in the new file, for its index (`None` when
+    /// converting, or if the file would be too large).
+    starts: Option<Vec<u32>>,
     len: u64,
     /// The old file's unterminated quote: where it is in the new one, or
     /// gone if its cell was edited (the quote closed).
@@ -393,8 +406,7 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
-        check_rows(&overlay)?;
-        check_encodable(&overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent)?;
         let mut sink = Collect::default();
         let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
         if !sink.refused.is_empty() {
@@ -407,11 +419,11 @@ impl Document {
         Ok(crate::save::SavePlan {
             splices: sink.splices,
             end: extent.end,
-            rows: extent.rows,
+            rows: streamed.rows,
             complete: extent.complete,
+            skipped: skipped_edits(&reading, &overlay, streamed.rows),
             fixes: streamed.fixes,
             len: streamed.len,
-            skipped: skipped_edits(&overlay, extent.rows),
         })
     }
 
@@ -429,13 +441,18 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
-        check_rows(&overlay)?;
-        check_encodable(&overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent)?;
         let progress = SaveShared::default();
         let mut census = (!extent.converts()).then(CensusStream::default);
-        let mut sink = FileSink::new(&reading, &extent, out, &progress, census.as_mut(), &|| {
-            Ok(())
-        });
+        let mut sink = FileSink::new(
+            &reading,
+            overlay.map(),
+            &extent,
+            out,
+            &progress,
+            census.as_mut(),
+            &|| Ok(()),
+        );
         let mut streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
         sink.finish(&mut streamed)?;
         Ok(streamed.len)
@@ -529,8 +546,7 @@ impl Document {
             SaveKind::SaveAs | SaveKind::SaveAsUtf8 => existing_at(&destination)?,
         };
         let extent = extent_of(&reading, kind)?;
-        check_rows(&overlay)?;
-        check_encodable(&overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent)?;
 
         // 4: the new file. Its length is known once it is written; until
         // then, the snapshot's bytes stand in for it.
@@ -557,10 +573,11 @@ impl Document {
         let utf8 = kind == SaveKind::SaveAsUtf8;
         let mut census =
             (needs_census(detection, had_text_encoding) && !utf8).then(CensusStream::default);
-        let (streamed, head) = {
+        let (mut streamed, head) = {
             let mut out = BufWriter::with_capacity(SAVE_CHUNK_BYTES, staged.writer());
             let mut sink = FileSink::new(
                 &reading,
+                overlay.map(),
                 &extent,
                 &mut out,
                 progress,
@@ -697,16 +714,19 @@ impl Document {
             interpretation: interpretation.map(String::into_bytes),
         };
         let estimated_rows = super::estimated_rows(&reading, &reading.head, reading.source.len());
-        let mut skipped_edits = skipped_edits(&overlay, extent.rows);
+        let mut skipped_edits = skipped_edits(&reading, &overlay, streamed.rows);
         // The rebase: the new reading is made without the writer lock, and
         // takes it only to carry the edits over and become current.
         let adopted =
             Source::from_snapshot(&destination, snapshot, identity, raw, temps, kind_of_volume)
                 .map_err(|error| error.to_string())
-                .and_then(|source| self.rebuilt(&reading, &Arc::new(source), &extent, &streamed))
+                .and_then(|source| {
+                    let starts = streamed.starts.take();
+                    self.rebuilt(&reading, &Arc::new(source), &extent, &streamed, starts)
+                })
                 .and_then(|new| {
                     reached(BEFORE_ADOPT);
-                    self.adopt(&reading, new, &overlay, version, extent.rows)
+                    self.adopt(&reading, new, &overlay, version, streamed.rows)
                 });
         // Deletes the old file a swap left in the new file's folder (unless
         // it was kept), with no lock held.
@@ -727,8 +747,8 @@ impl Document {
                     generation: new.generation,
                     detection: new.detection.clone(),
                     rows,
-                    row_count: extent.rows,
-                    estimated_row_count: extent.rows,
+                    row_count: streamed.rows,
+                    estimated_row_count: streamed.rows,
                     column_count,
                 };
                 (Some(screen), None, carried)
@@ -746,7 +766,7 @@ impl Document {
         Ok(Saved {
             path: as_on_disk(&destination),
             len: streamed.len,
-            rows: extent.rows,
+            rows: streamed.rows,
             complete: extent.complete,
             estimated_rows,
             skipped_edits,
@@ -785,16 +805,18 @@ impl Document {
 
     /// The new reading of the file a save wrote, whose snapshot is
     /// `source`, split into cells the way `old` was, in `old`'s lineage,
-    /// with no edits yet. Its rows are `old`'s index shifted by
-    /// `streamed`'s deltas, so they read at once; its index pass runs again
-    /// for the diagnostics and the review. Or why it couldn't be made (the
-    /// document then keeps reading `old`).
+    /// with no edits yet. Its rows come from an index built from the save's
+    /// plan (`starts`, task 2.4c), complete at once, so they read at once
+    /// and rows can be inserted and deleted again; its index pass runs
+    /// again for the diagnostics, the field count mode and the review. Or
+    /// why it couldn't be made (the document then keeps reading `old`).
     fn rebuilt(
         &self,
         old: &Reading,
         source: &Arc<Source>,
         extent: &Extent<'_>,
         streamed: &Streamed,
+        starts: Option<Vec<u32>>,
     ) -> Result<Rebuilt, String> {
         let head: Arc<[u8]> = Arc::from(
             &*source
@@ -848,14 +870,21 @@ impl Document {
             paint.head_index.field_count_mode().unwrap_or(0)
         } else {
             let len = usize::try_from(streamed.len).map_err(|error| error.to_string())?;
-            let shifted = extent
-                .index
-                .shifted(extent.rows, &streamed.deltas, len, streamed.unterminated)
+            let index = starts
+                .and_then(|starts| {
+                    RowIndex::from_starts(
+                        extent.index.dialect(),
+                        starts,
+                        len,
+                        extent.index.field_count_mode(),
+                        streamed.unterminated,
+                    )
+                })
                 .ok_or("the saved file's rows don't add up")?;
-            let column_count = shifted.field_count_mode().unwrap_or(0);
-            // Served until the new index pass passes them.
-            paint.head_index = shifted;
-            paint.head_rows = extent.rows;
+            let column_count = index.field_count_mode().unwrap_or(0);
+            // The rows are served from it; the index pass fills one of its
+            // own, for the diagnostics and the field count mode.
+            paint.index = Arc::new(index);
             column_count
         };
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
@@ -988,28 +1017,34 @@ fn may_replace(destination: &Path, existing: &Existing) -> Result<(), SaveError>
 /// edited in its row.
 fn touched_cells(old: &Reading, written: &Overlay, version: usize) -> Vec<(usize, Vec<usize>)> {
     // Rows can't be inserted or deleted while a save runs (ADR-0014
-    // decision 1), so every row touched is a row of the file, where it was.
+    // decision 1), so the piece list now is the snapshot's: each row
+    // touched is at its logical row there, which is its row in the new
+    // file.
+    // Nor columns (decision 1): each cell is at its logical column under
+    // the snapshot's column operations, its column in the new file.
     let (touched, _, _) = old.edits.since(version);
-    touched
+    let ops = written.columns();
+    let mut cells: Vec<(usize, Vec<usize>)> = touched
         .into_iter()
         .filter_map(|touched| {
-            let row = usize::try_from(touched.id.physical()?).ok()?;
-            let mut columns: Vec<usize> = touched
-                .edits
-                .iter()
-                .flat_map(|edits| edits.base_cells().into_iter().map(|(column, _)| column))
-                .collect();
-            columns.extend(
-                written
-                    .row(row)
+            let row = logical_row(written, touched.id)?;
+            let inserted = touched.id.inserted_index();
+            let shown = |edits: &RowEdits| -> Vec<usize> {
+                edits
+                    .shown(ops, inserted)
                     .into_iter()
-                    .flat_map(|edits| edits.base_cells().into_iter().map(|(column, _)| column)),
-            );
+                    .map(|(column, _)| column)
+                    .collect()
+            };
+            let mut columns: Vec<usize> = touched.edits.iter().flat_map(|e| shown(e)).collect();
+            columns.extend(written.edits(touched.id).into_iter().flat_map(|e| shown(e)));
             columns.sort_unstable();
             columns.dedup();
             Some((row, columns))
         })
-        .collect()
+        .collect();
+    cells.sort_unstable();
+    cells
 }
 
 /// Carries the edits made in `old` since `version` (during a save) over to
@@ -1126,17 +1161,45 @@ fn resolve_link(path: &Path) -> PathBuf {
     }
 }
 
-/// The edited cells (row, column) on rows that aren't written.
-fn skipped_edits(overlay: &Overlay, rows: usize) -> Vec<(usize, usize)> {
-    overlay
-        .rows_in(rows..usize::MAX)
-        .flat_map(|(row, edits)| {
-            edits
-                .base_cells()
-                .into_iter()
-                .map(move |(column, _)| (row, column))
-        })
-        .collect()
+/// The edited cells (logical row, column) on rows that aren't written,
+/// those of the first `rows` logical rows being written (Save As from an
+/// incomplete document, ADR-0008 decision 6): edited cells shown (not those
+/// a column delete hid), and inserted rows' own and inserted cells.
+fn skipped_edits(reading: &Reading, overlay: &Overlay, rows: usize) -> Vec<(usize, usize)> {
+    let past = |id| logical_row(overlay, id).filter(|&row| row >= rows);
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    for (id, edits) in overlay.all() {
+        if id.inserted_index().is_none()
+            && let Some(row) = past(id)
+        {
+            let shown = edits.shown(overlay.columns(), None);
+            cells.extend(shown.into_iter().map(|(column, _)| (row, column)));
+        }
+    }
+    for n in overlay.inserted_rows().map(|(n, _)| n) {
+        if let Some(row) = past(RowId::inserted(n)) {
+            new_cells(reading, overlay, n, &mut |column, _| {
+                cells.push((row, column))
+            });
+        }
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    cells
+}
+
+/// Calls `each` with each cell of inserted row `n` that holds a value (its
+/// own, an inserted column's, or an edit), by logical column.
+fn new_cells(reading: &Reading, overlay: &Overlay, n: u32, each: &mut dyn FnMut(usize, &str)) {
+    let Some((row, cells)) = inserted_row(overlay, n) else {
+        return;
+    };
+    let view = RowView::inserted(&reading.parser, row, cells);
+    for (column, cell) in view.filled() {
+        if let ViewCell::New(value) | ViewCell::Edited(value) = cell {
+            each(column, value);
+        }
+    }
 }
 
 /// What of `reading` a save writes: all of it, or (Save As from an
@@ -1178,42 +1241,105 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
     })
 }
 
-/// Until task 2.4c, a save with rows inserted or deleted is refused before
-/// anything is written: the writer doesn't walk the piece list yet.
-fn check_rows(overlay: &Overlay) -> Result<(), SaveError> {
-    if overlay.map().is_identity() && overlay.columns().is_empty() {
-        Ok(())
-    } else {
-        Err(SaveError::RowsChanged)
-    }
-}
-
 /// Every edited value written must be encodable in the encoding written
-/// (F5): checked before anything is written, naming each cell that isn't.
-fn check_encodable(overlay: &Overlay, extent: &Extent<'_>) -> Result<(), SaveError> {
+/// (F5): checked before anything is written, naming each cell that isn't,
+/// by its logical row and column: edited cells shown (a deleted column's
+/// aren't written), inserted rows' cells, and the cells a column insert
+/// gave original rows, which are looked for (a pass over the file) only if
+/// one of its values can't be encoded.
+fn check_encodable(
+    reading: &Reading,
+    overlay: &Overlay,
+    extent: &Extent<'_>,
+) -> Result<(), SaveError> {
     let encoding = extent.target;
-    let cells: Vec<(usize, usize)> = overlay
-        .rows_in(0..extent.rows)
-        .flat_map(|(row, edits)| {
-            edits
-                .base_cells()
-                .into_iter()
-                .filter(|(_, value)| encode(value, encoding).is_err())
-                .map(move |(column, _)| (row, column))
-        })
-        .collect();
-    if cells.is_empty() {
-        Ok(())
+    let rows = overlay.map().rows_within(extent.rows);
+    let bad = |value: &str| encode(value, encoding).is_err();
+    let columns = overlay.columns();
+    let new_bad = columns.ops().iter().any(|op| op.values().any(&bad));
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    if new_bad {
+        // Every original row, as it reads, for its inserted cells too.
+        let mut start = 0;
+        while start < extent.rows {
+            let batch = start..extent.rows.min(start + QUOTE_SCAN_ROWS);
+            Document::read_physical(reading, overlay, batch.clone(), &mut |view| {
+                let Some(row) = logical_row(overlay, view.id()).filter(|&row| row < rows) else {
+                    return;
+                };
+                for (column, cell) in view.filled() {
+                    if let ViewCell::New(value) | ViewCell::Edited(value) = cell
+                        && bad(value)
+                    {
+                        cells.push((row, column));
+                    }
+                }
+            })?;
+            start = batch.end;
+        }
     } else {
-        Err(SaveError::Unencodable { encoding, cells })
+        for (id, edits) in overlay.all() {
+            if id.inserted_index().is_some() {
+                continue;
+            }
+            let Some(row) = logical_row(overlay, id).filter(|&row| row < rows) else {
+                continue;
+            };
+            let shown = edits.shown(columns, None);
+            cells.extend(
+                shown
+                    .into_iter()
+                    .filter(|(_, value)| bad(value))
+                    .map(|(column, _)| (row, column)),
+            );
+        }
+    }
+    for n in overlay.inserted_rows().map(|(n, _)| n) {
+        let Some(row) = logical_row(overlay, RowId::inserted(n)).filter(|&row| row < rows) else {
+            continue;
+        };
+        new_cells(reading, overlay, n, &mut |column, value| {
+            if bad(value) {
+                cells.push((row, column));
+            }
+        });
+    }
+    if cells.is_empty() {
+        return Ok(());
+    }
+    cells.sort_unstable();
+    Err(SaveError::Unencodable { encoding, cells })
+}
+
+/// Row `id`'s logical row in `overlay`: an original row's (`None` if it is
+/// deleted), or an inserted row's.
+fn logical_row(overlay: &Overlay, id: RowId) -> Option<usize> {
+    let map = overlay.map();
+    match id.physical() {
+        Some(physical) => map.logical_of(physical).ok(),
+        None => {
+            let n = id.inserted_index()?;
+            map.logical_of_inserted(n, overlay.inserted(n)?.gap())
+        }
     }
 }
 
-/// Writes the save to `sink` in file order: the snapshot's bytes between
-/// the edited rows, and each edited row's splices, made as it is reached.
-/// A checkpoint every [`ROWS_PER_CHECKPOINT`] edited rows (and the sink's
-/// own, between chunks). Refuses [`SaveError::TooLarge`] as soon as the
-/// output passes [`MAX_FILE_BYTES`], before the file goes anywhere.
+/// Writes the save to `sink`: the snapshot's logical rows in order, walking
+/// its piece list (task 2.4c), with the save oracle's splices, splice for
+/// splice (DESIGN §3.7, `docs/tasks/2.4.md` §6):
+///
+/// - a stretch of original rows is copied in bulk, but for its edited rows
+///   and any row whose neighbours changed (its first, and its last if it
+///   now ends the file or used to), which go through [`row_splices`];
+/// - each deleted original row is one delete of its whole extent;
+/// - a run of inserted rows is one insert at the start of the next
+///   original row, deleted or not, or at the end ([`whole_row_bytes`]);
+/// - with a column operation, every row is looked at, and one whose cells
+///   it moved, took or added to is written whole from how it reads now.
+///
+/// A checkpoint every [`ROWS_PER_CHECKPOINT`] rows written one by one (and
+/// the sink's own, between chunks). Refuses [`SaveError::TooLarge`] as soon
+/// as the output passes [`MAX_FILE_BYTES`], before the file goes anywhere.
 fn stream(
     reading: &Reading,
     overlay: &Overlay,
@@ -1221,123 +1347,537 @@ fn stream(
     sink: &mut dyn Sink,
     checkpoint: &dyn Fn() -> Result<(), SaveError>,
 ) -> Result<Streamed, SaveError> {
-    let detection = &reading.detection;
-    let parser = &reading.parser;
-    let quote = extent
-        .index
-        .unterminated_quote()
-        .filter(|_| extent.complete);
-    let mut streamed = Streamed {
-        unterminated: quote,
-        ..Streamed::default()
-    };
-    let mut quote_all: Option<bool> = None;
-    let mut at = 0;
-    let mut total_delta: i64 = 0;
-    let converts = extent.converts();
-    // Converting, the sink checks the length of what it writes: the bytes
-    // between splices change length too.
-    let too_large = |delta: i64, at: usize| {
-        if converts {
-            return Ok(());
+    let map = overlay.map();
+    let rows = map.rows_within(extent.rows);
+    let mut walk = Walk::new(reading, overlay, extent, sink, checkpoint, rows)?;
+    let mut next: u32 = 0;
+    for segment in map.segments(0..rows) {
+        match segment {
+            Segment::Inserted(range) => walk.inserted(range)?,
+            Segment::Original(range) => {
+                walk.flush(next)?;
+                walk.deleted(next..range.start)?;
+                walk.originals(to_usize(range.start)..to_usize(range.end))?;
+                next = range.end;
+            }
         }
-        checked_len(at, delta)
-            .map(|_| ())
-            .map_err(|len| SaveError::TooLarge { len })
-    };
-    // Save As UTF-8 writes a UTF-8 BOM for the file's BOM (ADR-0008
-    // decision 7).
-    let bom = detection.bom.len();
-    if converts && bom > 0 && extent.end >= bom {
-        sink.splice(Splice {
-            range: 0..bom,
-            bytes: Bom::Utf8.bytes().to_vec(),
-        })?;
-        at = bom;
     }
-    for (n, (row, edits)) in overlay.rows_in(0..extent.rows).enumerate() {
-        if n % ROWS_PER_CHECKPOINT == 0 {
-            checkpoint()?;
+    walk.flush(next)?;
+    walk.deleted(next..u32::try_from(extent.rows).unwrap_or(u32::MAX))?;
+    walk.finish()
+}
+
+/// The line ending the output row before is known to have, or the
+/// original row it is (copied as it is).
+#[derive(Clone, Copy, Debug)]
+enum Prev {
+    None,
+    Ending(Option<LineEnding>),
+    Row(usize),
+}
+
+/// [`stream`]'s walk: where it is in the snapshot and in the output.
+struct Walk<'w, 's> {
+    reading: &'w Reading,
+    overlay: &'w Overlay,
+    extent: &'w Extent<'w>,
+    sink: &'s mut dyn Sink,
+    checkpoint: &'w dyn Fn() -> Result<(), SaveError>,
+    /// The logical rows written.
+    rows: usize,
+    /// The output rows written so far.
+    out_row: usize,
+    /// The snapshot is written (or skipped) up to here.
+    at: usize,
+    /// How much longer the output is than the snapshot so far.
+    delta: i64,
+    prev: Prev,
+    /// Inserted rows not placed yet, and where each starts in them.
+    pending: Vec<u8>,
+    pending_starts: Vec<usize>,
+    /// Each output row's start, for the new index (not when converting).
+    starts: Option<Vec<u32>>,
+    /// The old file's unterminated quote.
+    quote: Option<usize>,
+    /// Whether the file quotes every field, once it is needed.
+    quote_all: Option<bool>,
+    /// Which columns quote new fields, once a new field is written: the
+    /// census answers `quote_all` too.
+    quoting: Option<ColumnQuoting>,
+    /// The file's most common line ending: an inserted row's (ADR-0004
+    /// decision 3).
+    common: LineEnding,
+    /// The file's last row ends with a line ending (decision 4).
+    trailing_newline: bool,
+    /// Rows written one by one, for the checkpoints.
+    handled: usize,
+    streamed: Streamed,
+}
+
+impl<'w, 's> Walk<'w, 's> {
+    fn new(
+        reading: &'w Reading,
+        overlay: &'w Overlay,
+        extent: &'w Extent<'w>,
+        sink: &'s mut dyn Sink,
+        checkpoint: &'w dyn Fn() -> Result<(), SaveError>,
+        rows: usize,
+    ) -> Result<Self, SaveError> {
+        let quote = extent
+            .index
+            .unterminated_quote()
+            .filter(|_| extent.complete);
+        let mut walk = Walk {
+            reading,
+            overlay,
+            extent,
+            sink,
+            checkpoint,
+            rows,
+            out_row: 0,
+            at: 0,
+            delta: 0,
+            prev: Prev::None,
+            pending: Vec::new(),
+            pending_starts: Vec::new(),
+            starts: (!extent.converts()).then(|| Vec::with_capacity(rows)),
+            quote,
+            quote_all: None,
+            quoting: None,
+            common: reading.report().line_ending().unwrap_or(LineEnding::Lf),
+            trailing_newline: false,
+            handled: 0,
+            streamed: Streamed {
+                unterminated: quote,
+                ..Streamed::default()
+            },
+        };
+        walk.trailing_newline = match extent.rows.checked_sub(1) {
+            Some(last) => walk.line_ending_of(last)?.is_some(),
+            None => false,
+        };
+        // Save As UTF-8 writes a UTF-8 BOM for the file's BOM (ADR-0008
+        // decision 7).
+        let bom = reading.detection.bom.len();
+        if extent.converts() && bom > 0 && extent.end >= bom {
+            walk.sink.splice(Splice {
+                range: 0..bom,
+                bytes: Bom::Utf8.bytes().to_vec(),
+            })?;
+            walk.at = bom;
         }
+        Ok(walk)
+    }
+
+    /// A checkpoint every [`ROWS_PER_CHECKPOINT`] rows.
+    fn tick(&mut self) -> Result<(), SaveError> {
+        if self.handled.is_multiple_of(ROWS_PER_CHECKPOINT) {
+            (self.checkpoint)()?;
+        }
+        self.handled += 1;
+        Ok(())
+    }
+
+    /// The rules for a row, with whether the file quotes every field if
+    /// `needed`: it reads every row, so only then, once.
+    fn rules(&mut self, needed: bool) -> Result<RowRules, SaveError> {
+        let quote_all = match (needed, self.quote_all) {
+            (false, _) => false,
+            (true, Some(known)) => known,
+            (true, None) => {
+                let known = quotes_every_field(self.reading, self.extent, self.checkpoint)?;
+                self.quote_all = Some(known);
+                known
+            }
+        };
+        Ok(RowRules {
+            encoding: self.extent.target,
+            source: self.extent.source,
+            delimiter: self.reading.detection.delimiter.byte(),
+            quote_all,
+        })
+    }
+
+    /// Makes the census of which columns quote every field (ADR-0014
+    /// decision 4) the first time a row writes a new field: it reads every
+    /// row, so only then, once. It finds out whether the file quotes every
+    /// field on the way.
+    fn census(&mut self) -> Result<(), SaveError> {
+        if self.quoting.is_none() {
+            let census = ColumnQuoting::census(self.reading, self.overlay, self.checkpoint)?;
+            self.quote_all = Some(census.every_field());
+            self.quoting = Some(census);
+        }
+        Ok(())
+    }
+
+    /// Where original row `row` starts in the snapshot (the end of what is
+    /// written, past the last row).
+    fn row_start(&self, row: u32) -> Result<usize, SaveError> {
+        let row = to_usize(row);
+        if row >= self.extent.rows {
+            return Ok(self.extent.end);
+        }
+        self.extent
+            .index
+            .row_extent(row)
+            .map(|extent| extent.start)
+            .ok_or_else(|| SaveError::Failed(format!("row {row} isn't indexed")))
+    }
+
+    /// Original row `row`'s bytes, parsed, and its line ending.
+    fn read(
+        &self,
+        row: usize,
+    ) -> Result<(RowBytes<'w, 'w>, ParsedRow, Option<LineEnding>), SaveError> {
         // Every row before `rows` can be read: an edit is never dropped.
-        let unreadable = || SaveError::Failed(format!("edited row {row} can't be read"));
-        let bytes = Document::row_bytes(reading, row)?.ok_or_else(unreadable)?;
-        let parsed = parser
+        let unreadable = || SaveError::Failed(format!("row {row} can't be read"));
+        let bytes = Document::row_bytes(self.reading, row)?.ok_or_else(unreadable)?;
+        let parsed = self
+            .reading
+            .parser
             .parse_row_in(bytes.index, row, &bytes.bytes, bytes.base)
             .ok_or_else(unreadable)?;
         let line_ending = bytes
             .index
             .row_in(row, &bytes.bytes, bytes.base)
             .and_then(|span| span.line_ending);
-        // Whether the file quotes every field matters only to a cell with
-        // no quoting of its own: a hatched cell, or a blank line's one
-        // field (a file that quotes every field quotes every other one
-        // already). Finding it out reads every row, so only then, once.
-        let unquoted = edits.base_end() > parsed.fields().len() || parsed.span().is_empty();
-        let quote_all = match (unquoted, quote_all) {
-            (false, _) => false,
-            (true, Some(known)) => known,
-            (true, None) => {
-                let known = quotes_every_field(reading, extent, checkpoint)?;
-                quote_all = Some(known);
-                known
+        Ok((bytes, parsed, line_ending))
+    }
+
+    fn line_ending_of(&self, row: usize) -> Result<Option<LineEnding>, SaveError> {
+        Ok(self.read(row)?.2)
+    }
+
+    /// The line ending of the output row before this one.
+    fn prev_ending(&self) -> Result<Option<LineEnding>, SaveError> {
+        match self.prev {
+            Prev::None => Ok(None),
+            Prev::Ending(ending) => Ok(ending),
+            Prev::Row(row) => self.line_ending_of(row),
+        }
+    }
+
+    /// The line ending output row `self.out_row` gets, if its own is
+    /// `own` (`None` for an inserted row): none if it ends a file with no
+    /// final newline, otherwise its own, or the most common one.
+    fn ending(&self, own: Option<LineEnding>) -> Option<LineEnding> {
+        if self.out_row + 1 == self.rows && !self.trailing_newline {
+            None
+        } else {
+            own.or(Some(self.common))
+        }
+    }
+
+    /// Notes that the output row about to be written starts at snapshot
+    /// offset `offset`, moved by the splices so far.
+    fn push_start(&mut self, offset: usize) {
+        if let Some(starts) = &mut self.starts {
+            match u32::try_from(to_i64(offset).saturating_add(self.delta)) {
+                Ok(start) => starts.push(start),
+                // Past 4 GiB: the save is refused as too large.
+                Err(_) => self.starts = None,
             }
-        };
-        let rules = RowRules {
-            encoding: extent.target,
-            source: extent.source,
-            delimiter: detection.delimiter.byte(),
-            quote_all,
-        };
-        let cells = edits.base_cells();
+        }
+    }
+
+    /// Writes the snapshot up to `splice`, then `splice`. `drops_quote`:
+    /// if it covers the old file's unterminated quote, the quote is gone
+    /// (its row deleted, or its field edited, which closes it). Otherwise
+    /// the quote's bytes are kept (also at the end of a splice of the
+    /// whole row, a fix), so it moves by each splice's change in length up
+    /// to it.
+    fn put(&mut self, splice: Splice, drops_quote: bool) -> Result<(), SaveError> {
+        if splice.range.start < self.at || splice.range.end < splice.range.start {
+            return Err(SaveError::Failed(format!(
+                "splice {:?} out of order after {}",
+                splice.range, self.at
+            )));
+        }
+        let change = to_i64(splice.bytes.len()) - to_i64(splice.range.len());
+        if let Some(q) = self.quote
+            && let Some(moved) = self.streamed.unterminated
+            && splice.range.start <= q
+        {
+            let over_it = splice.range.end > q || splice.range.start == q;
+            self.streamed.unterminated = if drops_quote && over_it {
+                None
+            } else {
+                usize::try_from(to_i64(moved).saturating_add(change)).ok()
+            };
+        }
+        self.sink.copy(self.at..splice.range.start)?;
+        self.at = splice.range.end;
+        self.delta += change;
+        self.sink.splice(splice)?;
+        if !self.extent.converts() {
+            // Converting, the sink checks the length of what it writes:
+            // the bytes between splices change length too.
+            checked_len(self.at, self.delta).map_err(|len| SaveError::TooLarge { len })?;
+        }
+        Ok(())
+    }
+
+    /// Inserted rows `range` (by number), made ready to be placed before
+    /// the next original row.
+    fn inserted(&mut self, range: Range<u32>) -> Result<(), SaveError> {
+        let first_without_bom = self.reading.detection.bom.is_empty();
+        for n in range {
+            self.tick()?;
+            let Some((row, edits)) = inserted_row(self.overlay, n) else {
+                return Err(SaveError::Failed(format!("inserted row {n} is missing")));
+            };
+            let view = RowView::inserted(&self.reading.parser, row, edits);
+            // Its own values and a column insert's are new fields; an
+            // edited cell past them is a hatched one.
+            let cells: Vec<NewCell<'_>> = (0..view.len())
+                .map(|column| match (view.cell_id(column), view.cell(column)) {
+                    (Some(CellId::Appended(_)), Some(ViewCell::Edited(value))) => {
+                        NewCell::Hatched(value)
+                    }
+                    (_, Some(ViewCell::New(value) | ViewCell::Edited(value))) => {
+                        NewCell::New(value)
+                    }
+                    _ => NewCell::Padding,
+                })
+                .collect();
+            if cells.iter().any(|cell| matches!(cell, NewCell::New(_))) {
+                self.census()?;
+            }
+            let rules = self.rules(true)?;
+            let ending = self.ending(None);
+            let whole = WholeRow {
+                row: self.out_row,
+                cells: &cells,
+                ending,
+                blank_line: false,
+                after_cr: false,
+                first_without_bom: first_without_bom && self.out_row == 0,
+            };
+            let no_census = ColumnQuoting::default();
+            let quoting = self.quoting.as_ref().unwrap_or(&no_census);
+            let (bytes, ending) = whole_row_bytes(&whole, rules, quoting, &mut self.streamed.fixes)
+                .map_err(|columns| {
+                    // `check_encodable` passed every value.
+                    SaveError::Failed(format!(
+                        "inserted row {}'s columns {columns:?} can't be encoded",
+                        self.out_row
+                    ))
+                })?;
+            self.pending_starts.push(self.pending.len());
+            self.pending.extend_from_slice(&bytes);
+            self.out_row += 1;
+            self.prev = Prev::Ending(ending);
+        }
+        Ok(())
+    }
+
+    /// Places the inserted rows waiting, if any: one insert at the start
+    /// of original row `next` (or at the end).
+    fn flush(&mut self, next: u32) -> Result<(), SaveError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let offset = self.row_start(next)?;
+        for at in std::mem::take(&mut self.pending_starts) {
+            self.push_start(offset + at);
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        self.put(
+            Splice {
+                range: offset..offset,
+                bytes,
+            },
+            false,
+        )
+    }
+
+    /// Deleted original rows `rows`: one delete of each, line ending
+    /// included.
+    fn deleted(&mut self, rows: Range<u32>) -> Result<(), SaveError> {
+        for row in rows {
+            self.tick()?;
+            let range = self
+                .extent
+                .index
+                .row_extent(to_usize(row))
+                .ok_or_else(|| SaveError::Failed(format!("deleted row {row} isn't indexed")))?;
+            self.put(
+                Splice {
+                    range,
+                    bytes: Vec::new(),
+                },
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Original rows `rows`, a stretch the piece list keeps together:
+    /// copied, but for the rows that need a look of their own.
+    fn originals(&mut self, rows: Range<usize>) -> Result<(), SaveError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if !self.overlay.columns().is_empty() {
+            // A column operation may reach any row: each is looked at.
+            for row in rows {
+                self.original(row)?;
+            }
+            return Ok(());
+        }
+        let last = rows.end - 1;
+        // Its first row may now follow other rows than it did (a lone CR,
+        // decision 10) or start the file (a BOM-like field); its last may
+        // now end the file, or no longer (decision 4).
+        let mut look: Vec<usize> = self
+            .overlay
+            .rows_in(rows.clone())
+            .map(|(row, _)| row)
+            .collect();
+        look.push(rows.start);
+        if self.out_row + rows.len() == self.rows || last + 1 == self.extent.rows {
+            look.push(last);
+        }
+        look.sort_unstable();
+        look.dedup();
+        let mut looks = look.into_iter().peekable();
+        let mut from = rows.start;
+        // A row after one whose line ending became CR (a blank line split
+        // from a CR before it), which may need splitting too.
+        let mut after_split = None;
+        loop {
+            let next = match (looks.peek().copied(), after_split) {
+                (Some(row), Some(split)) => row.min(split),
+                (Some(row), None) => row,
+                (None, Some(split)) => split,
+                (None, None) => break,
+            };
+            if looks.peek() == Some(&next) {
+                looks.next();
+            }
+            if after_split == Some(next) {
+                after_split = None;
+            }
+            self.copied(from..next);
+            if self.original(next)? && next < last {
+                after_split = Some(next + 1);
+            }
+            from = next + 1;
+        }
+        self.copied(from..rows.end);
+        Ok(())
+    }
+
+    /// Original rows `rows`, copied as they are (the copy is made with the
+    /// next splice, or at the end).
+    fn copied(&mut self, rows: Range<usize>) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(starts) = &mut self.starts
+            && !self
+                .extent
+                .index
+                .extend_starts(rows.clone(), self.delta, starts)
+        {
+            self.starts = None;
+        }
+        self.out_row += rows.len();
+        self.prev = Prev::Row(rows.end - 1);
+    }
+
+    /// Original row `row`, written with its edits and any change its new
+    /// neighbours bring. Returns whether its line ending became a lone CR.
+    fn original(&mut self, row: usize) -> Result<bool, SaveError> {
+        self.tick()?;
+        let (bytes, parsed, line_ending) = self.read(row)?;
+        let overlay = self.overlay;
+        let ending = self.ending(line_ending);
+        let view = RowView::new(
+            &self.reading.parser,
+            &bytes.bytes,
+            bytes.base,
+            &parsed,
+            overlay.physical(row),
+        );
+        // Its edited cells shown, by column: not a deleted column's.
+        let cells: Vec<(usize, Arc<str>)> = overlay.row(row).map_or_else(Vec::new, |edits| {
+            edits
+                .shown(overlay.columns(), None)
+                .into_iter()
+                .map(|(column, value)| (column, Arc::clone(value)))
+                .collect()
+        });
+        let fields = parsed.fields().len();
+        let len = fields.max(cells.last().map_or(0, |&(column, _)| column + 1));
+        if !view.same_shape() || view.len() != len {
+            // Cells moved, taken or added by a column operation.
+            return self.whole(row, &view, &bytes, &parsed, line_ending, ending);
+        }
+        let blank = parsed.span().is_empty();
+        let after_cr = blank
+            && cells.is_empty()
+            && ending == Some(LineEnding::Lf)
+            && self.prev_ending()? == Some(LineEnding::Cr);
+        // Whether the file quotes every field matters only to an edited
+        // cell with no quoting of its own: a hatched cell, or a blank
+        // line's one field (a file that quotes every field quotes every
+        // other one already).
+        let unquoted = !cells.is_empty() && (len > fields || blank);
+        let rules = self.rules(unquoted)?;
         let edited = EditedRow {
-            row,
+            row: self.out_row,
             bytes: &bytes.bytes,
             base: bytes.base,
             span: parsed.span(),
             line_ending,
+            ending,
+            after_cr,
             fields: parsed.fields(),
             cells: &cells,
-            first_without_bom: row == 0 && detection.bom.is_empty(),
+            first_without_bom: self.out_row == 0 && self.reading.detection.bom.is_empty(),
         };
-        // The old file's open quote, if it is in this row: its field edited,
-        // the quote closes (the value is written quoted). Otherwise its
-        // bytes are kept as they were, also at the end of a splice of the
-        // whole row (a fix), so it moves by each splice's change in length
-        // up to it.
-        let open_field_edited = quote.is_some_and(|q| {
+        // The old file's open quote, if it is in this row: its field
+        // edited, the quote closes (the value is written quoted).
+        let open_field_edited = self.quote.is_some_and(|q| {
             parsed
                 .fields()
                 .iter()
                 .position(|field| field.start() == q)
-                .is_some_and(|column| edits.get(CellId::base(column, edits.fields())).is_some())
+                .is_some_and(|column| cells.binary_search_by_key(&column, |&(c, _)| c).is_ok())
         });
+        self.push_start(bytes.base);
         let mut splices = Vec::new();
-        if let Err(columns) = row_splices(&edited, rules, &mut splices, &mut streamed.fixes) {
-            if !converts {
-                // `check_encodable` passed every edited value.
-                return Err(SaveError::Failed(format!(
-                    "row {row}'s columns {columns:?} can't be encoded"
-                )));
+        let written = match row_splices(&edited, rules, &mut splices, &mut self.streamed.fixes) {
+            Ok(written) => written,
+            Err(columns) => {
+                if !self.extent.converts() {
+                    // `check_encodable` passed every edited value.
+                    return Err(SaveError::Failed(format!(
+                        "row {row}'s columns {columns:?} can't be encoded"
+                    )));
+                }
+                // Save As UTF-8: a fix that rewrites the row met an
+                // unedited field that can't be converted. The save will
+                // stop naming it and any other such field of the row; the
+                // rest of the file is still read, for the rest of the
+                // cells.
+                let mut unconvertible = edited.unconvertible(rules);
+                if unconvertible.is_empty() {
+                    unconvertible = columns;
+                }
+                let named: Vec<(usize, usize)> =
+                    unconvertible.iter().map(|&c| (self.out_row, c)).collect();
+                self.sink.copy(self.at..edited.span.start)?;
+                self.sink.refuse(&named)?;
+                self.at = edited.end(rules);
+                self.out_row += 1;
+                self.prev = Prev::Ending(ending);
+                return Ok(false);
             }
-            // Save As UTF-8: a fix that rewrites the row met an unedited
-            // field that can't be converted. The save will stop naming it
-            // and any other such field of the row; the rest of the file is
-            // still read, for the rest of the cells.
-            let mut unconvertible = edited.unconvertible(rules);
-            if unconvertible.is_empty() {
-                unconvertible = columns;
-            }
-            let cells: Vec<(usize, usize)> = unconvertible.iter().map(|&c| (row, c)).collect();
-            sink.copy(at..edited.span.start)?;
-            sink.refuse(&cells)?;
-            at = edited.end(rules);
-            continue;
-        }
-        let mut delta: i64 = 0;
+        };
         for splice in splices {
-            // Every splice is within its own row: cell edits never move a
-            // row boundary (the shifted index relies on it).
             debug_assert!(
                 bytes.index.row_extent(row).is_some_and(|extent| {
                     extent.start <= splice.range.start && splice.range.end <= extent.end
@@ -1345,45 +1885,150 @@ fn stream(
                 "splice {:?} outside row {row}",
                 splice.range
             );
-            if splice.range.start < at || splice.range.end < splice.range.start {
-                return Err(SaveError::Failed(format!(
-                    "splice {:?} out of order after {at}",
-                    splice.range
-                )));
-            }
-            let change = to_i64(splice.bytes.len()) - to_i64(splice.range.len());
-            if let Some(q) = quote
-                && let Some(moved) = streamed.unterminated
-                && splice.range.start <= q
-            {
-                let over_it = splice.range.end > q || splice.range.start == q;
-                streamed.unterminated = if open_field_edited && over_it {
-                    None
-                } else {
-                    usize::try_from(to_i64(moved).saturating_add(change)).ok()
-                };
-            }
-            sink.copy(at..splice.range.start)?;
-            at = splice.range.end;
-            delta += change;
-            sink.splice(splice)?;
+            self.put(splice, open_field_edited)?;
         }
-        if delta != 0 {
-            streamed.deltas.push((row, delta));
-        }
-        total_delta += delta;
-        too_large(total_delta, at)?;
+        self.out_row += 1;
+        self.prev = Prev::Ending(written);
+        Ok(written == Some(LineEnding::Cr) && line_ending != Some(LineEnding::Cr))
     }
-    sink.copy(at..extent.end)?;
-    too_large(total_delta, extent.end)?;
-    // In the order the oracle makes them (ADR-0004 decisions 6, then 7 and
-    // 10): the rows written `""`, then the BOM-like first field.
-    streamed
-        .fixes
-        .sort_by_key(|fix| matches!(fix, Fix::BomLikeQuoted));
-    streamed.len =
-        checked_len(extent.end, total_delta).map_err(|len| SaveError::TooLarge { len })?;
-    Ok(streamed)
+
+    /// Original row `row`, read as `view`, whose cells a column operation
+    /// moved, took or added to: written whole from how it reads now, as the
+    /// oracle does, unless that is what the file has. Returns whether its
+    /// line ending became a lone CR.
+    fn whole(
+        &mut self,
+        row: usize,
+        view: &RowView<'_>,
+        bytes: &RowBytes<'_, '_>,
+        parsed: &ParsedRow,
+        line_ending: Option<LineEnding>,
+        ending: Option<LineEnding>,
+    ) -> Result<bool, SaveError> {
+        let base = bytes.base;
+        let range = self
+            .extent
+            .index
+            .row_extent(row)
+            .ok_or_else(|| SaveError::Failed(format!("row {row} isn't indexed")))?;
+        let raw = |field: &FieldSpan| {
+            let span = field.span();
+            &bytes.bytes[span.start - base..span.end - base]
+        };
+        let converts = self.extent.converts();
+        let source = self.extent.source;
+        let mut cells: Vec<NewCell<'_>> = Vec::with_capacity(view.len());
+        let mut unconvertible = Vec::new();
+        // The old file's open quote's field, if it is still there unedited:
+        // its length as written. Nothing can follow it (2.4b's
+        // `AfterUnterminatedQuote`), so it ends the row's content.
+        let mut quote_len = None;
+        for column in 0..view.len() {
+            let cell = match (view.cell_id(column), view.cell(column)) {
+                (_, Some(ViewCell::Field(field))) => {
+                    let bytes = if converts {
+                        Transcoder::convert(raw(field), source)
+                    } else {
+                        Some(Cow::Borrowed(raw(field)))
+                    };
+                    if self.quote == Some(field.start()) {
+                        debug_assert_eq!(column + 1, view.len(), "a cell after the open quote");
+                        quote_len = bytes.as_ref().map(|bytes| bytes.len());
+                    }
+                    bytes.map_or_else(
+                        || {
+                            unconvertible.push(column);
+                            NewCell::Padding
+                        },
+                        NewCell::Bytes,
+                    )
+                }
+                (Some(CellId::Field(k)), Some(ViewCell::Edited(value))) => NewCell::Edited {
+                    value,
+                    quoted: usize::try_from(k)
+                        .ok()
+                        .and_then(|k| parsed.field(k))
+                        .is_some_and(FieldSpan::quoted),
+                },
+                (Some(CellId::Appended(_)), Some(ViewCell::Edited(value))) => {
+                    NewCell::Hatched(value)
+                }
+                (_, Some(ViewCell::New(value) | ViewCell::Edited(value))) => NewCell::New(value),
+                _ => NewCell::Padding,
+            };
+            cells.push(cell);
+        }
+        if !unconvertible.is_empty() {
+            // Save As UTF-8: the save will stop naming these cells; the
+            // rest of the file is still read, for the rest of the cells.
+            let named: Vec<(usize, usize)> =
+                unconvertible.iter().map(|&c| (self.out_row, c)).collect();
+            self.sink.copy(self.at..range.start)?;
+            self.sink.refuse(&named)?;
+            self.at = range.end;
+            self.out_row += 1;
+            self.prev = Prev::Ending(ending);
+            return Ok(false);
+        }
+        if cells.iter().any(|cell| matches!(cell, NewCell::New(_))) {
+            self.census()?;
+        }
+        // Whether the file quotes every field matters only to a value.
+        let values = cells
+            .iter()
+            .any(|cell| !matches!(cell, NewCell::Bytes(_) | NewCell::Padding));
+        let rules = self.rules(values)?;
+        let blank_line = parsed.span().is_empty();
+        let after_cr = blank_line
+            && ending == Some(LineEnding::Lf)
+            && self.prev_ending()? == Some(LineEnding::Cr);
+        let whole = WholeRow {
+            row: self.out_row,
+            cells: &cells,
+            ending,
+            blank_line,
+            after_cr,
+            first_without_bom: self.out_row == 0 && self.reading.detection.bom.is_empty(),
+        };
+        let no_census = ColumnQuoting::default();
+        let quoting = self.quoting.as_ref().unwrap_or(&no_census);
+        let (out, written) = whole_row_bytes(&whole, rules, quoting, &mut self.streamed.fixes)
+            .map_err(|columns| {
+                // `check_encodable` passed every value.
+                SaveError::Failed(format!("row {row}'s columns {columns:?} can't be encoded"))
+            })?;
+        self.push_start(range.start);
+        if out != bytes.bytes[range.start - base..range.end - base] {
+            let start = to_i64(range.start).saturating_add(self.delta);
+            let content = out.len() - written.map_or(0, |ending| ending.bytes().len());
+            let moved = self.quote.filter(|&q| range.contains(&q)).map(|_| {
+                quote_len.and_then(|len| usize::try_from(start + to_i64(content - len)).ok())
+            });
+            self.put(Splice { range, bytes: out }, false)?;
+            if let Some(moved) = moved {
+                self.streamed.unterminated = moved;
+            }
+        }
+        self.out_row += 1;
+        self.prev = Prev::Ending(written);
+        Ok(written == Some(LineEnding::Cr) && line_ending != Some(LineEnding::Cr))
+    }
+
+    /// The rest of the snapshot, and what the walk found.
+    fn finish(mut self) -> Result<Streamed, SaveError> {
+        debug_assert!(self.pending.is_empty(), "inserted rows left over");
+        debug_assert_eq!(self.out_row, self.rows, "rows written");
+        self.sink.copy(self.at..self.extent.end)?;
+        // In the order the oracle makes them (ADR-0004 decisions 6, 10,
+        // then 7): the rows written `""`, the CR splits, then the BOM-like
+        // first field.
+        self.streamed.fixes.sort_by_key(|fix| fix.rank());
+        self.streamed.len =
+            checked_len(self.extent.end, self.delta).map_err(|len| SaveError::TooLarge { len })?;
+        self.streamed.rows = self.rows;
+        self.streamed.starts = self.starts;
+        Ok(self.streamed)
+    }
 }
 
 fn to_i64(n: usize) -> i64 {
@@ -1439,6 +2084,8 @@ fn quotes_every_field(
 /// first such it writes nothing more, but reads on to name the rest.
 struct FileSink<'a, W: Write> {
     reading: &'a Reading,
+    /// The snapshot's piece list, to name a cell by its logical row.
+    map: &'a RowMap,
     stale: bool,
     out: W,
     progress: &'a SaveShared,
@@ -1464,6 +2111,7 @@ struct FileSink<'a, W: Write> {
 impl<'a, W: Write> FileSink<'a, W> {
     fn new(
         reading: &'a Reading,
+        map: &'a RowMap,
         extent: &Extent<'_>,
         out: W,
         progress: &'a SaveShared,
@@ -1477,6 +2125,7 @@ impl<'a, W: Write> FileSink<'a, W> {
         };
         FileSink {
             reading,
+            map,
             stale: reading.head_is_stale(),
             out,
             progress,
@@ -1554,9 +2203,14 @@ impl<'a, W: Write> FileSink<'a, W> {
             return Ok(());
         }
         match cell_at(self.reading, offset) {
-            Some((cell, span)) => {
+            Some(((row, column), span)) => {
                 self.last_named = Some(span);
-                self.name(cell)
+                // A row copied isn't deleted.
+                let row = u32::try_from(row)
+                    .ok()
+                    .and_then(|row| self.map.logical_of(row).ok())
+                    .unwrap_or(row);
+                self.name((row, column))
             }
             // In no row (a file that is only a broken BOM): the save is
             // still refused.

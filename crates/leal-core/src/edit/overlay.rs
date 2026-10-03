@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::Lineage;
-use super::columns::{CellId, Columns, Fold, Layout, Own, Parts, base_end};
+use super::columns::{CellId, Columns, Fold, Layout, Own, Parts};
 #[cfg(test)]
 use super::rows::Piece;
 use super::rows::{RowId, RowMap};
@@ -154,12 +154,6 @@ impl RowEdits {
         self.layout.as_deref()
     }
 
-    /// One past the last base position edited (a field's or a hatched
-    /// cell's): with no column operation, the row is at least this long.
-    pub(crate) fn base_end(&self) -> usize {
-        base_end(&self.cells)
-    }
-
     /// The parts a layout is made from.
     pub(crate) fn parts(&self) -> Parts<'_> {
         Parts {
@@ -278,19 +272,6 @@ impl RowEdits {
             let layout = self.layout_in(columns, inserted);
             layout.len() == 1 && layout.get(0) == Some(field)
         }
-    }
-
-    /// The edited cells by position with no column operation, which is
-    /// their column then (the writer before task 2.4c: saving refuses
-    /// column operations until then).
-    pub(crate) fn base_cells(&self) -> Vec<(usize, Arc<str>)> {
-        self.cells
-            .iter()
-            .filter_map(|(id, value)| match *id {
-                CellId::Field(k) | CellId::Appended(k) => Some((to_usize(k), Arc::clone(value))),
-                CellId::Inserted(_) => None,
-            })
-            .collect()
     }
 
     /// The edited cells the row shows under `columns` (inserted row `n` if
@@ -548,6 +529,11 @@ impl Overlay {
     /// Inserted row `n`, if it is in the document.
     pub(crate) fn inserted(&self, n: u32) -> Option<&Arc<InsertedRow>> {
         self.inserted.get(&n)
+    }
+
+    /// Every inserted row in the document, by number.
+    pub(crate) fn inserted_rows(&self) -> impl Iterator<Item = (u32, &Arc<InsertedRow>)> {
+        self.inserted.iter().map(|(&n, row)| (n, row))
     }
 
     /// True if physical row `row` has edits.
@@ -1067,7 +1053,6 @@ mod tests {
         let none = Columns::default();
         assert_eq!(edits(3, &[(1, "x")]).len_in(&none, None), 3);
         assert_eq!(edits(1, &[(4, "x")]).len_in(&none, None), 5);
-        assert_eq!(edits(1, &[(4, "x")]).base_end(), 5);
         let row = edits(2, &[(0, "a"), (5, "b")]);
         assert_eq!(row.get(at(0, 2)), Some("a"));
         assert_eq!(row.get(at(5, 2)), Some("b"));

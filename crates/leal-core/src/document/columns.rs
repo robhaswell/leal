@@ -217,10 +217,6 @@ impl ColumnQuoting {
     /// unquoted non-empty field, so no column quotes every field. A
     /// census stopped early answers [`quoted`](Self::quoted) and
     /// [`every_field`](Self::every_field) as a whole one would.
-    #[cfg_attr(
-        not(any(test, feature = "test-hooks")),
-        expect(dead_code, reason = "task 2.4c's writer")
-    )]
     pub(in crate::document) fn census<E: From<ReadError>>(
         reading: &Reading,
         overlay: &Overlay,

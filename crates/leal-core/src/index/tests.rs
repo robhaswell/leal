@@ -1086,3 +1086,33 @@ fn the_index_publishes_every_256_kib() {
     assert_eq!(publishes(len, false), 17);
     assert_eq!(publishes(len, true), 17);
 }
+
+/// Task 2.4c: an index built from a save's plan is the one a scan finds,
+/// and starts that can't be a file's are refused.
+#[test]
+fn an_index_from_starts_is_the_scanned_one() {
+    let bytes = b"a,b\r\n\"x\ny\",z\n\nlast";
+    let built = RowIndex::build(bytes, utf8(b',')).unwrap();
+    let starts: Vec<u32> = (0..built.row_count())
+        .map(|row| u32::try_from(built.row_extent(row).unwrap().start).unwrap())
+        .collect();
+    let index = RowIndex::from_starts(
+        utf8(b','),
+        starts.clone(),
+        bytes.len(),
+        built.field_count_mode(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(index.status(), Status::Complete);
+    assert_eq!(spans(&index, bytes), spans(&built, bytes));
+    assert_eq!(index.field_count_mode(), built.field_count_mode());
+    let mut moved = Vec::new();
+    assert!(index.extend_starts(1..3, 2, &mut moved));
+    assert_eq!(moved, [starts[1] + 2, starts[2] + 2]);
+    assert!(!index.extend_starts(0..1, -1, &mut moved));
+    let from = |starts: Vec<u32>, len| RowIndex::from_starts(utf8(b','), starts, len, None, None);
+    assert!(from(vec![0, 0], 4).is_none());
+    assert!(from(vec![0, 4], 4).is_none());
+    assert!(from(vec![], 0).is_some());
+}

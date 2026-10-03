@@ -1944,12 +1944,13 @@ fn save_as_reports_the_name_on_disk() {
     assert_eq!(std::fs::read(&existing).unwrap(), b"a,b\n");
 }
 
-/// Task 2.4a: rows aren't inserted or deleted while a save runs, nor a row
-/// command undone (ADR-0014 decision 1); until task 2.4c, a save with rows
-/// inserted or deleted is refused before anything is written; and a row
-/// command from before a save applies by value after it (decision 3).
+/// Tasks 2.4a and 2.4c: rows aren't inserted or deleted while a save runs,
+/// nor a row command undone (ADR-0014 decision 1); once it ends they can
+/// be at once (the new reading's index is built from the save's plan), and
+/// a row command from before a save applies by value after it (decision
+/// 3); a save with rows deleted writes them deleted.
 #[test]
-fn row_edits_wait_for_a_save_and_are_not_saved_yet() {
+fn row_edits_wait_for_a_save_and_are_saved() {
     let dir = Dir::new("save-rows");
     let bytes = sample(4 * SAVE_CHUNK_BYTES);
     let path = dir.file("a.csv", &bytes);
@@ -1982,9 +1983,8 @@ fn row_edits_wait_for_a_save_and_are_not_saved_yet() {
     });
     go_on();
     job.wait().unwrap();
-    // The saved file is indexed again before rows can change (ADR-0014
-    // decision 1).
-    wait_for_index(&document);
+    // The saved file's rows are all there at once: rows can change before
+    // its index pass ends.
     assert!(document.can_change_rows().is_ok());
 
     // After the save, the delete applies by value: the same row goes.
@@ -2001,11 +2001,93 @@ fn row_edits_wait_for_a_save_and_are_not_saved_yet() {
         Some("edited")
     );
     let saved = std::fs::read(&path).unwrap();
-    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
-    assert!(matches!(job.wait(), Err(SaveError::RowsChanged)));
-    assert_identical(&saved, &std::fs::read(&path).unwrap());
+    // Row 2 goes; row 3's cell edited during the first save is carried
+    // over, unsaved.
+    let row_2 = document.current().index.row_extent(2).unwrap();
+    let during = document.current().index.row_extent(3).unwrap().start + 2;
+    assert_eq!(&saved[during..during + 7], "caf\u{e9} 2".as_bytes());
     let copy = dir.0.join("copy.csv");
-    let job = document.save(SaveRequest::new(&copy, SaveKind::SaveAs));
-    assert!(matches!(job.wait(), Err(SaveError::RowsChanged)));
-    assert!(!copy.exists());
+    save(&document, &copy, SaveKind::SaveAs).unwrap();
+    assert_only_changed(
+        &saved,
+        &std::fs::read(&copy).unwrap(),
+        &[
+            Change::delete(row_2),
+            Change::replace(during..during + 7, b"during".to_vec()),
+        ],
+    );
+    assert!(!document.has_edits());
+    assert_eq!(document.row_count(), rows - 1);
+}
+
+/// The file `bytes`, opened, changed by `edit`, then saved over: the bytes
+/// written. The rebase reads the rows written at once.
+fn saved_after(name: &str, bytes: &[u8], edit: impl FnOnce(&Document)) -> Vec<u8> {
+    let dir = Dir::new(name);
+    let path = dir.file("a.csv", bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    edit(&document);
+    save(&document, &path, SaveKind::Save).unwrap();
+    let saved = std::fs::read(&path).unwrap();
+    let reading = document.current();
+    let built = RowIndex::build(&saved, reading.parser.dialect()).unwrap();
+    assert_eq!(reading.index.row_count(), built.row_count());
+    for row in 0..built.row_count() {
+        assert_eq!(reading.index.row_extent(row), built.row_extent(row));
+    }
+    saved
+}
+
+/// Task 2.4c, the line endings of rows inserted and deleted (ADR-0004
+/// decisions 3, 4, 6 and 10): a new row takes the file's most common
+/// ending; the last row has one only if the file had a final newline; a
+/// blank LF line brought after a lone CR becomes CR; a row with no bytes
+/// is `""`.
+#[test]
+fn inserted_and_deleted_rows_keep_the_files_line_endings() {
+    fn insert(at: usize, value: &str) -> impl FnOnce(&Document) {
+        let value = value.to_owned();
+        move |document: &Document| {
+            document.insert_rows(at, &[vec![value]]).unwrap();
+        }
+    }
+    fn delete(at: usize, count: usize) -> impl FnOnce(&Document) {
+        move |document: &Document| {
+            document.delete_rows(at, count).unwrap();
+        }
+    }
+    // Mixed: CRLF is the most common; the neighbours keep their own.
+    assert_eq!(
+        saved_after("rows-mixed", b"a\r\nb\nc\r\n", insert(1, "x")),
+        b"a\r\nx\r\nb\nc\r\n"
+    );
+    // No final newline: the old last row gets the common ending, the new
+    // one none.
+    assert_eq!(
+        saved_after("rows-append", b"a\nb", insert(2, "x")),
+        b"a\nb\nx"
+    );
+    // Deleting the last row strips the new last row's ending.
+    assert_eq!(saved_after("rows-strip", b"a\nb\nc", delete(2, 1)), b"a\nb");
+    // A blank line that ends a file with no final newline is `""`.
+    assert_eq!(
+        saved_after("rows-blank-last", b"a\n\nc", delete(2, 1)),
+        b"a\n\"\""
+    );
+    // A blank LF line brought after a lone CR becomes CR, and so does the
+    // next.
+    assert_eq!(
+        saved_after("rows-cr", b"a\rb\n\n\nc\n", delete(1, 1)),
+        b"a\r\r\rc\n"
+    );
+    assert_eq!(
+        saved_after("rows-empty", b"a\n", insert(0, "")),
+        b"\"\"\na\n"
+    );
+    // Every row deleted leaves the BOM.
+    assert_eq!(
+        saved_after("rows-none", b"\xEF\xBB\xBFa\nb\n", delete(0, 2)),
+        b"\xEF\xBB\xBF"
+    );
 }

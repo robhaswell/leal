@@ -121,7 +121,8 @@ impl Quoting {
         self.all || self.columns.get(column).copied().unwrap_or(false)
     }
 }
-use crate::layout::Layout;
+
+use crate::layout::{FieldLayout, Layout, RowLayout};
 
 /// The furthest a hatched-cell edit may reach (rule 12): column
 /// `COLUMN_LIMIT - 1`, unless the row is already longer. The same limit as
@@ -292,6 +293,11 @@ pub struct SavedFile {
     /// can compare these with the serializer's, and coverage tests use them
     /// to check that each rule is exercised.
     pub fixes: Vec<Fix>,
+    /// The output's rows and fields, as a parse of `bytes` finds them, so
+    /// that the saved file can be edited in its turn ([`Document::new`]
+    /// over `bytes`): undo after a save works on the saved file (ADR-0012
+    /// decision 4, ADR-0014 decision 3). `None` for Save As UTF-8.
+    pub layout: Option<Layout>,
 }
 
 /// An extra change a save makes so that the file reopens with the same
@@ -825,10 +831,11 @@ impl<'a> Document<'a> {
             .flatten()
             .copied()
             .collect();
-        let changes = if transcode {
-            Vec::new()
+        let (changes, layout) = if transcode {
+            (Vec::new(), None)
         } else {
-            self.changes(&serialized, &contents, &endings)
+            let layout = self.layout(bom.len(), &contents, &endings, &fixes);
+            (self.changes(&serialized, &contents, &endings), Some(layout))
         };
         // ADR-0004 decision 11: record the encoding when a reopen would
         // otherwise guess differently, or when the file already had a hint.
@@ -841,6 +848,7 @@ impl<'a> Document<'a> {
             line_endings: endings,
             encoding_hint,
             fixes,
+            layout,
         })
     }
 
@@ -887,6 +895,103 @@ impl<'a> Document<'a> {
             all: self.layout.quotes_every_field(),
             columns: self.column_quoting(),
         }
+    }
+
+    /// The layout of the output whose rows' contents are `contents` and
+    /// line endings `endings`, after `fixes`, for a BOM of `bom_len`
+    /// bytes: each cell's bytes as written, at its place.
+    fn layout(
+        &self,
+        bom_len: usize,
+        contents: &[(Vec<u8>, bool)],
+        endings: &[Option<LineEnding>],
+        fixes: &[Fix],
+    ) -> Layout {
+        let quoting = self.quoting();
+        let mut rows = Vec::with_capacity(self.rows.len());
+        let mut at = bom_len;
+        for (i, row) in self.rows.iter().enumerate() {
+            let content = &contents[i].0;
+            let start = at;
+            let quoted_empty = fixes.contains(&Fix::EmptyRowQuoted { row: i });
+            let mut fields = Vec::new();
+            if quoted_empty {
+                fields.push(FieldLayout {
+                    span: start..start + 2,
+                    quoted: true,
+                    value: Vec::new(),
+                    text_after_quote: None,
+                    unterminated: false,
+                });
+            } else if content.is_empty() {
+                fields.push(FieldLayout {
+                    span: start..start,
+                    quoted: false,
+                    value: Vec::new(),
+                    text_after_quote: None,
+                    unterminated: false,
+                });
+            } else {
+                let mut field_start = start;
+                for (k, cell) in row.cells.iter().enumerate() {
+                    let mut bytes = self
+                        .cell_bytes(row, k, cell, &quoting, false)
+                        .unwrap_or_default();
+                    let bom_quoted = i == 0 && k == 0 && fixes.contains(&Fix::BomLikeQuoted);
+                    if bom_quoted {
+                        bytes = quote(&bytes);
+                    }
+                    let span = field_start..field_start + bytes.len();
+                    let field = match (cell, row.source) {
+                        (Cell::Original(f), Some(s)) if !bom_quoted => {
+                            let old = &self.layout.rows[s].fields[*f];
+                            FieldLayout {
+                                span: span.clone(),
+                                quoted: old.quoted,
+                                value: old.value.clone(),
+                                text_after_quote: old
+                                    .text_after_quote
+                                    .map(|t| t - old.span.start + span.start),
+                                unterminated: old.unterminated,
+                            }
+                        }
+                        (Cell::Original(f), Some(s)) => FieldLayout {
+                            span: span.clone(),
+                            quoted: true,
+                            value: self.layout.rows[s].fields[*f].value.clone(),
+                            text_after_quote: None,
+                            unterminated: false,
+                        },
+                        _ => {
+                            let value = match cell {
+                                Cell::Edited { value, .. } | Cell::Appended(Some(value)) => {
+                                    encode_value(value, self.encoding).unwrap_or_default()
+                                }
+                                _ => Vec::new(),
+                            };
+                            FieldLayout {
+                                span: span.clone(),
+                                quoted: bytes.first() == Some(&b'"'),
+                                value,
+                                text_after_quote: None,
+                                unterminated: false,
+                            }
+                        }
+                    };
+                    fields.push(field);
+                    field_start = span.end + 1;
+                }
+            }
+            let end = start + content.len();
+            debug_assert_eq!(fields.last().map(|f| f.span.end), Some(end));
+            rows.push(RowLayout {
+                span: start..end,
+                line_ending: endings[i],
+                fields,
+            });
+            at = end + endings[i].map_or(0, LineEnding::byte_len);
+        }
+        Layout { bom_len, rows }
     }
 
     /// A cell's bytes as written: an original field's raw bytes (converted

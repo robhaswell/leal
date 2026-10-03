@@ -561,6 +561,7 @@ impl Collector {
             diagnostics,
             rows,
             complete,
+            line_ending: self.dominant_line_ending().map(|i| ENDINGS[i]),
         }
     }
 
@@ -583,19 +584,24 @@ impl Collector {
         })
     }
 
-    /// Rows whose line ending isn't the most common one. Line endings are
-    /// counted when their rows end, so every one counted is in a finished
-    /// row.
-    fn mixed_line_endings(&self) -> Option<Diagnostic> {
-        // The most common; a tie goes to the one seen first.
-        let dominant = (0..3)
+    /// Where the most common line ending's tally is: a tie goes to the one
+    /// seen first. `None` if no row has one.
+    fn dominant_line_ending(&self) -> Option<usize> {
+        (0..3)
             .filter(|&i| self.line_endings[i].count > 0)
             .max_by_key(|&i| {
                 (
                     self.line_endings[i].count,
                     std::cmp::Reverse(self.first_seen[i]),
                 )
-            })?;
+            })
+    }
+
+    /// Rows whose line ending isn't the most common one. Line endings are
+    /// counted when their rows end, so every one counted is in a finished
+    /// row.
+    fn mixed_line_endings(&self) -> Option<Diagnostic> {
+        let dominant = self.dominant_line_ending()?;
         let others = (0..3).filter(|&i| i != dominant);
         let count = others.clone().map(|i| self.line_endings[i].count).sum();
         // Each tally has its own first locations, so the first of all the
@@ -612,6 +618,9 @@ impl Collector {
         })
     }
 }
+
+/// The line endings in [`Collector::line_endings`] order.
+const ENDINGS: [LineEnding; 3] = [LineEnding::Lf, LineEnding::Crlf, LineEnding::Cr];
 
 /// Where a line ending's tally is in [`Collector::line_endings`].
 fn ending_index(line_ending: LineEnding) -> usize {

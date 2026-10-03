@@ -98,7 +98,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
-use crate::dialect::Encoding;
+use crate::dialect::{Encoding, LineEnding};
 use crate::index::{IndexDialect, IndexError};
 
 pub(crate) use collect::Collector;
@@ -252,6 +252,7 @@ pub struct Report {
     diagnostics: Vec<Diagnostic>,
     rows: usize,
     complete: bool,
+    line_ending: Option<LineEnding>,
 }
 
 impl Report {
@@ -266,6 +267,14 @@ impl Report {
     #[must_use]
     pub fn get(&self, kind: DiagnosticKind) -> Option<&Diagnostic> {
         self.diagnostics.iter().find(|d| d.kind == kind)
+    }
+
+    /// The most common line ending among the rows so far (a tie goes to
+    /// the one seen first), or `None` if no row has one: what a save ends
+    /// an inserted row with (ADR-0004 decision 3, task 2.4c).
+    #[must_use]
+    pub fn line_ending(&self) -> Option<LineEnding> {
+        self.line_ending
     }
 
     /// How many rows this report covers: the rows indexed when it was made.

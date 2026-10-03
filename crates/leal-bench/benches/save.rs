@@ -13,6 +13,14 @@
 //!   that keeps nothing (`Document::save_to_writer`, a test hook). It is
 //!   compared between commits, so a slower writer is caught where the
 //!   disk's noise would hide it.
+//! - `save/rows_deleted` (PLAN 2.4c): 1,000 rows deleted, spread over the
+//!   file (about 1,000 pieces in the piece list), then Save over it, timed
+//!   as `one_edit`: the writer walks the piece list, one delete a row, and
+//!   the rebase builds the new index from the plan. Budget-only, as
+//!   `one_edit`. TODO(2.4b): `save/column_insert`, a save after a column
+//!   insert, once columns can be inserted.
+//! - `save/rows_deleted_no_disk`: the same save's work without the disk,
+//!   compared between commits.
 //! - `save/utf8_from_utf16` (PLAN 2.3): Save As UTF-8 of the reference
 //!   file written as UTF-16 LE (about 200 MB, read-only in v1), to a new
 //!   place, timed from the request to the job's end: every byte converted
@@ -47,6 +55,22 @@ mod common;
 
 /// The edited row: the middle of the file.
 const ROW: usize = 500_000;
+
+/// Rows deleted for `save/rows_deleted`.
+const DELETED: usize = 1_000;
+
+/// Deletes [`DELETED`] rows of `document`, one at a time, spread over it
+/// (not the header row).
+fn delete_spread(document: &Document) {
+    document.index_job().wait().expect("indexing");
+    let step = document.row_count() / DELETED;
+    for k in (0..DELETED).rev() {
+        document
+            .delete_rows(1 + k * step, 1)
+            .expect("the delete")
+            .expect("a change");
+    }
+}
 
 fn save(c: &mut Criterion) {
     let reference = common::reference_file();
@@ -96,6 +120,37 @@ fn save(c: &mut Criterion) {
 
     common::whole_file(&mut group, document.source().len());
     group.bench_function("write_no_disk", |b| {
+        b.iter(|| {
+            document
+                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
+
+    // A save after 1,000 rows deleted (task 2.4c): the file loses them
+    // each time.
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10));
+    group.bench_function("rows_deleted", |b| {
+        b.iter_custom(|iterations| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iterations {
+                delete_spread(&document);
+                let started = Instant::now();
+                let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+                job.wait().expect("the save");
+                total += started.elapsed();
+            }
+            total
+        });
+    });
+
+    delete_spread(&document);
+    common::whole_file(&mut group, document.source().len());
+    group.bench_function("rows_deleted_no_disk", |b| {
         b.iter(|| {
             document
                 .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())

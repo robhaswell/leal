@@ -454,53 +454,76 @@ impl RowIndex {
         Ok((index, diagnostics, indexer))
     }
 
-    /// The complete index of the file a save wrote from this one (task
-    /// 2.2): its first `rows` rows, each `deltas` row (in order, with how
-    /// many bytes longer it became) changed only inside, so no row boundary
-    /// moves but each later row starts that much further on. The new file
-    /// is `len` bytes, ending where row `rows` would start, and its
-    /// unterminated quote, if any, is at `unterminated_quote`. The field
-    /// count mode is this index's; a save's index pass gives the new
-    /// file's own soon after. `None` if the deltas don't add up to `len`
-    /// (a bug in the caller).
+    /// The complete index of a file a save wrote (task 2.4c), built from
+    /// the save's plan rather than by scanning it: `starts` holds each row's
+    /// start, in order, and the file is `len` bytes, the last row ending
+    /// there. `field_count_mode` stands in until the file's own index pass
+    /// gives the real one ([`adopt_field_count_mode`]); the unterminated
+    /// quote, if any, is at `unterminated_quote`. `None` if the starts
+    /// aren't strictly increasing and inside the file (a bug in the caller).
+    ///
+    /// [`adopt_field_count_mode`]: RowIndex::adopt_field_count_mode
     #[must_use]
-    pub(crate) fn shifted(
-        &self,
-        rows: usize,
-        deltas: &[(usize, i64)],
+    pub(crate) fn from_starts(
+        dialect: IndexDialect,
+        mut starts: Vec<u32>,
         len: usize,
+        field_count_mode: Option<usize>,
         unterminated_quote: Option<usize>,
     ) -> Option<RowIndex> {
-        let state = self.read();
-        let old = state.starts.get(..=rows)?;
-        let mut starts = Vec::with_capacity(old.len());
-        let mut shift: i64 = 0;
-        let mut next = deltas.iter().peekable();
-        for (row, &start) in old.iter().enumerate() {
-            while let Some(&&(changed, delta)) = next.peek()
-                && changed < row
-            {
-                shift += delta;
-                next.next();
-            }
-            let moved = i64::from(start).checked_add(shift)?;
-            starts.push(u32::try_from(moved).ok()?);
-        }
-        if starts.last().map(|&end| to_usize(end)) != Some(len) {
+        let end = u32::try_from(len).ok()?;
+        let first = starts.first().copied().unwrap_or(end);
+        if to_usize(first) < dialect.bom_len
+            || starts.windows(2).any(|pair| pair[0] >= pair[1])
+            || starts.last().is_some_and(|&last| last >= end)
+        {
             return None;
         }
+        starts.push(end);
         Some(RowIndex {
-            dialect: self.dialect,
+            dialect,
             state: RwLock::new(State {
                 starts,
                 len,
                 scanned: len,
                 status: Status::Complete,
-                field_count_mode: state.field_count_mode,
+                field_count_mode,
                 unterminated_quote,
                 waiting: Waiting::default(),
             }),
         })
+    }
+
+    /// Takes `other`'s field count mode: a save's index ([`from_starts`])
+    /// takes the one the file's own index pass found.
+    ///
+    /// [`from_starts`]: RowIndex::from_starts
+    pub(crate) fn adopt_field_count_mode(&self, other: &RowIndex) {
+        let mode = other.field_count_mode();
+        self.write().field_count_mode = mode;
+    }
+
+    /// Appends the starts of rows `rows`, each moved by `shift` bytes, to
+    /// `out`: the rows a save copies unchanged ([`from_starts`]). `false`
+    /// if a row isn't indexed or would start outside 32 bits.
+    ///
+    /// [`from_starts`]: RowIndex::from_starts
+    pub(crate) fn extend_starts(&self, rows: Range<usize>, shift: i64, out: &mut Vec<u32>) -> bool {
+        let state = self.read();
+        let Some(starts) = state.starts.get(rows) else {
+            return false;
+        };
+        out.reserve(starts.len());
+        for &start in starts {
+            match i64::from(start)
+                .checked_add(shift)
+                .and_then(|moved| u32::try_from(moved).ok())
+            {
+                Some(moved) => out.push(moved),
+                None => return false,
+            }
+        }
+        true
     }
 
     fn new(dialect: IndexDialect) -> Result<RowIndex, IndexError> {
@@ -821,6 +844,11 @@ impl Waiting {
 }
 
 impl Indexer {
+    /// The index it fills.
+    pub(crate) fn index(&self) -> &Arc<RowIndex> {
+        &self.index
+    }
+
     /// This indexer, made to collect the file's diagnostics too, whose text
     /// is in `encoding`, and the shared [`Diagnostics`] it will publish
     /// them to: what [`RowIndex::start_with_diagnostics`] gives, but later.

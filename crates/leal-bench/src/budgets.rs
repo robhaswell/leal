@@ -115,6 +115,13 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 500.0,
         source: "DESIGN §1",
     },
+    // Save after 1,000 rows deleted (PLAN 2.4c): a save's budget, with the
+    // piece list walked.
+    Budget {
+        id: "save/rows_deleted",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
     // Save As UTF-8 of the reference file written as UTF-16 (PLAN 2.3):
     // Save's 500 ms, doubled for a file twice the size, every byte of it
     // converted (ADR-0013 decision 3).

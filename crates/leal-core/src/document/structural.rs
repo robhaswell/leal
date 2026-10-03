@@ -143,6 +143,10 @@ impl Document {
                 let Some(row) = now.get(i) else {
                     return Err(EditError::NoSuchRow { row: at + i });
                 };
+                // Empty cells at the end don't count: undoing an edit past a
+                // row's end after a save leaves an empty field there
+                // (ADR-0012 decision 4), which reads the same.
+                let (row, expected) = (filled(row), filled(expected));
                 if row != expected {
                     let column = row
                         .iter()
@@ -175,6 +179,15 @@ impl Document {
         whole_file(&reading)?;
         change(&reading)
     }
+}
+
+/// `values` without the empty cells at the end.
+fn filled(values: &[String]) -> &[String] {
+    let end = values
+        .iter()
+        .rposition(|value| !value.is_empty())
+        .map_or(0, |last| last + 1);
+    &values[..end]
 }
 
 /// [`EditError::StillReading`] unless the whole file has been read, and

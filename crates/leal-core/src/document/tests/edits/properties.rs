@@ -1,8 +1,9 @@
-//! The edit property (tasks 2.1, 2.4a and 2.4b): random cell edits, row
-//! and column inserts and deletes, undos and redos on generated files, with
-//! every reader of the document checked against the testkit's save
-//! oracle's edited view (`leal_testkit::save::Document`), which never sees
-//! leal-core's code.
+//! The edit property (tasks 2.1, 2.4a, 2.4b and 2.4c): random cell
+//! edits, row and column inserts and deletes, undos and redos on generated
+//! files, with every reader of the document checked against the testkit's
+//! save oracle's edited view (`leal_testkit::save::Document`), which never
+//! sees leal-core's code, and the save the document would make against the
+//! oracle's, splice for splice (F6).
 //!
 //! The edits come from the testkit's edit strategy, hatched cells and
 //! edits past an unterminated quote included, runs of several rows
@@ -15,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use leal_testkit::diagnostics::DiagnosticKind as TkKind;
+use leal_testkit::fidelity::Change;
 use leal_testkit::save::{CellSource, Document as Oracle, Edit as OracleEdit, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, GeneratedCsv};
 use leal_testkit::strategies::edits::{EDIT_VALUES, EditCase, edit_case};
@@ -25,6 +27,7 @@ use proptest::test_runner::TestRunner;
 
 use super::*;
 use crate::rows::{NUMBER_MAX_CHARS, NumericColumns};
+use crate::save::{SaveError as SavingError, SaveKind};
 
 /// One step of the user's: the strategy's next edit (a cell's, or a row
 /// or a column inserted or deleted), a run of rows inserted or deleted at
@@ -775,11 +778,29 @@ fn every_reader_agrees(
     let early = search(&document, query);
     run(&document, &mut state, &case, &steps)?;
     check_readers(&document, &state, &case.file, header, query, &early)?;
+    let oracle = &state.oracle;
+    // F6 (task 2.4c): after any edits, undos and redos, a save makes the
+    // oracle's splices, or names the same cells.
+    let expected = oracle.save();
+    match (&expected, document.save_plan(SaveKind::Save)) {
+        (Ok(saved), Ok(plan)) => {
+            let splices: Vec<Change> = plan
+                .splices()
+                .iter()
+                .map(|s| Change::replace(s.range.clone(), s.bytes.clone()))
+                .collect();
+            prop_assert_eq!(&splices, &saved.changes);
+            prop_assert_eq!(plan.rows(), oracle.row_count());
+        }
+        (Err(SaveError::Unencodable(cells)), Err(SavingError::Unencodable { cells: got, .. })) => {
+            prop_assert_eq!(&got, cells);
+        }
+        (expected, plan) => prop_assert!(false, "oracle {:?}, plan {:?}", expected, plan),
+    }
     // With the file's rows and columns as they were, the document has
     // unsaved edits exactly when saving would change the file's bytes.
     // With rows or columns inserted or deleted, it has them even if what
     // was inserted reads as what was deleted did.
-    let oracle = &state.oracle;
     let rows_as_read = oracle.row_count() == case.file.layout.rows.len()
         && (0..oracle.row_count()).all(|row| oracle.source_row(row) == Some(row))
         && state.columns.is_empty();
@@ -787,7 +808,7 @@ fn every_reader_agrees(
         prop_assert!(document.has_edits());
         return Ok(());
     }
-    match oracle.save() {
+    match expected {
         Ok(saved) => prop_assert_eq!(document.has_edits(), saved.bytes != case.file.bytes),
         Err(SaveError::Unencodable(_)) => prop_assert!(document.has_edits()),
         Err(error) => prop_assert!(false, "{}", error),

@@ -1,7 +1,3 @@
-#![cfg_attr(
-    not(any(test, feature = "test-hooks")),
-    expect(dead_code, reason = "task 2.4c's writer")
-)]
 //! Per-column quoting of new fields (ADR-0004 decision 2, ADR-0005
 //! decision 3, ADR-0014 decision 4; task 2.4b), for the writer (task 2.4c).
 //!

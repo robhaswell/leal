@@ -25,12 +25,24 @@
 //!    field that would start with BOM-like bytes (`EF BB BF`, `FF FE`,
 //!    `FE FF`) is quoted ([`Fix::BomLikeQuoted`]).
 //!
-//! The trailing newline is the last row's own, so it is kept as it was.
-//! These are the save oracle's rules (`leal_testkit::save`) for cell edits,
-//! and the property tests compare the two, splice for splice. Row and
-//! column inserts and deletes (task 2.4) add the rules for new rows and
-//! fields, and the CR/LF split (ADR-0004 decision 10), which only they can
-//! need: an edited row never starts with LF.
+//! Rows inserted and deleted (task 2.4c) add:
+//!
+//! 5. A **deleted row** is one delete of its bytes, line ending included.
+//! 6. A run of **inserted rows** is one insert at the start of the next
+//!    row of the file (deleted or not), or at its end (`new_row_bytes`):
+//!    each value encoded and quoted if it needs it, if the file quotes
+//!    every field, or if its column quotes new cells (`ColumnQuoting`,
+//!    ADR-0004 decision 2); a row with no bytes is `""`.
+//! 7. **Line endings** (ADR-0004 decisions 3 and 4): an inserted row ends
+//!    with the file's most common line ending; the last row of the output
+//!    has one only if the file had a final newline, so a row that ends the
+//!    file now, or no longer does, is rewritten whole with its new one. A
+//!    blank LF line brought after a lone CR becomes CR ([`Fix::CrSplit`],
+//!    decision 10): only deletes and inserts can bring the two together.
+//!    Rule 4's fixes apply to whichever row is first, or blank at the end.
+//!
+//! These are the save oracle's rules (`leal_testkit::save`), and the
+//! property tests compare the two, splice for splice.
 //!
 //! **Encoding** (DESIGN §3.7, F5, task 2.3). Each edited value is written
 //! in the file's encoding ([`encode`]): UTF-8 holds any value; a
@@ -116,9 +128,29 @@ pub enum Fix {
         /// The row.
         row: usize,
     },
+    /// A blank line after a row ending in a lone CR gets a CR line ending
+    /// instead of LF, so the two don't read back as one CRLF (decision 10).
+    /// Only rows inserted or deleted can bring the two together.
+    CrSplit {
+        /// The row whose line ending changed.
+        row: usize,
+    },
     /// The first field was quoted because it would start with BOM-like
     /// bytes (decisions 7 and 10).
     BomLikeQuoted,
+}
+
+impl Fix {
+    /// Where it comes in the list of a save's fixes, which is the oracle's
+    /// order: the rows written `""`, then the CR splits, then the BOM-like
+    /// first field, each kind in row order.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Fix::EmptyRowQuoted { .. } => 0,
+            Fix::CrSplit { .. } => 1,
+            Fix::BomLikeQuoted => 2,
+        }
+    }
 }
 
 /// What a save writes over.
@@ -459,9 +491,6 @@ pub enum SaveError {
         /// The error, with its errno.
         error: io::Error,
     },
-    /// Rows or columns have been inserted or deleted, which Leal can't
-    /// save yet (task 2.4c): nothing was written. The app keeps the edits.
-    RowsChanged,
     /// The save was cancelled.
     Cancelled,
     /// Anything else, such as a panic in the save. English, for logs.
@@ -503,9 +532,6 @@ impl fmt::Display for SaveError {
             SaveError::NotAFile => f.write_str("something other than a file is there"),
             SaveError::Read(error) => error.fmt(f),
             SaveError::Write { step, error } => write!(f, "{step}: {error}"),
-            SaveError::RowsChanged => {
-                f.write_str("rows or columns were inserted or deleted, which can't be saved yet")
-            }
             SaveError::Cancelled => f.write_str("the save was cancelled"),
             SaveError::Failed(message) => f.write_str(message),
         }
@@ -603,21 +629,30 @@ impl RowRules {
     }
 }
 
-/// One edited row of the file, as it was read.
+/// One row of the file, as it was read, that a save writes with any edits
+/// it has: an edited row, or one whose neighbours changed (task 2.4c).
 #[derive(Clone, Debug)]
 pub(crate) struct EditedRow<'a> {
-    /// The row, which is also its place in the output.
+    /// Its place in the output (the document's logical row): what fixes
+    /// and refusals name.
     pub(crate) row: usize,
     /// The file's bytes from `base` on, holding the row and its line ending.
     pub(crate) bytes: &'a [u8],
     pub(crate) base: usize,
     /// The row's bytes, without its line ending.
     pub(crate) span: Range<usize>,
+    /// Its line ending in the file.
     pub(crate) line_ending: Option<LineEnding>,
+    /// Its line ending in the output (ADR-0004 decisions 3 and 4): its
+    /// own, unless it now ends a file with no final newline (none), or no
+    /// longer ends the file and had none (the most common one).
+    pub(crate) ending: Option<LineEnding>,
+    /// The row before it in the output ends with a lone CR (decision 10).
+    pub(crate) after_cr: bool,
     pub(crate) fields: &'a [FieldSpan],
-    /// Its edited cells, by column, sorted.
+    /// Its edited cells, by column, sorted (none: an unedited row).
     pub(crate) cells: &'a [(usize, Arc<str>)],
-    /// It is the file's first row, in a file without a BOM.
+    /// It is the output's first row, in a file without a BOM.
     pub(crate) first_without_bom: bool,
 }
 
@@ -700,14 +735,18 @@ impl EditedRow<'_> {
 }
 
 /// The splices that write `row` (see the module docs), added to `splices`,
-/// and any fix, added to `fixes`. On error, the columns whose values can't
-/// be encoded, and nothing is added.
+/// and any fix, added to `fixes`. Returns the line ending written. On
+/// error, the columns whose values can't be encoded, and nothing is added.
+///
+/// An unedited row gets no splice unless a fix or its line ending changes
+/// it (task 2.4c: a neighbour inserted or deleted), and then one of the
+/// whole row, as does an edited row whose line ending changes.
 pub(crate) fn row_splices(
     row: &EditedRow<'_>,
     rules: RowRules,
     splices: &mut Vec<Splice>,
     fixes: &mut Vec<Fix>,
-) -> Result<(), Vec<usize>> {
+) -> Result<Option<LineEnding>, Vec<usize>> {
     let unencodable: Vec<usize> = row
         .cells
         .iter()
@@ -718,13 +757,22 @@ pub(crate) fn row_splices(
         return Err(unencodable);
     }
     let len = row.len();
+    let empty = len == 1 && row.cell_bytes(0, rules).is_ok_and(|bytes| bytes.is_empty());
     // ADR-0004 decision 6: a row with no bytes would read back as a blank
     // line, or vanish at the end of the file. An edited row is never an
     // original blank line (setting a blank line's cell back to "" removes
-    // the edit), so it is written `""`.
-    let empty = len == 1 && row.cell_bytes(0, rules).is_ok_and(|bytes| bytes.is_empty());
-    // ADR-0004 decisions 7 and 10: only the first field of the file can be
-    // read as a BOM.
+    // the edit), so it is written `""`; so is an original blank line that
+    // now ends a file with no final newline.
+    let empty_row = empty && (!row.cells.is_empty() || row.ending.is_none());
+    // Decision 10: a blank LF line after a lone CR would read back as one
+    // CRLF, so it ends with CR.
+    let mut ending = row.ending;
+    let cr_split = empty && !empty_row && row.after_cr && ending == Some(LineEnding::Lf);
+    if cr_split {
+        ending = Some(LineEnding::Cr);
+    }
+    // Decisions 7 and 10: only the first field of the file can be read as
+    // a BOM.
     let bom_like = !empty
         && row.first_without_bom
         && row.content(rules, 3).is_ok_and(|start| {
@@ -732,27 +780,36 @@ pub(crate) fn row_splices(
                 .iter()
                 .any(|bom| start.len() >= bom.len() && start.starts_with(bom))
         });
-    if empty || bom_like {
-        let ending = row.line_ending.map_or(&b""[..], LineEnding::bytes);
-        let mut bytes = if empty {
-            fixes.push(Fix::EmptyRowQuoted { row: row.row });
+    if empty_row || bom_like || ending != row.line_ending {
+        let mut bytes = if empty_row {
             b"\"\"".to_vec()
-        } else {
-            fixes.push(Fix::BomLikeQuoted);
+        } else if bom_like {
             let content = row.content(rules, usize::MAX).map_err(|c| vec![c])?;
             let first = row.cell_bytes(0, rules).map_err(|c| vec![c])?.len();
             let mut quoted = quote(&content[..first]);
             quoted.extend_from_slice(&content[first..]);
             quoted
+        } else {
+            row.content(rules, usize::MAX).map_err(|c| vec![c])?
         };
-        bytes.extend_from_slice(ending);
+        bytes.extend_from_slice(ending.map_or(&b""[..], LineEnding::bytes));
+        if empty_row {
+            fixes.push(Fix::EmptyRowQuoted { row: row.row });
+        }
+        if cr_split {
+            fixes.push(Fix::CrSplit { row: row.row });
+        }
+        if bom_like {
+            fixes.push(Fix::BomLikeQuoted);
+        }
         splices.push(Splice {
             range: row.span.start..row.end(rules),
             bytes,
         });
-        return Ok(());
+        return Ok(ending);
     }
     // Rule 2: each edited field whose bytes change.
+    let mut changed = Vec::new();
     for &(column, _) in row.cells {
         let Some(field) = row.fields.get(column) else {
             break;
@@ -762,7 +819,7 @@ pub(crate) fn row_splices(
             .original(field, rules)
             .is_none_or(|original| *bytes != *original)
         {
-            splices.push(Splice {
+            changed.push(Splice {
                 range: field.span(),
                 bytes: bytes.into_owned(),
             });
@@ -775,12 +832,121 @@ pub(crate) fn row_splices(
             appended.push(rules.delimiter);
             appended.extend_from_slice(&row.cell_bytes(column, rules).map_err(|c| vec![c])?);
         }
-        splices.push(Splice {
+        changed.push(Splice {
             range: row.span.end..row.span.end,
             bytes: appended,
         });
     }
-    Ok(())
+    splices.append(&mut changed);
+    Ok(ending)
+}
+
+/// One cell of a row written whole from how it reads now (task 2.4c): an
+/// inserted row, or a row of the file whose cells a column operation moved,
+/// took or added to.
+#[derive(Clone, Debug)]
+pub(crate) enum NewCell<'a> {
+    /// A new field, edited or not: one of an inserted row's own values, or
+    /// a column insert's. Quoted by its column's rule (ADR-0004 decision 2,
+    /// ADR-0014 decision 4).
+    New(&'a str),
+    /// An edited field of the file: quoted if the field was (task 2.2's
+    /// rule), or if the file quotes every field.
+    Edited { value: &'a str, quoted: bool },
+    /// An edited cell past the row's own values (a hatched cell): quoted
+    /// only if it needs it, or if the file quotes every field.
+    Hatched(&'a str),
+    /// An unedited field of the file: its bytes as written (converted, for
+    /// Save As UTF-8).
+    Bytes(Cow<'a, [u8]>),
+    /// Padding before a hatched cell: no bytes.
+    Padding,
+}
+
+/// A row written whole ([`whole_row_bytes`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WholeRow<'a> {
+    /// Its place in the output: what fixes and refusals name.
+    pub(crate) row: usize,
+    pub(crate) cells: &'a [NewCell<'a>],
+    /// Its line ending in the output.
+    pub(crate) ending: Option<LineEnding>,
+    /// It is a blank line of the file: with no bytes now, it stays one
+    /// while it has a line ending (ADR-0004 decision 6).
+    pub(crate) blank_line: bool,
+    /// The row before it in the output ends with a lone CR (decision 10).
+    pub(crate) after_cr: bool,
+    /// It is the output's first row, in a file without a BOM.
+    pub(crate) first_without_bom: bool,
+}
+
+/// The bytes of `row`, line ending included, with any fix added to
+/// `fixes`, and the line ending written: each value encoded, and quoted if
+/// it needs it, if the file quotes every field, or as its kind of cell says
+/// ([`NewCell`], `quoting` for a new field). The fixes are the oracle's:
+/// `""` for a row with no bytes that isn't a blank line keeping its line
+/// ending (decision 6), CR for a blank LF line after a lone CR (decision
+/// 10), and the first field quoted if it starts the file with BOM-like
+/// bytes (decision 7). On error, the columns whose values can't be
+/// encoded, and nothing is added.
+pub(crate) fn whole_row_bytes(
+    row: &WholeRow<'_>,
+    rules: RowRules,
+    quoting: &ColumnQuoting,
+    fixes: &mut Vec<Fix>,
+) -> Result<(Vec<u8>, Option<LineEnding>), Vec<usize>> {
+    let mut content = Vec::new();
+    let mut first = 0;
+    let mut unencodable = Vec::new();
+    for (column, cell) in row.cells.iter().enumerate() {
+        if column > 0 {
+            content.push(rules.delimiter);
+        }
+        let (encoding, delimiter) = (rules.encoding, rules.delimiter);
+        let bytes = match cell {
+            NewCell::New(value) => field_bytes(
+                value,
+                encoding,
+                delimiter,
+                rules.quote_all || quoting.quoted(column),
+            ),
+            NewCell::Edited { value, quoted } => {
+                field_bytes(value, encoding, delimiter, rules.quote_all || *quoted)
+            }
+            NewCell::Hatched(value) => field_bytes(value, encoding, delimiter, rules.quote_all),
+            NewCell::Bytes(bytes) => Ok(Cow::Borrowed(bytes.as_ref())),
+            NewCell::Padding => Ok(Cow::Borrowed(&b""[..])),
+        };
+        match bytes {
+            Ok(bytes) => content.extend_from_slice(&bytes),
+            Err(_) => unencodable.push(column),
+        }
+        if column == 0 {
+            first = content.len();
+        }
+    }
+    if !unencodable.is_empty() {
+        return Err(unencodable);
+    }
+    let mut ending = row.ending;
+    if content.is_empty() {
+        if !row.blank_line || ending.is_none() {
+            // ADR-0004 decision 6: a row with no bytes would read back as
+            // a blank line, or vanish at the end of the file.
+            fixes.push(Fix::EmptyRowQuoted { row: row.row });
+            content = b"\"\"".to_vec();
+        } else if row.after_cr && ending == Some(LineEnding::Lf) {
+            fixes.push(Fix::CrSplit { row: row.row });
+            ending = Some(LineEnding::Cr);
+        }
+    } else if row.first_without_bom && BOM_LIKE.iter().any(|bom| content.starts_with(bom)) {
+        fixes.push(Fix::BomLikeQuoted);
+        let mut quoted = quote(&content[..first]);
+        quoted.extend_from_slice(&content[first..]);
+        content = quoted;
+    }
+    content.extend_from_slice(ending.map_or(&b""[..], LineEnding::bytes));
+    Ok((content, ending))
 }
 
 /// The new file's length so far: `at` bytes of the snapshot, with splices

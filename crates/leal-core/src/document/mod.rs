@@ -2085,6 +2085,10 @@ fn start_index(
     let source = Arc::clone(context.source);
     let progress = context.progress.cloned();
     let readers = Arc::clone(index);
+    // A save's new reading serves its rows from an index built from the
+    // save's plan (task 2.4c), complete at once; the pass then fills an
+    // index of its own, for the diagnostics and the field count mode.
+    let filled = Arc::clone(indexer.index());
     let edits = Arc::clone(edits);
     let slot = Arc::clone(diagnostics);
     context
@@ -2105,6 +2109,9 @@ fn start_index(
                 checkpoint
             };
             index_file(&source, indexer, job, report)?;
+            if !Arc::ptr_eq(&filled, &readers) {
+                readers.adopt_field_count_mode(&filled);
+            }
             Ok(IndexSummary {
                 rows: readers.row_count(),
                 field_count_mode: readers.field_count_mode(),
@@ -2537,9 +2544,16 @@ fn index_progress(
     edits: &EditStore,
 ) -> IndexProgress {
     let complete = index.status() == Status::Complete;
+    // A save's new reading has every row at once (its index is built from
+    // the save's plan) while its index pass runs for the diagnostics.
+    let rows = if complete {
+        index.row_count()
+    } else {
+        progress.rows
+    };
     IndexProgress {
         generation,
-        rows: edits.rows_within(progress.rows),
+        rows: edits.rows_within(rows),
         estimated_rows: edits.shift(index.estimated_row_count().unwrap_or(0).max(progress.rows)),
         bytes_scanned: u64::try_from(progress.bytes_scanned).unwrap_or(u64::MAX),
         bytes_total: u64::try_from(progress.bytes_total).unwrap_or(u64::MAX),

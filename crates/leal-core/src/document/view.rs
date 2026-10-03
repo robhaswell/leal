@@ -145,10 +145,6 @@ impl<'a> RowView<'a> {
     }
 
     /// The row's id.
-    #[cfg_attr(
-        not(any(test, feature = "test-hooks")),
-        expect(dead_code, reason = "task 2.4c's writer")
-    )]
     pub(crate) fn id(&self) -> RowId {
         self.id
     }
@@ -201,7 +197,6 @@ impl<'a> RowView<'a> {
     /// Whether the row's cells are all its own fields in their places,
     /// then hatched cells: no column operation moved or took anything in
     /// it, so it can be written field by field (task 2.4c).
-    #[cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
     pub(crate) fn same_shape(&self) -> bool {
         let fields = self.own.len();
         match self.layout() {
