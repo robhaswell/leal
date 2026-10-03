@@ -184,6 +184,20 @@ final class GridContainerView: NSView {
             name: NSScrollView.willStartLiveScrollNotification,
             object: scrollView
         )
+        // The accent colour and Increase Contrast change the palette
+        // (`GridPalette`); strips hold the old colours until redrawn.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(systemColorsChanged(_:)),
+            name: NSColor.systemColorsDidChangeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemColorsChanged(_:)),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
         scrollView.onGesture = { [weak self] began in self?.onGesture?(began) }
         headerView.scrollTarget = scrollView
         gutterView.scrollTarget = scrollView
@@ -292,6 +306,16 @@ final class GridContainerView: NSView {
         jumpedAt = CACurrentMediaTime()
     }
 
+    /// The strips redraw with the new colours; AppKit's drawing, and the
+    /// header, redraw as the views are told.
+    @objc private func systemColorsChanged(_ notification: Notification) {
+        strips?.invalidateAll()
+        gutterStrips?.invalidateAll()
+        if strips == nil { gridView.needsDisplay = true }
+        if gutterStrips == nil { gutterView.needsDisplay = true }
+        headerView.needsDisplay = true
+    }
+
     @objc private func liveScrollWillStart(_ notification: Notification) {
         scrollInputArrived()
     }
@@ -344,8 +368,12 @@ final class GridContainerView: NSView {
     /// one, switching back only below the line less the hysteresis. Until
     /// the grid is laid out, strips.
     private func updateDrawing() {
-        let width = gridView.frame.width
-        let visible = scrollView.contentView.bounds.width
+        // Not `gridView.frame.width`: when the window narrows, this runs
+        // from the scroll view's tiling, before the document view is sized
+        // again, so that is the old width against the new visible width.
+        // The width it is about to get, against the same visible width.
+        let visible = scrollView.contentSize.width
+        let width = max(geometry.totalWidth, visible)
         let wanted: Bool
         if !allowsStrips {
             wanted = false
@@ -423,7 +451,14 @@ final class GridContainerView: NSView {
         guard !rows.isEmpty else { return }
         let top = CGFloat(rows.lowerBound) * geometry.rowHeight
         let height = CGFloat(rows.count) * geometry.rowHeight
-        gridView.invalidate(CGRect(x: 0, y: top, width: gridView.bounds.width, height: height))
+        // The rows the old values' ink reached are cleared in the same pass.
+        let reached = gridView.rows(withSpillsOf: rows)
+        gridView.invalidate(CGRect(
+            x: 0,
+            y: CGFloat(reached.lowerBound) * geometry.rowHeight,
+            width: gridView.bounds.width,
+            height: CGFloat(reached.count) * geometry.rowHeight
+        ))
         gutterView.invalidate(CGRect(x: 0, y: top, width: gutterView.bounds.width, height: height))
     }
 

@@ -187,22 +187,60 @@ final class GridStrips: NSObject, CALayerDelegate {
 
     /// How many times strips were asked to redraw, for snapshots.
     private var invalidations = 0
+    /// The strip being drawn.
+    private var drawing: Int?
 
     /// Redraws the part of `rect` (in the view's coordinates) that strips
     /// show.
     func invalidate(_ rect: CGRect) {
         invalidations += 1
         for (index, strip) in strips {
-            let stripRect = self.rect(ofStrip: index)
-            let part = rect.intersection(stripRect)
+            let part = rect.intersection(self.rect(ofStrip: index))
             guard !part.isNull, !part.isEmpty else { continue }
-            // In the strip's own coordinates, which go up.
-            strip.setNeedsDisplay(CGRect(
-                x: part.minX - stripRect.minX,
-                y: stripRect.maxY - part.maxY,
-                width: part.width,
-                height: part.height
-            ))
+            if index == drawing {
+                // Asked while this strip is being drawn (the ink of a row
+                // just drawn spills into rows of the strip not drawn this
+                // time): Core Animation drops that, and draws only its own
+                // dirty rectangle, so it is asked again once the drawing
+                // is over (the next frame; a snapshot shows it).
+                deferred.append((index, part))
+                scheduleDeferred()
+                continue
+            }
+            markDirty(strip, part: part)
+        }
+    }
+
+    /// `part` (in the view's coordinates) of the strip is to be drawn.
+    private func markDirty(_ strip: StripLayer, part: CGRect) {
+        let stripRect = rect(ofStrip: strip.index)
+        // In the strip's own coordinates, which go up.
+        strip.setNeedsDisplay(CGRect(
+            x: part.minX - stripRect.minX,
+            y: stripRect.maxY - part.maxY,
+            width: part.width,
+            height: part.height
+        ))
+    }
+
+    /// Parts of the strip being drawn, asked for meanwhile.
+    private var deferred: [(index: Int, part: CGRect)] = []
+    private var deferredScheduled = false
+
+    private func scheduleDeferred() {
+        guard !deferredScheduled else { return }
+        deferredScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.flushDeferred() }
+        }
+    }
+
+    private func flushDeferred() {
+        deferredScheduled = false
+        let parts = deferred
+        deferred = []
+        for (index, part) in parts {
+            if let strip = strips[index] { markDirty(strip, part: part) }
         }
     }
 
@@ -275,6 +313,7 @@ final class GridStrips: NSObject, CALayerDelegate {
         // the snapshot shows that frame.
         for _ in 0..<3 {
             let before = invalidations
+            flushDeferred()
             view.root.render(in: context)
             guard invalidations != before else { break }
         }
@@ -301,7 +340,9 @@ final class GridStrips: NSObject, CALayerDelegate {
             context.translateBy(x: -rect.minX, y: -rect.minY)
             let dirty = context.boundingBoxOfClipPath.intersection(CGRect(origin: rect.origin, size: strip.bounds.size))
             if !dirty.isNull, !dirty.isEmpty {
+                drawing = strip.index
                 content.drawDirectly(dirty, context: context)
+                drawing = nil
             }
             context.restoreGState()
         }

@@ -103,6 +103,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
         super.viewDidChangeEffectiveAppearance()
         lines.removeAll()
         ahead.reset()
+        forgetSpills()
         needsDisplay = true
     }
 
@@ -110,6 +111,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
     func invalidateContent() {
         lines.removeAll()
         ahead.reset()
+        forgetSpills()
         needsDisplay = true
     }
 
@@ -220,6 +222,30 @@ final class GridView: StripContentView, NSMenuItemValidation {
     /// look.
     private var farthestSpill = 0
 
+    /// `rows` and the rows their ink spilled into when last drawn: an
+    /// edit's rows are redrawn together with those, in the same pass, so a
+    /// neighbour that held ink of the old value is cleared at once (a
+    /// row's new ink is learnt when it is drawn: `noteSpill`).
+    func rows(withSpillsOf rows: Range<Int>) -> Range<Int> {
+        guard !spills.isEmpty, !rows.isEmpty else { return rows }
+        var low = rows.lowerBound
+        var high = rows.upperBound
+        let reaching: [(Int, InkSpill)] = rows.count <= spills.count
+            ? rows.compactMap { row in spills[row].map { (row, $0) } }
+            : spills.filter { rows.contains($0.key) }.map { ($0.key, $0.value) }
+        for (row, spill) in reaching {
+            low = min(low, max(0, row - spill.above))
+            high = max(high, row + spill.below + 1)
+        }
+        return low..<high
+    }
+
+    /// What was learnt is about values and fonts that may be different now.
+    private func forgetSpills() {
+        spills.removeAll()
+        farthestSpill = 0
+    }
+
     /// `rows`, and the rows outside them whose ink spills into them, in
     /// order: each a range.
     private func rowsReaching(_ rows: Range<Int>, rowCount: Int) -> [Range<Int>] {
@@ -244,8 +270,10 @@ final class GridView: StripContentView, NSMenuItemValidation {
         let new = whole ? spill : old.union(spill)
         guard new != old else { return }
         if spills.count > 10_000 {
-            spills.removeAll()
-            farthestSpill = 0
+            // Rows already drawn lose their record: draw everything again,
+            // which learns the spills that matter in view.
+            forgetSpills()
+            strips?.invalidateAll()
         }
         if new == InkSpill() {
             spills[row] = nil

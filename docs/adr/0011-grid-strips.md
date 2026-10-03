@@ -9,7 +9,8 @@
 
 **Decision: the grid and the gutter draw into strips of rows that scrolling
 moves, instead of letting AppKit rebuild the visible grid on every scroll
-step. Grids wider than 4,096 pt keep today's drawing.** It lands only once
+step. Grids wider than 1.5 times the visible width (or 4,096 pt) keep
+today's drawing.** It lands only once
 the prototype has tests and has been checked on screen, as a follow-up
 task; task 2.0a lands without it.
 
@@ -110,14 +111,17 @@ files. Not re-measured.
 ## Decision
 
 Accepted by Rob on 2 October 2026, conditional: **strips for grids up to
-4,096 pt wide, today's drawing for wider ones**, switching when the width
-crosses the line (a column resized, more columns read), with some
-hysteresis (switching back only a little below the line), so a column
-dragged back and forth across it doesn't switch on every step. The follow-up task
-lands it only once the prototype has tests and an on-screen check. Wide
-files keep 2.0a's drawing, where p99 is 2.9 ms at 200 columns on this Mac
-(the 3× rule judges only the reference file, but wide files are already
-over its number).
+1.5 times the visible width (never past 4,096 pt), today's drawing for
+wider ones**, switching when the width crosses the line (a column resized,
+more columns read, the window resized), with hysteresis: strips return
+below 1.4 times the visible width (never past 3,840 pt), so a column
+dragged back and forth across the line doesn't switch on every step. Rob
+accepted the 1.5 times / 1.4 times line on 3 October 2026 (it refines the
+4,096 pt line he accepted first; see "Measured in task 2.0b"). The
+follow-up task lands it only once the prototype has tests and an on-screen
+check. Wide files keep 2.0a's drawing, where p99 is 2.9 ms at 200 columns
+on this Mac (the 3× rule judges only the reference file, but wide files
+are already over its number).
 
 ## Risks to settle in the follow-up task
 
@@ -150,7 +154,7 @@ From the 2.0a review:
   WindowServer to composite; measure its CPU and late frames, not only
   Leal's main thread.
 
-## Measured in task 2.0b (for Rob to accept)
+## Measured in task 2.0b (answered: accepted by Rob, 2026-10-03)
 
 Rebuilt on 2.0a as landed, same binary, alternated, 1,200 × 784 pt window
 on Retina, visible width 1,134 pt (docs/tasks/2.0b.md, "Where strips pay"):
@@ -165,12 +169,12 @@ on Retina, visible width 1,134 pt (docs/tasks/2.0b.md, "Where strips pay"):
 WindowServer's CPU a frame is about the same with strips (1.97 against
 1.85 ms, and 2.20 against 2.40 ms with a search).
 
-**Proposed refinement of the line**: strips while the grid is within 1.5
+**Refinement of the line (accepted by Rob, 2026-10-03)**: strips while the grid is within 1.5
 times the visible width and no wider than 4,096 pt; back to strips below
 1.4 times (3,840 pt). A strip's cost grows with the grid's width and
 AppKit's with the visible width, so a fixed 4,096 pt line costs as much
 memory as 1.10's tiles and is slower at p99. Task 2.0b implements this
-refinement; the Decision above still says 4,096 pt until Rob accepts it.
+refinement, and the Decision above says so.
 
 ## Consequences
 

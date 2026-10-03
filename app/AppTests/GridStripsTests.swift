@@ -62,7 +62,7 @@ final class GridStripsTests: XCTestCase {
     }
 
     /// `view`, drawn by `cacheDisplay` into an sRGB bitmap at `scale`.
-    private func snapshot(_ view: NSView, scale: CGFloat = 2, rect: NSRect? = nil) -> NSBitmapImageRep {
+    private func snapshot(_ view: NSView, scale: CGFloat = 2, rect: NSRect? = nil, laterFrame: Bool = true) -> NSBitmapImageRep {
         let rect = rect ?? view.bounds
         let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -78,11 +78,13 @@ final class GridStripsTests: XCTestCase {
         )!.retagging(with: .sRGB)!
         rep.size = rect.size
         view.cacheDisplay(in: rect, to: rep)
-        if !(view is StripContentView) {
+        if laterFrame, !(view is StripContentView) {
             // A frame later: a strip that draws a row for the first time
-            // can ask for ink it spills upwards into the strip above to be
-            // drawn, in the next frame (`GridView.spills`). (A grid view's
+            // can ask for ink it spills past its edge (or past what was
+            // drawn of it) to be drawn, in the next frame
+            // (`GridView.spills`; `GridStrips.invalidate`). (A grid view's
             // own snapshot waits for that itself.)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.005))
             view.cacheDisplay(in: rect, to: rep)
         }
         return rep
@@ -229,6 +231,104 @@ final class GridStripsTests: XCTestCase {
         source.spillingRow = nil
         plain.gridView.needsDisplay = true
         assertDifferent(snapshot(grid.gridView, rect: edge), snapshot(plain.gridView, rect: edge), "row 11's marks reach row 12, in the next strip")
+    }
+
+    /// The strips against AppKit's own `draw(_:)` (a snapshot of the plain
+    /// grid, with nothing drawn over it), on a grid with no ink spilling
+    /// past its rows: a difference in appearance, colour space or context
+    /// setup between the strips and AppKit shows, which the reference
+    /// drawing in `assertSameGrid` (also ours) would not catch.
+    func testTheStripsMatchAppKitsOwnDrawing() {
+        let source = StripSource(rows: 400, loaded: 380)
+        source.spillingRow = -1
+        let highlighter = StripHighlighter()
+        for (appearance, scale) in [(light, 2.0), (dark, 2.0), (light, 1.0)] {
+            let (grid, plain) = makePair(source, appearance: appearance, scale: scale)
+            for (index, offset) in [NSPoint(x: 0, y: 0), NSPoint(x: 37, y: 22 * 41 + 11), NSPoint(x: 300, y: 22 * 375)].enumerated() {
+                for each in [grid, plain] {
+                    each.highlighter = highlighter
+                    scroll(each, to: offset)
+                    let top = each.visibleRows.lowerBound
+                    each.selection = GridSelection(active: CellPosition(row: top + 2, column: 0), anchor: CellPosition(row: top + 2, column: 0), extent: CellPosition(row: top + 4, column: 3))
+                }
+                XCTAssertNotNil(grid.strips)
+                assertSame(snapshot(grid, scale: scale), snapshot(plain, scale: scale), "\(appearance.name.rawValue) at \(scale)×, place \(index), against AppKit's draw(_:)")
+            }
+        }
+    }
+
+    /// Editing a cell's ink from spilling to plain and back: the rows its
+    /// ink reached are cleared (or drawn into) as when the whole grid is
+    /// drawn at once. Going to plain is cleared in the same pass as the
+    /// edit (one frame, not a later one); going to spilling is learnt when
+    /// the row is drawn, and shows a frame later (`GridView.spills`).
+    func testAnEditFromSpillingToPlainAndBack() {
+        for row in [11, 12] {
+            let source = StripSource(rows: 60)
+            source.spillingRow = row
+            let (grid, plain) = makePair(source)
+            assertSameGrid(grid, plain, "row \(row) spilling, before the edit")
+            // To plain: the marks reached the strip next door, which must
+            // be redrawn without them within the one frame.
+            source.spillingRow = -1
+            for each in [grid, plain] { each.cellsChanged(rows: row..<(row + 1)) }
+            assertSame(snapshot(grid, laterFrame: false), reference(plain), "row \(row), spilling to plain, in one frame")
+            // And back: plain to spilling.
+            source.spillingRow = row
+            for each in [grid, plain] { each.cellsChanged(rows: row..<(row + 1)) }
+            assertSameGrid(grid, plain, "row \(row), plain to spilling")
+        }
+    }
+
+    /// The accent colour (and Increase Contrast) change the palette:
+    /// every strip, the grid's and the gutter's, is drawn again.
+    func testASystemColourChangeRedrawsTheStrips() throws {
+        let source = StripSource(rows: 200)
+        let grid = makeGrid(source, strips: true)
+        let strips = try XCTUnwrap(grid.strips)
+        let gutter = try XCTUnwrap(grid.gutterStrips)
+        _ = snapshot(grid)
+        XCTAssertEqual(strips.strip(at: strips.placedIndexes[0])?.needsDisplay(), false, "drawn")
+        for (name, center) in [
+            (NSColor.systemColorsDidChangeNotification, NotificationCenter.default),
+            (NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, NSWorkspace.shared.notificationCenter),
+        ] {
+            let before = (strips.wholeRedraws, gutter.wholeRedraws)
+            center.post(name: name, object: nil)
+            // (At least once: AppKit may redraw views itself for Increase
+            // Contrast, as it does when their appearance changes.)
+            XCTAssertGreaterThanOrEqual(strips.wholeRedraws, before.0 + 1, "\(name.rawValue): the grid's strips")
+            XCTAssertGreaterThanOrEqual(gutter.wholeRedraws, before.1 + 1, "\(name.rawValue): the gutter's strips")
+            for each in [strips, gutter] {
+                XCTAssertEqual(each.strip(at: each.placedIndexes[0])?.needsDisplay(), true, "\(name.rawValue): a strip is to be drawn")
+            }
+            _ = snapshot(grid)
+        }
+    }
+
+    /// The window narrows in one step with the grid 1.45 times the new
+    /// visible width: the grid is within the line (1.5), so it keeps its
+    /// strips, however wide the document view still is while the window
+    /// tiles (it was as wide as the old, wide window).
+    func testANarrowingWindowKeepsStripsForAGridWithinTheLine() throws {
+        let source = StripSource(rows: 1_000, columns: 4)
+        // 1,015 pt: 1.45 times 700.
+        let widths: [CGFloat] = [250, 250, 250, 265]
+        let grid = makeGrid(source, strips: true, widths: widths, size: NSSize(width: 1_300, height: Self.size.height))
+        let plain = makeGrid(source, strips: false, widths: widths, size: NSSize(width: 1_300, height: Self.size.height))
+        let gutter = grid.window!.contentLayoutRect.width - grid.scrollView.contentView.bounds.width
+        let before = try XCTUnwrap(grid.strips)
+        let gutterBefore = try XCTUnwrap(grid.gutterStrips)
+        for each in [grid, plain] {
+            each.window?.setContentSize(NSSize(width: 700 + gutter, height: Self.size.height))
+            each.layoutSubtreeIfNeeded()
+        }
+        XCTAssertEqual(grid.scrollView.contentView.bounds.width, 700)
+        XCTAssertEqual(grid.gridView.frame.width, 1_015)
+        XCTAssertTrue(grid.strips === before, "the strips stay, the same ones")
+        XCTAssertTrue(grid.gutterStrips === gutterBefore)
+        XCTAssertTrue(grid.gridView.strips === before)
+        assertSameGrid(grid, plain, "after the window narrowed")
     }
 
     // MARK: Snapshots go through the strips
@@ -922,5 +1022,84 @@ final class GridStripsDocumentTests: XCTestCase {
         XCTAssertEqual(gridStrips.strip(at: index)?.needsDisplay(), true, "the edited row's strip")
         XCTAssertEqual(gridStrips.strip(at: placed[3])?.needsDisplay(), false, "another strip")
         document.close()
+    }
+
+    /// A new reading (a handle or a generation) redraws everything,
+    /// whichever change brought it: `DocumentViewController.modelChanged`
+    /// compares `model.readingID` with the one last drawn. The Header row
+    /// changes the reading and every value; the window is not told then
+    /// (its `onChange` is set aside), and the next change it hears, an
+    /// edit's rows, is one that redraws only those rows by itself. Without
+    /// the rule the strips would keep the old reading's cells.
+    func testANewReadingRedrawsEverythingWhateverTheChange() async throws {
+        var text = "id,name,city\n"
+        for row in 0..<300 { text += "\(row),n\(row),c\(row)\n" }
+        let url = directory.appending(path: "reading.csv")
+        try Data(text.utf8).write(to: url)
+        let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+        document.makeWindowControllers()
+        let model = try XCTUnwrap(document.model)
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let window = try XCTUnwrap(controller.window)
+        window.colorSpace = .sRGB
+        window.appearance = NSAppearance(named: .aqua)
+        let grid = controller.content.grid
+        grid.stripScaleForTesting = 2
+        try await waitUntil("indexed") { model.isIndexComplete }
+        controller.content.view.layoutSubtreeIfNeeded()
+        _ = try XCTUnwrap(grid.strips)
+        let (held, now) = strips(grid)
+        XCTAssertEqual(held, now, "at first")
+
+        let listener = model.onChange
+        let reading = model.readingID
+        model.onChange = nil
+        model.setHeaderRow(false)
+        XCTAssertNotEqual(model.readingID, reading, "a new reading")
+        try await waitUntil("read again") { model.isIndexComplete }
+        // Anything the window was not told of is settled.
+        try await Task.sleep(for: .milliseconds(100))
+        model.onChange = listener
+        model.cellsChanged(rows: 200..<201)
+        controller.content.view.layoutSubtreeIfNeeded()
+        let after = strips(grid)
+        XCTAssertNotEqual(after.held, held, "the values shown changed")
+        XCTAssertEqual(after.held, after.now, "the strips hold the new reading")
+        document.close()
+    }
+
+    /// Closing the document releases the strips and the document: nothing
+    /// in them (layer delegates, display callbacks, observers) keeps them
+    /// alive. (A closed window that was never shown stays in AppKit's list
+    /// in a test host, with its content; so the window's content is taken
+    /// away, as AppKit does when it lets a window go.)
+    func testClosingTheDocumentReleasesTheStrips() async throws {
+        let url = directory.appending(path: "release.csv")
+        try Data("a,b\n1,2\n3,4\n".utf8).write(to: url)
+        struct Held {
+            weak var strips: GridStrips?
+            weak var gutterStrips: GridStrips?
+            weak var document: CSVDocument?
+        }
+        func open() async throws -> Held {
+            let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+            document.makeWindowControllers()
+            let model = try XCTUnwrap(document.model)
+            let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+            let window = try XCTUnwrap(controller.window)
+            let grid = controller.content.grid
+            try await waitUntil("indexed") { model.isIndexComplete }
+            controller.content.view.layoutSubtreeIfNeeded()
+            let held = Held(strips: try XCTUnwrap(grid.strips), gutterStrips: try XCTUnwrap(grid.gutterStrips), document: document)
+            _ = strips(grid)
+            document.close()
+            window.contentViewController = nil
+            return held
+        }
+        let held = try await open()
+        try await waitUntil("released") { held.strips == nil && held.gutterStrips == nil && held.document == nil }
+        XCTAssertNil(held.strips, "the grid's strips")
+        XCTAssertNil(held.gutterStrips, "the gutter's strips")
+        XCTAssertNil(held.document, "the document")
     }
 }
