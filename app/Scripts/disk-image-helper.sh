@@ -40,6 +40,10 @@ container_tmp="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
 script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 # How long the helper waits for the next request, once it has had one.
 idle_timeout=1200
+# Before the first request: long enough for a slow build, but bounded, so a
+# run that never reaches the tests (a failed build, or Xcode as the owner)
+# can't leave the helper running.
+first_request_timeout=7200
 attempts=5
 transient='Resource busy|Resource temporarily unavailable|no mountable file systems|Device not configured'
 
@@ -248,6 +252,9 @@ watch() {
             [ $((SECONDS - last_request)) -ge "$idle_timeout" ] && { log "idle for $idle_timeout s"; break; }
         elif [ "$watched" = no ] && [ $((SECONDS - started)) -ge "$idle_timeout" ]; then
             log "no request for $idle_timeout s"
+            break
+        elif [ $((SECONDS - started)) -ge "$first_request_timeout" ]; then
+            log "no request for $first_request_timeout s"
             break
         fi
         # The run was interrupted: its post-action will never come.
