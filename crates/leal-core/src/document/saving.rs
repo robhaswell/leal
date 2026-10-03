@@ -22,7 +22,10 @@
 //!    order, making each edited row's splices as it reaches it: the
 //!    snapshot's bytes a chunk at a time with a checkpoint between chunks
 //!    (ADR-0005 decision 6). On a volume that can vanish it also tees the
-//!    bytes to a copy on the internal disk;
+//!    bytes to a copy on the internal disk. Save As UTF-8 (task 2.3)
+//!    converts the snapshot's bytes to UTF-8 as it copies them, a chunk at
+//!    a time; bytes that aren't text there name their cells, and the save
+//!    is refused once the file has been read ([`SaveError::Unconvertible`]);
 //! 5. gives it the old file's metadata, best-effort, and the two
 //!    attributes ([`AttributePlan`]), and orders it onto the disk; makes
 //!    the document's next snapshot of it (the tee copy, or a clone), and
@@ -35,9 +38,11 @@
 //! 7. rebases: makes the new reading with no lock held, its index the old
 //!    one shifted by the splices (cell edits never move a row boundary), so
 //!    every row reads at once; the index pass runs again in the background
-//!    only for the diagnostics and the review. Then, under the writer lock,
-//!    carries the edits made during the save (after step 2) over to it by
-//!    value, as unsaved edits, and makes it current.
+//!    only for the diagnostics and the review. A file converted to UTF-8
+//!    moved every byte, so its new reading waits for that pass instead
+//!    (about 60 ms per 100 MB), before it is current. Then, under the
+//!    writer lock, carries the edits made during the save (after step 2)
+//!    over to it by value, as unsaved edits, and makes it current.
 //!
 //! A cancel, or any failure, before the new file is in place deletes what
 //! was written and leaves the user's file as it was. From then on the
@@ -62,12 +67,13 @@ use std::time::Duration;
 
 use super::{Context, Document, FirstScreen, Reading, Restarted, read_first_paint, start_jobs};
 use crate::detect::{CensusStream, Choices, FIRST_PAINT_BYTES};
+use crate::dialect::{Bom, Encoding};
 use crate::edit::{EditStore, Overlay};
-use crate::index::{RowIndex, Status};
+use crate::index::{MAX_FILE_BYTES, RowIndex, Status};
 use crate::save::{
-    AttributeFacts, AttributePlan, EditedRow, Fix, Placed, RowRules, SaveError, SaveKind,
-    SavePhase, SaveProgress, SaveRequest, Saved, Splice, checked_len, encode, needs_census,
-    row_splices,
+    AttributeFacts, AttributePlan, EditedRow, Fix, MAX_NAMED_CELLS, Placed, RowRules, SaveError,
+    SaveKind, SavePhase, SaveProgress, SaveRequest, Saved, Splice, Transcoder, checked_len, encode,
+    needs_census, row_splices,
 };
 use crate::schedule::{Interval, JobError, JobHandle, Priority};
 use crate::source::{
@@ -258,7 +264,7 @@ impl Drop for Turn<'_> {
     }
 }
 
-/// What part of the reading a save writes.
+/// What part of the reading a save writes, and in what encoding.
 struct Extent<'r> {
     /// Every row, and the whole file.
     complete: bool,
@@ -267,6 +273,18 @@ struct Extent<'r> {
     rows: usize,
     /// The snapshot is written up to here.
     end: usize,
+    /// The document's encoding.
+    source: Encoding,
+    /// The encoding written ([`SaveKind::writes`]).
+    target: Encoding,
+}
+
+impl Extent<'_> {
+    /// Whether the file's bytes are converted as they are written (Save As
+    /// UTF-8 from another encoding).
+    fn converts(&self) -> bool {
+        self.source != self.target
+    }
 }
 
 /// What writing the new file found, for the rebase.
@@ -284,10 +302,15 @@ struct Streamed {
 /// Where the writer's output goes: a new file, or (tests) a list of the
 /// splices.
 trait Sink {
-    /// The snapshot's bytes in `range`, unchanged.
+    /// The snapshot's bytes in `range`, unchanged (or, for Save As UTF-8,
+    /// converted).
     fn copy(&mut self, range: Range<usize>) -> Result<(), SaveError>;
     /// A splice's bytes.
     fn splice(&mut self, splice: Splice) -> Result<(), SaveError>;
+    /// Save As UTF-8: these cells can't be converted, so the save will be
+    /// refused; their row isn't written. An error stops the save at once
+    /// (once [`MAX_NAMED_CELLS`] are named).
+    fn refuse(&mut self, cells: &[(usize, usize)]) -> Result<(), SaveError>;
 }
 
 impl Document {
@@ -356,7 +379,10 @@ impl Document {
 
     /// TEST HOOK, not for product code: what a save would write now (the
     /// splices over the snapshot, the rows, the fixes) without writing
-    /// anything. It waits for the index pass.
+    /// anything. It waits for the index pass. For Save As UTF-8 from
+    /// another encoding, the splices are in UTF-8, the bytes between them
+    /// aren't converted (so nothing they hold is refused), and the length
+    /// is the snapshot's with the splices.
     ///
     /// # Errors
     ///
@@ -367,9 +393,16 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
-        check_encodable(&reading, &overlay, extent.rows)?;
+        check_encodable(&overlay, &extent)?;
         let mut sink = Collect::default();
         let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
+        if !sink.refused.is_empty() {
+            return Err(SaveError::Unconvertible {
+                encoding: extent.source,
+                cells: sink.refused,
+                more: false,
+            });
+        }
         Ok(crate::save::SavePlan {
             splices: sink.splices,
             end: extent.end,
@@ -391,16 +424,18 @@ impl Document {
     /// As for a save, before it puts the file in place.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn save_to_writer(&self, out: &mut dyn Write) -> Result<u64, SaveError> {
+    pub fn save_to_writer(&self, kind: SaveKind, out: &mut dyn Write) -> Result<u64, SaveError> {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
-        let extent = extent_of(&reading, SaveKind::SaveAs)?;
-        check_encodable(&reading, &overlay, extent.rows)?;
+        let extent = extent_of(&reading, kind)?;
+        check_encodable(&overlay, &extent)?;
         let progress = SaveShared::default();
-        let mut census = Some(CensusStream::default());
-        let mut sink = FileSink::new(&reading, out, &progress, census.as_mut(), &|| Ok(()));
-        let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
-        sink.finish(streamed.len)?;
+        let mut census = (!extent.converts()).then(CensusStream::default);
+        let mut sink = FileSink::new(&reading, &extent, out, &progress, census.as_mut(), &|| {
+            Ok(())
+        });
+        let mut streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
+        sink.finish(&mut streamed)?;
         Ok(streamed.len)
     }
 
@@ -489,10 +524,10 @@ impl Document {
                 }
                 Some(self.check_before_writing(&destination, request)?)
             }
-            SaveKind::SaveAs => existing_at(&destination)?,
+            SaveKind::SaveAs | SaveKind::SaveAsUtf8 => existing_at(&destination)?,
         };
         let extent = extent_of(&reading, kind)?;
-        check_encodable(&reading, &overlay, extent.rows)?;
+        check_encodable(&overlay, &extent)?;
 
         // 4: the new file. Its length is known once it is written; until
         // then, the snapshot's bytes stand in for it.
@@ -515,12 +550,22 @@ impl Document {
         .map_err(write("making the new file"))?;
         let detection = &reading.detection;
         let had_text_encoding = reading.source.attributes().text_encoding.is_some();
-        let mut census = needs_census(detection, had_text_encoding).then(CensusStream::default);
+        // Save As UTF-8 records the encoding whatever a reopen would guess.
+        let utf8 = kind == SaveKind::SaveAsUtf8;
+        let mut census =
+            (needs_census(detection, had_text_encoding) && !utf8).then(CensusStream::default);
         let (streamed, head) = {
             let mut out = BufWriter::with_capacity(SAVE_CHUNK_BYTES, staged.writer());
-            let mut sink = FileSink::new(&reading, &mut out, progress, census.as_mut(), checkpoint);
-            let streamed = stream(&reading, &overlay, &extent, &mut sink, checkpoint)?;
-            let head = sink.finish(streamed.len)?;
+            let mut sink = FileSink::new(
+                &reading,
+                &extent,
+                &mut out,
+                progress,
+                census.as_mut(),
+                checkpoint,
+            );
+            let mut streamed = stream(&reading, &overlay, &extent, &mut sink, checkpoint)?;
+            let head = sink.finish(&mut streamed)?;
             out.flush().map_err(write("writing the new file"))?;
             (streamed, head)
         };
@@ -540,6 +585,7 @@ impl Document {
             head: &head,
             len: streamed.len,
             census: census.map(CensusStream::finish),
+            utf8,
         });
         let text_encoding = attributes.text_encoding_value();
         let interpretation = attributes.interpretation_value();
@@ -753,32 +799,60 @@ impl Document {
         // As a reopen would read it, with the attributes just written and
         // the user's own choices. If that splits it another way (the
         // attributes didn't suffice), it is read the old way regardless:
-        // the undo history's commands are tied to the split.
+        // the undo history's commands are tied to the split. Converted to
+        // UTF-8 (Save As UTF-8), the file is UTF-8, with a UTF-8 BOM if it
+        // had a BOM, and an encoding the user chose no longer applies.
+        let converts = extent.converts();
+        let (encoding, bom) = if converts {
+            let bom = if old.detection.bom == Bom::None {
+                Bom::None
+            } else {
+                Bom::Utf8
+            };
+            (extent.target, bom)
+        } else {
+            (old.detection.encoding, old.detection.bom)
+        };
+        let choices = if converts {
+            Choices {
+                encoding: None,
+                ..old.choices
+            }
+        } else {
+            old.choices
+        };
         let mut paint =
-            read_first_paint(source, &head, old.choices).map_err(|error| error.to_string())?;
+            read_first_paint(source, &head, choices).map_err(|error| error.to_string())?;
         let same_split = |d: &crate::detect::Detection| {
             d.delimiter == old.detection.delimiter
-                && d.encoding == old.detection.encoding
-                && d.bom == old.detection.bom
+                && d.encoding == encoding
+                && d.bom == bom
                 && d.header == old.detection.header
         };
         if !same_split(&paint.detection) {
             let forced = Choices {
                 delimiter: Some(old.detection.delimiter),
                 header: Some(old.detection.header),
-                encoding: Some(old.detection.encoding),
+                encoding: Some(encoding),
             };
             paint = read_first_paint(source, &head, forced).map_err(|error| error.to_string())?;
         }
-        let len = usize::try_from(streamed.len).map_err(|error| error.to_string())?;
-        let shifted = extent
-            .index
-            .shifted(extent.rows, &streamed.deltas, len, streamed.unterminated)
-            .ok_or("the saved file's rows don't add up")?;
-        let column_count = shifted.field_count_mode().unwrap_or(0);
-        // Served until the new index pass passes them.
-        paint.head_index = shifted;
-        paint.head_rows = extent.rows;
+        let column_count = if converts {
+            // Every byte moved: the rows are the new index pass's, which
+            // the rebase waits for (`Rebuilt::wait`).
+            paint.head_index.field_count_mode().unwrap_or(0)
+        } else {
+            let len = usize::try_from(streamed.len).map_err(|error| error.to_string())?;
+            let shifted = extent
+                .index
+                .shifted(extent.rows, &streamed.deltas, len, streamed.unterminated)
+                .ok_or("the saved file's rows don't add up")?;
+            let column_count = shifted.field_count_mode().unwrap_or(0);
+            // Served until the new index pass passes them.
+            paint.head_index = shifted;
+            paint.head_rows = extent.rows;
+            column_count
+        };
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let edits = Arc::new(EditStore::rebased(old.edits.lineage()));
         let context = Context {
@@ -787,7 +861,22 @@ impl Document {
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
-        let reading = start_jobs(&context, generation, paint, old.choices, edits);
+        let reading = start_jobs(&context, generation, paint, choices, edits);
+        if converts {
+            // So every row reads (and the edits made during the save carry
+            // over) once it is current. One pass, with no lock held; the
+            // save has succeeded, so it isn't cancelled.
+            let _ = reading.index_job.control().wait();
+            if reading.index.status() != Status::Complete {
+                reading.cancel();
+                return Err("the saved file couldn't be indexed".to_owned());
+            }
+            let column_count = reading.index.field_count_mode().unwrap_or(column_count);
+            return Ok(Rebuilt {
+                reading,
+                column_count,
+            });
+        }
         Ok(Rebuilt {
             reading,
             column_count,
@@ -1040,7 +1129,11 @@ fn skipped_edits(overlay: &Overlay, rows: usize) -> Vec<(usize, usize)> {
 /// incomplete document) up to the end of its last trusted row, so never
 /// half a row, half a character or an open quote (ADR-0008 decision 6).
 fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError> {
-    if !reading.detection.encoding.is_ascii_compatible() {
+    let source = reading.detection.encoding;
+    let target = kind.writes(source);
+    // UTF-16 files are read-only in v1 (DESIGN §1, §4.3): only Save As
+    // UTF-8 writes them, converted.
+    if !target.is_ascii_compatible() {
         return Err(SaveError::ReadOnly);
     }
     let complete = reading.index.status() == Status::Complete && reading.source.can_save();
@@ -1066,27 +1159,29 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
         index,
         rows,
         end,
+        source,
+        target,
     })
 }
 
-/// Every edited value written must be encodable (F5): checked before
-/// anything is written, naming each cell that isn't.
-fn check_encodable(reading: &Reading, overlay: &Overlay, rows: usize) -> Result<(), SaveError> {
-    let encoding = reading.detection.encoding;
+/// Every edited value written must be encodable in the encoding written
+/// (F5): checked before anything is written, naming each cell that isn't.
+fn check_encodable(overlay: &Overlay, extent: &Extent<'_>) -> Result<(), SaveError> {
+    let encoding = extent.target;
     let cells: Vec<(usize, usize)> = overlay
-        .rows_in(0..rows)
+        .rows_in(0..extent.rows)
         .flat_map(|(row, edits)| {
             edits
                 .cells()
                 .iter()
-                .filter(|(_, value)| encode(value, encoding).is_none())
+                .filter(|(_, value)| encode(value, encoding).is_err())
                 .map(move |&(column, _)| (row, column))
         })
         .collect();
     if cells.is_empty() {
         Ok(())
     } else {
-        Err(SaveError::EncodingNotSupported { encoding, cells })
+        Err(SaveError::Unencodable { encoding, cells })
     }
 }
 
@@ -1115,11 +1210,27 @@ fn stream(
     let mut quote_all: Option<bool> = None;
     let mut at = 0;
     let mut total_delta: i64 = 0;
+    let converts = extent.converts();
+    // Converting, the sink checks the length of what it writes: the bytes
+    // between splices change length too.
     let too_large = |delta: i64, at: usize| {
+        if converts {
+            return Ok(());
+        }
         checked_len(at, delta)
             .map(|_| ())
             .map_err(|len| SaveError::TooLarge { len })
     };
+    // Save As UTF-8 writes a UTF-8 BOM for the file's BOM (ADR-0008
+    // decision 7).
+    let bom = detection.bom.len();
+    if converts && bom > 0 && extent.end >= bom {
+        sink.splice(Splice {
+            range: 0..bom,
+            bytes: Bom::Utf8.bytes().to_vec(),
+        })?;
+        at = bom;
+    }
     for (n, (row, edits)) in overlay.rows_in(0..extent.rows).enumerate() {
         if n % ROWS_PER_CHECKPOINT == 0 {
             checkpoint()?;
@@ -1149,7 +1260,8 @@ fn stream(
             }
         };
         let rules = RowRules {
-            encoding: detection.encoding,
+            encoding: extent.target,
+            source: extent.source,
             delimiter: detection.delimiter.byte(),
             quote_all,
         };
@@ -1176,9 +1288,27 @@ fn stream(
                 .is_some_and(|column| edits.get(column).is_some())
         });
         let mut splices = Vec::new();
-        row_splices(&edited, rules, &mut splices, &mut streamed.fixes).map_err(|columns| {
-            SaveError::Failed(format!("row {row}'s columns {columns:?} can't be encoded"))
-        })?;
+        if let Err(columns) = row_splices(&edited, rules, &mut splices, &mut streamed.fixes) {
+            if !converts {
+                // `check_encodable` passed every edited value.
+                return Err(SaveError::Failed(format!(
+                    "row {row}'s columns {columns:?} can't be encoded"
+                )));
+            }
+            // Save As UTF-8: a fix that rewrites the row met an unedited
+            // field that can't be converted. The save will stop naming it
+            // and any other such field of the row; the rest of the file is
+            // still read, for the rest of the cells.
+            let mut unconvertible = edited.unconvertible(rules);
+            if unconvertible.is_empty() {
+                unconvertible = columns;
+            }
+            let cells: Vec<(usize, usize)> = unconvertible.iter().map(|&c| (row, c)).collect();
+            sink.copy(at..edited.span.start)?;
+            sink.refuse(&cells)?;
+            at = edited.end(rules);
+            continue;
+        }
         let mut delta: i64 = 0;
         for splice in splices {
             // Every splice is within its own row: cell edits never move a
@@ -1278,7 +1408,10 @@ fn quotes_every_field(
 
 /// A [`Sink`] that writes the new file: the snapshot a chunk at a time,
 /// with a checkpoint before each, telling the progress, keeping the first
-/// 64 KB for the attributes and feeding the census.
+/// 64 KB for the attributes and feeding the census. For Save As UTF-8 from
+/// another encoding it converts the snapshot's bytes as it copies them
+/// ([`Transcoder`]); bytes that aren't text name their cells, and from the
+/// first such it writes nothing more, but reads on to name the rest.
 struct FileSink<'a, W: Write> {
     reading: &'a Reading,
     stale: bool,
@@ -1288,16 +1421,35 @@ struct FileSink<'a, W: Write> {
     checkpoint: &'a dyn Fn() -> Result<(), SaveError>,
     head: Vec<u8>,
     written: u64,
+    /// The document's encoding, for a refusal.
+    encoding: Encoding,
+    /// Converting to UTF-8.
+    transcoder: Option<Transcoder>,
+    /// The converted chunk, its buffer kept between chunks.
+    converted: Vec<u8>,
+    /// The cells that can't be converted, in file order.
+    unconvertible: Vec<(usize, usize)>,
+    /// The span of the field last named, so its other bad bytes name it
+    /// only once.
+    last_named: Option<Range<usize>>,
+    /// Something can't be converted: nothing more is written.
+    refused: bool,
 }
 
 impl<'a, W: Write> FileSink<'a, W> {
     fn new(
         reading: &'a Reading,
+        extent: &Extent<'_>,
         out: W,
         progress: &'a SaveShared,
         census: Option<&'a mut CensusStream>,
         checkpoint: &'a dyn Fn() -> Result<(), SaveError>,
     ) -> Self {
+        let transcoder = if extent.converts() {
+            Transcoder::new(extent.source)
+        } else {
+            None
+        };
         FileSink {
             reading,
             stale: reading.head_is_stale(),
@@ -1307,10 +1459,27 @@ impl<'a, W: Write> FileSink<'a, W> {
             checkpoint,
             head: Vec::new(),
             written: 0,
+            encoding: extent.source,
+            transcoder,
+            converted: Vec::new(),
+            unconvertible: Vec::new(),
+            last_named: None,
+            refused: false,
         }
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<(), SaveError> {
+        if self.refused {
+            return Ok(());
+        }
+        if self.transcoder.is_some() {
+            // Converting changes every stretch's length, so the limit is
+            // checked on what is written (ADR-0012 decision 2).
+            let len = self.written + to_u64(bytes.len());
+            if len > to_u64(MAX_FILE_BYTES) {
+                return Err(SaveError::TooLarge { len });
+            }
+        }
         self.out
             .write_all(bytes)
             .map_err(|error| SaveError::Write {
@@ -1325,16 +1494,71 @@ impl<'a, W: Write> FileSink<'a, W> {
             census.push(bytes);
         }
         self.written += to_u64(bytes.len());
-        self.progress.written.store(self.written, Ordering::Relaxed);
+        if self.transcoder.is_none() {
+            self.progress.written.store(self.written, Ordering::Relaxed);
+        }
         Ok(())
     }
 
-    /// Checks that it wrote `len` bytes, and gives the first 64 KB.
-    fn finish(self, len: u64) -> Result<Vec<u8>, SaveError> {
-        if self.written != len {
+    /// Names `cell` as one that can't be converted, unless it is the last
+    /// one named. Stops the save once more than [`MAX_NAMED_CELLS`] are.
+    fn name(&mut self, cell: (usize, usize)) -> Result<(), SaveError> {
+        self.refused = true;
+        if self.unconvertible.last() == Some(&cell) {
+            return Ok(());
+        }
+        if self.unconvertible.len() == MAX_NAMED_CELLS {
+            return Err(SaveError::Unconvertible {
+                encoding: self.encoding,
+                cells: std::mem::take(&mut self.unconvertible),
+                more: true,
+            });
+        }
+        self.unconvertible.push(cell);
+        Ok(())
+    }
+
+    /// The bytes at `offset` aren't text: names their cell.
+    fn bad_at(&mut self, offset: usize) -> Result<(), SaveError> {
+        self.refused = true;
+        if self
+            .last_named
+            .as_ref()
+            .is_some_and(|span| span.contains(&offset))
+        {
+            return Ok(());
+        }
+        match cell_at(self.reading, offset) {
+            Some((cell, span)) => {
+                self.last_named = Some(span);
+                self.name(cell)
+            }
+            // In no row (a file that is only a broken BOM): the save is
+            // still refused.
+            None => Ok(()),
+        }
+    }
+
+    /// The first 64 KB written, once the file is; refused if anything
+    /// can't be converted. Checks that it wrote `streamed.len` bytes, or,
+    /// converting (when the length wasn't known before), sets it.
+    fn finish(self, streamed: &mut Streamed) -> Result<Vec<u8>, SaveError> {
+        if self.refused {
+            let mut cells = self.unconvertible;
+            cells.sort_unstable();
+            cells.dedup();
+            return Err(SaveError::Unconvertible {
+                encoding: self.encoding,
+                cells,
+                more: false,
+            });
+        }
+        if self.transcoder.is_some() {
+            streamed.len = self.written;
+        } else if self.written != streamed.len {
             return Err(SaveError::Failed(format!(
-                "wrote {} bytes, not {len}",
-                self.written
+                "wrote {} bytes, not {}",
+                self.written, streamed.len
             )));
         }
         Ok(self.head)
@@ -1356,7 +1580,24 @@ impl<W: Write> Sink for FileSink<'_, W> {
                     to - at
                 )));
             }
-            self.put(&bytes)?;
+            if let Some(transcoder) = &mut self.transcoder {
+                // A stretch between splices ends on a whole character:
+                // splices start and end at fields and rows.
+                let mut converted = std::mem::take(&mut self.converted);
+                converted.clear();
+                let mut bad = Vec::new();
+                transcoder.push(&bytes, at, to == range.end, &mut converted, &mut |offset| {
+                    bad.push(offset);
+                });
+                for offset in bad {
+                    self.bad_at(offset)?;
+                }
+                self.put(&converted)?;
+                self.converted = converted;
+                self.progress.written.store(to_u64(to), Ordering::Relaxed);
+            } else {
+                self.put(&bytes)?;
+            }
             at = to;
         }
         Ok(())
@@ -1365,6 +1606,32 @@ impl<W: Write> Sink for FileSink<'_, W> {
     fn splice(&mut self, splice: Splice) -> Result<(), SaveError> {
         self.put(&splice.bytes)
     }
+
+    fn refuse(&mut self, cells: &[(usize, usize)]) -> Result<(), SaveError> {
+        self.refused = true;
+        for &cell in cells {
+            self.name(cell)?;
+        }
+        Ok(())
+    }
+}
+
+/// The cell (row, column) whose bytes hold `offset`, and its field's span:
+/// for naming a cell that can't be converted.
+fn cell_at(reading: &Reading, offset: usize) -> Option<((usize, usize), Range<usize>)> {
+    let stale = reading.head_is_stale();
+    let (index, _) = reading.rows_from(&reading.index, stale);
+    let row = index.row_at_offset(offset)?;
+    let bytes = Document::row_bytes(reading, row).ok()??;
+    let parsed = reading
+        .parser
+        .parse_row_in(bytes.index, row, &bytes.bytes, bytes.base)?;
+    let fields = parsed.fields();
+    let column = fields
+        .iter()
+        .position(|field| field.span().contains(&offset))
+        .or_else(|| fields.iter().rposition(|field| field.start() <= offset))?;
+    Some(((row, column), fields[column].span()))
 }
 
 /// A [`Sink`] that only lists the splices (tests).
@@ -1372,6 +1639,8 @@ impl<W: Write> Sink for FileSink<'_, W> {
 #[derive(Default)]
 struct Collect {
     splices: Vec<Splice>,
+    /// Cells whose row's splices couldn't be made (Save As UTF-8).
+    refused: Vec<(usize, usize)>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1382,6 +1651,11 @@ impl Sink for Collect {
 
     fn splice(&mut self, splice: Splice) -> Result<(), SaveError> {
         self.splices.push(splice);
+        Ok(())
+    }
+
+    fn refuse(&mut self, cells: &[(usize, usize)]) -> Result<(), SaveError> {
+        self.refused.extend_from_slice(cells);
         Ok(())
     }
 }

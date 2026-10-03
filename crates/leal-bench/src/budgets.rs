@@ -115,4 +115,12 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 500.0,
         source: "DESIGN §1",
     },
+    // Save As UTF-8 of the reference file written as UTF-16 (PLAN 2.3):
+    // DESIGN §1 has no budget for it. Save's 500 ms, doubled for a file
+    // twice the size, every byte of it converted (docs/tasks/2.3.md).
+    Budget {
+        id: "save/utf8_from_utf16",
+        max_ms: 1000.0,
+        source: "task 2.3",
+    },
 ];

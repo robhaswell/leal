@@ -101,15 +101,61 @@ fn refusals_reach_swift_with_their_reasons() {
     assert_eq!(block_on(job.wait()), Err(SaveFailure::Missing));
 
     let (single, path) = open(&dir, &scheduler, "w.csv", b"caf\xE9\n");
-    single.set_cell(0, 0, "\u{e9}").unwrap();
+    assert_eq!(single.unencodable("\u{e9}t\u{e9}").unwrap(), None);
+    assert_eq!(
+        single.unencodable("ok \u{1F600}").unwrap(),
+        Some(crate::UnencodableCharacter {
+            character: "\u{1F600}".to_owned(),
+            encoding: TextEncoding::Windows1252,
+        })
+    );
+    single.set_cell(0, 0, "\u{1F600}").unwrap();
     let job = Arc::clone(&single)
         .save(request(&path, SaveKind::SaveAs))
         .unwrap();
     assert_eq!(
         block_on(job.wait()),
-        Err(SaveFailure::EncodingNotSupported {
+        Err(SaveFailure::Unencodable {
             encoding: TextEncoding::Windows1252,
             cells: vec![CellPlace { row: 0, column: 0 }],
+        })
+    );
+}
+
+/// The UTF-16 banner's Save As UTF-8 (task 2.3): the document then reads
+/// the UTF-8 file, so its first screen says UTF-8 (and the app's read-only
+/// state ends); bytes that can't be converted are refused, naming cells.
+#[test]
+fn save_as_utf8_reaches_swift() {
+    let dir = TempDir::new("save-utf8");
+    let scheduler = Scheduler::new().unwrap();
+    let (document, path) = open(&dir, &scheduler, "u.csv", b"\xFF\xFEa\0,\0b\0\n\0");
+    assert_eq!(
+        document.first_screen().unwrap().interpretation.encoding,
+        TextEncoding::Utf16Le
+    );
+    let copy = path.replace("u.csv", "u8.csv");
+    let job = Arc::clone(&document)
+        .save(request(&copy, SaveKind::SaveAsUtf8))
+        .unwrap();
+    let outcome = block_on(job.wait()).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), b"\xEF\xBB\xBFa,b\n");
+    assert_eq!(outcome.recorded_encoding, Some(TextEncoding::Utf8));
+    let screen = outcome.first_screen.unwrap();
+    assert_eq!(screen.interpretation.encoding, TextEncoding::Utf8);
+    assert_eq!(document.first_screen().unwrap(), screen);
+    assert_eq!(outcome.path, copy);
+
+    let (broken, _) = open(&dir, &scheduler, "b.csv", b"\xFF\xFEa\0,\0\x3D\xD8\n\0");
+    let job = Arc::clone(&broken)
+        .save(request(&copy, SaveKind::SaveAsUtf8))
+        .unwrap();
+    assert_eq!(
+        block_on(job.wait()),
+        Err(SaveFailure::Unconvertible {
+            encoding: TextEncoding::Utf16Le,
+            cells: vec![CellPlace { row: 0, column: 1 }],
+            more: false,
         })
     );
 }

@@ -1830,7 +1830,8 @@ mod saving;
 mod tests;
 
 pub use editing::{
-    CellEdit, CellPlace, EditCommand, EditRefusal, RefusedCommand, ReplayReport, ValueChange,
+    CellEdit, CellPlace, EditCommand, EditRefusal, RefusedCommand, ReplayReport,
+    UnencodableCharacter, ValueChange,
 };
 pub use find::{CellMatch, CellValue, CopyJob, Search, SearchProgress, SearchStep, TextRange};
 pub use saving::{

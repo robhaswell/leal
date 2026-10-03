@@ -21,6 +21,12 @@
 //!   on its share) it writes the complete rows Leal trusts:
 //!   [`SaveOutcome::complete`] is false, and the dialog says "about
 //!   `row_count` of `estimated_row_count` rows" (ADR-0008 decision 6).
+//! - **Save As UTF-8** (task 2.3, ADR-0008 decision 7) writes to the
+//!   chosen place in UTF-8, from a file in any encoding: the UTF-16
+//!   banner's button (mockup 06a), and the way out when Save refuses a
+//!   value the file's encoding can't hold ([`SaveFailure::Unencodable`]).
+//!   It refuses with [`SaveFailure::Unconvertible`], naming the cells,
+//!   when some of the file's bytes aren't text in its encoding.
 //! - Either way the document then *is* the saved file (ADR-0008 decision
 //!   1): a new snapshot, read the same way, with a new generation, in the
 //!   same lineage, so the undo history carries on by value (ADR-0012
@@ -60,13 +66,20 @@ use crate::{CellPlace, VolumeInfo};
 #[cfg(test)]
 mod tests;
 
-/// Save or Save As. See `leal_core::save::SaveKind`.
+/// Save, Save As or Save As UTF-8. See `leal_core::save::SaveKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SaveKind {
     /// Over the user's file.
     Save,
     /// To a new place, which the document then is.
     SaveAs,
+    /// To a new place, in UTF-8 whatever the file's encoding (ADR-0008
+    /// decision 7): the UTF-16 banner's **Save As UTF-8…** (mockup 06a),
+    /// and the way out of a value the file's encoding can't hold
+    /// ([`SaveFailure::Unencodable`]). The document then is the UTF-8
+    /// file: `FirstScreen.interpretation` says UTF-8, so a UTF-16
+    /// document's read-only state ends.
+    SaveAsUtf8,
 }
 
 /// What to save, and where.
@@ -182,15 +195,30 @@ pub struct SaveOutcome {
 /// `leal_core::save::SaveError`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum SaveFailure {
-    /// UTF-16 files are read-only in v1.
+    /// UTF-16 files are read-only in v1: Save As UTF-8 is the way out.
     ReadOnly,
-    /// Cells hold text other than ASCII in a single-byte file, which Leal
-    /// can't save yet (task 2.3).
-    EncodingNotSupported {
+    /// These cells hold a character the file's encoding can't represent
+    /// (F5: nothing is substituted), found before anything was written. The
+    /// app names them and offers Save As UTF-8 (DESIGN §3.7);
+    /// `Document.unencodable(value:)` gives each one's character.
+    Unencodable {
         /// The file's encoding.
         encoding: TextEncoding,
-        /// The cells.
+        /// Every such cell, in order.
         cells: Vec<CellPlace>,
+    },
+    /// Save As UTF-8: these unedited cells hold bytes that aren't text in
+    /// the file's encoding (an unpaired surrogate or a final odd byte in
+    /// UTF-16, a byte a single-byte encoding leaves unassigned), so they
+    /// can't be converted (F5). Nothing was written; the user can edit
+    /// them and try again.
+    Unconvertible {
+        /// The file's encoding.
+        encoding: TextEncoding,
+        /// The cells, in file order: the first 1,000.
+        cells: Vec<CellPlace>,
+        /// Whether there are more than those.
+        more: bool,
     },
     /// The file would be too large for Leal to open again.
     TooLarge {
@@ -267,9 +295,18 @@ impl From<&SaveError> for SaveFailure {
     fn from(error: &SaveError) -> Self {
         match error {
             SaveError::ReadOnly => Self::ReadOnly,
-            SaveError::EncodingNotSupported { encoding, cells } => Self::EncodingNotSupported {
+            SaveError::Unencodable { encoding, cells } => Self::Unencodable {
                 encoding: (*encoding).into(),
                 cells: cell_places(cells),
+            },
+            SaveError::Unconvertible {
+                encoding,
+                cells,
+                more,
+            } => Self::Unconvertible {
+                encoding: (*encoding).into(),
+                cells: cell_places(cells),
+                more: *more,
             },
             SaveError::TooLarge { len } => Self::TooLarge { byte_count: *len },
             SaveError::Incomplete => Self::Incomplete,
@@ -326,6 +363,7 @@ impl Document {
                 kind: match options.kind {
                     SaveKind::Save => save::SaveKind::Save,
                     SaveKind::SaveAs => save::SaveKind::SaveAs,
+                    SaveKind::SaveAsUtf8 => save::SaveKind::SaveAsUtf8,
                 },
                 folder: options.folder.map(PathBuf::from),
                 volume: options.volume.into(),

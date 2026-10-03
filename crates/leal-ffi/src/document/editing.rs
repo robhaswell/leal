@@ -26,11 +26,22 @@
 
 use leal_core::edit::{self, CellChange, Command, Edit, EditError, Lineage};
 
-use super::{Document, read_error, to_index, to_u32, to_u64, to_usize};
+use super::{Document, TextEncoding, read_error, to_index, to_u32, to_u64, to_usize};
 use crate::LealError;
 
 #[cfg(test)]
 mod tests;
+
+/// A character the document's encoding can't represent, so a Save would
+/// refuse the value (F5). See `leal_core::save::Unencodable`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct UnencodableCharacter {
+    /// The character (one Unicode scalar; it may be several UTF-16 units
+    /// in Swift).
+    pub character: String,
+    /// The document's encoding.
+    pub encoding: TextEncoding,
+}
 
 /// One cell's change, in a command: where, and its value before and after.
 /// `nil` is a missing cell.
@@ -273,6 +284,30 @@ impl Document {
                 .can_edit(to_index(row), to_usize(column))
                 .err()
                 .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// Whether `value` can be saved in the document's encoding (task 2.3,
+    /// F5), for saying so as it is typed or before it is committed: `nil` if
+    /// it can, otherwise the first character the encoding can't represent,
+    /// as in "“😀” can't be saved in Windows-1252". The edit is allowed
+    /// either way: Save then refuses it ([`SaveFailure::Unencodable`]),
+    /// and Save As UTF-8 writes it (DESIGN §3.7).
+    ///
+    /// [`SaveFailure::Unencodable`]: crate::document::saving::SaveFailure::Unencodable
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn unencodable(&self, value: &str) -> Result<Option<UnencodableCharacter>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .unencodable(value)
+                .map(|refused| UnencodableCharacter {
+                    character: refused.character.to_string(),
+                    encoding: refused.encoding.into(),
+                }))
         })
     }
 

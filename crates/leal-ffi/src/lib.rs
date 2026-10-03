@@ -25,7 +25,7 @@ pub use document::{
     JobFailure, LineEnding, OpenOptions, ProgressObserver, RefusedCommand, ReplayReport,
     ReviewResult, RowCells, SaveFailure, SaveJob, SaveKind, SaveOptions, SaveOutcome, SavePhase,
     SaveProgress, Scheduler, Search, SearchProgress, SearchStep, TextEncoding, TextRange,
-    ValueChange, open_document,
+    UnencodableCharacter, ValueChange, open_document,
 };
 
 use std::path::{Path, PathBuf};

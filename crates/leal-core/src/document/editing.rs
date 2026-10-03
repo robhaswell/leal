@@ -198,6 +198,19 @@ impl Document {
         Ok(())
     }
 
+    /// Whether `value` can be saved in the document's encoding, for the app
+    /// to say so as it is typed or before it is committed (task 2.3, F5):
+    /// `None` if it can, otherwise the first character the encoding can't
+    /// represent, as in "“😀” can't be saved in Windows-1252". The edit
+    /// itself is allowed either way: Save then refuses, naming the cell,
+    /// and Save As UTF-8 writes it (DESIGN §3.7). UTF-16 can represent any
+    /// character, so it is always `None` there; such files are read-only
+    /// in v1 for another reason.
+    #[must_use]
+    pub fn unencodable(&self, value: &str) -> Option<crate::save::Unencodable> {
+        crate::save::encode(value, self.current().detection.encoding).err()
+    }
+
     /// The lineage of the commands made now (see [`Lineage`]).
     #[must_use]
     pub fn lineage(&self) -> Lineage {

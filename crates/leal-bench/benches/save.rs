@@ -13,6 +13,13 @@
 //!   that keeps nothing (`Document::save_to_writer`, a test hook). It is
 //!   compared between commits, so a slower writer is caught where the
 //!   disk's noise would hide it.
+//! - `save/utf8_from_utf16` (PLAN 2.3): Save As UTF-8 of the reference
+//!   file written as UTF-16 LE (about 200 MB, read-only in v1), to a new
+//!   place, timed from the request to the job's end: every byte converted
+//!   a chunk at a time, 100 MB written and flushed, and the rebase, which
+//!   waits for the new file's index pass. Budget-only, as `one_edit`.
+//! - `save/utf8_no_disk`: the same conversion into a writer that keeps
+//!   nothing, compared between commits.
 //!
 //! The file is a copy of the reference file (a clone, on APFS) in a
 //! temporary folder: the benchmark saves over it. Both are one group, with
@@ -84,14 +91,83 @@ fn save(c: &mut Criterion) {
     group.bench_function("write_no_disk", |b| {
         b.iter(|| {
             document
-                .save_to_writer(&mut std::io::sink())
+                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
+
+    // Save As UTF-8 (task 2.3) of the reference file written as UTF-16
+    // (read-only in v1): every byte converted.
+    let utf16 = root.join("reference-utf16.csv");
+    write_utf16(&reference, &utf16);
+    let open = |path: &std::path::Path| {
+        let (document, _) = Document::open(
+            path,
+            &temp,
+            VolumeInfo::default(),
+            &scheduler,
+            OpenOptions::default(),
+            None,
+        )
+        .expect("opening the UTF-16 copy");
+        document.index_job().wait().expect("indexing");
+        Arc::new(document)
+    };
+    let utf16_document = open(&utf16);
+    let utf16_len = utf16_document.source().len();
+    common::whole_file(&mut group, utf16_len);
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(15));
+    let mut saves = 0_u64;
+    group.bench_function("utf8_from_utf16", |b| {
+        b.iter_custom(|iterations| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iterations {
+                // A fresh document each time: the save makes it the UTF-8
+                // file. Opening and indexing it aren't timed.
+                let document = open(&utf16);
+                saves += 1;
+                let destination = root.join(format!("utf8-{saves}.csv"));
+                let started = Instant::now();
+                let job = document.save(SaveRequest::new(&destination, SaveKind::SaveAsUtf8));
+                job.wait().expect("the save");
+                total += started.elapsed();
+                drop(document);
+                let _ = std::fs::remove_file(&destination);
+            }
+            total
+        });
+    });
+
+    common::whole_file(&mut group, utf16_len);
+    group.bench_function("utf8_no_disk", |b| {
+        b.iter(|| {
+            utf16_document
+                .save_to_writer(SaveKind::SaveAsUtf8, &mut std::io::sink())
                 .expect("the write")
         });
     });
     group.finish();
     common::canary(c, "save", Side::After);
+    drop(utf16_document);
     drop(document);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writes the reference file at `from` (UTF-8, no BOM) to `to` as UTF-16
+/// LE with a BOM.
+fn write_utf16(from: &std::path::Path, to: &std::path::Path) {
+    use std::io::Write;
+    let text = std::fs::read_to_string(from).expect("the reference file, in UTF-8");
+    let mut out = std::io::BufWriter::new(std::fs::File::create(to).expect("the UTF-16 copy"));
+    out.write_all(&[0xFF, 0xFE]).expect("writing");
+    for unit in text.encode_utf16() {
+        out.write_all(&unit.to_le_bytes()).expect("writing");
+    }
+    out.flush().expect("writing");
 }
 
 criterion_group!(benches, save);

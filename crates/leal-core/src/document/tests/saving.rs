@@ -198,9 +198,10 @@ fn the_fixes_keep_a_reopen_reading_the_same_rows() {
     );
 }
 
-/// Until task 2.3, a single-byte file takes ASCII edits only; the rest is
-/// refused, naming the cells, with the file untouched. UTF-16 files are
-/// read-only.
+/// A single-byte file saves values in its encoding (task 2.3); a value
+/// with a character it can't represent is refused, naming the cells, with
+/// the file untouched (F5), and asking about a value says which character.
+/// UTF-16 files are read-only.
 #[test]
 fn single_byte_and_utf16_files_are_saved_or_refused() {
     let dir = Dir::new("save-encodings");
@@ -216,21 +217,34 @@ fn single_byte_and_utf16_files_are_saved_or_refused() {
         b"caf\xE9,x\nna\xEFve,plain\n"
     );
     assert_eq!(saved.attributes.text_encoding, None, "the guess holds");
-    set(&document, 0, 1, "\u{e9}");
-    let error = save(&document, &path, SaveKind::Save).unwrap_err();
-    assert!(error.contains("EncodingNotSupported"), "{error}");
-    assert!(error.contains("[(0, 1)]"), "{error}");
+    set(&document, 0, 1, "\u{e9}t\u{e9} \u{20AC}");
+    save(&document, &path, SaveKind::Save).unwrap();
     assert_eq!(
         std::fs::read(&path).unwrap(),
-        b"caf\xE9,x\nna\xEFve,plain\n"
+        b"caf\xE9,\xE9t\xE9 \x80\nna\xEFve,plain\n"
+    );
+    assert_eq!(document.unencodable("na\u{EF}ve \u{20AC}"), None);
+    let asked = document.unencodable("ok \u{1F600}").unwrap();
+    assert_eq!(
+        (asked.encoding, asked.character),
+        (Encoding::Windows1252, '\u{1F600}')
+    );
+    set(&document, 1, 0, "\u{1F600}");
+    set(&document, 0, 0, "\u{100}");
+    let error = save(&document, &path, SaveKind::Save).unwrap_err();
+    assert!(error.contains("Unencodable"), "{error}");
+    assert!(error.contains("[(0, 0), (1, 0)]"), "{error}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"caf\xE9,\xE9t\xE9 \x80\nna\xEFve,plain\n"
     );
 
     let utf16 = dir.file("u.csv", b"\xFF\xFEa\0,\0b\0\n\0");
     let document = open_at(&utf16, &dir, &scheduler);
-    assert!(matches!(
-        document.save_plan(SaveKind::SaveAs),
-        Err(SaveError::ReadOnly)
-    ));
+    for kind in [SaveKind::Save, SaveKind::SaveAs] {
+        assert!(matches!(document.save_plan(kind), Err(SaveError::ReadOnly)));
+    }
+    assert_eq!(document.unencodable("\u{1F600}"), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +290,248 @@ fn a_cancelled_save_leaves_the_file_and_removes_what_it_wrote() {
     assert!(!document.original().diverged);
     save(&document, &path, SaveKind::Save).unwrap();
     assert!(!document.has_edits());
+}
+
+// ---------------------------------------------------------------------------
+// Save As UTF-8 (task 2.3, ADR-0008 decision 7)
+
+/// `text` as UTF-16 LE, with its BOM.
+fn utf16le(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    bytes
+}
+
+/// Opens `path` with `encoding` chosen, indexed, shared for saving.
+fn open_as(path: &Path, dir: &Dir, scheduler: &Scheduler, encoding: Encoding) -> Arc<Document> {
+    let options = OpenOptions {
+        choices: crate::detect::Choices {
+            encoding: Some(encoding),
+            ..crate::detect::Choices::default()
+        },
+        ..options(30)
+    };
+    let (document, _) = Document::open(
+        path,
+        &dir.temp(),
+        VolumeInfo::default(),
+        scheduler,
+        options,
+        None,
+    )
+    .unwrap();
+    wait_for_index(&document);
+    Arc::new(document)
+}
+
+/// A UTF-16 file (read-only in v1), several write chunks long, saved as
+/// UTF-8: the same rows, quoting and line endings in UTF-8, with a UTF-8
+/// BOM for its BOM, and the attribute set. The document then reads the new
+/// file in UTF-8, every row at once, and saves it as any other.
+#[test]
+fn a_utf16_file_saved_as_utf8_reads_the_same_and_saves() {
+    let dir = Dir::new("save-utf8-utf16");
+    let scheduler = scheduler();
+    let text: String = (0..60_000)
+        .map(|i| format!("{i},\"é 😀 {i}\nnext\"\r\n"))
+        .collect();
+    let bytes = utf16le(&text);
+    assert!(bytes.len() > 2 * SAVE_CHUNK_BYTES);
+    let path = dir.file("u.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Utf16Le);
+    let lineage = document.lineage();
+    let copy = dir.0.join("u8.csv");
+    let saved = save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    let expected = [&b"\xEF\xBB\xBF"[..], text.as_bytes()].concat();
+    assert_identical(&expected, &std::fs::read(&copy).unwrap());
+    assert_identical(&bytes, &std::fs::read(&path).unwrap());
+    assert_eq!(saved.len, expected.len() as u64);
+    assert_eq!((saved.rows, saved.complete), (60_000, true));
+    assert_eq!(saved.attributes.text_encoding, Some(Encoding::Utf8));
+    assert_eq!(
+        attribute(&copy, TEXT_ENCODING_ATTRIBUTE_C),
+        Some(b"utf-8;134217984".to_vec())
+    );
+    // The document is the UTF-8 file now, every row read at once.
+    let detection = document.detection();
+    assert_eq!(
+        (detection.encoding, detection.bom),
+        (Encoding::Utf8, crate::dialect::Bom::Utf8)
+    );
+    assert_eq!(document.original().path, copy);
+    assert_eq!(document.lineage(), lineage);
+    assert_eq!(document.row_count(), 60_000);
+    assert_eq!(
+        document.full_value(59_999, 1).unwrap().as_deref(),
+        Some("é 😀 59999\nnext")
+    );
+    set(&document, 59_999, 0, "Ω");
+    save(&document, &copy, SaveKind::Save).unwrap();
+    let mut edited = expected.clone();
+    let at = edited.len() - "59999,\"é 😀 59999\nnext\"\r\n".len();
+    edited.splice(at..at + 5, "Ω".bytes());
+    assert_identical(&edited, &std::fs::read(&copy).unwrap());
+    assert_eq!(
+        leftovers(&dir.0, &["u.csv", "u8.csv", "scratch", "records"]),
+        [""; 0]
+    );
+}
+
+/// DESIGN §3.7: a value the file's encoding can't hold stops Save, naming
+/// the cell; Save As UTF-8 writes it, and every other character converted.
+#[test]
+fn a_value_save_refuses_is_saved_as_utf8() {
+    let dir = Dir::new("save-utf8-1252");
+    let scheduler = scheduler();
+    let path = dir.file("w.csv", b"caf\xE9,\x80\r\nb,c\r\n");
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Windows1252);
+    set(&document, 1, 1, "😀");
+    let error = save(&document, &path, SaveKind::Save).unwrap_err();
+    assert_eq!(
+        error,
+        "Unencodable { encoding: Windows1252, cells: [(1, 1)] }"
+    );
+    let copy = dir.0.join("u8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "café,€\r\nb,😀\r\n".as_bytes()
+    );
+    assert_eq!(document.detection().encoding, Encoding::Utf8);
+    assert!(!document.has_edits());
+    assert_eq!(document.unencodable("😀"), None);
+}
+
+/// Bytes that aren't text in the file's encoding can't be converted: Save
+/// As UTF-8 names each such cell, in file order, and writes nothing.
+/// Editing them lets it save (ADR-0008 decision 7).
+#[test]
+fn save_as_utf8_names_the_cells_it_cant_convert() {
+    let dir = Dir::new("save-utf8-refused");
+    let scheduler = scheduler();
+    // A lone high surrogate in (1, 1), a lone low one in (2, 0), and a
+    // final odd byte, a row (3) of its own.
+    let mut bytes = utf16le("a,b\n1,X\nY,3\n");
+    let x = bytes.iter().position(|&b| b == b'X').unwrap();
+    bytes[x..x + 2].copy_from_slice(&0xD83D_u16.to_le_bytes());
+    let y = bytes.iter().position(|&b| b == b'Y').unwrap();
+    bytes[y..y + 2].copy_from_slice(&0xDE00_u16.to_le_bytes());
+    bytes.push(b'A');
+    let path = dir.file("u.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    let copy = dir.0.join("u8.csv");
+    let error = save(&document, &copy, SaveKind::SaveAsUtf8).unwrap_err();
+    assert_eq!(
+        error,
+        "Unconvertible { encoding: Utf16Le, cells: [(1, 1), (2, 0), (3, 0)], more: false }"
+    );
+    assert!(!copy.exists());
+    assert_eq!(leftovers(&dir.0, &["u.csv", "scratch", "records"]), [""; 0]);
+    assert_eq!(document.detection().encoding, Encoding::Utf16Le);
+    set(&document, 1, 1, "x");
+    set(&document, 2, 0, "y");
+    set(&document, 3, 0, "z");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "\u{FEFF}a,b\n1,x\ny,3\nz".as_bytes()
+    );
+
+    // A byte Windows-1253 leaves unassigned; no BOM, so none written.
+    let path = dir.file("g.csv", b"\xC1,\xAA\n");
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1253);
+    let error = save(&document, &copy, SaveKind::SaveAsUtf8).unwrap_err();
+    assert_eq!(
+        error,
+        "Unconvertible { encoding: Windows1253, cells: [(0, 1)], more: false }"
+    );
+    set(&document, 0, 1, "Ω");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), "Α,Ω\n".as_bytes());
+}
+
+/// A refusal names at most `MAX_NAMED_CELLS` cells, and says there are
+/// more, as soon as it knows.
+#[test]
+fn a_refusal_names_a_thousand_cells_and_says_there_are_more() {
+    let dir = Dir::new("save-utf8-many");
+    let scheduler = scheduler();
+    let mut bytes = vec![0xFF, 0xFE];
+    for i in 0..1500 {
+        bytes.extend(format!("{i},").encode_utf16().flat_map(u16::to_le_bytes));
+        bytes.extend(0xD83D_u16.to_le_bytes());
+        bytes.extend(u16::from(b'\n').to_le_bytes());
+    }
+    let path = dir.file("u.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    let job = document.save(SaveRequest::new(dir.0.join("u8.csv"), SaveKind::SaveAsUtf8));
+    match job.wait() {
+        Err(SaveError::Unconvertible { cells, more, .. }) => {
+            assert_eq!(cells.len(), crate::save::MAX_NAMED_CELLS);
+            assert_eq!(cells[0], (0, 1));
+            assert_eq!(cells[999], (999, 1));
+            assert!(more);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Save As UTF-8 cancelled part-way leaves nothing behind; one with an
+/// edit made while it ran carries the edit over to the UTF-8 file as an
+/// unsaved edit, on a row past the first 64 KB.
+#[test]
+fn save_as_utf8_can_be_cancelled_and_carries_edits_over() {
+    let dir = Dir::new("save-utf8-job");
+    let scheduler = scheduler();
+    let text: String = (0..200_000).map(|i| format!("{i},x\n")).collect();
+    let bytes = utf16le(&text);
+    let path = dir.file("u.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    let copy = dir.0.join("u8.csv");
+    let hold = |at: usize| {
+        let (reached, held) = (mpsc::channel(), mpsc::channel::<()>());
+        let (tell, go) = (Mutex::new(reached.0), Mutex::new(held.1));
+        let hook: crate::document::saving::ChunkHook = Arc::new(move |checkpoint| {
+            if checkpoint == at {
+                tell.lock().unwrap().send(()).unwrap();
+                go.lock().unwrap().recv().unwrap();
+            }
+        });
+        (hook, reached.1, held.0)
+    };
+    let (hook, reached, release) = hold(2);
+    let job = document.save_hooked(SaveRequest::new(&copy, SaveKind::SaveAsUtf8), hook);
+    reached.recv_timeout(LONG).unwrap();
+    let progress = job.progress();
+    assert!(
+        progress.written > 0 && progress.written < progress.total,
+        "{progress:?}"
+    );
+    job.cancel();
+    release.send(()).unwrap();
+    assert!(matches!(job.wait(), Err(SaveError::Cancelled)));
+    assert!(!copy.exists());
+    assert_eq!(leftovers(&dir.0, &["u.csv", "scratch", "records"]), [""; 0]);
+
+    let (hook, reached, release) = hold(2);
+    let job = document.save_hooked(SaveRequest::new(&copy, SaveKind::SaveAsUtf8), hook);
+    reached.recv_timeout(LONG).unwrap();
+    set(&document, 150_000, 1, "édité");
+    release.send(()).unwrap();
+    let saved = job.wait().unwrap();
+    assert_eq!(saved.edits_during_save, [(150_000, 1)]);
+    assert_eq!(document.detection().encoding, Encoding::Utf8);
+    assert!(document.has_edits());
+    assert_eq!(
+        document.full_value(150_000, 1).unwrap().as_deref(),
+        Some("édité")
+    );
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        [&b"\xEF\xBB\xBF"[..], text.as_bytes()].concat()
+    );
 }
 
 // ---------------------------------------------------------------------------

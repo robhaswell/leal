@@ -235,13 +235,15 @@ pub fn group_of(id: &str) -> &str {
 /// 95% interval spans tens of percent between identical commits. The
 /// simulated network share's open (task 2.0) reads the same way. A save
 /// (task 2.2) writes the whole reference file and flushes it to the disk
-/// (`F_FULLFSYNC`), so its time is the runner's disk's.
-pub const BUDGET_ONLY: [&str; 5] = [
+/// (`F_FULLFSYNC`), so its time is the runner's disk's; so does Save As
+/// UTF-8 (task 2.3).
+pub const BUDGET_ONLY: [&str; 6] = [
     "open/first_paint_removable_under_load",
     "open/first_paint_share_under_load",
     "open/first_paint_slow_share_small",
     "open/first_paint_slow_share",
     "save/one_edit",
+    "save/utf8_from_utf16",
 ];
 
 /// True if `id` is gated on its budget only (see [`BUDGET_ONLY`]).

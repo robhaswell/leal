@@ -32,12 +32,28 @@
 //! fields, and the CR/LF split (ADR-0004 decision 10), which only they can
 //! need: an edited row never starts with LF.
 //!
-//! **Encoding** (DESIGN §3.7, F5). UTF-8 can hold any edited value. Task
-//! 2.3 encodes values in the single-byte encodings; until then a value that
-//! isn't plain ASCII in such a file is refused
-//! ([`SaveError::EncodingNotSupported`]), since ASCII is the only text whose
-//! bytes are the same in all of them ([`encode`] is the seam). UTF-16 files
-//! are read-only in v1 ([`SaveError::ReadOnly`]).
+//! **Encoding** (DESIGN §3.7, F5, task 2.3). Each edited value is written
+//! in the file's encoding ([`encode`]): UTF-8 holds any value; a
+//! single-byte encoding (all of ADR-0005 decision 5's) holds the
+//! characters it has a byte for, and a value with any other is refused
+//! before anything is written, naming every such cell
+//! ([`SaveError::Unencodable`]). Nothing is ever substituted. The app can
+//! ask before an edit is committed ([`encode`], or
+//! [`Document::unencodable`](crate::document::Document::unencodable)).
+//! UTF-16 files are read-only in v1 ([`SaveError::ReadOnly`]).
+//!
+//! **Save As UTF-8** ([`SaveKind::SaveAsUtf8`], ADR-0008 decision 7)
+//! writes the same rows in UTF-8 from a file in any encoding: the same
+//! splices, in UTF-8, with every byte between them converted from the
+//! file's encoding as it is copied (`Transcoder`), a stretch at a time,
+//! and the BOM a UTF-8 one if the file had a BOM. Line endings, quoting and
+//! delimiters are the file's own, in meaning: they are ASCII in UTF-8 and
+//! convert one to one. An unedited field whose bytes aren't text in the
+//! file's encoding (an unpaired surrogate or a final odd byte in UTF-16, a
+//! byte a single-byte encoding leaves unassigned) can't be converted, and
+//! the save stops naming those cells ([`SaveError::Unconvertible`]); the
+//! user can edit them and try again. From UTF-8 it is Save As, with the
+//! attribute set.
 //!
 //! **Attributes** ([`AttributePlan`], ADR-0004 decision 11, ADR-0005
 //! decision 1, ADR-0008 decision 8): what a save sets the file's
@@ -54,11 +70,14 @@
 //! [`Document::save`]: crate::document::Document::save
 
 mod attributes;
+mod encode;
 #[cfg(test)]
 mod tests;
 
 pub use attributes::AttributePlan;
 pub(crate) use attributes::{AttributeFacts, needs_census};
+pub(crate) use encode::Transcoder;
+pub use encode::{Unencodable, encode};
 
 use std::borrow::Cow;
 use std::fmt;
@@ -112,7 +131,35 @@ pub enum SaveKind {
     /// bytes aren't all there: only its complete, trusted rows (ADR-0008
     /// decision 6).
     SaveAs,
+    /// **Save As UTF-8** (ADR-0008 decision 7): Save As, writing the
+    /// document in UTF-8 whatever the file's encoding (see the module docs).
+    /// The way out of a UTF-16 file (read-only in v1), and of a value a
+    /// single-byte encoding can't hold. Like Save As, from an incomplete
+    /// document it writes the complete, trusted rows.
+    SaveAsUtf8,
 }
+
+impl SaveKind {
+    /// The encoding a save of this kind writes, for a document in
+    /// `encoding`.
+    #[must_use]
+    pub fn writes(self, encoding: Encoding) -> Encoding {
+        match self {
+            SaveKind::Save | SaveKind::SaveAs => encoding,
+            SaveKind::SaveAsUtf8 => Encoding::Utf8,
+        }
+    }
+
+    /// Whether it writes to a new place (Save As, of either kind).
+    #[must_use]
+    pub fn is_save_as(self) -> bool {
+        self != SaveKind::Save
+    }
+}
+
+/// How many cells a refusal names at most ([`SaveError::Unconvertible`]):
+/// as many as a diagnostic locates (DESIGN §3.5).
+pub const MAX_NAMED_CELLS: usize = 1000;
 
 /// What [`Document::save`](crate::document::Document::save) is asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,16 +387,30 @@ pub struct SaveProgress {
 #[derive(Debug)]
 pub enum SaveError {
     /// UTF-16 files are read-only in v1 (DESIGN §4.3): Save As UTF-8
-    /// (task 2.3) is the way out.
+    /// ([`SaveKind::SaveAsUtf8`]) is the way out.
     ReadOnly,
-    /// These cells (row, column) hold text other than ASCII in a file of
-    /// a single-byte encoding, which task 2.3 will encode; until then the
-    /// save stops rather than guess (F5).
-    EncodingNotSupported {
+    /// These cells (row, column) hold a character the file's encoding
+    /// can't represent (F5: nothing is substituted). Checked before
+    /// anything is written. The app names them and offers Save As UTF-8
+    /// (DESIGN §3.7).
+    Unencodable {
         /// The file's encoding.
         encoding: Encoding,
-        /// The cells.
+        /// Every such cell, in order.
         cells: Vec<(usize, usize)>,
+    },
+    /// Save As UTF-8 (ADR-0008 decision 7): these unedited cells (row,
+    /// column) hold bytes that aren't text in the file's encoding (an
+    /// unpaired surrogate or a final odd byte in UTF-16, a byte a
+    /// single-byte encoding leaves unassigned), so they can't be converted
+    /// (F5). The user can edit them and try again.
+    Unconvertible {
+        /// The file's encoding.
+        encoding: Encoding,
+        /// The cells, in file order: the first [`MAX_NAMED_CELLS`].
+        cells: Vec<(usize, usize)>,
+        /// Whether there are more than those.
+        more: bool,
     },
     /// The new file would be `len` bytes, more than Leal reads
     /// ([`MAX_FILE_BYTES`]), so Leal couldn't open it again.
@@ -406,9 +467,20 @@ impl fmt::Display for SaveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SaveError::ReadOnly => f.write_str("UTF-16 files are read-only"),
-            SaveError::EncodingNotSupported { encoding, cells } => write!(
+            SaveError::Unencodable { encoding, cells } => write!(
                 f,
-                "cells {cells:?} hold text that can't be saved in {encoding:?} yet"
+                "cells {cells:?} hold text that can't be saved in {}",
+                encoding.iana_name()
+            ),
+            SaveError::Unconvertible {
+                encoding,
+                cells,
+                more,
+            } => write!(
+                f,
+                "cells {cells:?}{} hold bytes that aren't {} text, so they can't be converted",
+                if *more { " and more" } else { "" },
+                encoding.iana_name()
             ),
             SaveError::TooLarge { len } => write!(
                 f,
@@ -440,20 +512,6 @@ impl From<ReadError> for SaveError {
     }
 }
 
-/// `value`'s bytes in `encoding`, if the save can write it: always in
-/// UTF-8; in a single-byte encoding, only ASCII until task 2.3; never in
-/// UTF-16, which is read-only.
-#[must_use]
-pub fn encode(value: &str, encoding: Encoding) -> Option<&[u8]> {
-    match encoding {
-        Encoding::Utf8 => Some(value.as_bytes()),
-        Encoding::Utf16Le | Encoding::Utf16Be => None,
-        // TODO(2.3): encode in the single-byte encodings, naming the
-        // characters each can't hold (F5).
-        _ => value.is_ascii().then_some(value.as_bytes()),
-    }
-}
-
 /// Whether a field holding `value` must be quoted wherever it is written:
 /// it holds the delimiter, `"`, CR or LF (§3.7). On the encoded bytes; the
 /// structural bytes are ASCII in every encoding Leal saves.
@@ -466,20 +524,24 @@ pub fn needs_quotes(value: &[u8], delimiter: u8) -> bool {
 
 /// The bytes §3.7 rule 2 writes for an edited field: `value` encoded, and
 /// quoted (each `"` doubled) if it needs it or `quoted` (the field was
-/// quoted, or the file quotes every field). `None` if `value` can't be
-/// encoded ([`encode`]).
-#[must_use]
+/// quoted, or the file quotes every field). For the encodings a save
+/// writes, which are all ASCII-compatible (not UTF-16, read-only in v1).
+///
+/// # Errors
+///
+/// [`Unencodable`] if `value` can't be encoded ([`encode`]).
 pub fn field_bytes(
     value: &str,
     encoding: Encoding,
     delimiter: u8,
     quoted: bool,
-) -> Option<Cow<'_, [u8]>> {
+) -> Result<Cow<'_, [u8]>, Unencodable> {
+    debug_assert!(encoding.is_ascii_compatible(), "{encoding:?} isn't written");
     let encoded = encode(value, encoding)?;
-    if quoted || needs_quotes(encoded, delimiter) {
-        Some(Cow::Owned(quote(encoded)))
+    if quoted || needs_quotes(&encoded, delimiter) {
+        Ok(Cow::Owned(quote(&encoded)))
     } else {
-        Some(Cow::Borrowed(encoded))
+        Ok(encoded)
     }
 }
 
@@ -504,11 +566,33 @@ const BOM_LIKE: [&[u8]; 3] = [b"\xEF\xBB\xBF", b"\xFF\xFE", b"\xFE\xFF"];
 /// How an edited row is written, as far as the file as a whole decides it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowRules {
+    /// The encoding written ([`SaveKind::writes`]).
     pub(crate) encoding: Encoding,
+    /// The file's own encoding. Where it isn't the one written (Save As
+    /// UTF-8), the row's unedited bytes are converted.
+    pub(crate) source: Encoding,
     pub(crate) delimiter: u8,
     /// The file quotes every field (ADR-0004 decision 1), so an edited
     /// hatched cell is quoted too.
     pub(crate) quote_all: bool,
+}
+
+impl RowRules {
+    /// Whether the row's own bytes are converted (Save As UTF-8 from
+    /// another encoding).
+    fn converts(self) -> bool {
+        self.source != self.encoding
+    }
+
+    /// How many bytes a structural character takes in the file: 2 in
+    /// UTF-16, otherwise 1.
+    fn unit(self) -> usize {
+        if self.source.is_ascii_compatible() {
+            1
+        } else {
+            2
+        }
+    }
 }
 
 /// One edited row of the file, as it was read.
@@ -546,18 +630,40 @@ impl EditedRow<'_> {
         self.fields.len().max(end)
     }
 
-    /// Cell `column`'s bytes as written: its raw bytes, its new value's, or
-    /// none (padding before an edited hatched cell). `Err` with the column
-    /// if its value can't be encoded.
+    /// An unedited field's bytes as written: its raw bytes, converted to
+    /// the encoding written if that isn't the file's (Save As UTF-8).
+    /// `None` if they aren't text in the file's encoding.
+    fn original(&self, field: &FieldSpan, rules: RowRules) -> Option<Cow<'_, [u8]>> {
+        let raw = self.raw(field);
+        if rules.converts() {
+            Transcoder::convert(raw, rules.source)
+        } else {
+            Some(Cow::Borrowed(raw))
+        }
+    }
+
+    /// Cell `column`'s bytes as written: its raw bytes (converted, for Save
+    /// As UTF-8), its new value's, or none (padding before an edited
+    /// hatched cell). `Err` with the column if its value can't be encoded,
+    /// or its bytes converted.
     fn cell_bytes(&self, column: usize, rules: RowRules) -> Result<Cow<'_, [u8]>, usize> {
         match (self.edited(column), self.fields.get(column)) {
             (Some(value), field) => {
                 let quoted = rules.quote_all || field.is_some_and(FieldSpan::quoted);
-                field_bytes(value, rules.encoding, rules.delimiter, quoted).ok_or(column)
+                field_bytes(value, rules.encoding, rules.delimiter, quoted).map_err(|_| column)
             }
-            (None, Some(field)) => Ok(Cow::Borrowed(self.raw(field))),
+            (None, Some(field)) => self.original(field, rules).ok_or(column),
             (None, None) => Ok(Cow::Borrowed(&[])),
         }
+    }
+
+    /// The unedited columns whose bytes can't be converted (Save As UTF-8):
+    /// the cells a refusal names when the row can't be written.
+    pub(crate) fn unconvertible(&self, rules: RowRules) -> Vec<usize> {
+        (0..self.fields.len())
+            .filter(|&column| self.edited(column).is_none())
+            .filter(|&column| self.original(&self.fields[column], rules).is_none())
+            .collect()
     }
 
     /// The row's content (its bytes without the line ending) as written,
@@ -576,9 +682,12 @@ impl EditedRow<'_> {
         Ok(content)
     }
 
-    /// The end of the row's line ending.
-    fn end(&self) -> usize {
-        self.span.end + self.line_ending.map_or(0, |ending| ending.bytes().len())
+    /// The end of the row's line ending, in the file.
+    pub(crate) fn end(&self, rules: RowRules) -> usize {
+        self.span.end
+            + self
+                .line_ending
+                .map_or(0, |ending| ending.bytes().len() * rules.unit())
     }
 }
 
@@ -630,7 +739,7 @@ pub(crate) fn row_splices(
         };
         bytes.extend_from_slice(ending);
         splices.push(Splice {
-            range: row.span.start..row.end(),
+            range: row.span.start..row.end(rules),
             bytes,
         });
         return Ok(());
@@ -641,7 +750,10 @@ pub(crate) fn row_splices(
             break;
         };
         let bytes = row.cell_bytes(column, rules).map_err(|c| vec![c])?;
-        if *bytes != *row.raw(field) {
+        if row
+            .original(field, rules)
+            .is_none_or(|original| *bytes != *original)
+        {
             splices.push(Splice {
                 range: field.span(),
                 bytes: bytes.into_owned(),

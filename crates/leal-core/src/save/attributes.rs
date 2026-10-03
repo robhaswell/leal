@@ -8,6 +8,7 @@
 //!   when a reopen would guess another one: from the first 64 KB at first
 //!   paint (ADR-0005 decision 4) or from the whole file (ADR-0003 decision
 //!   1). A BOM decides the encoding by itself. Otherwise it is removed.
+//!   Save As UTF-8 always sets it to UTF-8 (ADR-0008 decision 7).
 //! - **The interpretation attribute** records the delimiter and the header
 //!   choice, with the new file's fingerprint (ADR-0007 decision 1), when
 //!   either was the user's choice or came from the attribute, or when a
@@ -69,6 +70,10 @@ pub(crate) struct AttributeFacts<'a> {
     pub(crate) len: u64,
     /// The census of the whole new file, if [`needs_census`] said so.
     pub(crate) census: Option<Census>,
+    /// The file was written in UTF-8 whatever the document's encoding (Save
+    /// As UTF-8, ADR-0008 decision 7): `com.apple.TextEncoding` is set to
+    /// UTF-8, and the BOM is a UTF-8 one if the document had a BOM.
+    pub(crate) utf8: bool,
 }
 
 /// Whether the plan needs the census of the whole new file: only for an
@@ -92,7 +97,10 @@ impl AttributePlan {
             };
             detect(facts.head, facts.len, hints, Choices::default())
         };
-        let text_encoding = if document.bom == Bom::None {
+        let text_encoding = if facts.utf8 {
+            // Save As UTF-8 sets it, BOM or not (ADR-0008 decision 7).
+            Some(Encoding::Utf8)
+        } else if document.bom == Bom::None {
             let first_paint = reopen(None).map(|d| d.encoding).ok();
             let whole_file = facts.census.map(Census::guess);
             let record = facts.had_text_encoding
