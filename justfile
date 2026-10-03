@@ -22,11 +22,20 @@ default:
 
 # `--all-features` (here and in `test`, `test-deep` and `lint`) also covers
 # leal-ffi's test-only exports (the `test-exports` feature; see `ffi`).
+#
+# `check` also lints the code as it ships, without those features: an item
+# only test hooks use (a field only they read, say) warns only there. Only
+# the libraries and binaries, not `--all-targets`: that builds leal-bench's
+# benchmarks and tests, whose dev-dependency on leal-core turns on its
+# `test-hooks` for the whole build. Both profiles, as release builds drop
+# `debug_assertions` code.
 
-# Format check, clippy (-D warnings), tests, doctests and rustdoc (-D warnings). Must pass before every commit.
+# Format check, clippy (-D warnings; with and without test features, debug and release), tests, doctests and rustdoc (-D warnings). Must pass before every commit.
 check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --release -- -D warnings
     cargo nextest run --workspace --all-features
     cargo test --workspace --doc --exclude leal-ffi
     just doc

@@ -377,7 +377,7 @@ pub enum SimulatedFault {
 
 /// The file on the removable drive.
 struct External {
-    // Dropped before `folder`, so the clone is closed before it is deleted.
+    // Dropped before `_folder`, so the clone is closed before it is deleted.
     // Readers hold their own `Arc` for the length of one read, so the
     // descriptor can outlive this (deleting an open file is fine on Unix).
     file: Arc<File>,
@@ -386,14 +386,18 @@ struct External {
     /// to it.
     id: (u64, u64),
     /// Which file `file` and `path` are: the clone or the user's file. Ask
-    /// this, not `folder`, which outlives reading the clone.
+    /// this, not `_folder`, which outlives reading the clone.
     reads: Reads,
     /// Leal's clone's folder, if one was made: held so that dropping it
     /// deletes the clone, the folder and the record. It stays after a
     /// reconnect falls back to the user's file (`reads` says so), so a
     /// clone that is only missing for now is still cleaned up. `None` for a
     /// drive that can't clone, and for a share.
-    folder: Option<TempFolder>,
+    ///
+    /// Held for its `Drop`, which does the deleting: outside the tests and
+    /// test hooks nothing reads it (hence the `_`, so builds without them
+    /// don't warn that it is never read).
+    _folder: Option<TempFolder>,
 }
 
 /// Which file an [`External`] reads.
@@ -538,7 +542,7 @@ impl Removable {
                     path,
                     id: (metadata.dev(), metadata.ino()),
                     reads: Reads::Clone,
-                    folder: Some(clone),
+                    _folder: Some(clone),
                 }
             }
             Origin::Original {
@@ -550,7 +554,7 @@ impl Removable {
                 path,
                 id: (identity.device, identity.inode),
                 reads: Reads::Original(identity),
-                folder: None,
+                _folder: None,
             },
         };
         // A clone's size is the snapshot's. The user's file is read only up
@@ -855,7 +859,7 @@ impl Removable {
     pub(super) fn simulate_clone_lost(&self) -> bool {
         let external = self.lock_external();
         let Some(External {
-            folder: Some(folder),
+            _folder: Some(folder),
             ..
         }) = external.as_ref()
         else {
@@ -1517,7 +1521,7 @@ impl Removable {
     #[cfg(test)]
     pub(super) fn abandon_external_clone(&self) {
         if let Some(External {
-            folder: Some(folder),
+            _folder: Some(folder),
             ..
         }) = self.lock_external().take()
         {
