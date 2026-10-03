@@ -67,7 +67,7 @@ pub(super) fn is_network_file_system(type_name: &str) -> bool {
 
 /// What kind of volume a file is on, for choosing how to read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VolumeKind {
+pub(crate) enum VolumeKind {
     /// Can't vanish while the file is open: an internal disk.
     Fixed,
     /// A removable drive (ADR-0006 option C): never mapped from there.

@@ -57,7 +57,8 @@ use crate::attributes::{Fingerprint, Interpretation, TextEncodingError, parse_te
 use crate::dialect::{Bom, Delimiter, Encoding, LineEnding, QUOTE};
 use crate::source::RawAttributes;
 use delimiter::{Scores, Tally, best, score_of, scores, tally};
-use encoding::{Census, assigned_bytes, chunk_end, decodes};
+pub(crate) use encoding::{Census, CensusStream};
+use encoding::{assigned_bytes, chunk_end, decodes};
 use rows::{Row, Scanner, field_values, whole_rows};
 use units::Units;
 

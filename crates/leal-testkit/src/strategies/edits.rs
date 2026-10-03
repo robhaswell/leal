@@ -35,12 +35,13 @@ use crate::strategies::csv::{
 };
 
 /// Values the edit strategy writes: plain text, every character that forces
-/// quoting, leading and trailing spaces, the empty string, text that
-/// Windows-1252 can (é, €) and can't (😀) encode, and BOM-like starts
+/// quoting, leading and trailing spaces, the empty string, a NUL (which a
+/// value may hold, and the diagnostics mark), text that Windows-1252 can
+/// (é, €) and can't (😀) encode, and BOM-like starts
 /// (ADR-0004 decisions 7 and 10): U+FEFF, and "ÿþ", "þÿ" and "ï»¿", which are
 /// the bytes `FF FE`, `FE FF` and `EF BB BF` in Windows-1252. The BOM-like
 /// values come first.
-pub const EDIT_VALUES: [&str; 22] = [
+pub const EDIT_VALUES: [&str; 23] = [
     "\u{FEFF}x",
     "\u{FF}\u{FE}",
     "\u{FE}\u{FF}",
@@ -60,6 +61,7 @@ pub const EDIT_VALUES: [&str; 22] = [
     "cr\rhere",
     "crlf\r\nhere",
     " padded ",
+    "nul\0here",
     "é",
     "€",
     "😀",

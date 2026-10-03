@@ -223,6 +223,10 @@ impl Overlay {
 #[derive(Debug)]
 pub(crate) struct EditStore {
     lineage: Lineage,
+    /// The edits start from a file Leal saved in this lineage (task 2.2's
+    /// rebase), so the lineage's earlier commands may name a missing cell
+    /// that is a field now (`document::editing::holds`).
+    rebased: bool,
     state: RwLock<EditState>,
     /// How many edits had to copy the overlay, for tests.
     #[cfg(test)]
@@ -253,10 +257,25 @@ impl EditStore {
     pub(crate) fn with_lineage(lineage: Lineage) -> EditStore {
         EditStore {
             lineage,
+            rebased: false,
             state: RwLock::default(),
             #[cfg(test)]
             copies: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// No edits, in `lineage`, over the file a save in that lineage just
+    /// wrote: the undo history carries on (ADR-0008 decision 1).
+    pub(crate) fn rebased(lineage: Lineage) -> EditStore {
+        EditStore {
+            rebased: true,
+            ..EditStore::with_lineage(lineage)
+        }
+    }
+
+    /// Whether the edits start from a file Leal saved in their lineage.
+    pub(crate) fn is_rebased(&self) -> bool {
+        self.rebased
     }
 
     /// The lineage of every command made in these edits.
@@ -267,6 +286,13 @@ impl EditStore {
     /// The edits now.
     pub(crate) fn overlay(&self) -> Arc<Overlay> {
         Arc::clone(&self.read().overlay)
+    }
+
+    /// The edits now and their version, in one look: what a save writes,
+    /// and where it carries later edits over from (task 2.2).
+    pub(crate) fn snapshot(&self) -> (Arc<Overlay>, usize) {
+        let state = self.read();
+        (Arc::clone(&state.overlay), state.log.len())
     }
 
     /// How many edits have been made: the version the edits are.

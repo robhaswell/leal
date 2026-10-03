@@ -59,6 +59,76 @@ impl Census {
     }
 }
 
+/// [`Census::of`] a file that arrives in pieces cut anywhere, such as the
+/// pieces a save writes (task 2.2): a sequence cut between two pieces is
+/// held back until the next one, so the sum is the census of the whole.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CensusStream {
+    census: Census,
+    /// The end of the last piece: the start of a sequence it cut off.
+    carry: Vec<u8>,
+}
+
+impl CensusStream {
+    /// Counts the next piece, in place: only a sequence the last piece
+    /// cut off is copied, with the at most three bytes of this one that
+    /// finish it.
+    pub(crate) fn push(&mut self, piece: &[u8]) {
+        let mut piece = piece;
+        if !self.carry.is_empty() {
+            let take = piece.len().min(3);
+            let carried = self.carry.len();
+            let mut small = std::mem::take(&mut self.carry);
+            small.extend_from_slice(&piece[..take]);
+            // How far into `small` the sequences that start in the carry
+            // reach: a sequence is at most four bytes, so they end in it.
+            let mut reach = 0;
+            let mut chunks = small.utf8_chunks().peekable();
+            'chunks: while let Some(chunk) = chunks.next() {
+                for c in chunk.valid().chars() {
+                    if reach >= carried {
+                        break 'chunks;
+                    }
+                    reach += c.len_utf8();
+                }
+                if reach >= carried {
+                    break;
+                }
+                let invalid = chunk.invalid();
+                if chunks.peek().is_none() && take == piece.len() && unfinished(invalid) {
+                    // Still cut off: it waits for the next piece.
+                    self.census = self.census.plus(Census::of(&small[..reach], false));
+                    self.carry = small[reach..].to_vec();
+                    return;
+                }
+                reach += invalid.len();
+            }
+            self.census = self.census.plus(Census::of(&small[..reach], false));
+            piece = &piece[reach.saturating_sub(carried).min(piece.len())..];
+        }
+        if piece.is_ascii() {
+            return;
+        }
+        // A tail that only the end of the piece makes invalid waits for the
+        // next piece: at most three bytes.
+        let tail = piece.utf8_chunks().last().map_or(0, |chunk| {
+            if unfinished(chunk.invalid()) {
+                chunk.invalid().len()
+            } else {
+                0
+            }
+        });
+        let whole = piece.len() - tail;
+        self.census = self.census.plus(Census::of(&piece[..whole], false));
+        self.carry = piece[whole..].to_vec();
+    }
+
+    /// The census of everything pushed.
+    pub(crate) fn finish(self) -> Census {
+        self.census.plus(Census::of(&self.carry, false))
+    }
+}
+
 /// True if `invalid` (the invalid tail of the bytes) is the start of a
 /// valid sequence that the end of the bytes cut off, rather than bytes
 /// that could never be valid.
@@ -181,6 +251,32 @@ mod tests {
         assert_eq!(chunk_end(&[0; 10], 0, 5, Encoding::Utf16Le), 4);
         assert_eq!(chunk_end(&[0; 10], 4, 5, Encoding::Utf16Le), 8);
         assert_eq!(chunk_end(&[0; 10], 8, 5, Encoding::Utf16Le), 10);
+    }
+
+    /// Pushed in pieces cut anywhere, the census is the whole's.
+    #[test]
+    fn a_streamed_census_equals_the_whole() {
+        let samples: [&[u8]; 4] = [
+            "aé€😀b".as_bytes(),
+            b"\xF0\x9F\x98\x80\x80\x80x\xE2\x82",
+            b"ab\xC3\xA9\xFF\xF0\x9F\x98\xC3",
+            b"\xED\xA0\x80\xC0\xAF\xE2\x82\xAC\xE2",
+        ];
+        for bytes in samples {
+            let whole = Census::of(bytes, false);
+            for size in 1..=bytes.len() {
+                let mut stream = CensusStream::default();
+                for piece in bytes.chunks(size) {
+                    stream.push(piece);
+                }
+                assert_eq!(
+                    stream.finish(),
+                    whole,
+                    "{} in pieces of {size}",
+                    bytes.escape_ascii()
+                );
+            }
+        }
     }
 
     #[test]

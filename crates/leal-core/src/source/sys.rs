@@ -4,7 +4,9 @@
 //! thread, and for watching the
 //! user's file, a kernel event queue (`kqueue`) and an open file's current
 //! path (`F_GETPATH`); and for the simulated share's delay (a test hook),
-//! a kernel timer that isn't coalesced. (Ordinary reads at an
+//! a kernel timer that isn't coalesced. For saving (task 2.2): copying a
+//! file's access control list and extended attributes, setting and
+//! removing an attribute, its flags and its creation date. (Ordinary reads at an
 //! offset, `pread`, need no `unsafe`: the standard library has them as
 //! `FileExt::read_at`.)
 //!
@@ -395,9 +397,10 @@ pub(super) fn sleep_strictly(duration: Duration) -> io::Result<()> {
 }
 
 /// Swaps the files at `a` and `b` atomically (`renamex_np` with
-/// `RENAME_SWAP`), as `FileManager.replaceItemAt` does for a safe save.
-/// Tests only: they reproduce that save.
-#[cfg(test)]
+/// `RENAME_SWAP`), as `FileManager.replaceItemAt` does for a safe save, and
+/// as Leal's own save does (task 2.2). Fails with `ENOTSUP` (or `EINVAL`)
+/// on a volume that can't swap, such as some FAT and SMB volumes, and
+/// `ENOENT` if either is missing.
 pub(super) fn swap(a: &Path, b: &Path) -> io::Result<()> {
     let a = c_path(a)?;
     let b = c_path(b)?;
@@ -410,6 +413,407 @@ pub(super) fn swap(a: &Path, b: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+unsafe extern "C" {
+    /// `acl_get_fd_np(3)`: the open file's access control list, or null
+    /// (`ENOENT` if it has none). The caller frees it with `acl_free`.
+    fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_uint) -> *mut libc::c_void;
+    /// `acl_set_fd_np(3)`: sets the open file's access control list.
+    fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, kind: libc::c_uint) -> libc::c_int;
+    /// `acl_free(3)`.
+    fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    /// `acl_init(3)`: a new, empty access control list, or null.
+    fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+}
+
+/// `ACL_TYPE_EXTENDED`, the only kind macOS file systems have.
+const ACL_TYPE_EXTENDED: libc::c_uint = 0x100;
+
+/// An access control list from `acl_get_fd_np` or `acl_init`, freed when
+/// dropped.
+struct Acl(*mut libc::c_void);
+
+impl Drop for Acl {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `acl_get_fd_np` or `acl_init`, which
+        // allocated it, is not null, and is freed only here, once.
+        unsafe {
+            acl_free(self.0);
+        }
+    }
+}
+
+/// Copies the access control list of the open file `from` to the open
+/// file `to` (`acl_get_fd_np` and `acl_set_fd_np`), and nothing else: not
+/// with `fcopyfile(COPYFILE_ACL)`, which also applies the old file's
+/// quarantine, which a safe save doesn't keep. A save sets it last, so an
+/// entry denying attribute or permission writes can't stop anything before
+/// it (ADR-0012 decision 1). If `from` has none, `to` is given an empty one,
+/// so entries it inherited from the folder it was made in don't stay.
+pub(super) fn copy_acl(from: &File, to: &File) -> io::Result<()> {
+    // SAFETY: the descriptor is open, borrowed from `from` for the call;
+    // the type is a plain integer. The result is null or a list this
+    // function owns, which `Acl` frees.
+    let acl = unsafe { acl_get_fd_np(from.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    let acl = if acl.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        // SAFETY: `acl_init` takes a plain count and returns a new list this
+        // function owns, or null.
+        let empty = unsafe { acl_init(1) };
+        if empty.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Acl(empty)
+    } else {
+        Acl(acl)
+    };
+    // SAFETY: `acl.0` is a valid list from `acl_get_fd_np`, alive until
+    // `acl` drops after this call, which only reads it. The descriptor is
+    // open, borrowed from `to`.
+    let result = unsafe { acl_set_fd_np(to.as_raw_fd(), acl.0, ACL_TYPE_EXTENDED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Gives the open file an empty access control list: entries a save had
+/// copied are cleared before its metadata is copied again.
+pub(super) fn clear_acl(file: &File) -> io::Result<()> {
+    // SAFETY: `acl_init` takes a plain count and returns a new list this
+    // function owns, or null.
+    let empty = unsafe { acl_init(1) };
+    if empty.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let empty = Acl(empty);
+    // SAFETY: `empty.0` is a valid list, alive until `empty` drops after
+    // this call, which only reads it. The descriptor is open, borrowed from
+    // `file`.
+    let result = unsafe { acl_set_fd_np(file.as_raw_fd(), empty.0, ACL_TYPE_EXTENDED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Sets the extended attribute `name` of the open file `file` to `value`,
+/// with `fsetxattr(2)`, replacing any value it had.
+pub(super) fn set_xattr(file: &File, name: &CStr, value: &[u8]) -> io::Result<()> {
+    // SAFETY: `value` is valid for reads of `value.len()` bytes and `name`
+    // is a NUL-terminated string; both outlive the call, which keeps no
+    // pointer to them. The descriptor is open and borrowed from `file`.
+    // Position 0 and options 0 set the whole value of an ordinary attribute.
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Removes the extended attribute `name` from the open file `file`, with
+/// `fremovexattr(2)`. A file without it is left as it is.
+pub(super) fn remove_xattr(file: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: `name` is a NUL-terminated string that outlives the call,
+    // which keeps no pointer to it. The descriptor is open and borrowed from
+    // `file`. Options 0: an ordinary attribute.
+    let result = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOATTR) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// Sets the BSD file flags (`fchflags(2)`) of the open file `file`.
+pub(super) fn set_flags_of(file: &File, flags: u32) -> io::Result<()> {
+    // SAFETY: the descriptor is open and borrowed from `file` for the call;
+    // `flags` is a plain integer.
+    let result = unsafe { libc::fchflags(file.as_raw_fd(), flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Sets the creation date (`ATTR_CMN_CRTIME`, what Finder shows as
+/// Created) of the open file `file`, with `fsetattrlist(2)`.
+pub(super) fn set_creation_time(file: &File, created: std::time::SystemTime) -> io::Result<()> {
+    let since = created
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut time = libc::timespec {
+        tv_sec: libc::time_t::try_from(since.as_secs())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+        tv_nsec: libc::c_long::from(since.subsec_nanos()),
+    };
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_CRTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // SAFETY: `attributes` asks for one attribute, the creation time, whose
+    // value in the buffer is one `struct timespec`; the buffer is `time`,
+    // exactly that size, owned by this function and outliving the call,
+    // which keeps no pointer to either. The descriptor is open and borrowed
+    // from `file`. Options 0.
+    let result = unsafe {
+        libc::fsetattrlist(
+            file.as_raw_fd(),
+            (&raw mut attributes).cast(),
+            (&raw mut time).cast(),
+            std::mem::size_of::<libc::timespec>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Renames `from` to `to`, failing with `EEXIST` if something is at `to`
+/// already (`renamex_np` with `RENAME_EXCL`): a Save As to a new place never
+/// replaces a file that appeared there meanwhile.
+pub(super) fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
+    let from = c_path(from)?;
+    let to = c_path(to)?;
+    // SAFETY: `renamex_np` reads the two NUL-terminated strings, which live
+    // until the end of this function, and doesn't keep the pointers.
+    // `RENAME_EXCL` is a plain flag.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether this process may write the file at `path`, by its effective
+/// user and groups and the file's mode and access control list
+/// (`faccessat(2)` with `W_OK` and `AT_EACCESS`). A rename over a file
+/// needs only write access to its folder, so a save asks this first.
+pub(super) fn can_write(path: &Path) -> io::Result<bool> {
+    let path = c_path(path)?;
+    // SAFETY: `faccessat` reads the NUL-terminated string `path`, which
+    // lives until the end of this function, and keeps no pointer to it.
+    // `AT_FDCWD` only matters for a relative path. The mode and flags are
+    // plain integers.
+    let result =
+        unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM | libc::EROFS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+/// Orders the open file's writes before any later ones on its volume
+/// (`fcntl(F_BARRIERFSYNC)`): the new file's bytes are on the disk before
+/// the rename that makes them the file. Where the volume doesn't support
+/// barriers (`ENOTSUP`, `EINVAL`, `ENOTTY`), a full flush
+/// (`F_FULLFSYNC`), and where that isn't supported either, `fsync(2)`.
+pub(super) fn barrier_sync(file: &File) -> io::Result<()> {
+    let unsupported = |error: &io::Error| {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY)
+        )
+    };
+    // SAFETY: `F_BARRIERFSYNC` takes no argument. The descriptor is open and
+    // borrowed from `file` for the length of the call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
+    if result != -1 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !unsupported(&error) {
+        return Err(error);
+    }
+    // SAFETY: as above, for `F_FULLFSYNC`.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if result != -1 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if !unsupported(&error) {
+        return Err(error);
+    }
+    // SAFETY: `fsync` takes only the descriptor, open and borrowed from
+    // `file`.
+    let result = unsafe { libc::fsync(file.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// What the volume a folder is on can do for a save's rename
+/// (`getattrlist(ATTR_VOL_CAPABILITIES)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RenameCapabilities {
+    /// `renamex_np(RENAME_SWAP)` is supported (`VOL_CAP_INT_RENAME_SWAP`).
+    /// APFS: yes; HFS+, exFAT and FAT: no. (FAT's driver returns success for
+    /// a swap and does a plain rename, so the capability, not the result,
+    /// decides.)
+    pub(super) swap: bool,
+    /// `renamex_np(RENAME_EXCL)` is supported (`VOL_CAP_INT_RENAME_EXCL`).
+    /// APFS and HFS+: yes; exFAT and FAT: no.
+    pub(super) exclusive: bool,
+}
+
+/// [`RenameCapabilities`] of the volume `folder` is on. Unknown bits count
+/// as unsupported.
+pub(super) fn rename_capabilities(folder: &Path) -> io::Result<RenameCapabilities> {
+    #[repr(C)]
+    struct Buffer {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+    let folder = c_path(folder)?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = std::mem::MaybeUninit::<Buffer>::zeroed();
+    // SAFETY: `attributes` asks for the volume's capabilities only, which
+    // `getattrlist` writes after a `u32` length: exactly `Buffer`'s layout
+    // (`repr(C)`), which is zeroed, owned by this function, and as long as
+    // the size passed. The path is NUL-terminated and outlives the call;
+    // nothing keeps a pointer. Options 0 follow a symbolic link, as the
+    // folder of a resolved destination has none.
+    let result = unsafe {
+        libc::getattrlist(
+            folder.as_ptr(),
+            (&raw mut attributes).cast(),
+            buffer.as_mut_ptr().cast(),
+            std::mem::size_of::<Buffer>(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: zeroed memory is a valid `Buffer` (plain integers), and
+    // `getattrlist` filled in what it returned.
+    let buffer = unsafe { buffer.assume_init() };
+    let interfaces = libc::VOL_CAPABILITIES_INTERFACES;
+    let has = |bit: u32| {
+        buffer.capabilities.capabilities[interfaces] & bit != 0
+            && buffer.capabilities.valid[interfaces] & bit != 0
+    };
+    Ok(RenameCapabilities {
+        swap: has(libc::VOL_CAP_INT_RENAME_SWAP),
+        exclusive: has(libc::VOL_CAP_INT_RENAME_EXCL),
+    })
+}
+
+/// The names of the open file's extended attributes (`flistxattr(2)`).
+pub(super) fn list_xattrs(file: &File) -> io::Result<Vec<CString>> {
+    // SAFETY: a null buffer and size 0 ask only for the size the list
+    // needs; nothing is written. The descriptor is open and borrowed from
+    // `file`. Options 0.
+    let size = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    let Ok(size) = usize::try_from(size) else {
+        return Err(io::Error::last_os_error());
+    };
+    let mut names = vec![0_u8; size];
+    // SAFETY: `names` is valid for writes of `names.len()` bytes, and
+    // `flistxattr` writes at most that many. The descriptor is open.
+    let len =
+        unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0) };
+    let Ok(len) = usize::try_from(len) else {
+        return Err(io::Error::last_os_error());
+    };
+    names.truncate(len);
+    Ok(names
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| CString::new(name).ok())
+        .collect())
+}
+
+/// The whole value of the open file's extended attribute `name`, however
+/// long (a resource fork can be megabytes): `None` if it has none.
+pub(super) fn read_whole_xattr(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+    // SAFETY: a null buffer and size 0 ask only for the value's size. The
+    // descriptor is open and borrowed from `file`; `name` is NUL-terminated
+    // and outlives the call. Position 0, options 0.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    let Ok(size) = usize::try_from(size) else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOATTR) {
+            return Ok(None);
+        }
+        return Err(error);
+    };
+    read_xattr(file, name, size)
+}
+
+unsafe extern "C" {
+    /// `xattr_preserve_for_intent(3)`, from `<xattr_flags.h>`, in
+    /// libSystem: whether an extended attribute should be kept for an
+    /// operation, by the flags in its name or the system's defaults.
+    fn xattr_preserve_for_intent(name: *const libc::c_char, intent: libc::c_uint) -> libc::c_int;
+}
+
+/// `XATTR_OPERATION_INTENT_SAVE`: a safe save, the new file replacing the
+/// old.
+const XATTR_OPERATION_INTENT_SAVE: libc::c_uint = 2;
+
+/// Whether the system says the extended attribute `name` belongs on the
+/// new version of a file a safe save writes (`xattr_preserve_for_intent`
+/// with `XATTR_OPERATION_INTENT_SAVE`). Attributes tied to the contents
+/// (`#C` in their name, such as a checksum) and ones never to be kept are
+/// not.
+pub(super) fn keep_on_save(name: &CStr) -> bool {
+    // SAFETY: `xattr_preserve_for_intent` reads the NUL-terminated string
+    // `name`, which outlives the call, and keeps no pointer to it. The
+    // intent is a plain integer.
+    unsafe { xattr_preserve_for_intent(name.as_ptr(), XATTR_OPERATION_INTENT_SAVE) != 0 }
 }
 
 /// `path` as a NUL-terminated C string.

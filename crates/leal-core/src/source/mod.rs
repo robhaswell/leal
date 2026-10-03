@@ -89,6 +89,7 @@ mod temp;
 #[cfg(test)]
 pub(crate) mod tests;
 mod volume;
+mod write;
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -116,7 +117,11 @@ use temp::TempFolder;
 pub use temp::TempFolders;
 #[cfg(test)]
 use volume::VolumeFlags;
-use volume::VolumeKind;
+pub(crate) use volume::VolumeKind;
+pub use write::Placed;
+pub(crate) use write::{
+    Existing, Put, Snapshot, Staged, SwapError, can_write, look_afresh, same_file,
+};
 
 /// The largest file the fallback reads into memory, when its volume can't
 /// clone: 512 MiB (DESIGN §3.1). A larger file is copied to Leal's
@@ -142,9 +147,10 @@ pub const STREAM_CHUNK_BYTES: usize = 1 << 20;
 /// few dozen bytes; a longer value is treated as absent.
 pub const ATTRIBUTE_MAX_BYTES: usize = 64 * 1024;
 
-/// The C-string forms of the attribute names, for `fgetxattr`.
-const TEXT_ENCODING_ATTRIBUTE_C: &CStr = c"com.apple.TextEncoding";
-const INTERPRETATION_ATTRIBUTE_C: &CStr = c"io.github.robhaswell.leal.interpretation";
+/// The C-string forms of the attribute names, for `fgetxattr` and, when a
+/// save writes them, `fsetxattr`.
+pub(crate) const TEXT_ENCODING_ATTRIBUTE_C: &CStr = c"com.apple.TextEncoding";
+pub(crate) const INTERPRETATION_ATTRIBUTE_C: &CStr = c"io.github.robhaswell.leal.interpretation";
 
 /// An opened file's bytes: a private, read-only snapshot of the file as it
 /// was when it was opened.
@@ -173,6 +179,9 @@ pub struct Source {
     /// Where this snapshot's temporary folders went: a save takes the
     /// snapshot of the file it wrote there too (task 2.2).
     folders: TempFolders,
+    /// For the snapshot of a file Leal saved ([`Source::from_snapshot`]),
+    /// the kind of volume the file is on; `None` otherwise (the bytes say).
+    saved_on: Option<VolumeKind>,
 }
 
 /// Where a [`Source`]'s bytes are held.
@@ -597,6 +606,7 @@ impl Source {
             identity,
             chunk_len: options.chunk_len.max(1),
             folders: temp.clone(),
+            saved_on: None,
         })
     }
 
@@ -782,6 +792,54 @@ impl Source {
     /// reloads such a file off the main thread.
     #[must_use]
     pub fn is_on_network_share(&self) -> bool {
+        match self.saved_on {
+            Some(kind) => kind == VolumeKind::Network,
+            None => self.is_share_bytes(),
+        }
+    }
+
+    /// Whether the file is on a volume that can vanish (a removable drive
+    /// or a network share), so it was never mapped from there.
+    #[must_use]
+    pub fn can_vanish(&self) -> bool {
+        match self.saved_on {
+            Some(kind) => kind != VolumeKind::Fixed,
+            None => matches!(self.bytes, Bytes::Removable(_)),
+        }
+    }
+
+    /// The snapshot of the file Leal just saved at `path` (task 2.2), made
+    /// as it was written ([`Staged::snapshot`]): a clone, or a copy on the
+    /// internal disk, mapped. It is never read from a volume that can
+    /// vanish, and isn't read again at all: the save knows its `identity`,
+    /// the `attributes` it wrote and the `kind` of volume it is on.
+    ///
+    /// # Errors
+    ///
+    /// If the snapshot can't be mapped.
+    pub(crate) fn from_snapshot(
+        path: &Path,
+        snapshot: Snapshot,
+        identity: FileIdentity,
+        attributes: RawAttributes,
+        temps: &TempFolders,
+        kind: VolumeKind,
+    ) -> Result<Source, OpenError> {
+        let map = map_file(path, &snapshot.folder.file_path())?;
+        Ok(Source {
+            bytes: Bytes::Mapped(map),
+            temp: Some(snapshot.folder),
+            path: path.to_owned(),
+            storage: snapshot.storage,
+            attributes,
+            identity,
+            chunk_len: STREAM_CHUNK_BYTES,
+            folders: temps.clone(),
+            saved_on: Some(kind),
+        })
+    }
+
+    fn is_share_bytes(&self) -> bool {
         match &self.bytes {
             Bytes::Removable(removable) => removable.is_share(),
             Bytes::Mapped(_) | Bytes::Owned(_) => false,
@@ -1080,6 +1138,34 @@ fn share_rules(options: &Options) -> ShareRules {
     #[cfg(not(any(test, feature = "test-hooks")))]
     let _ = options;
     ShareRules::new()
+}
+
+/// What kind of volume `folder` is on (a save's destination's folder),
+/// as for a file there ([`volume_kind`]), with what the app knows about it.
+///
+/// # Errors
+///
+/// If the folder can't be opened.
+pub(crate) fn kind_of_folder(
+    folder: &Path,
+    temp: &TempFolders,
+    volume: &VolumeInfo,
+) -> io::Result<VolumeKind> {
+    let file = File::open(folder)?;
+    let metadata = file.metadata()?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    };
+    Ok(volume_kind(
+        &file,
+        &identity,
+        temp,
+        volume,
+        VolumeCheck::Detect,
+    ))
 }
 
 /// What kind of volume the file is on, for how to read it: a fixed volume

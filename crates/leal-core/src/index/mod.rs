@@ -454,6 +454,55 @@ impl RowIndex {
         Ok((index, diagnostics, indexer))
     }
 
+    /// The complete index of the file a save wrote from this one (task
+    /// 2.2): its first `rows` rows, each `deltas` row (in order, with how
+    /// many bytes longer it became) changed only inside, so no row boundary
+    /// moves but each later row starts that much further on. The new file
+    /// is `len` bytes, ending where row `rows` would start, and its
+    /// unterminated quote, if any, is at `unterminated_quote`. The field
+    /// count mode is this index's; a save's index pass gives the new
+    /// file's own soon after. `None` if the deltas don't add up to `len`
+    /// (a bug in the caller).
+    #[must_use]
+    pub(crate) fn shifted(
+        &self,
+        rows: usize,
+        deltas: &[(usize, i64)],
+        len: usize,
+        unterminated_quote: Option<usize>,
+    ) -> Option<RowIndex> {
+        let state = self.read();
+        let old = state.starts.get(..=rows)?;
+        let mut starts = Vec::with_capacity(old.len());
+        let mut shift: i64 = 0;
+        let mut next = deltas.iter().peekable();
+        for (row, &start) in old.iter().enumerate() {
+            while let Some(&&(changed, delta)) = next.peek()
+                && changed < row
+            {
+                shift += delta;
+                next.next();
+            }
+            let moved = i64::from(start).checked_add(shift)?;
+            starts.push(u32::try_from(moved).ok()?);
+        }
+        if starts.last().map(|&end| to_usize(end)) != Some(len) {
+            return None;
+        }
+        Some(RowIndex {
+            dialect: self.dialect,
+            state: RwLock::new(State {
+                starts,
+                len,
+                scanned: len,
+                status: Status::Complete,
+                field_count_mode: state.field_count_mode,
+                unterminated_quote,
+                waiting: Waiting::default(),
+            }),
+        })
+    }
+
     fn new(dialect: IndexDialect) -> Result<RowIndex, IndexError> {
         let IndexDialect {
             delimiter, quote, ..

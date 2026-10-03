@@ -82,6 +82,7 @@ log_strings! {
     ACCELERATION = b"Acceleration\0";
     FIND = b"Find\0";
     COPY = b"Copy\0";
+    SAVE = b"Save\0";
     PAUSED = b"Paused\0";
     EMPTY_FORMAT = b"\0";
 }
@@ -96,6 +97,7 @@ fn name(interval: Interval) -> &'static [u8] {
         Interval::Acceleration => &ACCELERATION,
         Interval::Find => &FIND,
         Interval::Copy => &COPY,
+        Interval::Save => &SAVE,
         Interval::Paused => &PAUSED,
     }
 }
@@ -107,7 +109,9 @@ pub struct MacPlatform;
 impl Platform for MacPlatform {
     fn thread_started(&self, class: ThreadClass) {
         let qos = match class {
-            ThreadClass::Index | ThreadClass::Watcher => QOS_CLASS_USER_INITIATED,
+            ThreadClass::Index | ThreadClass::Save | ThreadClass::Watcher => {
+                QOS_CLASS_USER_INITIATED
+            }
             ThreadClass::Background => QOS_CLASS_UTILITY,
         };
         set_thread_qos(qos);
@@ -264,6 +268,7 @@ mod tests {
             Interval::Acceleration,
             Interval::Find,
             Interval::Copy,
+            Interval::Save,
             Interval::Paused,
         ] {
             let name = CStr::from_bytes_with_nul(super::name(interval)).unwrap();

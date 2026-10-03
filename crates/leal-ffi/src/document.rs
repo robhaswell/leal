@@ -739,7 +739,8 @@ impl Future for Finished {
 /// error and offers to reopen the file.
 #[derive(Debug, uniffi::Object)]
 pub struct Document {
-    document: document::Document,
+    /// Shared with its save jobs, which hold it while they run.
+    document: Arc<document::Document>,
     /// The path, for errors.
     path: String,
     /// The latest first screen.
@@ -822,7 +823,7 @@ pub fn open_document(
     )
     .map_err(|error| document_error(path, error))?;
     let document = Document {
-        document,
+        document: Arc::new(document),
         path: path.to_owned(),
         first_screen: Mutex::new(screen.into()),
         failure: Arc::default(),
@@ -849,6 +850,23 @@ impl Document {
             Err(error) if error.kind() == ReadErrorKind::Cancelled => Ok(None),
             Err(error) => Err(read_error(&self.path, &error)),
         }
+    }
+
+    /// After the core read the file again (a drive back): the cached first
+    /// screen, which is the same, takes the new generation if it is the
+    /// reading restarted (not one a save has replaced meanwhile), and the
+    /// new jobs are watched.
+    fn adopt_restart(&self, restarted: leal_core::document::Restarted) {
+        {
+            let mut cached = self
+                .first_screen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if cached.generation == restarted.from {
+                cached.generation = restarted.to;
+            }
+        }
+        self.watch_jobs();
     }
 
     /// Marks the document failed if a job of its current reading panics.
@@ -1295,15 +1313,9 @@ impl Document {
     /// [`LealError::DocumentFailed`].
     pub fn check_original(&self) -> Result<OriginalStatus, LealError> {
         self.call(|| {
-            let before = self.document.generation();
-            let status = self.document.check_original();
-            let after = self.document.generation();
-            if after != before {
-                self.watch_jobs();
-                self.first_screen
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .generation = after;
+            let (status, restarted) = self.document.check_original_restarting();
+            if let Some(restarted) = restarted {
+                self.adopt_restart(restarted);
             }
             Ok(status.into())
         })
@@ -1549,7 +1561,7 @@ fn debug_document_from(
         document::Document::from_source(source, &scheduler.scheduler, options.into(), progress)
             .map_err(|error| document_error(path, error))?;
     let document = Document {
-        document,
+        document: Arc::new(document),
         path: path.to_owned(),
         first_screen: Mutex::new(screen.into()),
         failure: Arc::default(),
@@ -1594,6 +1606,7 @@ fn document_error(path: &str, error: DocumentError) -> LealError {
             byte_count: len,
         },
         DocumentError::UnsavedEdits => LealError::UnsavedEdits { path: path_owned },
+        DocumentError::Saving => LealError::Saving { path: path_owned },
         DocumentError::Internal(message) => LealError::Internal { message },
     }
 }
@@ -1772,6 +1785,7 @@ both_ways!(
 
 mod editing;
 mod find;
+mod saving;
 #[cfg(test)]
 mod tests;
 
@@ -1779,3 +1793,6 @@ pub use editing::{
     CellEdit, CellPlace, EditCommand, EditRefusal, RefusedCommand, ReplayReport, ValueChange,
 };
 pub use find::{CellMatch, CellValue, CopyJob, Search, SearchProgress, SearchStep, TextRange};
+pub use saving::{
+    SaveFailure, SaveJob, SaveKind, SaveOptions, SaveOutcome, SavePhase, SaveProgress,
+};

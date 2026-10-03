@@ -690,6 +690,9 @@
     "View" : {
       "comment" : "Menu title"
     },
+    "Wait for the save to finish." : {
+      "comment" : "Error: the file can't be read another way while it is being saved"
+    },
     "Window" : {
       "comment" : "Menu title"
     },

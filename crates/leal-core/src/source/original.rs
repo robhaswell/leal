@@ -145,8 +145,6 @@ pub struct Original {
 }
 
 struct Shared {
-    /// The file as it was opened.
-    opened: FileIdentity,
     /// `None` if the kernel wouldn't make a queue: then nothing is watched,
     /// and only [`Original::check`] notices changes.
     queue: Option<Kqueue>,
@@ -165,6 +163,8 @@ struct Shared {
 }
 
 struct Inner {
+    /// The file as it was opened, or as Leal last saved it (task 2.2).
+    opened: FileIdentity,
     /// Where the file is, as reported: during a pending move, still where
     /// it was.
     path: PathBuf,
@@ -254,6 +254,7 @@ impl Original {
             Err(error) => (None, Some(error)),
         };
         let mut inner = Inner {
+            opened,
             path: path.to_owned(),
             pending: None,
             clock: Clock::default(),
@@ -262,11 +263,10 @@ impl Original {
             diverged: false,
             written: false,
         };
-        inner.first_look(&opened, queue.as_ref());
+        inner.first_look(queue.as_ref());
         let published = Mutex::new(inner.status());
         Self {
             shared: Arc::new(Shared {
-                opened,
                 queue,
                 no_queue,
                 inner: Mutex::new(inner),
@@ -294,8 +294,86 @@ impl Original {
     /// network volume, call it off the main thread.
     pub fn check(&self) -> OriginalStatus {
         let mut inner = self.shared.lock();
-        inner.evaluate(&self.shared.opened, self.shared.queue.as_ref(), 0);
+        inner.evaluate(self.shared.queue.as_ref(), 0);
         self.shared.publish(&inner)
+    }
+
+    /// The file as it was opened, or as Leal last saved it: what Save's
+    /// check before writing compares the file on disk with (ADR-0008
+    /// decision 9). No system calls.
+    #[must_use]
+    pub fn opened(&self) -> FileIdentity {
+        self.shared.lock().opened
+    }
+
+    /// Whether the file was renamed a moment ago and the move hasn't
+    /// stood for [`MOVE_WINDOW`] yet: it may be a save's backup step, so
+    /// where the file is isn't settled. A save then asks the user to try
+    /// again rather than write to either place.
+    #[must_use]
+    pub fn is_moving(&self) -> bool {
+        self.shared.lock().pending.is_some()
+    }
+
+    /// Leal's own save (ADR-0008 decision 1): `replace` puts the file Leal
+    /// wrote at `path` (over the file, or, for Save As, at a new place) and
+    /// returns its identity, and from then on that file is the one watched,
+    /// as if it had just been opened: unchanged, not diverged, at `path`.
+    /// Its replacing the old file is Leal's own change, so it is never
+    /// reported: it happens under the lock the watching thread takes to look
+    /// at the file, so the thread sees only the new file afterwards.
+    ///
+    /// First, under the same lock, any events the kernel has queued for the
+    /// file and the watching thread hasn't taken yet are looked at, so a
+    /// change made a moment ago counts; then `check` is given the file's
+    /// identity as Leal knows it and whether it has diverged: the check
+    /// before writing (ADR-0008 decision 9), with no gap in which a change
+    /// could land unseen by both it and the watcher. (Events the thread had
+    /// already taken are looked at after the swap, against the new file; a
+    /// write among them shows it as changed, never the other way round.) If
+    /// `check` or `replace` fails, nothing changes and the error is
+    /// returned.
+    ///
+    /// Returns the new status. The watching thread isn't told: the save's
+    /// caller has the status.
+    ///
+    /// # Errors
+    ///
+    /// `check`'s or `replace`'s error.
+    pub fn replace_with<E>(
+        &self,
+        path: &Path,
+        check: impl FnOnce(&FileIdentity, bool) -> Result<(), E>,
+        replace: impl FnOnce() -> Result<FileIdentity, E>,
+    ) -> Result<OriginalStatus, E> {
+        let mut inner = self.shared.lock();
+        if let Some(queue) = &self.shared.queue
+            && let Ok(events) = queue.wait(Some(Duration::ZERO))
+        {
+            if events.iter().any(|event| event.user && event.ident == STOP) {
+                // Not this one's to take: the watching thread stops on it.
+                let _ = queue.trigger(STOP);
+            }
+            let fflags = events
+                .iter()
+                .filter(|event| !event.user)
+                .fold(0, |all, event| all | event.fflags);
+            if fflags != 0 {
+                inner.evaluate(Some(queue), fflags);
+                self.shared.publish(&inner);
+            }
+        }
+        check(&inner.opened, inner.diverged)?;
+        let written = replace()?;
+        inner.opened = written;
+        inner.path = path.to_owned();
+        inner.pending = None;
+        inner.watched = None;
+        inner.presence = Presence::Here;
+        inner.diverged = false;
+        inner.written = false;
+        inner.first_look(self.shared.queue.as_ref());
+        Ok(self.shared.publish(&inner))
     }
 
     /// Starts a thread that waits for the file's events and calls
@@ -540,7 +618,7 @@ impl Shared {
             let changed = {
                 let mut inner = self.lock();
                 let before = inner.status();
-                inner.evaluate(&self.opened, Some(queue), fflags);
+                inner.evaluate(Some(queue), fflags);
                 let after = self.publish(&inner);
                 (after != before).then_some(after)
             };
@@ -569,14 +647,15 @@ impl Inner {
 
     /// The look `Original::new` takes: open the file at the path for
     /// events, and compare it with what was opened, device included.
-    fn first_look(&mut self, opened: &FileIdentity, queue: Option<&Kqueue>) {
+    fn first_look(&mut self, queue: Option<&Kqueue>) {
+        let opened = self.opened;
         match watch_path(&self.path, queue) {
             Ok((file, now)) => {
                 let same_file = now.dev() == opened.device && now.ino() == opened.inode;
                 if !same_file {
                     // The path already leads to another file.
                     self.diverged = true;
-                } else if !same_contents(opened, &now) {
+                } else if !same_contents(&opened, &now) {
                     self.diverged = true;
                     self.written = true;
                 }
@@ -597,7 +676,7 @@ impl Inner {
     }
 
     /// Looks at the file after events `fflags` (0 for an explicit check).
-    fn evaluate(&mut self, opened: &FileIdentity, queue: Option<&Kqueue>, fflags: u32) {
+    fn evaluate(&mut self, queue: Option<&Kqueue>, fflags: u32) {
         // A move that has stood for the window is followed now, whatever is
         // at the old path by then.
         if let Some(pending) = &self.pending
@@ -608,19 +687,14 @@ impl Inner {
             self.path = to;
         }
         match self.watched.take() {
-            Some(watched) => self.follow(watched, opened, queue, fflags),
-            None => self.look_again(opened, queue),
+            Some(watched) => self.follow(watched, queue, fflags),
+            None => self.look_again(queue),
         }
     }
 
     /// The watched file after `fflags`.
-    fn follow(
-        &mut self,
-        watched: Watched,
-        opened: &FileIdentity,
-        queue: Option<&Kqueue>,
-        fflags: u32,
-    ) {
+    fn follow(&mut self, watched: Watched, queue: Option<&Kqueue>, fflags: u32) {
+        let opened = self.opened;
         if watched.opened && fflags & WRITES != 0 {
             // Written, even if its size and modification time look the
             // same (the granularity limit in the module docs).
@@ -636,7 +710,7 @@ impl Inner {
                 // The volume may already be back (a check after it
                 // mounted again, with no thread to see it go).
                 drop(watched);
-                self.look_again(opened, queue);
+                self.look_again(queue);
                 return;
             }
         };
@@ -684,7 +758,7 @@ impl Inner {
                 }
             }
         }
-        if watched.opened && !same_contents(opened, &now) {
+        if watched.opened && !same_contents(&opened, &now) {
             self.diverged = true;
             self.written = true;
         }
@@ -723,13 +797,14 @@ impl Inner {
     /// that is back is compared with what was opened by inode, size and
     /// modification time, not by device, because a volume gets a new
     /// device number each time it mounts.
-    fn look_again(&mut self, opened: &FileIdentity, queue: Option<&Kqueue>) {
+    fn look_again(&mut self, queue: Option<&Kqueue>) {
+        let opened = self.opened;
         let Ok((file, now)) = watch_path(&self.path, queue) else {
             // Still not there (a missing path while the volume is away
             // can't be told from a deleted file, so it stays as it was).
             return;
         };
-        let same = now.ino() == opened.inode && same_contents(opened, &now);
+        let same = now.ino() == opened.inode && same_contents(&opened, &now);
         if !same {
             self.diverged = true;
             if now.ino() == opened.inode {

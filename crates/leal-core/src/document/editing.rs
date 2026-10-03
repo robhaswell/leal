@@ -21,11 +21,11 @@ use crate::source::{ReadError, Storage};
 /// One cell to change: where, and to what (`None`: missing, which only a
 /// cell past the row's own fields can be). `expected` is the value a
 /// command expects the cell to hold first; a new edit has none.
-struct Target<'a> {
-    row: usize,
-    column: usize,
-    value: Option<&'a str>,
-    expected: Option<Option<&'a str>>,
+pub(super) struct Target<'a> {
+    pub(super) row: usize,
+    pub(super) column: usize,
+    pub(super) value: Option<&'a str>,
+    pub(super) expected: Option<Option<&'a str>>,
 }
 
 /// A row being changed: its bytes, as the file has it, and its edited
@@ -211,6 +211,17 @@ impl Document {
         !self.current().edits.is_empty()
     }
 
+    /// The edits' version: how many edits (each change, undo and redo)
+    /// the current reading's edits have had. A save's
+    /// [`snapshot_version`](crate::save::SaveProgress::snapshot_version)
+    /// is one: the edits up to it are in the file the save writes, and
+    /// those after it aren't. It counts within one set of edits; the
+    /// reading a save makes starts its own, with the edits carried over.
+    #[must_use]
+    pub fn edit_version(&self) -> u64 {
+        u64::try_from(self.current().edits.version()).unwrap_or(u64::MAX)
+    }
+
     /// How many cells are edited.
     #[must_use]
     pub fn edited_cells(&self) -> usize {
@@ -282,18 +293,32 @@ impl Document {
         // One change at a time, and none while the file is read again.
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let reading = self.current();
+        Self::change_in(&reading, lineage, targets)
+    }
+
+    /// [`change`](Self::change) in `reading`, with the writer lock held by
+    /// the caller: a save carries edits over to the reading of the file it
+    /// wrote before it becomes the current one.
+    pub(super) fn change_in(
+        reading: &Reading,
+        lineage: Option<Lineage>,
+        targets: &[Target<'_>],
+    ) -> Result<(Lineage, Vec<CellChange>), EditError> {
         let store = &reading.edits;
         if lineage.is_some_and(|lineage| lineage != store.lineage()) {
             return Err(EditError::OtherLineage);
         }
         let overlay = store.overlay();
         let parser = &reading.parser;
+        // After a save, a missing cell a command names may be a field now
+        // (see `holds`).
+        let rebased = store.is_rebased();
         let mut rows: BTreeMap<usize, Work<'_>> = BTreeMap::new();
         let mut changes = Vec::new();
         for target in targets {
             let Target { row, column, .. } = *target;
             if let Entry::Vacant(entry) = rows.entry(row) {
-                entry.insert(Self::work(&reading, &overlay, row)?);
+                entry.insert(Self::work(reading, &overlay, row)?);
             }
             let Some(work) = rows.get_mut(&row) else {
                 continue;
@@ -301,14 +326,14 @@ impl Document {
             check_column(work, row, column)?;
             let old = work.value(parser, column).map(Cow::into_owned);
             if let Some(expected) = target.expected
-                && expected != old.as_deref()
+                && !holds(old.as_deref(), expected, rebased)
             {
                 return Err(EditError::ValueChanged { row, column });
             }
-            set(work, parser, row, column, target.value)?;
+            set(work, parser, row, column, target.value, rebased)?;
             work.last_column = column;
             let new = work.value(parser, column).map(Cow::into_owned);
-            if target.expected.is_some() && new.as_deref() != target.value {
+            if target.expected.is_some() && !holds(new.as_deref(), target.value, rebased) {
                 // The command doesn't fit the row as it is: a missing cell
                 // it means can't be, or one it means to empty would go.
                 return Err(EditError::ValueChanged { row, column });
@@ -354,7 +379,7 @@ impl Document {
         let updates = rows
             .into_iter()
             .filter(|(row, _)| changed.contains(row))
-            .map(|(row, work)| (row, row_edits(&reading, parser, row, work)))
+            .map(|(row, work)| (row, row_edits(reading, parser, row, work)))
             .collect();
         // Let go of this snapshot first: the store copies the overlay if
         // anyone else holds it, and this edit mustn't count.
@@ -434,16 +459,34 @@ fn open_quote(work: &Work<'_>) -> Option<usize> {
     open.then_some(quote)
 }
 
+/// Whether a cell that reads as `actual` holds what a command means by
+/// `meant`: the same value, or, once the document has been saved and
+/// rebased onto the file it wrote (`rebased`, task 2.2), an empty field
+/// where the command means a missing cell. Saving a hatched cell's edit
+/// (ADR-0005 decision 2) makes it, and any padding before it, a field of
+/// the file; the command still says "missing". So undoing a hatched edit
+/// after a save empties the cell rather than shortening the row, which no
+/// cell edit can do, and redoing it then finds the empty field it left.
+fn holds(actual: Option<&str>, meant: Option<&str>, rebased: bool) -> bool {
+    actual == meant || (rebased && meant.is_none() && actual == Some(""))
+}
+
 /// Sets `work`'s cell `column` to `value`. Back to the original display
 /// value (`""`, or missing, past the row's fields) removes the edit. Only
-/// a cell past the row's fields can be made missing.
+/// a cell past the row's fields can be made missing; once the document is
+/// `rebased` (see [`holds`]), making one of its fields missing empties it.
 fn set(
     work: &mut Work<'_>,
     parser: &RowParser,
     row: usize,
     column: usize,
     value: Option<&str>,
+    rebased: bool,
 ) -> Result<(), EditError> {
+    let value = match value {
+        None if rebased && work.parsed.field(column).is_some() => Some(""),
+        value => value,
+    };
     let original = work
         .parsed
         .field(column)

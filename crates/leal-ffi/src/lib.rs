@@ -23,7 +23,8 @@ pub use document::{
     Cell, CellEdit, CellMatch, CellPlace, CellValue, CopyJob, Delimiter, DialectSource, Document,
     EditCommand, EditRefusal, EncodingSource, FirstScreen, IndexProgress, Interpretation, Job,
     JobFailure, LineEnding, OpenOptions, ProgressObserver, RefusedCommand, ReplayReport,
-    ReviewResult, RowCells, Scheduler, Search, SearchProgress, SearchStep, TextEncoding, TextRange,
+    ReviewResult, RowCells, SaveFailure, SaveJob, SaveKind, SaveOptions, SaveOutcome, SavePhase,
+    SaveProgress, Scheduler, Search, SearchProgress, SearchStep, TextEncoding, TextRange,
     ValueChange, open_document,
 };
 
@@ -123,6 +124,13 @@ pub enum LealError {
         /// The document's path.
         path: String,
     },
+    /// A save is running, so the file can't be read another way until it
+    /// ends (task 2.2). The app disables Treat As and the header toggle
+    /// while it saves; this is the core refusing if one gets through.
+    Saving {
+        /// The document's path.
+        path: String,
+    },
     /// An edit, or an undo, redo or replayed command, wasn't applied: the
     /// document is unchanged (task 2.1).
     EditRefused {
@@ -207,6 +215,7 @@ impl std::fmt::Display for LealError {
                 f,
                 "{path} can't be read another way while it has unsaved edits"
             ),
+            Self::Saving { path } => write!(f, "{path} is being saved"),
             Self::EditRefused {
                 path,
                 refusal,

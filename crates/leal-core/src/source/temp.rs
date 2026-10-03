@@ -128,6 +128,20 @@ impl TempFolders {
         Ok(temp)
     }
 
+    /// Records and creates a new hidden folder `.leal-save-<id>` in
+    /// `parent`, for the new file a save writes there before renaming it
+    /// into place (task 2.2). Recorded like the others, so a crash between
+    /// the two leaves nothing behind after the next launch's cleanup.
+    /// Dropping the result deletes it.
+    pub(super) fn create_in(&self, parent: &Path) -> io::Result<TempFolder> {
+        let id = RecordId::new();
+        let folder = parent.join(format!(".leal-save-{id}"));
+        let (record, record_path) = self.write_record(&id, &folder)?;
+        let temp = TempFolder::new(folder, &id, record, record_path);
+        DirBuilder::new().mode(0o700).create(&temp.folder)?;
+        Ok(temp)
+    }
+
     /// Creates the record `<id>.record`, locks it and writes `folder` in it.
     /// Returns the open record and its path.
     fn write_record(&self, id: &RecordId, folder: &Path) -> io::Result<(File, PathBuf)> {
@@ -211,6 +225,23 @@ impl TempFolder {
         &self.folder
     }
 
+    /// Keeps the folder and the file in it for good: its record is deleted,
+    /// so no cleanup ever removes them (a file a save must not lose,
+    /// task 2.2). Returns the file's path.
+    pub(super) fn keep(mut self) -> PathBuf {
+        let path = self.file_path();
+        let _ = fs::remove_file(&self.record_path);
+        drop(self.record.take());
+        // Its paths are freed as usual; only the deleting `Drop` is skipped.
+        drop((
+            std::mem::take(&mut self.folder),
+            std::mem::take(&mut self.file_name),
+            std::mem::take(&mut self.record_path),
+        ));
+        std::mem::forget(self);
+        path
+    }
+
     /// The record's path.
     #[cfg(test)]
     pub(super) fn record_path(&self) -> &Path {
@@ -265,7 +296,7 @@ fn remove_folder(folder: &Path, file_name: &OsString) -> bool {
 
 /// The BSD file flags that stop a file being changed or deleted: immutable
 /// (`uchg`, Finder's Locked; `schg`) and append-only (`uappnd`, `sappnd`).
-const LOCKING_FLAGS: u32 =
+pub(super) const LOCKING_FLAGS: u32 =
     libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
 
 /// Clears the flags in [`LOCKING_FLAGS`] on Leal's own clone at `path`,

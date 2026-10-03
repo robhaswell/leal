@@ -65,12 +65,25 @@
 //! [`Priority::P3`]: crate::schedule::Priority::P3
 
 mod editing;
+mod saving;
 mod search;
 #[cfg(test)]
 mod tests;
 mod values;
 mod view;
 
+pub use saving::{SAVE_CHUNK_BYTES, SaveJob};
+
+/// A document read again after its removable drive came back
+/// ([`Document::check_original_restarting`]): the generation it was, and
+/// the one it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restarted {
+    /// The reading's generation before.
+    pub from: u64,
+    /// Its generation now.
+    pub to: u64,
+}
 pub use search::{
     CellMatch, SEARCH_CHUNK_BYTES, Search, SearchProgress, SearchStep, SearchSummary,
 };
@@ -299,6 +312,9 @@ pub enum DocumentError {
     /// delimiter or encoding (ADR-0008 decision 4): edits are tied to how
     /// the file was split into cells. The header row can still change.
     UnsavedEdits,
+    /// A save is running (task 2.2): the file is read again, the new way,
+    /// only once it has finished, since the save replaces the reading.
+    Saving,
     /// Detection gave a dialect the index or the row parser refused. This
     /// is a bug; the message is English, for logs.
     Internal(String),
@@ -317,6 +333,7 @@ impl fmt::Display for DocumentError {
             DocumentError::UnsavedEdits => f.write_str(
                 "the file can't be read with another delimiter or encoding while it has unsaved edits",
             ),
+            DocumentError::Saving => f.write_str("the file is being saved"),
             DocumentError::Internal(message) => f.write_str(message),
         }
     }
@@ -359,6 +376,13 @@ pub struct Document {
     /// Counts kind searches (`next_with_kind`): a search stops when a
     /// newer one starts.
     searches: AtomicU64,
+    /// A save is running or queued (task 2.2): saves take turns, and the
+    /// file isn't read again meanwhile.
+    saving: AtomicBool,
+    /// A check of the user's file found its drive back while a save ran,
+    /// and left reconnecting to it until the save ends
+    /// ([`check_original`](Self::check_original)).
+    recheck: AtomicBool,
     /// The current reading. Shared with the watching thread
     /// ([`watch_original`](Self::watch_original)), which notes what it sees
     /// on the reading's source, whichever reading is current then: a save
@@ -520,6 +544,8 @@ impl Document {
             generations: AtomicU64::new(1),
             writer: Mutex::new(()),
             searches: AtomicU64::new(0),
+            saving: AtomicBool::new(false),
+            recheck: AtomicBool::new(false),
             reading: Arc::new(RwLock::new(Arc::new(reading))),
             original,
         };
@@ -555,7 +581,10 @@ impl Document {
         first_screen_rows: usize,
         max_chars: usize,
     ) -> Result<FirstScreen, DocumentError> {
+        // Refused before waiting for the writer lock as well as after.
+        self.refuse_while_saving()?;
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.refuse_while_saving()?;
         let first_paint = self.scheduler.interval(Interval::FirstPaint);
         let old = self.current();
         let paint = read_first_paint(&old.source, &old.head, choices)?;
@@ -591,18 +620,38 @@ impl Document {
         Ok(screen)
     }
 
-    /// Reads the file again the way the current reading does, with a new
-    /// index and review and a new generation: after its removable drive
-    /// came back, so the index pass carries on copying it. The first screen
-    /// is the same as before.
-    fn restart(&self) -> Result<u64, DocumentError> {
+    /// Reconnects `source` (the current reading's) to the user's file at
+    /// `path`, its removable drive back, and reads the file again the way
+    /// the current reading does, with a new index and review and a new
+    /// generation, so the index pass carries on copying it. The first
+    /// screen is the same as before. While a save runs, nothing is done
+    /// and the save checks again when it ends ([`recheck`](Self::recheck)):
+    /// it may replace the reading. `None` if nothing was restarted.
+    fn reconnect_and_restart(&self, source: &Arc<Source>, path: &Path) -> Option<Restarted> {
+        // A save takes its turn before it takes the writer lock for its
+        // snapshot, so under the lock, a save not seen yet starts on the
+        // reading made here.
+        if self.saving.load(Ordering::Acquire) {
+            self.recheck.store(true, Ordering::Release);
+            return None;
+        }
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.saving.load(Ordering::Acquire) {
+            self.recheck.store(true, Ordering::Release);
+            return None;
+        }
         let old = self.current();
-        let paint = read_first_paint(&old.source, &old.head, old.choices)?;
-        old.refuse_once_stale()?;
+        if !Arc::ptr_eq(&old.source, source) || !source.reconnect(path) {
+            return None;
+        }
+        // Detection already succeeded with these choices on these bytes, so
+        // this can't fail; if it did, the source stays reconnected, read
+        // the old way.
+        let paint = read_first_paint(&old.source, &old.head, old.choices).ok()?;
+        old.refuse_once_stale().ok()?;
         // The same choices on the same bytes split the file the same way,
         // so the edits carry on (ADR-0008 decision 4).
-        let edits = edits_after(&old, &paint.detection)?;
+        let edits = edits_after(&old, &paint.detection).ok()?;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         old.cancel();
         let context = Context {
@@ -613,7 +662,20 @@ impl Document {
         };
         let reading = start_jobs(&context, generation, paint, old.choices, edits);
         *self.reading.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reading);
-        Ok(generation)
+        Some(Restarted {
+            from: old.generation,
+            to: generation,
+        })
+    }
+
+    /// [`reinterpret`](Self::reinterpret)'s and `restart`'s refusal while
+    /// a save runs: the save replaces the reading when it ends.
+    fn refuse_while_saving(&self) -> Result<(), DocumentError> {
+        if self.saving.load(Ordering::Acquire) {
+            Err(DocumentError::Saving)
+        } else {
+            Ok(())
+        }
     }
 
     /// Rows `rows` (as many of them as can be read now), each as its
@@ -1323,6 +1385,16 @@ impl Document {
     /// It makes a few system calls, which can block on a network volume:
     /// call it off the main thread.
     pub fn check_original(&self) -> OriginalStatus {
+        self.check_original_restarting().0
+    }
+
+    /// [`check_original`](Self::check_original), saying whether it read the
+    /// file again, and from which generation to which: the app's cached
+    /// first screen is relabelled only for its own restart (a save may
+    /// have replaced the reading meanwhile). While a save runs, a
+    /// disconnected document isn't reconnected; the save checks again when
+    /// it ends ([`SaveJob::restarted`]).
+    pub fn check_original_restarting(&self) -> (OriginalStatus, Option<Restarted>) {
         // It looks at the file: never on the main thread for a share.
         let source = self.source();
         source.note_share_use();
@@ -1335,17 +1407,12 @@ impl Document {
             status.state,
             OriginalState::Unchanged | OriginalState::Changed
         );
-        if back
-            && !status.diverged
-            && source.storage() == Storage::Disconnected
-            && source.reconnect(&status.path)
-        {
-            // Detection already succeeded with these choices on these
-            // bytes, so this can't fail; if it did, the source stays
-            // reconnected and the next check tries again.
-            let _ = self.restart();
-        }
-        status
+        let restarted = if back && !status.diverged && source.storage() == Storage::Disconnected {
+            self.reconnect_and_restart(&source, &status.path)
+        } else {
+            None
+        };
+        (status, restarted)
     }
 
     /// Whether the file changed on its drive while Leal was reading it

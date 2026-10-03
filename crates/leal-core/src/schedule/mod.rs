@@ -110,6 +110,9 @@ pub enum ThreadClass {
     Index,
     /// A background pool thread (P2 and P3): utility.
     Background,
+    /// A save (task 2.2): user initiated, as the index; the user is
+    /// waiting for it.
+    Save,
     /// A document's file watcher ([`Document::watch_original`]): user
     /// initiated, as the index. The window reads what it publishes, under
     /// a lock it holds while it looks at the file, so at the default
@@ -137,6 +140,8 @@ pub enum Interval {
     Find,
     /// Copying cells to the clipboard (P2, task 1.8).
     Copy,
+    /// Saving the document (P1, task 2.2).
+    Save,
     /// A P2 or P3 job waiting for the user to stop interacting.
     Paused,
 }
@@ -153,6 +158,7 @@ impl Interval {
             Interval::Acceleration => "Acceleration",
             Interval::Find => "Find",
             Interval::Copy => "Copy",
+            Interval::Save => "Save",
             Interval::Paused => "Paused",
         }
     }
@@ -449,13 +455,14 @@ impl Scheduler {
             Priority::P1 => {
                 let platform = Arc::clone(&self.shared.platform);
                 let control = task.control.clone();
-                let spawned =
-                    thread::Builder::new()
-                        .name("leal-index".to_owned())
-                        .spawn(move || {
-                            contain(|| platform.thread_started(ThreadClass::Index));
-                            task.run();
-                        });
+                let (name, class) = match control.interval() {
+                    Interval::Save => ("leal-save", ThreadClass::Save),
+                    _ => ("leal-index", ThreadClass::Index),
+                };
+                let spawned = thread::Builder::new().name(name.to_owned()).spawn(move || {
+                    contain(|| platform.thread_started(class));
+                    task.run();
+                });
                 if let Err(error) = spawned {
                     control.finish(Err(JobError::Failed(format!(
                         "couldn't start a thread: {error}"

@@ -355,6 +355,19 @@ impl Document {
         self.call(|| Ok(self.document.has_edits()))
     }
 
+    /// The edits' version: how many edits (each change, undo and redo) the
+    /// current reading's edits have had. A save's
+    /// `SaveProgress.snapshot_version` is one; the app notes it after each
+    /// edit, with NSDocument's `changeCountToken`, to know which token the
+    /// saved file matches (task 2.5).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn edit_version(&self) -> Result<u64, LealError> {
+        self.call(|| Ok(self.document.edit_version()))
+    }
+
     /// How many cells are edited.
     ///
     /// # Errors

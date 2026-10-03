@@ -67,6 +67,37 @@ impl Drop for TempDir {
     }
 }
 
+/// Sets (or, with `None`, removes) the extended attribute `name` of the file
+/// at `path` (other modules' tests: an attribute the file had when opened).
+pub(crate) fn write_attribute(path: &Path, name: &CStr, value: Option<&[u8]>) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    match value {
+        Some(value) => sys::set_xattr(&file, name, value).unwrap(),
+        None => sys::remove_xattr(&file, name).unwrap(),
+    }
+}
+
+/// Tries to set the extended attribute `name` of the file at `path`:
+/// whether it could (the system protects some from apps).
+pub(crate) fn try_write_attribute(path: &Path, name: &CStr, value: &[u8]) -> bool {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    sys::set_xattr(&file, name, value).is_ok()
+}
+
+/// The extended attribute `name` of the file at `path`, if it has it.
+pub(crate) fn attribute(path: &Path, name: &CStr) -> Option<Vec<u8>> {
+    let file = File::open(path).unwrap();
+    sys::read_whole_xattr(&file, name).unwrap()
+}
+
 /// A small disk image, attached for the length of a test.
 ///
 /// Tests that use one are in the `disk-images` test group in
@@ -102,8 +133,9 @@ const TRANSIENT_HDIUTIL_ERRORS: [&str; 4] = [
 
 impl DiskImage {
     /// Creates and attaches a 16 MB image formatted as `fs` (`"APFS"`, `"ExFAT"` or
-    /// `"HFS+"`), mounted inside a temporary directory, not in `/Volumes`,
-    /// and hidden from Finder (`-nobrowse`).
+    /// `"HFS+"`; 40 MB for `"MS-DOS FAT32"`, the least FAT32 allows),
+    /// mounted inside a temporary directory, not in `/Volumes`, and hidden
+    /// from Finder (`-nobrowse`).
     pub(crate) fn new(fs_type: &str) -> Self {
         // Under nextest, a disk-image test outside the group would run in
         // parallel with the others.
@@ -130,12 +162,17 @@ impl DiskImage {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
 
+        let size = if fs_type == "MS-DOS FAT32" {
+            "40m"
+        } else {
+            "16m"
+        };
         hdiutil_with_retries("create", || {
             // A failed attempt may leave a partial image behind.
             let _ = fs::remove_file(&image);
             let mut command = Command::new("/usr/bin/hdiutil");
             command
-                .args(["create", "-size", "16m", "-fs", fs_type, "-volname"])
+                .args(["create", "-size", size, "-fs", fs_type, "-volname"])
                 .arg(&volume_name)
                 .arg(&image);
             command
@@ -1246,4 +1283,144 @@ fn cleanup_removes_a_locked_leftover_clone() {
     assert_eq!(temp.remove_leftovers().unwrap(), 1);
     assert!(entries(temp.scratch()).is_empty());
     assert!(entries(temp.records()).is_empty());
+}
+
+/// The swap (ADR-0012 decision 1): a file that isn't the one checked, put
+/// there by another app between the check and the swap, is swapped back and
+/// kept; the one checked is replaced, and the folder the new file was made
+/// in goes, with the old file in it.
+#[test]
+fn a_swap_with_a_file_other_than_the_one_checked_is_undone() {
+    use std::io::Write as _;
+    let dir = TempDir::new("swap-check");
+    let temps = dir.temp_folders();
+    let dest = dir.file("a.csv", b"old");
+    let checked = write::identity_at(&dest).unwrap();
+    let other = dir.file("other.csv", b"another app's");
+    fs::rename(&other, &dest).unwrap();
+    let mut staged = Staged::create(&temps, None, &dest, false).unwrap();
+    staged.writer().write_all(b"new").unwrap();
+    staged.finish(None).unwrap();
+    let _snapshot = staged.snapshot(&temps, None, &|| false).unwrap();
+    assert!(matches!(
+        staged.swap_into(&dest, Some(&checked)),
+        Err(SwapError::Changed)
+    ));
+    assert_eq!(fs::read(&dest).unwrap(), b"another app's");
+    let checked = write::identity_at(&dest).unwrap();
+    let put = staged.swap_into(&dest, Some(&checked)).unwrap();
+    assert_eq!(put.placed, Placed::Swapped);
+    assert_eq!(put.kept, None);
+    assert_eq!(fs::read(&dest).unwrap(), b"new");
+    drop(staged);
+    let mut left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "scratch" && name != "records")
+        .collect();
+    left.sort();
+    assert_eq!(left, [std::ffi::OsString::from("a.csv")], "{left:?}");
+}
+
+/// A swap that took out another app's file and can't swap it back (the
+/// volume went, say) has still put the new file in place: the save has
+/// succeeded, and the other app's file is kept next to it, under a visible
+/// name, never deleted.
+#[test]
+fn a_file_swapped_out_that_cant_be_swapped_back_is_kept() {
+    use std::io::Write as _;
+    let dir = TempDir::new("swap-back-fails");
+    let temps = dir.temp_folders();
+    let dest = dir.file("a.csv", b"old");
+    let checked = write::identity_at(&dest).unwrap();
+    let other = dir.file("other.csv", b"another app's");
+    fs::rename(&other, &dest).unwrap();
+    let mut staged = Staged::create(&temps, None, &dest, false).unwrap();
+    staged.writer().write_all(b"new").unwrap();
+    staged.finish(None).unwrap();
+    let _snapshot = staged.snapshot(&temps, None, &|| false).unwrap();
+    write::FAIL_SWAP_BACK.with(|fail| fail.set(true));
+    let put = staged.swap_into(&dest, Some(&checked));
+    write::FAIL_SWAP_BACK.with(|fail| fail.set(false));
+    let put = put.unwrap();
+    assert_eq!(put.placed, Placed::Swapped);
+    let kept = put.kept.unwrap();
+    assert_eq!(kept, dir.path().join("a (replaced, kept by Leal).csv"));
+    assert_eq!(fs::read(&kept).unwrap(), b"another app's");
+    assert_eq!(fs::read(&dest).unwrap(), b"new");
+    drop(staged);
+    let mut left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "scratch" && name != "records")
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            std::ffi::OsString::from("a (replaced, kept by Leal).csv"),
+            std::ffi::OsString::from("a.csv"),
+        ],
+        "{left:?}"
+    );
+}
+
+/// Something other than a regular file at the destination is never
+/// replaced; nor is a regular file swapped out in its place kept there.
+#[test]
+fn a_swap_never_replaces_a_folder_or_a_pipe() {
+    use std::io::Write as _;
+    let dir = TempDir::new("swap-not-a-file");
+    let temps = dir.temp_folders();
+    let folder = dir.path().join("folder.csv");
+    fs::create_dir(&folder).unwrap();
+    let pipe = dir.path().join("pipe.csv");
+    let made = Command::new("/usr/bin/mkfifo").arg(&pipe).status().unwrap();
+    assert!(made.success());
+    for dest in [&folder, &pipe] {
+        let mut staged = Staged::create(&temps, None, dest, false).unwrap();
+        staged.writer().write_all(b"new").unwrap();
+        staged.finish(None).unwrap();
+        let _snapshot = staged.snapshot(&temps, None, &|| false).unwrap();
+        assert!(matches!(
+            staged.swap_into(dest, None),
+            Err(SwapError::NotAFile)
+        ));
+    }
+    assert!(folder.is_dir());
+    assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+        &fs::symlink_metadata(&pipe).unwrap().file_type()
+    ));
+}
+
+/// The volume's rename capabilities: the scratch directory's APFS volume
+/// swaps and renames exclusively.
+#[test]
+fn apfs_can_swap_and_rename_exclusively() {
+    let dir = TempDir::new("rename-capabilities");
+    let capabilities = sys::rename_capabilities(dir.path()).unwrap();
+    assert!(capabilities.swap);
+    assert!(capabilities.exclusive);
+}
+
+/// An attribute the new file can't be given (here an access control list
+/// on it denies writing attributes) is skipped and named, never a failed
+/// save (ADR-0012 decision 1).
+#[test]
+fn an_attribute_that_cant_be_set_is_skipped_and_named() {
+    let dir = TempDir::new("attribute-skipped");
+    let temps = dir.temp_folders();
+    let dest = dir.file("a.csv", b"old");
+    let tags = b"bplist00\xa1\x01UGreen\n\x08\x0a";
+    write_attribute(&dest, c"com.apple.metadata:_kMDItemUserTags", Some(tags));
+    let existing = write::look_afresh(&dest).unwrap().unwrap();
+    let staged = Staged::create(&temps, None, &dest, false).unwrap();
+    let staged_path = staged.path().to_str().unwrap().to_owned();
+    let status = Command::new("/bin/chmod")
+        .args(["+a", "everyone deny writeextattr", &staged_path])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let skipped = staged.copy_attributes(&existing).unwrap();
+    assert_eq!(skipped, ["com.apple.metadata:_kMDItemUserTags"]);
 }

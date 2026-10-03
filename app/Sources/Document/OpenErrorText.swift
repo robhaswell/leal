@@ -89,6 +89,13 @@ enum OpenErrorText {
                 localized: "Save or revert your changes first.",
                 comment: "Error: the file can't be read with another delimiter or encoding while it has unsaved edits"
             )
+        case .Saving:
+            // Task 2.5 disables re-reading while it saves; this is the core
+            // refusing if one gets through.
+            String(
+                localized: "Wait for the save to finish.",
+                comment: "Error: the file can't be read another way while it is being saved"
+            )
         case .EditRefused:
             // Task 2.5 words each refusal where the edit is made.
             String(localized: "The change couldn’t be made.", comment: "Error: an edit, undo or redo wasn't applied")

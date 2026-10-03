@@ -78,6 +78,12 @@ impl Gate {
         self.opened.notify_all();
     }
 
+    /// Holds the index threads started from now on (each P1 job has a
+    /// thread of its own).
+    fn close(&self) {
+        *self.closed.lock().unwrap() = true;
+    }
+
     fn intervals(&self) -> Vec<(Interval, u64, bool)> {
         self.intervals.lock().unwrap().clone()
     }
@@ -2239,4 +2245,5 @@ fn a_write_to_a_file_read_without_a_clone_is_caught_by_its_event() {
 
 mod edits;
 mod find;
+mod saving;
 mod share;
