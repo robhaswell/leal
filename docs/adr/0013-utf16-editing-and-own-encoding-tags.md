@@ -26,9 +26,13 @@ Task 2.3 (encoding on save) raised three questions; details are in
    is the only way to save one, so the user can fix the cells it names and
    try again. The window says so (the 06a banner and its Save As UTF-8
    button already explain it).
-2. **Leal trusts encoding tags it wrote itself.** When Leal's own
-   interpretation attribute (ADR-0007) has a fingerprint matching the file,
-   the file's encoding tag is honoured even if a byte doesn't decode in it.
+2. **Leal trusts encoding tags it wrote itself.** Whenever a save would
+   leave an encoding that a reopen wouldn't otherwise use (ADR-0004
+   decision 11 ignores a single-byte tag that doesn't decode cleanly),
+   Leal also records the encoding in its own interpretation attribute
+   (ADR-0007), with the fingerprint of the bytes it wrote. On reopen, a
+   matching fingerprint makes that encoding win, even if a byte doesn't
+   decode in it.
    That byte is shown faithfully, with a warning, as any undecodable byte
    is. Tags written by other apps keep ADR-0004 decision 11's rule.
 3. **Budget:** Save As UTF-8 of the 100 MB reference file, from UTF-16,
