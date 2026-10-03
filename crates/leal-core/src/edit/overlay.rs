@@ -1,11 +1,16 @@
-//! The overlay: what the commands changed, by physical row, and the store
-//! that shares it between a document's readings and its jobs.
+//! The overlay: what the commands changed, by row id, the inserted rows
+//! and the piece list, and the store that shares it between a document's
+//! readings and its jobs.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::Lineage;
+#[cfg(test)]
+use super::rows::Piece;
+use super::rows::{RowId, RowMap};
+use super::structural::BaseId;
 use crate::diagnostics::DiagnosticKind;
 
 /// The field-level diagnostics a row or a cell has (task 1.7's flagged
@@ -106,6 +111,11 @@ impl RowEdits {
         }
     }
 
+    /// How many fields of its own the row had when it was first edited.
+    pub(crate) fn fields(&self) -> usize {
+        self.fields
+    }
+
     /// One past the last edited cell.
     pub(crate) fn end(&self) -> usize {
         self.cells.last().map_or(0, |&(column, _)| column + 1)
@@ -142,67 +152,160 @@ impl RowEdits {
     }
 }
 
-/// A row an edit touched, with its edits now (none: it has none left).
-pub(crate) type Touched = (usize, Option<Arc<RowEdits>>);
+/// An inserted row (task 2.4a): its own values, and the gap it was
+/// inserted at, for life. Its cell edits are [`RowEdits`] like any row's.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InsertedRow {
+    /// The physical row it was inserted before (the file's row count at
+    /// the end).
+    gap: u32,
+    /// Its values, at least one.
+    fields: Vec<Arc<str>>,
+}
 
-/// Every edited row, by physical row. A snapshot: edits make a new one
-/// ([`EditStore`]), so a reader holding this one (a copy, ADR-0008
-/// decision 2) sees the cells as they were when it took it.
+impl InsertedRow {
+    /// A row of `values` (an empty row has one empty cell, as a blank line
+    /// reads), inserted before physical row `gap`.
+    pub(crate) fn new(gap: u32, values: &[String]) -> InsertedRow {
+        let mut fields: Vec<Arc<str>> = values.iter().map(|v| Arc::from(v.as_str())).collect();
+        if fields.is_empty() {
+            fields.push(Arc::from(""));
+        }
+        InsertedRow { gap, fields }
+    }
+
+    pub(crate) fn gap(&self) -> u32 {
+        self.gap
+    }
+
+    pub(crate) fn fields(&self) -> &[Arc<str>] {
+        &self.fields
+    }
+}
+
+/// A row an edit touched, with what it is now: its edits (none: it has
+/// none, or is gone) and, for an inserted row still there, the row.
+#[derive(Clone, Debug)]
+pub(crate) struct Touched {
+    pub(crate) id: RowId,
+    pub(crate) edits: Option<Arc<RowEdits>>,
+    pub(crate) inserted: Option<Arc<InsertedRow>>,
+}
+
+/// Every edited row, by [`RowId`], the inserted rows, and the piece list
+/// that says which row each logical row is. A snapshot: edits make a new
+/// one ([`EditStore`]), so a reader holding this one (a copy, ADR-0008
+/// decision 2) sees the rows as they were when it took it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Overlay {
-    rows: BTreeMap<usize, Arc<RowEdits>>,
+    rows: BTreeMap<RowId, Arc<RowEdits>>,
+    inserted: BTreeMap<u32, Arc<InsertedRow>>,
+    map: RowMap,
 }
 
 impl Overlay {
-    /// True if nothing is edited.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+    /// An overlay of `rows`' edits alone, to read original rows with edits
+    /// a command holds (`Rows::values`).
+    pub(crate) fn of_rows(rows: impl IntoIterator<Item = (RowId, Arc<RowEdits>)>) -> Overlay {
+        Overlay {
+            rows: rows.into_iter().collect(),
+            ..Overlay::default()
+        }
     }
 
-    /// Row `row`'s edits, if it has any.
+    /// True if nothing is edited: no cell, and no row inserted or deleted.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.map.is_identity()
+    }
+
+    /// Which row each logical row is.
+    pub(crate) fn map(&self) -> &RowMap {
+        &self.map
+    }
+
+    /// Physical row `row`'s edits, if it has any.
     pub(crate) fn row(&self, row: usize) -> Option<&RowEdits> {
         if self.rows.is_empty() {
             return None;
         }
-        self.rows.get(&row).map(AsRef::as_ref)
+        self.row_arc(row).map(AsRef::as_ref)
     }
 
-    /// Row `row`'s edits, shared, if it has any.
+    /// Physical row `row`'s edits, shared, if it has any.
     pub(crate) fn row_arc(&self, row: usize) -> Option<&Arc<RowEdits>> {
-        self.rows.get(&row)
+        let row = u32::try_from(row).ok()?;
+        self.rows.get(&RowId::original(row))
     }
 
-    /// True if row `row` has edits.
+    /// Row `id`'s edits, if it has any.
+    pub(crate) fn edits(&self, id: RowId) -> Option<&Arc<RowEdits>> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        self.rows.get(&id)
+    }
+
+    /// Inserted row `n`, if it is in the document.
+    pub(crate) fn inserted(&self, n: u32) -> Option<&Arc<InsertedRow>> {
+        self.inserted.get(&n)
+    }
+
+    /// True if physical row `row` has edits.
     pub(crate) fn contains(&self, row: usize) -> bool {
-        self.rows.contains_key(&row)
+        self.row_arc(row).is_some()
     }
 
-    /// The edited rows among `rows`, in order.
+    /// The edited original rows among physical rows `rows`, in order.
     pub(crate) fn rows_in(
         &self,
         rows: Range<usize>,
     ) -> impl DoubleEndedIterator<Item = (usize, &RowEdits)> {
         // A reversed range would panic: it is empty.
-        self.rows
-            .range(rows.start..rows.end.max(rows.start))
-            .map(|(&row, edits)| (row, edits.as_ref()))
+        let start = RowId::original_bound(rows.start);
+        let end = RowId::original_bound(rows.end).max(start);
+        self.rows.range(start..end).map(|(&id, edits)| {
+            let row = id.physical().map_or(usize::MAX, to_usize);
+            (row, edits.as_ref())
+        })
     }
 
-    /// Every edited row, in order.
-    pub(crate) fn all(&self) -> impl Iterator<Item = (usize, &RowEdits)> {
-        self.rows.iter().map(|(&row, edits)| (row, edits.as_ref()))
+    /// The edits of rows `ids`, shared, in order.
+    pub(crate) fn edits_in(
+        &self,
+        ids: Range<RowId>,
+    ) -> impl Iterator<Item = (RowId, &Arc<RowEdits>)> {
+        self.rows.range(ids).map(|(&id, edits)| (id, edits))
     }
 
-    fn set(&mut self, row: usize, edits: Option<RowEdits>) {
+    /// Every edited row, in order (original rows first, by physical row).
+    pub(crate) fn all(&self) -> impl Iterator<Item = (RowId, &RowEdits)> {
+        self.rows.iter().map(|(&id, edits)| (id, edits.as_ref()))
+    }
+
+    fn set(&mut self, id: RowId, edits: Option<Arc<RowEdits>>) {
         match edits {
             Some(edits) => {
-                self.rows.insert(row, Arc::new(edits));
+                self.rows.insert(id, edits);
             }
             None => {
-                self.rows.remove(&row);
+                self.rows.remove(&id);
             }
         }
     }
+}
+
+/// A row insert or delete, ready to be made ([`EditStore::change_rows`]):
+/// the piece list afterwards, the rows' edits and inserted rows that come
+/// or go, and the rows to log.
+#[derive(Debug)]
+pub(crate) struct RowChange {
+    pub(crate) map: RowMap,
+    pub(crate) edits: Vec<(RowId, Option<Arc<RowEdits>>)>,
+    pub(crate) inserted: Vec<(u32, Option<Arc<InsertedRow>>)>,
+    /// The rows inserted, deleted or restored, as runs of ids.
+    pub(crate) touched: Vec<Range<RowId>>,
+    /// The next inserted row's number afterwards.
+    pub(crate) next_inserted: u32,
 }
 
 /// A document's edits, in one [`Lineage`], shared by its readings while
@@ -218,11 +321,16 @@ impl Overlay {
 /// last looked. Edits are made one at a time (the document serializes
 /// them), so the log's order is the edits' order.
 ///
-/// The log grows by one entry (8 bytes) per row each edit touches, for the
-/// document's life: 8 MB after a million cell edits.
+/// The log has an entry per run of consecutive row ids an edit touched (a
+/// row, for a cell edit; a run, for a row insert or delete), 16 bytes, for
+/// the document's life: 16 MB after a million cell edits. The version
+/// counts rows, not entries, so a big delete is a big step.
 #[derive(Debug)]
 pub(crate) struct EditStore {
     lineage: Lineage,
+    /// Which file the row ids are of (task 2.4a): new for every store, so
+    /// a structural command from another works by value.
+    base: BaseId,
     /// The edits start from a file Leal saved in this lineage (task 2.2's
     /// rebase), so the lineage's earlier commands may name a missing cell
     /// that is a field now (`document::editing::holds`).
@@ -243,21 +351,38 @@ impl Default for EditStore {
 #[derive(Debug, Default)]
 struct EditState {
     overlay: Arc<Overlay>,
-    /// The row each edit touched, in order. The store's version is `base`
-    /// plus its length.
-    log: Vec<usize>,
+    /// The runs of row ids each edit touched, in order.
+    log: Vec<(RowId, u32)>,
+    /// `ends[i]`: the rows logged in `log[..=i]`. The store's version is
+    /// `start` plus the last.
+    ends: Vec<usize>,
     /// The version the log starts from: a store that replaces another
     /// (a save's rebase, a re-read with another split) carries on from its
     /// version, so a document's edit versions only ever increase.
-    base: usize,
+    start: usize,
     /// How many cells are edited.
     cells: usize,
+    /// The next inserted row's number.
+    next_inserted: u32,
 }
 
 impl EditState {
     fn version(&self) -> usize {
-        self.base + self.log.len()
+        self.start + self.ends.last().copied().unwrap_or(0)
     }
+
+    fn log(&mut self, first: RowId, count: u32) {
+        let total = self.ends.last().copied().unwrap_or(0) + to_usize(count);
+        self.log.push((first, count));
+        self.ends.push(total);
+    }
+}
+
+/// `cells` edited cells, once a row's edits `before` are `after`.
+fn counted(cells: usize, before: Option<&Arc<RowEdits>>, after: Option<&Arc<RowEdits>>) -> usize {
+    let before = before.map_or(0, |e| e.cells.len());
+    let after = after.map_or(0, |e| e.cells.len());
+    cells - before + after
 }
 
 impl EditStore {
@@ -267,6 +392,7 @@ impl EditStore {
     pub(crate) fn with_lineage(lineage: Lineage) -> EditStore {
         EditStore {
             lineage,
+            base: BaseId::new(),
             rebased: false,
             state: RwLock::default(),
             #[cfg(test)]
@@ -293,9 +419,37 @@ impl EditStore {
         self.lineage
     }
 
+    /// The file the edits' row ids are of.
+    pub(crate) fn base(&self) -> BaseId {
+        self.base
+    }
+
     /// The edits now.
     pub(crate) fn overlay(&self) -> Arc<Overlay> {
         Arc::clone(&self.read().overlay)
+    }
+
+    /// The piece list now (a snapshot that shares its leaves, without the
+    /// rest of the overlay).
+    #[cfg(test)]
+    pub(crate) fn map(&self) -> RowMap {
+        self.read().overlay.map.clone()
+    }
+
+    /// How many logical rows can be read when the first `available`
+    /// physical rows can ([`RowMap::rows_within`]).
+    pub(crate) fn rows_within(&self, available: usize) -> usize {
+        self.read().overlay.map.rows_within(available)
+    }
+
+    /// A count of physical rows as logical rows ([`RowMap::shift`]).
+    pub(crate) fn shift(&self, physical: usize) -> usize {
+        self.read().overlay.map.shift(physical)
+    }
+
+    /// The logical row count, once a row has been inserted or deleted.
+    pub(crate) fn map_len(&self) -> Option<usize> {
+        self.read().overlay.map.len()
     }
 
     /// The edits now and their version, in one look: what a save writes,
@@ -310,45 +464,85 @@ impl EditStore {
         self.read().version()
     }
 
+    /// The next inserted row's number.
+    pub(crate) fn next_inserted(&self) -> u32 {
+        self.read().next_inserted
+    }
+
     /// Makes the version `version` now, as the store this one replaces had
     /// reached it: edits already logged here (a save's carry-over, made
     /// before the store is current) are counted within it, not after it.
     pub(crate) fn carry_on_from(&self, version: usize) {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        state.base = version.saturating_sub(state.log.len());
+        let logged = state.ends.last().copied().unwrap_or(0);
+        state.start = version.saturating_sub(logged);
     }
 
-    /// Row `row`'s edits now, if it has any.
+    /// Physical row `row`'s edits now, if it has any.
     pub(crate) fn row(&self, row: usize) -> Option<Arc<RowEdits>> {
         self.read().overlay.row_arc(row).cloned()
     }
 
-    /// The edited rows among `rows` now, and the version they are.
-    pub(crate) fn rows_in(&self, rows: Range<usize>) -> (Vec<(usize, Arc<RowEdits>)>, usize) {
+    /// Inserted row `n` now, if it is in the document, with its edits.
+    pub(crate) fn inserted(&self, n: u32) -> Option<(Arc<InsertedRow>, Option<Arc<RowEdits>>)> {
+        let state = self.read();
+        let row = Arc::clone(state.overlay.inserted(n)?);
+        let edits = state.overlay.edits(RowId::inserted(n)).cloned();
+        Some((row, edits))
+    }
+
+    /// The edited original rows among physical rows `rows` now, the
+    /// stretches of them that are still in the document (not deleted), and
+    /// the version they are: all in one look.
+    pub(crate) fn rows_in(&self, rows: Range<usize>) -> RowsIn {
         let state = self.read();
         let range = rows.start..rows.end.max(rows.start);
         let edited = state
             .overlay
-            .rows
-            .range(range)
-            .map(|(&row, edits)| (row, Arc::clone(edits)))
+            .rows_in(range.clone())
+            .filter_map(|(row, _)| Some((row, Arc::clone(state.overlay.row_arc(row)?))))
             .collect();
-        (edited, state.version())
+        let to_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let live = state
+            .overlay
+            .map
+            .originals_in(to_u32(range.start)..to_u32(range.end))
+            .into_iter()
+            .map(|r| to_usize(r.start)..to_usize(r.end))
+            .collect();
+        RowsIn {
+            edited,
+            live,
+            version: state.version(),
+        }
     }
 
     /// The rows touched by every edit since version `at`, each once, in
-    /// order, with their edits now, and the version now.
-    pub(crate) fn since(&self, at: usize) -> (Vec<Touched>, usize) {
+    /// id order, with what they are now, the piece list now, and the
+    /// version now.
+    pub(crate) fn since(&self, at: usize) -> (Vec<Touched>, RowMap, usize) {
         let state = self.read();
-        let from = at.saturating_sub(state.base);
-        let mut rows = state.log.get(from..).unwrap_or_default().to_vec();
-        rows.sort_unstable();
-        rows.dedup();
-        let rows = rows
-            .into_iter()
-            .map(|row| (row, state.overlay.row_arc(row).cloned()))
+        let from = at.saturating_sub(state.start);
+        // The first entry not wholly before `from`.
+        let first = state.ends.partition_point(|&end| end <= from);
+        let mut ids: Vec<RowId> = state.log[first..]
+            .iter()
+            .flat_map(|&(id, count)| (0..count).map(move |k| id.plus(k)))
             .collect();
-        (rows, state.version())
+        ids.sort_unstable();
+        ids.dedup();
+        let overlay = &state.overlay;
+        let touched = ids
+            .into_iter()
+            .map(|id| Touched {
+                id,
+                edits: overlay.edits(id).cloned(),
+                inserted: id
+                    .inserted_index()
+                    .and_then(|n| overlay.inserted(n).cloned()),
+            })
+            .collect();
+        (touched, overlay.map.clone(), state.version())
     }
 
     /// True if nothing is edited.
@@ -365,22 +559,49 @@ impl EditStore {
     /// edit. The overlay is copied first if a reader holds it (a copy in
     /// progress): the copy is of the `Arc`s of the edited rows, not of
     /// their values.
-    pub(crate) fn set_rows(&self, rows: Vec<(usize, Option<RowEdits>)>) {
-        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        #[cfg(test)]
-        if Arc::get_mut(&mut state.overlay).is_none() {
-            self.copies
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let state = &mut *state;
+    pub(crate) fn set_rows(&self, rows: Vec<(RowId, Option<RowEdits>)>) {
+        let mut state = self.write();
+        let mut cells = state.cells;
         let overlay = Arc::make_mut(&mut state.overlay);
-        for (row, edits) in rows {
-            let before = overlay.row(row).map_or(0, |e| e.cells.len());
-            let after = edits.as_ref().map_or(0, |e| e.cells.len());
-            state.cells = state.cells - before + after;
-            overlay.set(row, edits);
-            state.log.push(row);
+        let mut ids = Vec::with_capacity(rows.len());
+        for (id, edits) in rows {
+            let edits = edits.map(Arc::new);
+            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
+            overlay.set(id, edits);
+            ids.push(id);
         }
+        state.cells = cells;
+        for id in ids {
+            state.log(id, 1);
+        }
+    }
+
+    /// Makes a row insert or delete (task 2.4a), as one edit.
+    pub(crate) fn change_rows(&self, change: RowChange) {
+        let mut state = self.write();
+        let mut cells = state.cells;
+        let overlay = Arc::make_mut(&mut state.overlay);
+        overlay.map = change.map;
+        for (id, edits) in change.edits {
+            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
+            overlay.set(id, edits);
+        }
+        for (n, row) in change.inserted {
+            match row {
+                Some(row) => {
+                    overlay.inserted.insert(n, row);
+                }
+                None => {
+                    overlay.inserted.remove(&n);
+                }
+            }
+        }
+        state.cells = cells;
+        for ids in change.touched {
+            let count = ids.start.until(ids.end);
+            state.log(ids.start, count);
+        }
+        state.next_inserted = change.next_inserted;
     }
 
     /// How many edits so far had to copy the overlay.
@@ -394,6 +615,31 @@ impl EditStore {
         // good one.
         self.state.read().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn write(&self) -> RwLockWriteGuard<'_, EditState> {
+        let state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        // `Arc::make_mut` copies the overlay if a reader holds it.
+        #[cfg(test)]
+        if Arc::strong_count(&state.overlay) > 1 {
+            self.copies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        state
+    }
+}
+
+/// What [`EditStore::rows_in`] gives a search's chunk.
+#[derive(Debug)]
+pub(crate) struct RowsIn {
+    /// The edited original rows, by physical row, in order.
+    pub(crate) edited: Vec<(usize, Arc<RowEdits>)>,
+    /// The stretches of physical rows still in the document, in order.
+    pub(crate) live: Vec<Range<usize>>,
+    pub(crate) version: usize,
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -403,6 +649,10 @@ mod tests {
     fn edits(fields: usize, cells: &[(usize, &str)]) -> RowEdits {
         let cells = cells.iter().map(|&(c, v)| (c, Arc::from(v))).collect();
         RowEdits::new(fields, cells, Arc::new([]), None)
+    }
+
+    fn id(row: u32) -> RowId {
+        RowId::original(row)
     }
 
     #[test]
@@ -450,25 +700,29 @@ mod tests {
         let store = EditStore::default();
         assert!(store.is_empty());
         let before = store.overlay();
-        store.set_rows(vec![(7, Some(edits(2, &[(0, "x"), (1, "y")])))]);
-        store.set_rows(vec![(2, Some(edits(2, &[(1, "y")]))), (7, None)]);
+        store.set_rows(vec![(id(7), Some(edits(2, &[(0, "x"), (1, "y")])))]);
+        store.set_rows(vec![(id(2), Some(edits(2, &[(1, "y")]))), (id(7), None)]);
         assert!(before.is_empty(), "a snapshot doesn't change");
         assert_eq!(store.version(), 3);
         assert_eq!(store.cells(), 1);
         assert!(store.row(2).is_some() && store.row(7).is_none());
-        let (rows, version) = store.since(1);
-        let rows: Vec<(usize, bool)> = rows.into_iter().map(|(r, e)| (r, e.is_some())).collect();
-        assert_eq!((rows, version), (vec![(2, true), (7, false)], 3));
+        let (rows, _, version) = store.since(1);
+        let rows: Vec<(RowId, bool)> = rows
+            .into_iter()
+            .map(|t| (t.id, t.edits.is_some()))
+            .collect();
+        assert_eq!((rows, version), (vec![(id(2), true), (id(7), false)], 3));
         assert!(store.since(3).0.is_empty());
         assert!(store.since(99).0.is_empty());
         assert_ne!(store.lineage(), EditStore::default().lineage());
+        assert_ne!(store.base(), EditStore::default().base());
     }
 
     #[test]
     fn rows_in_gives_the_edited_rows_in_a_range_either_way() {
         let store = EditStore::default();
         for row in [1, 4, 9] {
-            store.set_rows(vec![(row, Some(edits(1, &[(0, "x")])))]);
+            store.set_rows(vec![(id(row), Some(edits(1, &[(0, "x")])))]);
         }
         let overlay = store.overlay();
         let rows = |range: Range<usize>| overlay.rows_in(range).map(|(r, _)| r).collect::<Vec<_>>();
@@ -479,9 +733,79 @@ mod tests {
         assert_eq!(rows(start..end), Vec::<usize>::new(), "reversed");
         let back: Vec<usize> = overlay.rows_in(0..9).rev().map(|(r, _)| r).collect();
         assert_eq!(back, [4, 1]);
-        let (shared, version) = store.rows_in(start..end);
-        assert!(shared.is_empty());
-        assert_eq!(version, 3);
-        assert_eq!(store.rows_in(2..10).0.len(), 2);
+        let shared = store.rows_in(start..end);
+        assert!(shared.edited.is_empty());
+        assert_eq!(shared.version, 3);
+        assert_eq!(store.rows_in(2..10).edited.len(), 2);
+        assert_eq!(store.rows_in(2..10).live, vec![2..10]);
+    }
+
+    /// A row insert or delete logs its rows as one run, which the version
+    /// counts row by row; the edits it moves go and come back whole.
+    #[test]
+    fn a_row_change_logs_its_run_and_moves_edits() {
+        let store = EditStore::default();
+        store.set_rows(vec![(id(3), Some(edits(2, &[(0, "x")])))]);
+        let mut map = store.map();
+        map.begin(10);
+        let removed = map.remove(2..6);
+        let moved = Arc::clone(store.overlay().edits(id(3)).unwrap());
+        store.change_rows(RowChange {
+            map,
+            edits: vec![(id(3), None)],
+            inserted: vec![],
+            touched: removed.iter().map(|p| p.ids()).collect(),
+            next_inserted: 0,
+        });
+        assert_eq!(store.version(), 5, "one cell edit, then four rows");
+        assert_eq!(store.cells(), 0);
+        assert!(!store.is_empty(), "rows are deleted");
+        let (touched, map, _) = store.since(1);
+        assert_eq!(touched.len(), 4);
+        assert_eq!(map.len(), Some(6));
+        assert_eq!(store.rows_in(0..10).live, vec![0..2, 6..10]);
+        let mut back = store.map();
+        assert!(back.insert(2, &removed));
+        store.change_rows(RowChange {
+            map: back,
+            edits: vec![(id(3), Some(moved))],
+            inserted: vec![],
+            touched: removed.iter().map(|p| p.ids()).collect(),
+            next_inserted: 0,
+        });
+        assert!(!store.is_empty());
+        assert_eq!(store.cells(), 1);
+        assert!(store.map().is_identity());
+        store.set_rows(vec![(id(3), None)]);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn an_inserted_row_has_at_least_one_cell() {
+        let row = InsertedRow::new(4, &[]);
+        assert_eq!(row.fields().len(), 1);
+        assert_eq!(row.gap(), 4);
+        let store = EditStore::default();
+        let mut map = store.map();
+        map.begin(0);
+        assert!(map.insert(
+            0,
+            &[Piece::Inserted {
+                gap: 0,
+                first: 0,
+                len: 1
+            }]
+        ));
+        store.change_rows(RowChange {
+            map,
+            edits: vec![],
+            inserted: vec![(0, Some(Arc::new(row)))],
+            touched: vec![RowId::inserted(0)..RowId::inserted(1)],
+            next_inserted: 1,
+        });
+        assert_eq!(store.next_inserted(), 1);
+        assert!(store.inserted(0).is_some());
+        let (touched, _, _) = store.since(0);
+        assert!(touched[0].inserted.is_some());
     }
 }

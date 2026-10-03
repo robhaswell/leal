@@ -8,7 +8,7 @@
 //!   [`job`](CopyJob::job), then [`take`](CopyJob::take) the text.
 //! - [`Document::cell_value`]: one cell's whole value, for the inspector.
 //!
-//! Rows here are physical rows (the header row, if any, is row 0), as
+//! Rows here are logical rows (the header row, if any, is row 0), as
 //! everywhere in this crate. A search and a copy belong to their document:
 //! once it has failed (DESIGN §3.9), their calls fail too, and a panic in
 //! one of their jobs fails it.
@@ -31,7 +31,7 @@ pub struct SearchProgress {
     pub generation: u64,
     /// Matching cells found so far.
     pub matches: u64,
-    /// Every physical row before this one has been searched.
+    /// Every physical row of the file before this one has been searched.
     pub rows_searched: u64,
     /// Every row has been searched.
     pub complete: bool,
@@ -46,11 +46,11 @@ pub struct SearchProgress {
 /// The answer to **Next** or **Previous** ([`Search::step`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SearchStep {
-    /// The match to select: its physical row and field, its 1-based number
+    /// The match to select: its logical row and field, its 1-based number
     /// among the matches ("k of N"), and whether the step went round the
     /// end of the file.
     Found {
-        /// The physical row.
+        /// The logical row.
         row: u64,
         /// The field.
         column: u32,
@@ -79,7 +79,7 @@ pub struct TextRange {
 /// A matching cell in a window of the grid ([`Search::matches_in`]).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CellMatch {
-    /// The physical row.
+    /// The logical row.
     pub row: u64,
     /// The field.
     pub column: u32,
@@ -154,7 +154,7 @@ impl Document {
         })
     }
 
-    /// Starts copying physical rows `row_start` to `row_start + row_count`
+    /// Starts copying logical rows `row_start` to `row_start + row_count`
     /// and fields `column_start` to `column_start + column_count` as
     /// tab-separated display values: cells with a tab, line break or quote
     /// are quoted. Rows past the indexed ones are waited for, and rows past
@@ -182,7 +182,7 @@ impl Document {
         })
     }
 
-    /// Copies physical rows `row_start` to `row_start + row_count` and
+    /// Copies logical rows `row_start` to `row_start + row_count` and
     /// fields `column_start` to `column_start + column_count` as
     /// tab-separated display values at once, if the index has every one of
     /// the rows (or is complete); `None` otherwise, when
@@ -228,7 +228,7 @@ impl Document {
         })
     }
 
-    /// Field `column` of physical row `row` in full, up to `max_chars`
+    /// Field `column` of logical row `row` in full, up to `max_chars`
     /// characters of it, with its length in characters and lines; `None`
     /// if the row can't be read yet. It decodes the whole value: call it
     /// off the main thread.
@@ -307,7 +307,7 @@ impl Search {
         })
     }
 
-    /// **Next** (`forward`) or **Previous** from physical row `row`, field
+    /// **Next** (`forward`) or **Previous** from logical row `row`, field
     /// `column` (any cell, a match or not), or with no `row` the first or
     /// last match. It wraps round the ends once the search is complete.
     ///
@@ -346,7 +346,7 @@ impl Search {
         })
     }
 
-    /// The 1-based number of the match at physical row `row`, field
+    /// The 1-based number of the match at logical row `row`, field
     /// `column` ("k of N"), or `None` if that cell isn't one found so far.
     ///
     /// # Errors
@@ -363,7 +363,7 @@ impl Search {
         })
     }
 
-    /// The matches found so far in physical rows `row_start` to `row_start
+    /// The matches found so far in logical rows `row_start` to `row_start
     /// + row_count` and fields `column_start` to `column_start +
     /// column_count`, with where the query is in the first `max_chars`
     /// characters of each: one call per tile of the grid.

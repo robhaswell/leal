@@ -1,7 +1,11 @@
 //! Editing a document (task 2.1, DESIGN §3.6): cell edits, alone or in a
 //! batch, the commands that undo, redo and replay them, and the full value
 //! an editor starts from. See [`crate::edit`] for the overlay and the
-//! command model.
+//! command model, and `structural.rs` for row inserts and deletes.
+//!
+//! Rows are logical rows (task 2.4a): the piece list says which row of the
+//! file, or which inserted row, each one is, and a row's edits are kept by
+//! its [`RowId`](crate::edit::RowId).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -12,7 +16,8 @@ use std::sync::{Arc, PoisonError};
 use super::{Document, Reading, RowBytes, RowView};
 use crate::diagnostics::Mark;
 use crate::edit::{
-    COLUMN_LIMIT, CellChange, Command, Edit, EditError, Lineage, Overlay, Replay, RowEdits,
+    COLUMN_LIMIT, CellChange, Command, Edit, EditError, InsertedRow, Lineage, Overlay, Replay,
+    RowEdits, RowId, Slot,
 };
 use crate::index::Status;
 use crate::rows::{ParsedRow, RowParser};
@@ -28,28 +33,62 @@ pub(super) struct Target<'a> {
     pub(super) expected: Option<Option<&'a str>>,
 }
 
-/// A row being changed: its bytes, as the file has it, and its edited
-/// cells so far.
+/// A row's own cells, for a change: its bytes as the file has it, or an
+/// inserted row's values.
+enum Own<'b> {
+    File {
+        bytes: Cow<'b, [u8]>,
+        base: usize,
+        parsed: ParsedRow,
+        /// Its physical row.
+        row: usize,
+        /// The row was read from the first 64 KB kept in memory.
+        from_head: bool,
+    },
+    New(Arc<InsertedRow>),
+}
+
+/// A row being changed: its own cells, and its edited cells so far.
 struct Work<'b> {
-    bytes: Cow<'b, [u8]>,
-    base: usize,
-    parsed: ParsedRow,
+    own: Own<'b>,
+    id: RowId,
     cells: Vec<(usize, Arc<str>)>,
     previous: Option<Arc<RowEdits>>,
-    /// The row was read from the first 64 KB kept in memory.
-    from_head: bool,
     /// The last cell of the row a target changed, for a refusal to name.
     last_column: usize,
 }
 
 impl Work<'_> {
+    /// How many cells of its own the row has.
+    fn own_len(&self) -> usize {
+        match &self.own {
+            Own::File { parsed, .. } => parsed.fields().len(),
+            Own::New(row) => row.fields().len(),
+        }
+    }
+
+    /// Its own cell `column`'s value, unedited, if it has one.
+    fn own_value(&self, parser: &RowParser, column: usize) -> Option<Cow<'_, str>> {
+        match &self.own {
+            Own::File {
+                bytes,
+                base,
+                parsed,
+                ..
+            } => parsed
+                .field(column)
+                .map(|field| parser.display_value_in(bytes, *base, field)),
+            Own::New(row) => row.fields().get(column).map(|v| Cow::Borrowed(v.as_ref())),
+        }
+    }
+
     /// Cell `column`'s value now: `None` past the row's end.
     fn value(&self, parser: &RowParser, column: usize) -> Option<Cow<'_, str>> {
         if let Ok(at) = self.cells.binary_search_by_key(&column, |&(c, _)| c) {
             return Some(Cow::Borrowed(&self.cells[at].1));
         }
-        if let Some(field) = self.parsed.field(column) {
-            return Some(parser.display_value_in(&self.bytes, self.base, field));
+        if let Some(value) = self.own_value(parser, column) {
+            return Some(value);
         }
         let end = self.cells.last().map_or(0, |&(c, _)| c + 1);
         (column < end).then_some(Cow::Borrowed(""))
@@ -58,7 +97,7 @@ impl Work<'_> {
 
 impl Document {
     /// Sets cell (`row`, `column`) to `value`: the user committed an edit.
-    /// `row` is the physical row (the header row, if any, is row 0, and can
+    /// `row` is the logical row (the header row, if any, is row 0, and can
     /// be edited too); `column` is a field of it, or a cell past its end (a
     /// hatched cell, ADR-0005 decision 2).
     ///
@@ -133,15 +172,24 @@ impl Document {
     /// again, undo applies its [`inverse`](Command::inverse). It applies
     /// only in the edits it was made in (its lineage), and only if every
     /// cell holds the command's old value and ends up holding its new one;
-    /// otherwise nothing changes.
+    /// otherwise nothing changes. A row insert or delete applies by
+    /// identity in the edits it was made in, so an undone delete puts back
+    /// the same rows, original bytes and all; after a save it applies by
+    /// value (ADR-0014 decision 3).
     ///
     /// # Errors
     ///
     /// [`EditError::OtherLineage`] for a command made before the file was
     /// read with another delimiter or encoding, [`EditError::ValueChanged`]
-    /// if a cell doesn't hold what the command expects, and the errors of
-    /// [`set_cell`](Self::set_cell).
+    /// if a cell (or a row) doesn't hold what the command expects, the
+    /// errors of [`set_cell`](Self::set_cell), and for a row insert or
+    /// delete those of [`insert_rows`](Self::insert_rows).
     pub fn apply(&self, command: &Command) -> Result<(), EditError> {
+        if command.is_structural() {
+            return self
+                .apply_rows(Some(command.lineage), &command.edit)
+                .map(|_| ());
+        }
         self.change(Some(command.lineage), &targets(command))
             .map(|_| ())
     }
@@ -152,23 +200,34 @@ impl Document {
     /// commands into a freshly opened document of the same file (ADR-0008
     /// decision 5). A command that doesn't apply is skipped, and the rest
     /// are still tried; one that built on it then usually doesn't apply
-    /// either, since its cell doesn't hold the value it expects.
+    /// either, since its cell doesn't hold the value it expects. Row
+    /// inserts and deletes apply by value (ADR-0014 decision 3).
     ///
     /// The commands that applied come back in this document's lineage, for
-    /// the app's new undo history.
+    /// the app's new undo history (a row insert or delete as a new command
+    /// of this document's rows).
     ///
     /// Rows the index hasn't reached yet are refused with
-    /// [`EditError::NotReadYet`], so call it once the index job has
+    /// [`EditError::NotReadYet`] (and row inserts and deletes with
+    /// [`EditError::StillReading`]), so call it once the index job has
     /// finished. It reads each row a command changes: call it off the main
     /// thread for a long history.
     pub fn replay(&self, commands: &[Command]) -> Replay {
         let mut replay = Replay::default();
         for (at, command) in commands.iter().enumerate() {
-            match self.change(None, &targets(command)) {
-                Ok((lineage, _)) => replay.commands.push(Command {
-                    lineage,
-                    edit: command.edit.clone(),
-                }),
+            let applied = if command.is_structural() {
+                self.apply_rows(None, &command.edit)
+            } else {
+                self.change(None, &targets(command)).map(|(lineage, _)| {
+                    Some(Command {
+                        lineage,
+                        edit: command.edit.clone(),
+                    })
+                })
+            };
+            match applied {
+                Ok(Some(command)) => replay.commands.push(command),
+                Ok(None) => {}
                 Err(error) => replay.refused.push((at, error)),
             }
         }
@@ -218,7 +277,10 @@ impl Document {
     }
 
     /// Whether the document has unsaved edits: some cell reads differently
-    /// from the file. Edits set back to their original values don't count.
+    /// from the file, or a row is inserted or deleted. Edits set back to
+    /// their original values don't count, nor do rows inserted and deleted
+    /// again; but a row deleted, and another inserted that reads the same,
+    /// does.
     #[must_use]
     pub fn has_edits(&self) -> bool {
         !self.current().edits.is_empty()
@@ -236,7 +298,8 @@ impl Document {
         u64::try_from(self.current().edits.version()).unwrap_or(u64::MAX)
     }
 
-    /// How many cells are edited.
+    /// How many cells are edited (an inserted row's own values don't
+    /// count).
     #[must_use]
     pub fn edited_cells(&self) -> usize {
         self.current().edits.cells()
@@ -263,12 +326,12 @@ impl Document {
     /// edited from (task 1.9): rows read from the first 64 KB kept in
     /// memory, once those turn out to be a different version of the file
     /// than the copy ([`changed_on_disk`](Self::changed_on_disk)), whose
-    /// bytes in the trusted copy differ or aren't there. Each as (row,
-    /// column), in order. The edits are kept and still shown where the row
-    /// can be read; the app names these cells (task 2.5) and so does Save
-    /// As from an incomplete document (ADR-0008 decision 6). Empty while
-    /// the first 64 KB can be trusted. It reads each edited row that came
-    /// from them.
+    /// bytes in the trusted copy differ or aren't there. Each as (logical
+    /// row, column), in order; a deleted row's are left out. The edits are
+    /// kept and still shown where the row can be read; the app names these
+    /// cells (task 2.5) and so does Save As from an incomplete document
+    /// (ADR-0008 decision 6). Empty while the first 64 KB can be trusted.
+    /// It reads each edited row that came from them.
     ///
     /// A row the copy hasn't reached yet counts as conflicted until it
     /// has, if it ever does.
@@ -280,18 +343,23 @@ impl Document {
         }
         let overlay = reading.edits.overlay();
         let mut cells = Vec::new();
-        for (row, edits) in overlay.all() {
-            let Some(hash) = edits.head_hash() else {
+        for (id, edits) in overlay.all() {
+            let (Some(hash), Some(physical)) = (edits.head_hash(), id.physical()) else {
                 continue;
             };
+            let Ok(logical) = overlay.map().logical_of(physical) else {
+                continue;
+            };
+            let row = usize::try_from(physical).unwrap_or(usize::MAX);
             let same = matches!(
                 Self::row_bytes(&reading, row),
                 Ok(Some(RowBytes { bytes, .. })) if hash_of(&bytes) == hash
             );
             if !same {
-                cells.extend(edits.cells().iter().map(|&(column, _)| (row, column)));
+                cells.extend(edits.cells().iter().map(|&(column, _)| (logical, column)));
             }
         }
+        cells.sort_unstable();
         cells
     }
 
@@ -378,13 +446,18 @@ impl Document {
             changes.clear();
         }
 
-        // ADR-0004 decision 8, on each row as it ends up.
+        // ADR-0004 decision 8, on each row as it ends up: nothing after an
+        // open unterminated quote, in its row or (once rows are inserted
+        // or deleted) after its row.
+        let rows_now = overlay.map().len();
         for (&row, work) in &rows {
-            if let Some(quote) = open_quote(work)
-                && work.cells.last().is_some_and(|&(c, _)| c > quote)
-            {
-                let column = work.last_column;
-                return Err(EditError::AfterUnterminatedQuote { row, column });
+            if let Some(quote) = open_quote(work) {
+                let past = work.cells.last().is_some_and(|&(c, _)| c > quote);
+                let not_last = rows_now.is_some_and(|len| row + 1 != len);
+                if past || not_last {
+                    let column = work.last_column;
+                    return Err(EditError::AfterUnterminatedQuote { row, column });
+                }
             }
         }
 
@@ -393,7 +466,7 @@ impl Document {
         let updates = rows
             .into_iter()
             .filter(|(row, _)| changed.contains(row))
-            .map(|(row, work)| (row, row_edits(reading, parser, row, work)))
+            .map(|(_, work)| (work.id, row_edits(reading, parser, work)))
             .collect();
         // Let go of this snapshot first: the store copies the overlay if
         // anyone else holds it, and this edit mustn't count.
@@ -404,34 +477,63 @@ impl Document {
         Ok((store.lineage(), changes))
     }
 
-    /// Row `row`, read for a change.
+    /// Logical row `row`, read for a change.
     fn work<'b>(
         reading: &'b Reading,
         overlay: &Overlay,
         row: usize,
     ) -> Result<Work<'b>, EditError> {
+        let slot = overlay.map().slot(row);
+        let Some(Slot::Original(physical)) = slot else {
+            let Some(Slot::Inserted(n)) = slot else {
+                return Err(missing_row(reading, row));
+            };
+            let id = RowId::inserted(n);
+            let inserted = overlay
+                .inserted(n)
+                .ok_or_else(|| missing_row(reading, row))?;
+            let previous = overlay.edits(id).cloned();
+            return Ok(Work {
+                own: Own::New(Arc::clone(inserted)),
+                id,
+                cells: previous
+                    .as_ref()
+                    .map(|edits| edits.cells().to_vec())
+                    .unwrap_or_default(),
+                previous,
+                last_column: 0,
+            });
+        };
+        let physical_row = usize::try_from(physical).unwrap_or(usize::MAX);
         // As `Reading::rows_from` decides it.
         let from_head = !reading.head_is_stale() && reading.index.row_count() < reading.head_rows;
-        let Some(RowBytes { bytes, base, index }) =
-            Self::row_bytes(reading, row).map_err(|error| EditError::Read { row, error })?
+        let Some(RowBytes { bytes, base, index }) = Self::row_bytes(reading, physical_row)
+            .map_err(|error| EditError::Read { row, error })?
         else {
             return Err(missing_row(reading, row));
         };
-        let Some(parsed) = reading.parser.parse_row_in(index, row, &bytes, base) else {
+        let Some(parsed) = reading
+            .parser
+            .parse_row_in(index, physical_row, &bytes, base)
+        else {
             return Err(missing_row(reading, row));
         };
-        let previous = overlay.row_arc(row).cloned();
+        let previous = overlay.row_arc(physical_row).cloned();
         let cells = previous
             .as_ref()
             .map(|edits| edits.cells().to_vec())
             .unwrap_or_default();
         Ok(Work {
-            bytes,
-            base,
-            parsed,
+            own: Own::File {
+                bytes,
+                base,
+                parsed,
+                row: physical_row,
+                from_head,
+            },
+            id: RowId::original(physical),
             cells,
             previous,
-            from_head,
             last_column: 0,
         })
     }
@@ -454,16 +556,20 @@ fn targets(command: &Command) -> Vec<Target<'_>> {
 /// The column limit: a cell past the row's fields and past
 /// [`COLUMN_LIMIT`] can't be edited.
 fn check_column(work: &Work<'_>, row: usize, column: usize) -> Result<(), EditError> {
-    if column >= work.parsed.fields().len().max(COLUMN_LIMIT) {
+    if column >= work.own_len().max(COLUMN_LIMIT) {
         return Err(EditError::TooFarRight { row, column });
     }
     Ok(())
 }
 
 /// The column of the row's unterminated quote, if it has one and it is
-/// still open (unedited). It is always the row's last field.
+/// still open (unedited). It is always the row's last field, and only the
+/// file's last row can have one.
 fn open_quote(work: &Work<'_>) -> Option<usize> {
-    let fields = work.parsed.fields();
+    let Own::File { parsed, .. } = &work.own else {
+        return None;
+    };
+    let fields = parsed.fields();
     let quote = fields.len().checked_sub(1)?;
     let open = fields[quote].unterminated()
         && work
@@ -486,9 +592,10 @@ fn holds(actual: Option<&str>, meant: Option<&str>, rebased: bool) -> bool {
 }
 
 /// Sets `work`'s cell `column` to `value`. Back to the original display
-/// value (`""`, or missing, past the row's fields) removes the edit. Only
-/// a cell past the row's fields can be made missing; once the document is
-/// `rebased` (see [`holds`]), making one of its fields missing empties it.
+/// value (`""`, or missing, past the row's fields) removes the edit; for an
+/// inserted row, its own value. Only a cell past the row's own cells can be
+/// made missing; once the document is `rebased` (see [`holds`]), making
+/// one of its fields missing empties it.
 fn set(
     work: &mut Work<'_>,
     parser: &RowParser,
@@ -498,14 +605,10 @@ fn set(
     rebased: bool,
 ) -> Result<(), EditError> {
     let value = match value {
-        None if rebased && work.parsed.field(column).is_some() => Some(""),
+        None if rebased && column < work.own_len() => Some(""),
         value => value,
     };
-    let original = work
-        .parsed
-        .field(column)
-        .map(|field| parser.display_value_in(&work.bytes, work.base, field));
-    let back = match (&original, value) {
+    let back = match (work.own_value(parser, column), value) {
         (Some(original), Some(value)) => original == value,
         (Some(_), None) => return Err(EditError::ValueChanged { row, column }),
         (None, Some(value)) => value.is_empty(),
@@ -525,46 +628,53 @@ fn set(
 }
 
 /// A changed row's new edits, or `None` if it has none left.
-fn row_edits(
-    reading: &Reading,
-    parser: &RowParser,
-    row: usize,
-    work: Work<'_>,
-) -> Option<RowEdits> {
+fn row_edits(reading: &Reading, parser: &RowParser, work: Work<'_>) -> Option<RowEdits> {
     if work.cells.is_empty() {
         return None;
     }
-    let fields = work.parsed.fields().len();
+    let fields = work.own_len();
+    let Own::File {
+        bytes,
+        base,
+        parsed,
+        row,
+        from_head,
+    } = &work.own
+    else {
+        // An inserted row's values are text: no diagnostics of their own
+        // but a NUL, which the edits' marks check on every value anyway.
+        return Some(RowEdits::new(fields, work.cells, Arc::from([]), None));
+    };
     // The row's own fields' diagnostics, worked out the first time it is
     // edited: none to look for if its marks say it has none.
     let flagged = match &work.previous {
         Some(previous) => Arc::clone(previous.flagged()),
         None => {
             let unflagged = reading.diagnostics.get().is_some_and(|diagnostics| {
-                row < diagnostics.marked_rows_and_mode().0
-                    && !diagnostics.row_is(row, Mark::Flagged)
+                *row < diagnostics.marked_rows_and_mode().0
+                    && !diagnostics.row_is(*row, Mark::Flagged)
             });
             if unflagged {
                 Arc::from([])
             } else {
-                let view = RowView::new(parser, &work.bytes, work.base, &work.parsed, None);
+                let view = RowView::new(parser, bytes, *base, parsed, None);
                 Arc::from(view.flagged_fields())
             }
         }
     };
     let head_hash = match &work.previous {
         Some(previous) => previous.head_hash(),
-        None => work.from_head.then(|| hash_of(&work.bytes)),
+        None => from_head.then(|| hash_of(bytes)),
     };
     Some(RowEdits::new(fields, work.cells, flagged, head_hash))
 }
 
-/// Why row `row` can't be edited: it isn't there (the index is complete
-/// without it); it can't be read, because the file changed while it was
-/// read or was deleted on its share, so the row will never come; or it
-/// hasn't been read yet (the index hasn't reached it, or stopped before it:
-/// its drive may come back).
-fn missing_row(reading: &Reading, row: usize) -> EditError {
+/// Why logical row `row` can't be edited: it isn't there (the index is
+/// complete without it); it can't be read, because the file changed while
+/// it was read or was deleted on its share, so the row will never come; or
+/// it hasn't been read yet (the index hasn't reached it, or stopped before
+/// it: its drive may come back).
+pub(super) fn missing_row(reading: &Reading, row: usize) -> EditError {
     if reading.index.status() == Status::Complete {
         EditError::NoSuchRow { row }
     } else if reading.source.changed_on_disk() {

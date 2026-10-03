@@ -1943,3 +1943,69 @@ fn save_as_reports_the_name_on_disk() {
     assert_eq!(saved.path.file_name().unwrap(), "b.csv");
     assert_eq!(std::fs::read(&existing).unwrap(), b"a,b\n");
 }
+
+/// Task 2.4a: rows aren't inserted or deleted while a save runs, nor a row
+/// command undone (ADR-0014 decision 1); until task 2.4c, a save with rows
+/// inserted or deleted is refused before anything is written; and a row
+/// command from before a save applies by value after it (decision 3).
+#[test]
+fn row_edits_wait_for_a_save_and_are_not_saved_yet() {
+    let dir = Dir::new("save-rows");
+    let bytes = sample(4 * SAVE_CHUNK_BYTES);
+    let path = dir.file("a.csv", &bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    let deleted = document.delete_rows(2, 1).unwrap().unwrap();
+    let rows = document.row_count() + 1;
+    document.apply(&deleted.inverse()).unwrap();
+    set(&document, 1, 1, "edited");
+    let (job, go_on) = held_save(&document, SaveRequest::new(&path, SaveKind::Save));
+    promptly({
+        let document = Arc::clone(&document);
+        let deleted = deleted.clone();
+        move || {
+            assert!(matches!(
+                document.insert_rows(1, &[vec!["x".into()]]),
+                Err(crate::edit::EditError::Saving)
+            ));
+            assert!(matches!(
+                document.apply(&deleted),
+                Err(crate::edit::EditError::Saving)
+            ));
+            assert!(matches!(
+                document.can_change_rows(),
+                Err(crate::edit::EditError::Saving)
+            ));
+            // Cell edits carry on.
+            document.set_cell(3, 1, "during").unwrap();
+        }
+    });
+    go_on();
+    job.wait().unwrap();
+    // The saved file is indexed again before rows can change (ADR-0014
+    // decision 1).
+    wait_for_index(&document);
+    assert!(document.can_change_rows().is_ok());
+
+    // After the save, the delete applies by value: the same row goes.
+    document.apply(&deleted).unwrap();
+    assert_eq!(
+        (
+            document.row_count(),
+            document.full_value(2, 1).unwrap().as_deref()
+        ),
+        (rows - 1, Some("during"))
+    );
+    assert_eq!(
+        document.full_value(1, 1).unwrap().as_deref(),
+        Some("edited")
+    );
+    let saved = std::fs::read(&path).unwrap();
+    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+    assert!(matches!(job.wait(), Err(SaveError::RowsChanged)));
+    assert_identical(&saved, &std::fs::read(&path).unwrap());
+    let copy = dir.0.join("copy.csv");
+    let job = document.save(SaveRequest::new(&copy, SaveKind::SaveAs));
+    assert!(matches!(job.wait(), Err(SaveError::RowsChanged)));
+    assert!(!copy.exists());
+}

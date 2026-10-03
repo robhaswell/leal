@@ -1,8 +1,10 @@
 //! The commands that change a document, and why one may not apply.
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::Rows;
 use crate::source::ReadError;
 
 /// The furthest a hatched-cell edit may reach: column `COLUMN_LIMIT - 1`,
@@ -89,11 +91,27 @@ pub enum Edit {
     /// Several cells at once, in order, as one undo step: a paste, or
     /// clearing a selection (task 2.6). All of them apply, or none.
     SetCells(Vec<CellChange>),
+    /// Rows inserted at logical row `at` (task 2.4a): new rows, or, as the
+    /// inverse of a delete, the rows it took out, back with their edits.
+    InsertRows {
+        /// The first row's logical row.
+        at: usize,
+        /// The rows.
+        rows: Arc<Rows>,
+    },
+    /// Logical rows `at..at + rows.len()` deleted (task 2.4a), keeping
+    /// them (and their edits) for undo.
+    DeleteRows {
+        /// The first row deleted.
+        at: usize,
+        /// The rows.
+        rows: Arc<Rows>,
+    },
 }
 
 /// A change to a document, with what it replaced, so it can be undone,
-/// redone and replayed (DESIGN §3.6). Task 2.4 adds row and column inserts
-/// and deletes.
+/// redone and replayed (DESIGN §3.6): cell edits, and row inserts and
+/// deletes (task 2.4a; columns are task 2.4b's).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Command {
     /// The edits it belongs to.
@@ -104,7 +122,8 @@ pub struct Command {
 
 impl Command {
     /// The command that undoes this one: each cell from its new value back
-    /// to its old, the last first.
+    /// to its old, the last first; a row insert's is the delete of the same
+    /// rows, and the other way round.
     #[must_use]
     pub fn inverse(&self) -> Command {
         self.clone().into_inverse()
@@ -122,6 +141,8 @@ impl Command {
                     .map(CellChange::into_inverse)
                     .collect(),
             ),
+            Edit::InsertRows { at, rows } => Edit::DeleteRows { at, rows },
+            Edit::DeleteRows { at, rows } => Edit::InsertRows { at, rows },
         };
         Command {
             lineage: self.lineage,
@@ -129,13 +150,20 @@ impl Command {
         }
     }
 
-    /// The cells it changes, in order.
+    /// The cells it changes, in order: none for a row insert or delete.
     #[must_use]
     pub fn changes(&self) -> &[CellChange] {
         match &self.edit {
             Edit::SetCell(change) => std::slice::from_ref(change),
             Edit::SetCells(changes) => changes,
+            Edit::InsertRows { .. } | Edit::DeleteRows { .. } => &[],
         }
+    }
+
+    /// Whether it inserts or deletes rows.
+    #[must_use]
+    pub fn is_structural(&self) -> bool {
+        matches!(self.edit, Edit::InsertRows { .. } | Edit::DeleteRows { .. })
     }
 }
 
@@ -183,6 +211,14 @@ pub enum EditError {
     /// The command belongs to another [`Lineage`]: it was made before the
     /// file was read with another delimiter or encoding.
     OtherLineage,
+    /// Rows can't be inserted or deleted until the whole file has been
+    /// read (and, on a removable drive or a share, copied) and can be
+    /// trusted (ADR-0014 decision 1). Ask again once the index is complete.
+    StillReading,
+    /// Rows can't be inserted or deleted while a save runs (ADR-0014
+    /// decision 1); that includes undoing or redoing a row insert or
+    /// delete. Ask again once it has finished.
+    Saving,
     /// The row couldn't be read (see `Document::rows`).
     Read {
         /// The row.
@@ -212,6 +248,10 @@ impl fmt::Display for EditError {
             EditError::OtherLineage => {
                 f.write_str("the edit was made before the file was read another way")
             }
+            EditError::StillReading => {
+                f.write_str("rows can't be inserted or deleted until the whole file is read")
+            }
+            EditError::Saving => f.write_str("rows can't be inserted or deleted while saving"),
             EditError::Read { row, error } => write!(f, "row {row} couldn't be read: {error}"),
         }
     }

@@ -10,16 +10,18 @@
 //! row's end and an edited cell past it (a hatched cell, ADR-0005
 //! decision 2).
 //!
-//! Task 2.4 (row and column inserts and deletes) changes which field a
-//! logical cell comes from, which is decided here, so the readers of one
-//! row don't change. Which physical row a logical row is isn't decided
-//! here: every walk over rows (Find's chunks, the marks, Copy's ranges)
-//! needs a logical-to-physical map of its own then (`docs/tasks/2.1.md`).
+//! An inserted row (task 2.4a) is a view too: its own values instead of
+//! the file's fields, with its edits on top. Task 2.4b's column inserts and
+//! deletes change which field a logical cell comes from, which is decided
+//! here, so the readers of one row don't change. Which row a logical row is
+//! isn't decided here: every walk over rows goes through the piece list
+//! (`RowMap::segments`).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::diagnostics::{DiagnosticKind, field_has, value_has};
-use crate::edit::{Kinds, RowEdits};
+use crate::edit::{InsertedRow, Kinds, RowEdits};
 use crate::rows::{FieldSpan, ParsedRow, RowParser};
 
 /// One cell of a [`RowView`].
@@ -29,19 +31,37 @@ pub(crate) enum ViewCell<'a> {
     Field(&'a FieldSpan),
     /// An edited value.
     Edited(&'a str),
+    /// One of an inserted row's own values, unedited.
+    New(&'a str),
     /// A cell between the end of the row's own fields and an edited cell
     /// past them: empty, with no bytes in the file.
     Padding,
 }
 
+/// A row's own cells: the file's fields, or an inserted row's values.
+#[derive(Clone, Copy, Debug)]
+enum Own<'a> {
+    Parsed(&'a ParsedRow),
+    New(&'a [Arc<str>]),
+}
+
+impl Own<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Own::Parsed(row) => row.fields().len(),
+            Own::New(values) => values.len(),
+        }
+    }
+}
+
 /// A row as it reads now. `bytes` are the file's bytes from `base` on, and
-/// hold the row.
+/// hold the row (none, for an inserted row).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowView<'a> {
     parser: &'a RowParser,
     bytes: &'a [u8],
     base: usize,
-    row: &'a ParsedRow,
+    own: Own<'a>,
     edits: Option<&'a RowEdits>,
 }
 
@@ -57,7 +77,22 @@ impl<'a> RowView<'a> {
             parser,
             bytes,
             base,
-            row,
+            own: Own::Parsed(row),
+            edits,
+        }
+    }
+
+    /// Inserted row `row`, with `edits`.
+    pub(crate) fn inserted(
+        parser: &'a RowParser,
+        row: &'a InsertedRow,
+        edits: Option<&'a RowEdits>,
+    ) -> RowView<'a> {
+        RowView {
+            parser,
+            bytes: &[],
+            base: 0,
+            own: Own::New(row.fields()),
             edits,
         }
     }
@@ -74,14 +109,13 @@ impl<'a> RowView<'a> {
         self.base
     }
 
-    /// The row as the file has it.
-    pub(crate) fn parsed(&self) -> &'a ParsedRow {
-        self.row
-    }
-
-    /// The row's edits, if it has any.
-    pub(crate) fn edits(&self) -> Option<&'a RowEdits> {
-        self.edits
+    /// The row as the file has it, if it is a row of the file with no
+    /// edits: what the readers' fast paths take.
+    pub(crate) fn plain(&self) -> Option<&'a ParsedRow> {
+        match (self.own, self.edits) {
+            (Own::Parsed(row), None) => Some(row),
+            _ => None,
+        }
     }
 
     /// How many cells the row has now: its own fields as read, or up to
@@ -89,20 +123,28 @@ impl<'a> RowView<'a> {
     /// with the edits: the row may have been edited from the first 64 KB
     /// and now be read from the trusted copy, task 1.9.)
     pub(crate) fn len(&self) -> usize {
-        let fields = self.row.fields().len();
+        let fields = self.own.len();
         self.edits.map_or(fields, |edits| fields.max(edits.end()))
+    }
+
+    /// The row's own cell `column`, unedited, if it has one.
+    fn own(&self, column: usize) -> Option<ViewCell<'a>> {
+        match self.own {
+            Own::Parsed(row) => row.field(column).map(ViewCell::Field),
+            Own::New(values) => values.get(column).map(|value| ViewCell::New(value)),
+        }
     }
 
     /// Cell `column`, or `None` past the row's end.
     pub(crate) fn cell(&self, column: usize) -> Option<ViewCell<'a>> {
         let Some(edits) = self.edits else {
-            return self.row.field(column).map(ViewCell::Field);
+            return self.own(column);
         };
         if let Some(value) = edits.get(column) {
             return Some(ViewCell::Edited(value));
         }
-        match self.row.field(column) {
-            Some(field) => Some(ViewCell::Field(field)),
+        match self.own(column) {
+            Some(cell) => Some(cell),
             None if column < edits.end() => Some(ViewCell::Padding),
             None => None,
         }
@@ -116,22 +158,12 @@ impl<'a> RowView<'a> {
     ///
     /// [`COLUMN_LIMIT`]: crate::edit::COLUMN_LIMIT
     pub(crate) fn filled(&self) -> Vec<(usize, ViewCell<'a>)> {
+        let own = (0..self.own.len()).filter_map(|column| Some((column, self.own(column)?)));
         let Some(edits) = self.edits else {
-            return self
-                .row
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(column, field)| (column, ViewCell::Field(field)))
-                .collect();
+            return own.collect();
         };
-        let mut cells: Vec<(usize, ViewCell<'a>)> = self
-            .row
-            .fields()
-            .iter()
-            .enumerate()
+        let mut cells: Vec<(usize, ViewCell<'a>)> = own
             .filter(|&(column, _)| edits.get(column).is_none())
-            .map(|(column, field)| (column, ViewCell::Field(field)))
             .collect();
         cells.extend(
             edits
@@ -156,10 +188,12 @@ impl<'a> RowView<'a> {
             ViewCell::Field(field) => self
                 .parser
                 .display_prefix_in(self.bytes, self.base, field, max_chars),
-            ViewCell::Edited(value) => match value.char_indices().nth(max_chars) {
-                Some((cut, _)) => (Cow::Borrowed(&value[..cut]), true),
-                None => (Cow::Borrowed(value), false),
-            },
+            ViewCell::Edited(value) | ViewCell::New(value) => {
+                match value.char_indices().nth(max_chars) {
+                    Some((cut, _)) => (Cow::Borrowed(&value[..cut]), true),
+                    None => (Cow::Borrowed(value), false),
+                }
+            }
             ViewCell::Padding => (Cow::Borrowed(""), false),
         }
     }
@@ -173,7 +207,7 @@ impl<'a> RowView<'a> {
     pub(crate) fn value_of(&self, cell: ViewCell<'a>) -> Cow<'a, str> {
         match cell {
             ViewCell::Field(field) => self.parser.display_value_in(self.bytes, self.base, field),
-            ViewCell::Edited(value) => Cow::Borrowed(value),
+            ViewCell::Edited(value) | ViewCell::New(value) => Cow::Borrowed(value),
             ViewCell::Padding => Cow::Borrowed(""),
         }
     }
@@ -186,7 +220,7 @@ impl<'a> RowView<'a> {
             ViewCell::Field(field) => {
                 field_has(kind, self.parser.encoding(), self.bytes, self.base, field)
             }
-            ViewCell::Edited(value) => value_has(kind, value),
+            ViewCell::Edited(value) | ViewCell::New(value) => value_has(kind, value),
             ViewCell::Padding => false,
         }
     }
@@ -204,7 +238,10 @@ impl<'a> RowView<'a> {
     /// marks, worked out once, when the row is first edited.
     pub(crate) fn flagged_fields(&self) -> Vec<(usize, Kinds)> {
         let mut flagged = Vec::new();
-        for (column, field) in self.row.fields().iter().enumerate() {
+        let Own::Parsed(row) = self.own else {
+            return flagged;
+        };
+        for (column, field) in row.fields().iter().enumerate() {
             let mut kinds = Kinds::default();
             for &(kind, bit) in &Kinds::FIELD_KINDS {
                 if self.cell_has(kind, ViewCell::Field(field)) {

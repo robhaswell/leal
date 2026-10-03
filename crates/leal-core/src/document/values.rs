@@ -18,7 +18,7 @@ use super::search::{Settled, index_ended, more_rows};
 use super::view::ViewCell;
 use super::{Document, Reading, RowView, bytes_in, index_file};
 use crate::diagnostics::has_invalid;
-use crate::edit::Overlay;
+use crate::edit::{Overlay, RowId, Segment};
 use crate::index::RowIndex;
 use crate::schedule::{Interval, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{ReadError, Source};
@@ -71,7 +71,7 @@ impl CopiedText {
 }
 
 impl Document {
-    /// Field `column` of physical row `row` in full (up to `max_chars`
+    /// Field `column` of logical row `row` in full (up to `max_chars`
     /// characters of it), with its length in characters and lines, for the
     /// cell inspector: as it reads now, edits included. `None` if the row
     /// can't be read yet (past the indexed rows).
@@ -112,7 +112,7 @@ impl Document {
                         .unwrap_or_default();
                     has_invalid(raw, encoding)
                 }
-                ViewCell::Edited(_) | ViewCell::Padding => false,
+                ViewCell::Edited(_) | ViewCell::New(_) | ViewCell::Padding => false,
             };
             let characters = value.chars().count();
             let shown = value
@@ -131,7 +131,7 @@ impl Document {
         Ok(values.pop())
     }
 
-    /// Copies physical rows `rows` and fields `columns` as tab-separated
+    /// Copies logical rows `rows` and fields `columns` as tab-separated
     /// text ([`push_tsv_cell`]) at once, on the calling thread, if every
     /// one of the rows can be read now, as [`rows`](Self::rows) reads them
     /// (from the first 64 KB, or the index), or no more rows will come (the
@@ -153,6 +153,7 @@ impl Document {
         let edits = reading.edits.overlay();
         let stale = reading.head_is_stale();
         let (index, available) = reading.rows_from(&reading.index, stale);
+        let available = edits.map().rows_within(available);
         let settled = matches!(
             index_ended(&reading.index, reading.index_job.control()),
             Some(Ok(()))
@@ -187,6 +188,10 @@ impl Document {
     #[must_use]
     pub fn estimated_copy_bytes(&self, rows: Range<usize>, columns: Range<usize>) -> u64 {
         let reading = self.current();
+        let overlay = reading.edits.overlay();
+        if !overlay.map().is_identity() {
+            return estimated_logical_copy_bytes(&reading, &overlay, rows, &columns);
+        }
         let edited: usize = reading
             .edits
             .overlay()
@@ -223,7 +228,7 @@ impl Document {
         u64::try_from(total).unwrap_or(u64::MAX)
     }
 
-    /// Copies physical rows `rows` and fields `columns` as tab-separated
+    /// Copies logical rows `rows` and fields `columns` as tab-separated
     /// text ([`push_tsv_cell`]), a row per line, as a P2 job: it pauses
     /// while the user scrolls, and a selection past the rows that can be
     /// read waits for the index to reach them, without holding a pool
@@ -283,6 +288,7 @@ impl Document {
                     };
                     let indexed = filled.row_count();
                     let (index, available) = reading.rows_from(filled, stale);
+                    let available = edits.map().rows_within(available);
                     if next >= available {
                         match more_rows(filled, filler, indexed, job) {
                             Ok(Settled::Done) => {
@@ -290,7 +296,9 @@ impl Document {
                                 // index or the file moved on since this step
                                 // looked.
                                 let now = source.changed_on_disk();
-                                if now == stale && next >= reading.rows_from(filled, now).1 {
+                                let now_available =
+                                    edits.map().rows_within(reading.rows_from(filled, now).1);
+                                if now == stale && next >= now_available {
                                     break;
                                 }
                             }
@@ -359,12 +367,13 @@ impl Drop for OwnIndex {
     }
 }
 
-/// Appends rows `rows` (all in `index`) of a copy that starts at row
-/// `first` to `out`: a line break before each row but the first, a tab
-/// between fields `columns`, and each display value as [`push_tsv_cell`]
-/// writes it, with `edits` on top. The bytes come from `file`, the source,
-/// the first 64 KB and whether they are stale, as [`bytes_in`] gives them.
-/// Returns whether they came from the first 64 KB.
+/// Appends logical rows `rows` (their original rows all in `index`) of a
+/// copy that starts at row `first` to `out`: a line break before each row
+/// but the first, a tab between fields `columns`, and each display value as
+/// [`push_tsv_cell`] writes it, with `edits` on top. Each stretch of the
+/// file's rows is one read; the bytes come from `file`, the source, the
+/// first 64 KB and whether they are stale, as [`bytes_in`] gives them.
+/// Returns whether any came from the first 64 KB.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is one thing a copy step needs; a struct would hold only these"
@@ -379,12 +388,66 @@ fn append_rows(
     columns: &Range<usize>,
     out: &mut String,
 ) -> Result<bool, ReadError> {
+    let mut from_head = false;
+    let mut logical = rows.start;
+    for segment in edits.map().segments(rows) {
+        match segment {
+            Segment::Original(range) => {
+                let start = usize::try_from(range.start).unwrap_or(usize::MAX);
+                let end = usize::try_from(range.end).unwrap_or(usize::MAX);
+                from_head |= append_physical(
+                    reading,
+                    index,
+                    file,
+                    edits,
+                    (start..end, logical),
+                    first,
+                    columns,
+                    out,
+                )?;
+                logical += end - start;
+            }
+            Segment::Inserted(range) => {
+                for n in range {
+                    if logical > first {
+                        out.push('\n');
+                    }
+                    let row = edits.inserted(n);
+                    let view = row.map(|row| {
+                        let row_edits = edits.edits(RowId::inserted(n)).map(AsRef::as_ref);
+                        RowView::inserted(&reading.parser, row, row_edits)
+                    });
+                    append_cells(view.as_ref(), columns, out);
+                    logical += 1;
+                }
+            }
+        }
+    }
+    Ok(from_head)
+}
+
+/// [`append_rows`] for physical rows `rows.0`, the first of which is
+/// logical row `rows.1`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one thing a copy step needs; a struct would hold only these"
+)]
+fn append_physical(
+    reading: &Reading,
+    index: &RowIndex,
+    file: (&Source, &[u8], bool),
+    edits: &Overlay,
+    (rows, logical): (Range<usize>, usize),
+    first: usize,
+    columns: &Range<usize>,
+    out: &mut String,
+) -> Result<bool, ReadError> {
     let Some(extent) = index.rows_extent(rows.clone()) else {
         return Ok(false);
     };
     let (bytes, from_head) = bytes_in(file.0, file.1, extent.clone(), file.2)?;
-    for row in rows {
-        if row > first {
+    for (k, row) in rows.enumerate() {
+        if logical + k > first {
             out.push('\n');
         }
         let parsed = reading
@@ -399,16 +462,81 @@ fn append_rows(
                 edits.row(row),
             )
         });
-        for column in columns.clone() {
-            if column > columns.start {
-                out.push('\t');
+        append_cells(view.as_ref(), columns, out);
+    }
+    Ok(from_head)
+}
+
+/// One row's cells `columns`, tab-separated: empty past its end (or for a
+/// row that couldn't be parsed).
+fn append_cells(view: Option<&RowView<'_>>, columns: &Range<usize>, out: &mut String) {
+    for column in columns.clone() {
+        if column > columns.start {
+            out.push('\t');
+        }
+        if let Some(value) = view.and_then(|view| view.value(column)) {
+            push_tsv_cell(out, &value);
+        }
+    }
+}
+
+/// [`Document::estimated_copy_bytes`] once rows are inserted or deleted (so
+/// the index is complete): each stretch of the file's rows by its bytes,
+/// each inserted row by its values, times the share of the columns copied,
+/// plus the edited values among them.
+fn estimated_logical_copy_bytes(
+    reading: &Reading,
+    overlay: &Overlay,
+    rows: Range<usize>,
+    columns: &Range<usize>,
+) -> u64 {
+    let index = &reading.index;
+    let mut file_bytes: usize = 0;
+    let mut edited: usize = 0;
+    let in_columns = |cells: &[(usize, Arc<str>)]| -> usize {
+        cells
+            .iter()
+            .filter(|(column, _)| columns.contains(column))
+            .map(|(_, value)| value.len())
+            .sum()
+    };
+    for segment in overlay.map().segments(rows) {
+        match segment {
+            Segment::Original(range) => {
+                let range = usize::try_from(range.start).unwrap_or(usize::MAX)
+                    ..usize::try_from(range.end).unwrap_or(usize::MAX);
+                file_bytes += index
+                    .rows_extent(range.clone())
+                    .map_or(0, |extent| extent.len());
+                edited += overlay
+                    .rows_in(range)
+                    .map(|(_, edits)| in_columns(edits.cells()))
+                    .sum::<usize>();
             }
-            if let Some(value) = view.as_ref().and_then(|view| view.value(column)) {
-                push_tsv_cell(out, &value);
+            Segment::Inserted(range) => {
+                for n in range {
+                    if let Some(row) = overlay.inserted(n) {
+                        edited += row
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .filter(|(column, _)| columns.contains(column))
+                            .map(|(_, value)| value.len())
+                            .sum::<usize>();
+                    }
+                    if let Some(edits) = overlay.edits(RowId::inserted(n)) {
+                        edited += in_columns(edits.cells());
+                    }
+                }
             }
         }
     }
-    Ok(from_head)
+    let fields = index.field_count_mode().unwrap_or(1).max(1);
+    let copied = columns.len().min(fields);
+    let bytes = u128::try_from(file_bytes).unwrap_or(u128::MAX);
+    let share = bytes * u128::try_from(copied).unwrap_or(0) / u128::try_from(fields).unwrap_or(1);
+    let total = share.saturating_add(u128::try_from(edited).unwrap_or(u128::MAX));
+    u64::try_from(total).unwrap_or(u64::MAX)
 }
 
 /// Appends one cell to tab-separated text, the way spreadsheets put cells

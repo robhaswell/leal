@@ -17,9 +17,20 @@
 //! [`Scheduler::spawn_resumable`]: crate::schedule::Scheduler::spawn_resumable
 //!
 //! **A match is a cell** whose display value holds the query
-//! ([`Matcher`]). The count and "k of N" count cells, in file order: row
-//! by row, and left to right within a row. The header row isn't searched:
-//! it isn't one of the grid's rows.
+//! ([`Matcher`]). The count and "k of N" count cells, in the document's
+//! order: row by row, and left to right within a row. The header row (the
+//! logical row 0, if the file has one) isn't one of the grid's rows, so
+//! its matches are left out of every answer.
+//!
+//! **Rows inserted and deleted** (task 2.4a, `docs/tasks/2.4.md` §5). The
+//! file's rows keep their physical row as their key, which is their
+//! logical order too, so nothing is remapped when rows come and go: a
+//! chunk passes over deleted rows, and a delete (or its undo) is caught up
+//! like a cell edit, by the rows' ids, a deleted row counting 0. Inserted
+//! rows are in memory: they are all searched when the search starts, kept
+//! in logical order with running counts of their own, and caught up the
+//! same way. A query adds both counts, with logical places worked out in
+//! the piece list the counts are right for.
 //!
 //! **What is kept.** For each row with a match, its row number and the
 //! running count of matching cells up to and including it: 12 bytes a
@@ -55,9 +66,10 @@ use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::task::Poll;
 
 use super::{Document, Place, Reading, RowView, bytes_in};
-use crate::edit::RowEdits;
+use crate::edit::{InsertedRow, Overlay, RowEdits, RowId, RowMap, Segment, Slot};
 use crate::find::{FindError, Matcher, Query};
 use crate::index::{RowIndex, Status};
+use crate::rows::RowParser;
 use crate::schedule::{Interval, Job, JobControl, JobError, JobHandle, Priority, Scheduler};
 use crate::source::{ReadError, Source};
 
@@ -102,7 +114,8 @@ pub struct SearchProgress {
     pub generation: u64,
     /// Matching cells found so far.
     pub matches: u64,
-    /// Rows searched so far: every physical row before this one.
+    /// Rows of the file searched so far: every physical row before this
+    /// one.
     pub rows_searched: usize,
     /// Whether every row has been searched.
     pub complete: bool,
@@ -135,7 +148,7 @@ pub enum SearchStep {
 /// One matching cell in a window of the grid ([`Search::matches_in`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellMatch {
-    /// The physical row.
+    /// The logical row.
     pub row: usize,
     /// The field.
     pub column: usize,
@@ -153,8 +166,8 @@ pub struct CellMatch {
 /// pauses at each chunk while the user scrolls or types. It searches the
 /// rows indexed so far and keeps up as more arrive, so it works while
 /// indexing, and ends once it has searched the last row. A match is a cell
-/// whose display value holds the query ([`Matcher`]); the header row isn't
-/// searched.
+/// whose display value holds the query ([`Matcher`]); the header row's
+/// matches are left out.
 pub struct Search {
     state: Arc<SearchState>,
     job: JobHandle<SearchSummary>,
@@ -166,8 +179,6 @@ struct SearchState {
     source: Arc<Source>,
     head: Arc<[u8]>,
     matcher: Matcher,
-    /// The first row searched: 1 if the file has a header row.
-    first_row: usize,
     /// The matches, and where the search has got to.
     found: Mutex<Found>,
     /// For catch-up jobs.
@@ -193,14 +204,59 @@ struct SearchState {
     in_chunk: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
+/// An inserted row as it is now, with its edits: `None` if it is gone.
+type InsertedNow = Option<(Arc<InsertedRow>, Option<Arc<RowEdits>>)>;
+
+/// An inserted row with matches (task 2.4a).
+#[derive(Clone, Copy, Debug)]
+struct InsertedMatch {
+    /// The inserted row's number, and its gap.
+    n: u32,
+    gap: u32,
+    /// Its logical row, in [`Found::map`].
+    logical: usize,
+    /// Its matching cells.
+    cells: u64,
+}
+
+/// A matching row, for a step: its logical row, which row it is, and the
+/// matching cells before it.
+#[derive(Clone, Copy, Debug)]
+struct MatchRow {
+    logical: usize,
+    slot: Slot,
+    before: u64,
+}
+
+/// What [`Found::next_from`] finds.
+enum Next {
+    Row(MatchRow),
+    /// An inserted row matches, but the file's rows before it haven't all
+    /// been searched yet.
+    NotYet,
+    None,
+}
+
 /// The matches found so far.
 #[derive(Debug, Default)]
 struct Found {
-    /// Rows with a match, in order.
+    /// Rows of the file with a match, by physical row, in order (which is
+    /// their logical order too: original rows never reorder). Deleted rows
+    /// aren't in it; the header row may be ([`Found::header_cells`]).
     rows: Vec<u32>,
     /// `ends[i]`: matching cells in `rows[..=i]`.
     ends: Vec<u64>,
-    /// Every row before this one has been searched.
+    /// Inserted rows with a match, in logical order (task 2.4a). They are
+    /// in memory, so they are all searched when the search starts.
+    inserted: Vec<InsertedMatch>,
+    /// `inserted_ends[i]`: matching cells in `inserted[..=i]`.
+    inserted_ends: Vec<u64>,
+    /// The piece list the counts are right for (as of `synced`): logical
+    /// places are worked out with it.
+    map: RowMap,
+    /// The file has a header row.
+    header: bool,
+    /// Every physical row before this one has been searched.
     searched: usize,
     complete: bool,
     /// Some of the rows searched were read from the first 64 KB kept in
@@ -212,8 +268,32 @@ struct Found {
 }
 
 impl Found {
+    /// Every match: in the file's rows and the inserted ones, less the
+    /// header row's.
     fn total(&self) -> u64 {
-        self.ends.last().copied().unwrap_or(0)
+        let originals = self.ends.last().copied().unwrap_or(0);
+        let inserted = self.inserted_ends.last().copied().unwrap_or(0);
+        (originals + inserted).saturating_sub(self.header_cells())
+    }
+
+    /// The matching cells of the header row (logical row 0) if the file
+    /// has one: it is searched like any row, and left out of the answers.
+    fn header_cells(&self) -> u64 {
+        if !self.header {
+            return 0;
+        }
+        match self.map.slot(0) {
+            Some(Slot::Original(row)) => match self.rows.binary_search(&row) {
+                Ok(i) => self.ends[i] - self.before(i),
+                Err(_) => 0,
+            },
+            Some(Slot::Inserted(n)) => self
+                .inserted
+                .first()
+                .filter(|m| m.n == n)
+                .map_or(0, |m| m.cells),
+            None => 0,
+        }
     }
 
     /// Each of `counts`' rows (searched rows, in order, each once) has
@@ -257,6 +337,48 @@ impl Found {
         self.ends = ends;
     }
 
+    /// The inserted rows `counts` (each inserted row's number, gap and
+    /// matching cells now; 0 if it is gone) are recounted, and every
+    /// inserted row's logical row is worked out again in `map`, which the
+    /// counts become right for. O(I log P) for I matching inserted rows.
+    fn merge_inserted(&mut self, counts: &[(u32, u32, u64)], map: RowMap) {
+        if !counts.is_empty() {
+            let touched: std::collections::HashSet<u32> =
+                counts.iter().map(|&(n, _, _)| n).collect();
+            self.inserted.retain(|m| !touched.contains(&m.n));
+            self.inserted
+                .extend(counts.iter().filter(|&&(_, _, cells)| cells > 0).map(
+                    |&(n, gap, cells)| InsertedMatch {
+                        n,
+                        gap,
+                        logical: 0,
+                        cells,
+                    },
+                ));
+        }
+        self.map = map;
+        if self.inserted.is_empty() && self.inserted_ends.is_empty() {
+            return;
+        }
+        for m in &mut self.inserted {
+            m.logical = self
+                .map
+                .logical_of_inserted(m.n, m.gap)
+                .unwrap_or(usize::MAX);
+        }
+        self.inserted.retain(|m| m.logical != usize::MAX);
+        self.inserted.sort_unstable_by_key(|m| m.logical);
+        let mut total = 0;
+        self.inserted_ends = self
+            .inserted
+            .iter()
+            .map(|m| {
+                total += m.cells;
+                total
+            })
+            .collect();
+    }
+
     /// Matching cells before `rows[i]`.
     fn before(&self, i: usize) -> u64 {
         i.checked_sub(1).map_or(0, |prev| self.ends[prev])
@@ -265,12 +387,147 @@ impl Found {
     fn row(&self, i: usize) -> usize {
         to_usize(self.rows[i])
     }
+
+    /// The matching cells before logical row `logical`, the header row's
+    /// left out.
+    fn before_logical(&self, logical: usize) -> u64 {
+        let physical = self.map.physical_at_or_after(logical);
+        let i = self.rows.partition_point(|&row| to_usize(row) < physical);
+        let j = self.inserted.partition_point(|m| m.logical < logical);
+        let inserted = j.checked_sub(1).map_or(0, |j| self.inserted_ends[j]);
+        let header = if logical > 0 { self.header_cells() } else { 0 };
+        (self.before(i) + inserted).saturating_sub(header)
+    }
+
+    /// The first logical row searched: 1 if the file has a header row.
+    fn first(&self) -> usize {
+        usize::from(self.header)
+    }
+
+    /// The first matching row at or after logical row `start`, among those
+    /// found so far.
+    fn next_from(&self, start: usize) -> Next {
+        let start = start.max(self.first());
+        let physical = self.map.physical_at_or_after(start);
+        let mut i = self.rows.partition_point(|&row| to_usize(row) < physical);
+        let j = self.inserted.partition_point(|m| m.logical < start);
+        // The file's next matching row still in the document.
+        let original = loop {
+            let Some(&row) = self.rows.get(i) else {
+                break None;
+            };
+            match self.map.logical_of(row) {
+                Ok(logical) => break Some((logical, row)),
+                Err(_) => i += 1,
+            }
+        };
+        let inserted = self
+            .inserted
+            .get(j)
+            .filter(|m| original.is_none_or(|(logical, _)| m.logical < logical));
+        let row = match (original, inserted) {
+            (_, Some(m)) => {
+                // Every row of the file before it must have been searched.
+                if !self.complete && self.map.physical_at_or_after(m.logical) > self.searched {
+                    return Next::NotYet;
+                }
+                MatchRow {
+                    logical: m.logical,
+                    slot: Slot::Inserted(m.n),
+                    before: 0,
+                }
+            }
+            (Some((logical, row)), None) => MatchRow {
+                logical,
+                slot: Slot::Original(row),
+                before: 0,
+            },
+            (None, None) => return Next::None,
+        };
+        Next::Row(MatchRow {
+            before: self.before_logical(row.logical),
+            ..row
+        })
+    }
+
+    /// The last matching row before logical row `end`, among those found
+    /// so far.
+    fn previous_before(&self, end: usize) -> Option<MatchRow> {
+        let physical = self.map.physical_at_or_after(end);
+        let mut i = self.rows.partition_point(|&row| to_usize(row) < physical);
+        let j = self.inserted.partition_point(|m| m.logical < end);
+        let original = loop {
+            let Some(k) = i.checked_sub(1) else {
+                break None;
+            };
+            let row = self.rows[k];
+            match self.map.logical_of(row) {
+                Ok(logical) => break Some((logical, row)),
+                Err(_) => i = k,
+            }
+        };
+        let inserted = j
+            .checked_sub(1)
+            .map(|j| self.inserted[j])
+            .filter(|m| original.is_none_or(|(logical, _)| m.logical > logical));
+        let row = match (original, inserted) {
+            (_, Some(m)) => MatchRow {
+                logical: m.logical,
+                slot: Slot::Inserted(m.n),
+                before: 0,
+            },
+            (Some((logical, row)), None) => MatchRow {
+                logical,
+                slot: Slot::Original(row),
+                before: 0,
+            },
+            (None, None) => return None,
+        };
+        (row.logical >= self.first()).then(|| MatchRow {
+            before: self.before_logical(row.logical),
+            ..row
+        })
+    }
+
+    /// Whether every row up to and including logical row `logical` has
+    /// been searched.
+    fn covers(&self, logical: usize) -> bool {
+        match self.map.slot(logical) {
+            Some(Slot::Original(row)) => to_usize(row) < self.searched,
+            _ => self.map.physical_at_or_after(logical) <= self.searched,
+        }
+    }
+
+    /// The matching rows among logical rows `rows`, in order.
+    fn rows_in(&self, rows: Range<usize>) -> Vec<(usize, Slot)> {
+        let rows = rows.start.max(self.first())..rows.end;
+        if rows.start >= rows.end {
+            return Vec::new();
+        }
+        let from = self.map.physical_at_or_after(rows.start);
+        let to = self.map.physical_at_or_after(rows.end);
+        let start = self.rows.partition_point(|&row| to_usize(row) < from);
+        let end = self.rows.partition_point(|&row| to_usize(row) < to);
+        let mut wanted: Vec<(usize, Slot)> = self.rows[start..end.max(start)]
+            .iter()
+            .filter_map(|&row| Some((self.map.logical_of(row).ok()?, Slot::Original(row))))
+            .collect();
+        wanted.extend(
+            self.inserted
+                .iter()
+                .filter(|m| rows.contains(&m.logical))
+                .map(|m| (m.logical, Slot::Inserted(m.n))),
+        );
+        wanted.sort_unstable_by_key(|&(logical, _)| logical);
+        wanted
+    }
 }
 
 impl Document {
     /// Starts searching the current reading for `query` (the find bar,
     /// task 1.8), as a P2 job (see [`Search`]). It returns at once; the
-    /// [`Search`] gives what it has found so far.
+    /// [`Search`] gives what it has found so far. Inserted rows (task 2.4a)
+    /// are in memory and are searched here, before it returns.
     ///
     /// # Errors
     ///
@@ -278,20 +535,23 @@ impl Document {
     pub fn find(&self, query: &Query) -> Result<Search, FindError> {
         let reading = self.current();
         let matcher = Matcher::new(query, reading.detection.encoding)?;
-        let first_row = usize::from(reading.detection.header);
+        let header = reading.detection.header;
         // A search starts from the edits as they are when it starts.
-        let synced = reading.edits.version();
+        let (overlay, synced) = reading.edits.snapshot();
+        let mut found = Found {
+            header,
+            synced,
+            ..Found::default()
+        };
+        let counts = inserted_counts(&reading.parser, &matcher, &overlay);
+        found.merge_inserted(&counts, overlay.map().clone());
+        drop(overlay);
         let state = Arc::new(SearchState {
             source: Arc::clone(&reading.source),
             head: Arc::clone(&reading.head),
             reading,
             matcher,
-            first_row,
-            found: Mutex::new(Found {
-                searched: first_row,
-                synced,
-                ..Found::default()
-            }),
+            found: Mutex::new(found),
             scheduler: self.scheduler.clone(),
             catching_up: Mutex::new(()),
             catch_up_started: AtomicBool::new(false),
@@ -308,6 +568,52 @@ impl Document {
             .spawn_resumable(Priority::P2, Interval::Find, move |job| worker.turn(job));
         Ok(Search { state, job })
     }
+}
+
+/// Every inserted row in `overlay` with a match: its number, gap and
+/// matching cells.
+fn inserted_counts(
+    parser: &RowParser,
+    matcher: &Matcher,
+    overlay: &Overlay,
+) -> Vec<(u32, u32, u64)> {
+    let map = overlay.map();
+    let Some(len) = map.len() else {
+        return Vec::new();
+    };
+    let mut counts = Vec::new();
+    for segment in map.segments(0..len) {
+        let Segment::Inserted(range) = segment else {
+            continue;
+        };
+        for n in range {
+            let Some(row) = overlay.inserted(n) else {
+                continue;
+            };
+            let edits = overlay.edits(RowId::inserted(n)).map(AsRef::as_ref);
+            let cells = inserted_cells_matching(parser, matcher, row, edits);
+            if cells > 0 {
+                counts.push((n, row.gap(), cells));
+            }
+        }
+    }
+    counts
+}
+
+/// How many of an inserted row's cells match, as it reads with `edits`.
+fn inserted_cells_matching(
+    parser: &RowParser,
+    matcher: &Matcher,
+    row: &InsertedRow,
+    edits: Option<&RowEdits>,
+) -> u64 {
+    let view = RowView::inserted(parser, row, edits);
+    let matching = view
+        .filled()
+        .into_iter()
+        .filter(|&(_, cell)| matcher.is_match(&view.value_of(cell)))
+        .count();
+    to_u64(matching)
 }
 
 impl Search {
@@ -372,11 +678,11 @@ impl Search {
     }
 
     /// **Next** (`forward`) or **Previous** from the cell `from` (a
-    /// physical row and a field), which need not be a match: the first
-    /// match after it, or the last one before it, in file order. With no
-    /// `from`, the first match (forward) or the last one. Past the last
-    /// match it wraps round to the first, and before the first to the last,
-    /// once the search is complete; until then it is
+    /// logical row and a field), which need not be a match: the first
+    /// match after it, or the last one before it, in the document's order.
+    /// With no `from`, the first match (forward) or the last one. Past the
+    /// last match it wraps round to the first, and before the first to the
+    /// last, once the search is complete; until then it is
     /// [`SearchStep::Pending`]. It is also `Pending` while edits are being
     /// counted ([`SearchProgress::catching_up`]).
     ///
@@ -397,48 +703,49 @@ impl Search {
     }
 
     fn step_forward(&self, from: Option<Place>) -> Result<SearchStep, ReadError> {
-        let start = from.map_or(0, |place| place.row);
+        let mut start = from.map_or(0, |place| place.row);
         loop {
             // The first matching row at or after `from`'s, among the
             // matches found by now.
-            let mut i = self
-                .state
-                .lock()
-                .rows
-                .partition_point(|&row| to_usize(row) < start);
-            while let Some((row, before)) = self.match_row(i) {
-                let columns = self.state.columns_of(row)?;
+            loop {
+                // The lock is let go before the row is read.
+                let next = self.state.lock().next_from(start);
+                let Next::Row(row) = next else {
+                    break;
+                };
+                let columns = self.state.columns_of(row.slot)?;
                 let next = match from {
-                    Some(place) if place.row == row => {
+                    Some(place) if place.row == row.logical => {
                         columns.iter().position(|&column| column > place.column)
                     }
                     _ => (!columns.is_empty()).then_some(0),
                 };
                 if let Some(rank) = next {
-                    return Ok(found(row, columns[rank], before, rank, false));
+                    return Ok(found(row.logical, columns[rank], row.before, rank, false));
                 }
-                i += 1;
+                start = row.logical + 1;
             }
             self.state.before_settling();
             let (complete, first) = {
                 let found = self.state.lock();
                 // A chunk may have landed since the last look, and the
                 // search may have finished with it: its rows come first.
-                if found.rows.len() > i {
+                if matches!(found.next_from(start), Next::Row(_)) {
                     continue;
                 }
-                (
-                    found.complete,
-                    (!found.rows.is_empty()).then(|| found.row(0)),
-                )
+                let first = match found.next_from(0) {
+                    Next::Row(row) => Some(row),
+                    Next::NotYet | Next::None => None,
+                };
+                (found.complete, first)
             };
             return match (complete, first) {
                 (false, _) => Ok(SearchStep::Pending),
                 (true, None) => Ok(SearchStep::NotFound),
                 (true, Some(row)) => {
-                    let columns = self.state.columns_of(row)?;
+                    let columns = self.state.columns_of(row.slot)?;
                     Ok(match columns.first() {
-                        Some(&column) => found(row, column, 0, 0, true),
+                        Some(&column) => found(row.logical, column, 0, 0, true),
                         None => SearchStep::NotFound,
                     })
                 }
@@ -450,34 +757,33 @@ impl Search {
         // Rows between the last searched one and `from` may still hold the
         // previous match, so it is only looked for once they are searched.
         let settled =
-            |found: &Found| found.complete || from.is_some_and(|place| place.row < found.searched);
+            |found: &Found| found.complete || from.is_some_and(|place| found.covers(place.row));
+        let mut end = from.map_or(usize::MAX, |place| place.row.saturating_add(1));
         loop {
-            let (mut i, was_settled) = {
+            let (mut row, was_settled) = {
                 let found = self.state.lock();
-                let i = match from {
-                    Some(place) => found
-                        .rows
-                        .partition_point(|&row| to_usize(row) <= place.row),
-                    None => found.rows.len(),
-                };
-                (i, settled(&found))
+                (found.previous_before(end), settled(&found))
             };
             if was_settled {
-                while let Some(j) = i.checked_sub(1) {
-                    let Some((row, before)) = self.match_row(j) else {
-                        break;
-                    };
-                    let columns = self.state.columns_of(row)?;
+                while let Some(matching) = row {
+                    let columns = self.state.columns_of(matching.slot)?;
                     let previous = match from {
-                        Some(place) if place.row == row => {
+                        Some(place) if place.row == matching.logical => {
                             columns.iter().rposition(|&column| column < place.column)
                         }
                         _ => columns.len().checked_sub(1),
                     };
                     if let Some(rank) = previous {
-                        return Ok(found(row, columns[rank], before, rank, false));
+                        return Ok(found(
+                            matching.logical,
+                            columns[rank],
+                            matching.before,
+                            rank,
+                            false,
+                        ));
                     }
-                    i = j;
+                    end = matching.logical;
+                    row = self.state.lock().previous_before(end);
                 }
             }
             self.state.before_settling();
@@ -488,30 +794,22 @@ impl Search {
                 if !was_settled && settled(&found) {
                     continue;
                 }
-                let last = found.rows.len().checked_sub(1);
-                (
-                    found.complete,
-                    last.map(|i| (found.row(i), found.before(i))),
-                )
+                (found.complete, found.previous_before(usize::MAX))
             };
             return match (complete, last) {
                 (false, _) => Ok(SearchStep::Pending),
                 (true, None) => Ok(SearchStep::NotFound),
-                (true, Some((row, before))) => {
-                    let columns = self.state.columns_of(row)?;
+                (true, Some(row)) => {
+                    let columns = self.state.columns_of(row.slot)?;
                     Ok(match columns.len().checked_sub(1) {
-                        Some(rank) => found(row, columns[rank], before, rank, from.is_some()),
+                        Some(rank) => {
+                            found(row.logical, columns[rank], row.before, rank, from.is_some())
+                        }
                         None => SearchStep::NotFound,
                     })
                 }
             };
         }
-    }
-
-    /// The `i`th matching row and the matching cells before it.
-    fn match_row(&self, i: usize) -> Option<(usize, u64)> {
-        let found = self.state.lock();
-        (i < found.rows.len()).then(|| (found.row(i), found.before(i)))
     }
 
     /// The 1-based number of the match at `place` among all of them ("k of
@@ -522,25 +820,28 @@ impl Search {
     /// As for [`step`](Self::step).
     pub fn ordinal(&self, place: Place) -> Result<Option<u64>, ReadError> {
         self.catch_up()?;
-        let before = {
+        let (slot, before) = {
             let found = self.state.lock();
-            let i = found.rows.partition_point(|&row| to_usize(row) < place.row);
-            if i >= found.rows.len() || found.row(i) != place.row {
+            let Some((logical, slot)) = found
+                .rows_in(place.row..place.row.saturating_add(1))
+                .first()
+                .copied()
+            else {
                 return Ok(None);
-            }
-            found.before(i)
+            };
+            (slot, found.before_logical(logical))
         };
-        let columns = self.state.columns_of(place.row)?;
+        let columns = self.state.columns_of(slot)?;
         Ok(columns
             .iter()
             .position(|&column| column == place.column)
             .map(|rank| before + to_u64(rank) + 1))
     }
 
-    /// The matches found so far among rows `rows` and fields `columns` (a
-    /// window of the grid), with where the query is in the first
-    /// `max_chars` characters of each, for the grid's highlights. Only the
-    /// matching rows are read.
+    /// The matches found so far among logical rows `rows` and fields
+    /// `columns` (a window of the grid), with where the query is in the
+    /// first `max_chars` characters of each, for the grid's highlights.
+    /// Only the matching rows are read.
     ///
     /// # Errors
     ///
@@ -552,41 +853,24 @@ impl Search {
         max_chars: usize,
     ) -> Result<Vec<CellMatch>, ReadError> {
         self.catch_up()?;
-        let wanted: Vec<usize> = {
-            let found = self.state.lock();
-            let start = found
-                .rows
-                .partition_point(|&row| to_usize(row) < rows.start);
-            let end = found.rows.partition_point(|&row| to_usize(row) < rows.end);
-            found.rows[start..end.max(start)]
-                .iter()
-                .map(|&row| to_usize(row))
-                .collect()
-        };
+        let wanted = self.state.lock().rows_in(rows);
         let state = &self.state;
         let mut matches = Vec::new();
-        for row in wanted {
-            let parser = &state.reading.parser;
-            let Some(RowRead { bytes, base, index }) = state.row_bytes(row)? else {
-                continue;
-            };
-            let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
-                continue;
-            };
-            let edits = state.reading.edits.row(row);
-            let view = RowView::new(parser, &bytes, base, &parsed, edits.as_deref());
-            for column in columns.start..columns.end.min(view.len()) {
-                let Some(value) = view.value(column) else {
-                    continue;
-                };
-                if state.matcher.is_match(&value) {
-                    matches.push(CellMatch {
-                        row,
-                        column,
-                        ranges: state.matcher.utf16_ranges(&value, max_chars),
-                    });
+        for (row, slot) in wanted {
+            state.with_view(slot, |view| {
+                for column in columns.start..columns.end.min(view.len()) {
+                    let Some(value) = view.value(column) else {
+                        continue;
+                    };
+                    if state.matcher.is_match(&value) {
+                        matches.push(CellMatch {
+                            row,
+                            column,
+                            ranges: state.matcher.utf16_ranges(&value, max_chars),
+                        });
+                    }
                 }
-            }
+            })?;
         }
         Ok(matches)
     }
@@ -675,7 +959,9 @@ impl SearchState {
     /// One turn of the job: search the rows that can be read, a chunk at a
     /// time, and once caught up with the index, end the turn until it has
     /// more ([`more_rows`]). The search's place is `found.searched`, so a
-    /// turn starts where the last one stopped.
+    /// turn starts where the last one stopped. The file's rows are searched
+    /// by physical row, passing over deleted ones (task 2.4a); inserted
+    /// rows were searched when the search started.
     ///
     /// Each step looks once at whether the first 64 KB are stale, for both
     /// the rows and their bytes. If they turn stale after the search read
@@ -691,7 +977,7 @@ impl SearchState {
                 if stale && found.used_head {
                     found.rows.clear();
                     found.ends.clear();
-                    found.searched = self.first_row;
+                    found.searched = 0;
                     found.used_head = false;
                 }
                 found.searched
@@ -714,17 +1000,19 @@ impl SearchState {
                 }
             }
             let end = chunk_end(index, next, available);
-            // The chunk is searched with its rows' edits as they are now,
-            // without holding the rest of the overlay (so an edit meanwhile
-            // doesn't copy it); any made meanwhile are caught up as it is
-            // added.
-            let (edits, version) = self.reading.edits.rows_in(next..end);
-            let (hits, from_head) = self.search_rows(index, next..end, stale, &edits)?;
-            drop(edits);
+            // The chunk is searched with its rows' edits, and which of them
+            // are still in the document, as they are now, without holding
+            // the rest of the overlay (so an edit meanwhile doesn't copy
+            // it); any made meanwhile are caught up as it is added.
+            let chunk = self.reading.edits.rows_in(next..end);
+            let (hits, from_head) =
+                self.search_rows(index, next..end, stale, &chunk.edited, &chunk.live)?;
+            let version = chunk.version;
+            drop(chunk);
             self.in_chunk();
             let mut found = self.lock();
             for (row, cells) in hits {
-                let total = found.total() + u64::from(cells);
+                let total = found.ends.last().copied().unwrap_or(0) + u64::from(cells);
                 found.rows.push(u32::try_from(row).unwrap_or(u32::MAX));
                 found.ends.push(total);
             }
@@ -746,19 +1034,21 @@ impl SearchState {
         found.searched = found.searched.max(available);
         Poll::Ready(Ok(SearchSummary {
             matches: found.total(),
-            rows: found.rows.len(),
+            rows: found.rows.len() + found.inserted.len(),
         }))
     }
 
     /// The rows of `rows` (in `index`) with matches, how many cells of
     /// each match, and whether they were read from the first 64 KB kept in
-    /// memory (trusted unless `head_stale`), with `edits` on top.
+    /// memory (trusted unless `head_stale`), with `edits` on top. Only the
+    /// rows in `live` (not deleted) are counted.
     fn search_rows(
         &self,
         index: &RowIndex,
         rows: Range<usize>,
         head_stale: bool,
         edits: &[(usize, Arc<RowEdits>)],
+        live: &[Range<usize>],
     ) -> Result<(Vec<(usize, u32)>, bool), JobError> {
         let Some(extent) = index.rows_extent(rows.clone()) else {
             return Ok((Vec::new(), false));
@@ -769,6 +1059,13 @@ impl SearchState {
         // search below can't see their edited values, so it passes over
         // them. (`edits` are in row order.)
         let edited = |row: usize| edits.binary_search_by_key(&row, |&(r, _)| r).is_ok();
+        let all_live = live.len() == 1 && live[0] == rows;
+        let is_live = |row: usize| {
+            all_live || {
+                let i = live.partition_point(|range| range.end <= row);
+                live.get(i).is_some_and(|range| range.contains(&row))
+            }
+        };
         let mut hits = Vec::new();
         // `at` is where `row` starts, in `bytes`.
         let mut at = 0;
@@ -785,7 +1082,7 @@ impl SearchState {
             if holder >= rows.end {
                 break;
             }
-            if !edited(holder) {
+            if !edited(holder) && is_live(holder) {
                 let cells = self.cells_matching(index, holder, &bytes, base);
                 if cells > 0 {
                     hits.push((holder, cells));
@@ -854,19 +1151,20 @@ impl SearchState {
 
     /// Catches the counts up with the edits made since they were last right
     /// (`Found::synced`): each row those edits touched that the search has
-    /// searched is recounted as it reads now, without holding the counts'
-    /// lock, then the counts are rebuilt in one pass (`Found::merge`). If a
-    /// chunk was added meanwhile, it goes round again. Returns whether the
-    /// counts are caught up.
+    /// searched is recounted as it reads now (0 if it is deleted), without
+    /// holding the counts' lock, then the counts are rebuilt in one pass
+    /// (`Found::merge`, and `Found::merge_inserted` for inserted rows,
+    /// which are all searched). If a chunk was added meanwhile, it goes
+    /// round again. Returns whether the counts are caught up.
     ///
     /// With no edits since, it returns at once, taking no lock but the
     /// counts'. A main-thread query ([`CatchUp::Inline`]) does only a
     /// little: it gives up, returning `false`, if the edits since touched
-    /// more than [`INLINE_ROWS`] rows (or made that many changes), or the
-    /// counts have more than [`INLINE_MATCHING_ROWS`] matching rows to
-    /// rebuild, or another catch-up is running. A job checkpoints every
-    /// [`CATCH_UP_ROWS`] rows, and if it is cancelled it returns `false`
-    /// without moving the counts on.
+    /// more than [`INLINE_ROWS`] rows (a row insert or delete counts each
+    /// of its rows), or the counts have more than [`INLINE_MATCHING_ROWS`]
+    /// matching rows to rebuild, or another catch-up is running. A job
+    /// checkpoints every [`CATCH_UP_ROWS`] rows, and if it is cancelled it
+    /// returns `false` without moving the counts on.
     fn catch_up(&self, how: CatchUp<'_>) -> Result<bool, ReadError> {
         let inline = matches!(how, CatchUp::Inline);
         let version = self.reading.edits.version();
@@ -896,38 +1194,69 @@ impl SearchState {
                 let found = self.lock();
                 (found.synced, found.searched, found.rows.len())
             };
-            let (touched, version) = self.reading.edits.since(synced);
-            let touched: Vec<(usize, Option<Arc<RowEdits>>)> = touched
-                .into_iter()
-                .filter(|&(row, _)| row >= self.first_row && row < searched)
-                .collect();
-            let big = touched.len() > INLINE_ROWS
-                || (!touched.is_empty() && matching > INLINE_MATCHING_ROWS);
+            let (touched, map, version) = self.reading.edits.since(synced);
+            let mut originals: Vec<(usize, Option<Arc<RowEdits>>)> = Vec::new();
+            let mut inserted: Vec<(u32, InsertedNow)> = Vec::new();
+
+            for touched in touched {
+                if let Some(row) = touched.id.physical() {
+                    let row = to_usize(row);
+                    if row >= searched {
+                        continue;
+                    }
+                    originals.push((row, touched.edits));
+                } else if let Some(n) = touched.id.inserted_index() {
+                    inserted.push((n, touched.inserted.map(|row| (row, touched.edits))));
+                }
+            }
+            let rows = originals.len() + inserted.len();
+            let big = rows > INLINE_ROWS || (rows > 0 && matching > INLINE_MATCHING_ROWS);
             if inline && big {
                 return Ok(false);
             }
-            let mut counts = Vec::with_capacity(touched.len());
-            for (i, (row, edits)) in touched.into_iter().enumerate() {
+            let mut counts = Vec::with_capacity(originals.len());
+            for (i, (row, edits)) in originals.into_iter().enumerate() {
                 if let CatchUp::Job(job) = how
                     && i % CATCH_UP_ROWS == 0
                     && job.checkpoint().is_err()
                 {
                     return Ok(false);
                 }
-                let cells = match self.row_bytes(row)? {
-                    Some(RowRead { bytes, base, index }) => {
-                        self.edited_cells_matching(index, row, &bytes, base, edits.as_deref())
+                // A deleted row has no matches.
+                let gone = map
+                    .logical_of(u32::try_from(row).unwrap_or(u32::MAX))
+                    .is_err();
+                let cells = if gone {
+                    0
+                } else {
+                    match self.row_bytes(row)? {
+                        Some(RowRead { bytes, base, index }) => {
+                            self.edited_cells_matching(index, row, &bytes, base, edits.as_deref())
+                        }
+                        None => 0,
                     }
-                    None => 0,
                 };
                 counts.push((row, u64::from(cells)));
             }
+            let parser = &self.reading.parser;
+            let inserted_counts: Vec<(u32, u32, u64)> = inserted
+                .into_iter()
+                .map(|(n, now)| match now {
+                    Some((row, edits)) => (
+                        n,
+                        row.gap(),
+                        inserted_cells_matching(parser, &self.matcher, &row, edits.as_deref()),
+                    ),
+                    None => (n, 0, 0),
+                })
+                .collect();
             let mut found = self.lock();
             if found.synced != synced || found.searched != searched {
                 // A chunk was added (or the search started again) meanwhile.
                 continue;
             }
             found.merge(&counts);
+            found.merge_inserted(&inserted_counts, map);
             found.synced = version;
             drop(found);
             if self.reading.edits.version() == version {
@@ -1052,24 +1381,50 @@ impl SearchState {
         count
     }
 
-    /// Which of row `row`'s cells match as it reads now, in order.
-    fn columns_of(&self, row: usize) -> Result<Vec<usize>, ReadError> {
-        let Some(RowRead { bytes, base, index }) = self.row_bytes(row)? else {
-            return Ok(Vec::new());
-        };
+    /// Hands row `slot`, as it reads now, to `each`; nothing if it can't
+    /// be read (or is gone).
+    fn with_view(&self, slot: Slot, each: impl FnOnce(&RowView<'_>)) -> Result<(), ReadError> {
         let parser = &self.reading.parser;
-        let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
-            return Ok(Vec::new());
-        };
-        let edits = self.reading.edits.row(row);
-        let view = RowView::new(parser, &bytes, base, &parsed, edits.as_deref());
-        // Padding is empty, and a query never is, so it never matches.
-        Ok(view
-            .filled()
-            .into_iter()
-            .filter(|&(_, cell)| self.matcher.is_match(&view.value_of(cell)))
-            .map(|(column, _)| column)
-            .collect())
+        match slot {
+            Slot::Original(row) => {
+                let row = to_usize(row);
+                let Some(RowRead { bytes, base, index }) = self.row_bytes(row)? else {
+                    return Ok(());
+                };
+                let Some(parsed) = parser.parse_row_in(index, row, &bytes, base) else {
+                    return Ok(());
+                };
+                let edits = self.reading.edits.row(row);
+                each(&RowView::new(
+                    parser,
+                    &bytes,
+                    base,
+                    &parsed,
+                    edits.as_deref(),
+                ));
+            }
+            Slot::Inserted(n) => {
+                if let Some((row, edits)) = self.reading.edits.inserted(n) {
+                    each(&RowView::inserted(parser, &row, edits.as_deref()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Which of row `slot`'s cells match as it reads now, in order.
+    fn columns_of(&self, slot: Slot) -> Result<Vec<usize>, ReadError> {
+        let mut columns = Vec::new();
+        self.with_view(slot, |view| {
+            // Padding is empty, and a query never is, so it never matches.
+            columns = view
+                .filled()
+                .into_iter()
+                .filter(|&(_, cell)| self.matcher.is_match(&view.value_of(cell)))
+                .map(|(column, _)| column)
+                .collect();
+        })?;
+        Ok(columns)
     }
 
     /// Row `row`'s bytes (line ending included), their offset in the file

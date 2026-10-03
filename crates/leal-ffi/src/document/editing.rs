@@ -20,9 +20,18 @@
 //! refused with [`EditRefusal::OtherLineage`], so the app clears its undo
 //! stack then.
 //!
-//! Rows are physical rows (the header row, if any, is row 0, and can be
-//! edited), as everywhere in this crate. A missing cell (past the end of
-//! its row: a hatched cell) is `nil`, not `""`.
+//! **Rows** (task 2.4a). [`Document::insert_rows`] and
+//! [`Document::delete_rows`] give commands too, undone and redone the same
+//! way: their [`EditCommand::rows`] holds the rows, which the app keeps
+//! but can't look into beyond [`RowEdit`]'s summary. They need the whole
+//! file read, and no save running ([`Document::can_change_rows`]).
+//!
+//! Rows are logical rows: as the document has them now, after any rows
+//! inserted or deleted (the header row, if any, is row 0, and can be
+//! edited). A missing cell (past the end of its row: a hatched cell) is
+//! `nil`, not `""`.
+
+use std::sync::Arc;
 
 use leal_core::edit::{self, CellChange, Command, Edit, EditError, Lineage};
 
@@ -47,7 +56,7 @@ pub struct UnencodableCharacter {
 /// `nil` is a missing cell.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ValueChange {
-    /// The physical row.
+    /// The logical row.
     pub row: u64,
     /// The column: a field of the row, or a cell past its end.
     pub column: u32,
@@ -64,14 +73,52 @@ pub struct EditCommand {
     /// The edits it belongs to ([`Document::lineage`]).
     pub lineage: u64,
     /// The cells it changes, in order: one for an edit, several for a
-    /// batch (all or nothing).
+    /// batch (all or nothing). Empty for a row insert or delete.
     pub changes: Vec<ValueChange>,
+    /// The rows it inserts or deletes, for a row insert or delete.
+    pub rows: Option<Arc<RowEdit>>,
+}
+
+/// A row insert or delete, inside an [`EditCommand`]: opaque to the app,
+/// which keeps it for undo and redo, but for where the rows are. See
+/// `leal_core::edit::Edit::InsertRows`.
+#[derive(Debug, PartialEq, Eq, uniffi::Object)]
+pub struct RowEdit {
+    edit: Edit,
+}
+
+#[uniffi::export]
+impl RowEdit {
+    /// Whether it inserts rows (its undo deletes them), rather than
+    /// deleting them.
+    #[must_use]
+    pub fn inserts(&self) -> bool {
+        matches!(self.edit, Edit::InsertRows { .. })
+    }
+
+    /// The first row's logical row.
+    #[must_use]
+    pub fn first_row(&self) -> u64 {
+        match &self.edit {
+            Edit::InsertRows { at, .. } | Edit::DeleteRows { at, .. } => to_u64(*at),
+            Edit::SetCell(_) | Edit::SetCells(_) => 0,
+        }
+    }
+
+    /// How many rows.
+    #[must_use]
+    pub fn row_count(&self) -> u64 {
+        match &self.edit {
+            Edit::InsertRows { rows, .. } | Edit::DeleteRows { rows, .. } => to_u64(rows.len()),
+            Edit::SetCell(_) | Edit::SetCells(_) => 0,
+        }
+    }
 }
 
 /// One cell to set, for [`Document::set_cells`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CellEdit {
-    /// The physical row.
+    /// The logical row.
     pub row: u64,
     /// The column.
     pub column: u32,
@@ -82,7 +129,7 @@ pub struct CellEdit {
 /// A cell, for [`Document::edit_conflicts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct CellPlace {
-    /// The physical row.
+    /// The logical row.
     pub row: u64,
     /// The column.
     pub column: u32,
@@ -108,6 +155,13 @@ pub enum EditRefusal {
     /// The command was made before the file was read with another
     /// delimiter or encoding.
     OtherLineage,
+    /// Rows can't be inserted or deleted until the whole file has been
+    /// read (ADR-0014 decision 1): disable Insert and Delete Row, saying
+    /// so, and try again once the index is complete.
+    StillReading,
+    /// Rows can't be inserted or deleted, nor such a command undone or
+    /// redone, while a save runs (ADR-0014 decision 1).
+    Saving,
     /// The row couldn't be read (its drive or share went away).
     Unreadable,
 }
@@ -133,12 +187,16 @@ pub struct ReplayReport {
 
 impl From<Command> for EditCommand {
     fn from(command: Command) -> Self {
-        let changes = match command.edit {
-            Edit::SetCell(change) => vec![change],
-            Edit::SetCells(changes) => changes,
+        let (changes, rows) = match command.edit {
+            Edit::SetCell(change) => (vec![change], None),
+            Edit::SetCells(changes) => (changes, None),
+            edit @ (Edit::InsertRows { .. } | Edit::DeleteRows { .. }) => {
+                (Vec::new(), Some(Arc::new(RowEdit { edit })))
+            }
         };
         EditCommand {
             lineage: command.lineage.get(),
+            rows,
             changes: changes
                 .into_iter()
                 .map(|change| ValueChange {
@@ -154,6 +212,12 @@ impl From<Command> for EditCommand {
 
 impl From<EditCommand> for Command {
     fn from(command: EditCommand) -> Self {
+        if let Some(rows) = command.rows {
+            return Command {
+                lineage: Lineage::from_raw(command.lineage),
+                edit: rows.edit.clone(),
+            };
+        }
         let mut changes: Vec<CellChange> = command
             .changes
             .into_iter()
@@ -191,6 +255,8 @@ fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
             (EditRefusal::ValueChanged, Some(row), Some(column))
         }
         EditError::OtherLineage => (EditRefusal::OtherLineage, None, None),
+        EditError::StillReading => (EditRefusal::StillReading, None, None),
+        EditError::Saving => (EditRefusal::Saving, None, None),
         EditError::Read { row, .. } => (EditRefusal::Unreadable, Some(row), None),
     }
 }
@@ -271,6 +337,88 @@ impl Document {
         })
     }
 
+    /// Inserts `rows` (each a row's values; an empty one has one empty
+    /// cell) before logical row `at` (the row count appends them), as one
+    /// command for the undo manager. A row inserted at 0 becomes the header
+    /// row when the file has one, so the app's **Insert Row Above** on the
+    /// first data row inserts at 1. `nil` if `rows` is empty. Fast enough
+    /// for the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::EditRefused`] with [`EditRefusal::StillReading`],
+    /// [`EditRefusal::Saving`], [`EditRefusal::NoSuchRow`] or
+    /// [`EditRefusal::AfterUnterminatedQuote`], with the document
+    /// unchanged; [`LealError::DocumentFailed`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "UniFFI passes a list from Swift by value"
+    )]
+    pub fn insert_rows(
+        &self,
+        at: u64,
+        rows: Vec<Vec<String>>,
+    ) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .insert_rows(to_index(at), &rows)
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Deletes logical rows `at..at + count`, as one command for the undo
+    /// manager: undo puts the same rows back, their original bytes and
+    /// edits included. `nil` if `count` is 0.
+    ///
+    /// # Errors
+    ///
+    /// As for [`insert_rows`](Self::insert_rows).
+    pub fn delete_rows(&self, at: u64, count: u64) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .delete_rows(to_index(at), to_index(count))
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Whether rows can be inserted or deleted now, for enabling **Insert
+    /// Row** and **Delete Row**: `nil` if they can, otherwise why not
+    /// ([`EditRefusal::StillReading`] or [`EditRefusal::Saving`]).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_change_rows(&self) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_change_rows()
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// Whether rows can be inserted before logical row `at` now: `nil` if
+    /// they can, otherwise why not (as [`can_change_rows`], or after an
+    /// unterminated quote's row).
+    ///
+    /// [`can_change_rows`]: Self::can_change_rows
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_insert_rows(&self, at: u64) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_insert_rows(to_index(at))
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
     /// Whether the cell can be edited now, for deciding before the in-cell
     /// editor opens: `nil` if it can, otherwise why not.
     ///
@@ -312,7 +460,8 @@ impl Document {
     }
 
     /// Undoes `command`: each cell goes back to its old value, if it still
-    /// holds the new one, the last first.
+    /// holds the new one, the last first; inserted rows go, deleted rows
+    /// come back.
     ///
     /// # Errors
     ///

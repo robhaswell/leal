@@ -519,7 +519,7 @@ pub struct DiagnosticsReport {
 /// [`leal_core::document::Place`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct DiagnosticPlace {
-    /// The 0-based physical row (the header row, if any, is row 0).
+    /// The 0-based logical row (the header row, if any, is row 0).
     pub row: u64,
     /// The 0-based field.
     pub column: u32,

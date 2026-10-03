@@ -259,6 +259,9 @@ pub enum SaveFailure {
         /// English, for logs.
         message: String,
     },
+    /// Rows were inserted or deleted, which Leal can't save yet (task
+    /// 2.4c): nothing was written.
+    RowsChanged,
     /// The save was cancelled.
     Cancelled,
     /// The document failed after a panic (DESIGN §3.9).
@@ -333,6 +336,7 @@ impl From<&SaveError> for SaveFailure {
                 code: error.raw_os_error(),
                 message: error.to_string(),
             },
+            SaveError::RowsChanged => Self::RowsChanged,
             SaveError::Cancelled => Self::Cancelled,
             SaveError::Failed(message) => Self::Internal {
                 message: message.clone(),

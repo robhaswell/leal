@@ -57,6 +57,7 @@ fn an_edit_gives_a_command_that_undoes_and_redoes() {
                 old_value: Some("Marlow".into()),
                 new_value: Some("Marlowe".into()),
             }],
+            rows: None,
         }
     );
     assert!(document.has_unsaved_edits().unwrap());
@@ -196,6 +197,7 @@ fn replay_recovers_the_edits_and_names_those_that_no_longer_apply() {
                 old_value: Some("not what it holds".into()),
                 new_value: Some("x".into()),
             }],
+            rows: None,
         },
     ];
     let fresh = open(&dir, &scheduler, "fresh.csv");
@@ -214,6 +216,88 @@ fn replay_recovers_the_edits_and_names_those_that_no_longer_apply() {
     assert_eq!(name(&fresh, 1), ["1", "Marlowe"]);
     assert_eq!(name(&fresh, 2), ["2", "", "far"]);
     // The replayed commands undo in the fresh document.
+    for command in report.applied.into_iter().rev() {
+        fresh.undo(command).unwrap();
+    }
+    assert!(!fresh.has_unsaved_edits().unwrap());
+}
+
+/// Row inserts and deletes (task 2.4a): commands Swift undoes and redoes
+/// like any other, logical rows everywhere, and the refusals.
+#[test]
+fn rows_inserted_and_deleted_undo_redo_and_replay() {
+    let dir = TempDir::new("edit-rows");
+    let scheduler = Scheduler::new().unwrap();
+    let document = open(&dir, &scheduler, "a.csv");
+    let path = dir.file("a.csv", FILE);
+    assert_eq!(document.can_change_rows().unwrap(), None);
+    assert_eq!(document.row_count().unwrap(), 4);
+
+    let insert = document
+        .insert_rows(1, vec![vec!["0".into(), "Vane".into()]])
+        .unwrap()
+        .unwrap();
+    assert!(insert.changes.is_empty());
+    let rows = insert.rows.clone().unwrap();
+    assert!(rows.inserts());
+    assert_eq!((rows.first_row(), rows.row_count()), (1, 1));
+    assert_eq!(document.row_count().unwrap(), 5);
+    assert_eq!(name(&document, 1), ["0", "Vane"]);
+    assert_eq!(name(&document, 2), ["1", "Marlow"]);
+    // A cell of the inserted row is edited like any other.
+    let edit = document.set_cell(1, 1, "Vale").unwrap().unwrap();
+    assert_eq!(name(&document, 1), ["0", "Vale"]);
+
+    let delete = document.delete_rows(2, 2).unwrap().unwrap();
+    assert!(!delete.rows.clone().unwrap().inserts());
+    assert_eq!(document.row_count().unwrap(), 3);
+    assert_eq!(name(&document, 2), ["3", "open\nquote\n"]);
+    assert!(document.has_unsaved_edits().unwrap());
+
+    // Nothing may follow the unterminated quote's row (ADR-0004 decision 8).
+    assert_eq!(
+        document.can_insert_rows(3).unwrap(),
+        Some(EditRefusal::AfterUnterminatedQuote)
+    );
+    assert_eq!(document.can_insert_rows(2).unwrap(), None);
+    assert_eq!(
+        document.insert_rows(3, vec![vec!["x".into()]]),
+        Err(refused(
+            &path,
+            EditRefusal::AfterUnterminatedQuote,
+            Some(3),
+            Some(0)
+        ))
+    );
+    assert_eq!(
+        document.delete_rows(2, 5),
+        Err(refused(&path, EditRefusal::NoSuchRow, Some(3), None))
+    );
+
+    // Undo, last first, back to the file; redo, and undo again.
+    document.undo(delete.clone()).unwrap();
+    assert_eq!(name(&document, 2), ["1", "Marlow"]);
+    document.undo(edit.clone()).unwrap();
+    document.undo(insert.clone()).unwrap();
+    assert!(!document.has_unsaved_edits().unwrap());
+    assert_eq!(document.row_count().unwrap(), 4);
+    document.redo(insert.clone()).unwrap();
+    document.redo(edit.clone()).unwrap();
+    document.redo(delete.clone()).unwrap();
+    assert_eq!(document.row_count().unwrap(), 3);
+    assert_eq!(name(&document, 1), ["0", "Vale"]);
+
+    // Replayed into a fresh document, by value: the same rows.
+    let fresh = open(&dir, &scheduler, "b.csv");
+    let report = fresh
+        .replay(vec![insert.clone(), edit.clone(), delete.clone()])
+        .unwrap();
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    assert_eq!(report.applied.len(), 3);
+    assert_eq!(fresh.row_count().unwrap(), 3);
+    for row in 0..3 {
+        assert_eq!(name(&fresh, row), name(&document, row));
+    }
     for command in report.applied.into_iter().rev() {
         fresh.undo(command).unwrap();
     }

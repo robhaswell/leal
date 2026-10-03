@@ -457,6 +457,9 @@ pub enum SaveError {
         /// The error, with its errno.
         error: io::Error,
     },
+    /// Rows have been inserted or deleted, which Leal can't save yet (task
+    /// 2.4c): nothing was written. The app keeps the edits.
+    RowsChanged,
     /// The save was cancelled.
     Cancelled,
     /// Anything else, such as a panic in the save. English, for logs.
@@ -498,6 +501,9 @@ impl fmt::Display for SaveError {
             SaveError::NotAFile => f.write_str("something other than a file is there"),
             SaveError::Read(error) => error.fmt(f),
             SaveError::Write { step, error } => write!(f, "{step}: {error}"),
+            SaveError::RowsChanged => {
+                f.write_str("rows were inserted or deleted, which can't be saved yet")
+            }
             SaveError::Cancelled => f.write_str("the save was cancelled"),
             SaveError::Failed(message) => f.write_str(message),
         }

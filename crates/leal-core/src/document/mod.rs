@@ -67,6 +67,7 @@
 mod editing;
 mod saving;
 mod search;
+mod structural;
 #[cfg(test)]
 mod tests;
 mod values;
@@ -104,7 +105,7 @@ use crate::diagnostics::{
     next_hit, row_may_have,
 };
 use crate::dialect::{Encoding, QUOTE};
-use crate::edit::{EditStore, Kinds, Overlay, RowEdits};
+use crate::edit::{EditStore, InsertedRow, Kinds, Overlay, RowEdits, RowId, Segment, Slot};
 use crate::index::{
     DIAGNOSTICS_CHUNK_BYTES, IndexDialect, IndexError, Indexer, MAX_FILE_BYTES, Progress, RowIndex,
     Status,
@@ -125,7 +126,7 @@ use view::RowView;
 /// **Previous** and **Next** (task 1.7): the cell to select.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
-    /// The 0-based physical row (the header row, if any, is row 0).
+    /// The 0-based logical row (the header row, if any, is row 0).
     pub row: usize,
     /// The 0-based field: the one with the occurrence, or for a ragged row
     /// its first missing or extra cell.
@@ -160,6 +161,10 @@ struct RowBytes<'a, 'r> {
 /// How many candidate rows a kind's search takes from the row marks per
 /// lock.
 const SEARCH_BATCH: usize = 256;
+
+/// How many logical rows a walk over the piece list takes at a time
+/// (**Next** and **Previous** with rows inserted or deleted).
+const WALK_ROWS: usize = 1 << 20;
 
 /// The row of the occurrence of `kind` that **Next** from `start`
 /// (`Forward`) or **Previous** before it would find, if the report's
@@ -726,8 +731,8 @@ impl Document {
             // clamped first.)
             let start = columns.start.min(count);
             let window = start..columns.end.clamp(start, count);
-            let cells = if view.edits().is_none() {
-                let fields = view.parsed().fields().get(window).unwrap_or_default();
+            let cells = if let Some(parsed) = view.plain() {
+                let fields = parsed.fields().get(window).unwrap_or_default();
                 cells(view.parser(), view.bytes(), view.base(), fields, max_chars)
             } else {
                 edited_cells(&view, window, max_chars)
@@ -746,6 +751,10 @@ impl Document {
     #[must_use]
     pub fn column_count(&self) -> usize {
         let reading = self.current();
+        if reading.edits.map_len() == Some(0) {
+            // Every row deleted.
+            return 0;
+        }
         Self::rows_index(&reading).0.field_count_mode().unwrap_or(0)
     }
 
@@ -782,11 +791,51 @@ impl Document {
         Self::read_rows_of(&self.current(), rows, each)
     }
 
-    /// [`read_rows`](Self::read_rows), in a given reading.
+    /// [`read_rows`](Self::read_rows), in a given reading. `rows` are
+    /// logical rows: they are read a segment of the piece list at a time,
+    /// stretches of the file's rows as one read each, and inserted rows
+    /// from the edits.
     fn read_rows_of<T>(
         reading: &Reading,
         rows: Range<usize>,
         mut each: impl FnMut(RowView<'_>) -> T,
+    ) -> Result<Vec<T>, ReadError> {
+        // One look at the edits for the whole call: a reference count, and
+        // for each row a look-up that finds nothing when there are no edits.
+        let overlay = reading.edits.overlay();
+        let map = overlay.map();
+        if map.is_identity() {
+            return Self::read_physical(reading, &overlay, rows, &mut each);
+        }
+        let available = map.rows_within(Self::rows_index(reading).1);
+        let mut out = Vec::new();
+        for segment in map.segments(rows.start..rows.end.min(available)) {
+            match segment {
+                Segment::Original(range) => out.extend(Self::read_physical(
+                    reading,
+                    &overlay,
+                    to_usize(range.start)..to_usize(range.end),
+                    &mut each,
+                )?),
+                Segment::Inserted(range) => {
+                    for n in range {
+                        if let Some((row, edits)) = inserted_row(&overlay, n) {
+                            out.push(each(RowView::inserted(&reading.parser, row, edits)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Physical rows `rows` (as many as can be read now), each to `each`
+    /// with `overlay`'s edits on top. One read of the file.
+    fn read_physical<T>(
+        reading: &Reading,
+        overlay: &Overlay,
+        rows: Range<usize>,
+        each: &mut impl FnMut(RowView<'_>) -> T,
     ) -> Result<Vec<T>, ReadError> {
         // One look, so the rows and their bytes agree on whether the first
         // 64 KB can be trusted.
@@ -812,9 +861,6 @@ impl Document {
             rows.filter_map(|r| Some((r, cache.row_in(index, r, &bytes, base)?)))
                 .collect()
         };
-        // One look at the edits for the whole call: a reference count, and
-        // for each row a look-up that finds nothing when there are no edits.
-        let overlay = reading.edits.overlay();
         Ok(parsed
             .iter()
             .map(|(r, row)| {
@@ -835,7 +881,13 @@ impl Document {
     /// read ([`changed_on_disk`](Self::changed_on_disk)), only the index's.
     #[must_use]
     pub fn row_count(&self) -> usize {
-        Self::rows_index(&self.current()).1
+        Self::logical_rows(&self.current())
+    }
+
+    /// The logical rows that can be read now: the rows the index has, with
+    /// rows inserted and deleted (task 2.4a).
+    fn logical_rows(reading: &Reading) -> usize {
+        reading.edits.rows_within(Self::rows_index(reading).1)
     }
 
     /// The index rows are read from, and how many rows it has
@@ -849,7 +901,8 @@ impl Document {
     #[must_use]
     pub fn estimated_row_count(&self) -> usize {
         let reading = self.current();
-        estimated_rows(&reading, &reading.head, reading.source.len())
+        let estimate = estimated_rows(&reading, &reading.head, reading.source.len());
+        reading.edits.shift(estimate)
     }
 
     /// Where indexing has got to.
@@ -859,8 +912,12 @@ impl Document {
         let index = &reading.index;
         IndexProgress {
             generation: reading.generation,
-            rows: Self::rows_index(&reading).1,
-            estimated_rows: estimated_rows(&reading, &reading.head, reading.source.len()),
+            rows: Self::logical_rows(&reading),
+            estimated_rows: reading.edits.shift(estimated_rows(
+                &reading,
+                &reading.head,
+                reading.source.len(),
+            )),
             bytes_scanned: u64::try_from(index.bytes_scanned()).unwrap_or(u64::MAX),
             bytes_total: reading.source.len(),
             complete: index.status() == Status::Complete,
@@ -930,7 +987,8 @@ impl Document {
     /// (every such row, not only the report's first locations). False for a
     /// row not indexed yet. An edited row is marked as it reads now: its
     /// edited cells are checked on their new values, and its field count is
-    /// the one it has now (ADR-0008 decision 2).
+    /// the one it has now (ADR-0008 decision 2). An inserted row is marked
+    /// from its cells: ragged, or holding a NUL.
     #[must_use]
     pub fn row_has_diagnostic(&self, row: usize) -> bool {
         let reading = self.current();
@@ -938,17 +996,27 @@ impl Document {
             return false;
         };
         let overlay = reading.edits.overlay();
-        if let Some(edits) = overlay.row(row) {
-            let (marked, mode) = diagnostics.marked_rows_and_mode();
-            let len = Self::edited_len(&reading, row, edits);
-            return row < marked && edited_flags(len, edits, mode).marked;
+        match overlay.map().slot(row) {
+            None => false,
+            Some(Slot::Original(row)) => {
+                let row = to_usize(row);
+                if let Some(edits) = overlay.row(row) {
+                    let (marked, mode) = diagnostics.marked_rows_and_mode();
+                    let len = Self::edited_len(&reading, row, edits);
+                    return row < marked && edited_flags(len, edits, mode).marked;
+                }
+                diagnostics.row_has_diagnostic(row)
+            }
+            Some(Slot::Inserted(n)) => {
+                inserted_flags(&reading, &overlay, n, diagnostics.marked_rows_and_mode().1).marked
+            }
         }
-        diagnostics.row_has_diagnostic(row)
     }
 
     /// The first row at or after `from` with a warning or an error, for
     /// **Next**. Edited rows are marked as they read now, as for
-    /// [`row_has_diagnostic`](Self::row_has_diagnostic).
+    /// [`row_has_diagnostic`](Self::row_has_diagnostic); deleted rows are
+    /// passed over.
     #[must_use]
     pub fn next_row_with_diagnostic(&self, from: usize) -> Option<usize> {
         let reading = self.current();
@@ -957,28 +1025,42 @@ impl Document {
         if overlay.is_empty() {
             return diagnostics.next_row_with_diagnostic(from);
         }
-        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let map = overlay.map();
+        let Some(len) = map.len() else {
+            return Self::next_marked(&reading, diagnostics, &overlay, from..usize::MAX);
+        };
+        let mode = diagnostics.marked_rows_and_mode().1;
         let mut at = from;
-        loop {
-            // The next row the file's own marks give, and any edited row
-            // up to it that is marked now.
-            let next = diagnostics.next_row_with_diagnostic(at);
-            let end = next.map_or(marked, |row| row + 1).min(marked);
-            if let Some((row, _)) = overlay.rows_in(at..end).find(|&(row, edits)| {
-                edited_flags(Self::edited_len(&reading, row, edits), edits, mode).marked
-            }) {
-                return Some(row);
+        while at < len {
+            let end = len.min(at.saturating_add(WALK_ROWS));
+            let mut logical = at;
+            for segment in map.segments(at..end) {
+                match &segment {
+                    Segment::Original(range) => {
+                        let rows = to_usize(range.start)..to_usize(range.end);
+                        if let Some(row) = Self::next_marked(&reading, diagnostics, &overlay, rows)
+                        {
+                            return Some(logical + row - to_usize(range.start));
+                        }
+                    }
+                    Segment::Inserted(range) => {
+                        for (k, n) in range.clone().enumerate() {
+                            if inserted_flags(&reading, &overlay, n, mode).marked {
+                                return Some(logical + k);
+                            }
+                        }
+                    }
+                }
+                logical += segment.len();
             }
-            let row = next?;
-            if !overlay.contains(row) {
-                return Some(row);
-            }
-            at = row + 1;
+            at = end;
         }
+        None
     }
 
     /// The last row before `to` with a warning or an error, for
-    /// **Previous**. Edited rows are marked as they read now.
+    /// **Previous**. Edited rows are marked as they read now; deleted rows
+    /// are passed over.
     #[must_use]
     pub fn previous_row_with_diagnostic(&self, to: usize) -> Option<usize> {
         let reading = self.current();
@@ -987,22 +1069,97 @@ impl Document {
         if overlay.is_empty() {
             return diagnostics.previous_row_with_diagnostic(to);
         }
+        let map = overlay.map();
+        let Some(len) = map.len() else {
+            return Self::previous_marked(&reading, diagnostics, &overlay, 0..to);
+        };
+        let mode = diagnostics.marked_rows_and_mode().1;
+        let mut at = to.min(len);
+        while at > 0 {
+            let start = at.saturating_sub(WALK_ROWS);
+            let mut logical = start;
+            let mut segments = Vec::new();
+            for segment in map.segments(start..at) {
+                let len = segment.len();
+                segments.push((logical, segment));
+                logical += len;
+            }
+            for (logical, segment) in segments.into_iter().rev() {
+                match &segment {
+                    Segment::Original(range) => {
+                        let rows = to_usize(range.start)..to_usize(range.end);
+                        if let Some(row) =
+                            Self::previous_marked(&reading, diagnostics, &overlay, rows)
+                        {
+                            return Some(logical + row - to_usize(range.start));
+                        }
+                    }
+                    Segment::Inserted(range) => {
+                        for (k, n) in range.clone().enumerate().rev() {
+                            if inserted_flags(&reading, &overlay, n, mode).marked {
+                                return Some(logical + k);
+                            }
+                        }
+                    }
+                }
+            }
+            at = start;
+        }
+        None
+    }
+
+    /// The first marked physical row among `rows`, edited rows as they
+    /// read now.
+    fn next_marked(
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        overlay: &Overlay,
+        rows: Range<usize>,
+    ) -> Option<usize> {
         let (marked, mode) = diagnostics.marked_rows_and_mode();
-        let mut at = to;
+        let mut at = rows.start;
+        loop {
+            // The next row the file's own marks give, and any edited row
+            // up to it that is marked now.
+            let next = diagnostics.next_row_with_diagnostic(at);
+            let end = next.map_or(marked, |row| row + 1).min(marked).min(rows.end);
+            if let Some((row, _)) = overlay.rows_in(at..end).find(|&(row, edits)| {
+                edited_flags(Self::edited_len(reading, row, edits), edits, mode).marked
+            }) {
+                return Some(row);
+            }
+            let row = next.filter(|&row| row < rows.end)?;
+            if !overlay.contains(row) {
+                return Some(row);
+            }
+            at = row + 1;
+        }
+    }
+
+    /// The last marked physical row among `rows`, edited rows as they read
+    /// now.
+    fn previous_marked(
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        overlay: &Overlay,
+        rows: Range<usize>,
+    ) -> Option<usize> {
+        let (marked, mode) = diagnostics.marked_rows_and_mode();
+        let mut at = rows.end;
         loop {
             let previous = diagnostics.previous_row_with_diagnostic(at);
-            let start = previous.unwrap_or(0);
+            let start = previous.unwrap_or(0).max(rows.start);
             if let Some((row, _)) =
                 overlay
                     .rows_in(start..at.min(marked))
                     .rev()
                     .find(|&(row, edits)| {
-                        edited_flags(Self::edited_len(&reading, row, edits), edits, mode).marked
+                        edited_flags(Self::edited_len(reading, row, edits), edits, mode).marked
                     })
             {
                 return Some(row);
             }
-            let row = previous?;
+            let row = previous.filter(|&row| row >= rows.start)?;
             if !overlay.contains(row) {
                 return Some(row);
             }
@@ -1015,19 +1172,49 @@ impl Document {
     /// (ADR-0002 questions 5 and 7). Rows not indexed yet are unmarked.
     /// Edited rows are marked as they read now: a short row whose hatched
     /// cells were filled in up to the common field count is no longer
-    /// ragged, for example.
+    /// ragged, for example. Inserted rows are marked from their cells.
     #[must_use]
     pub fn row_flags(&self, rows: Range<usize>) -> Vec<RowFlags> {
         let reading = self.current();
         let Some(diagnostics) = reading.diagnostics.get() else {
             return vec![RowFlags::default(); rows.len()];
         };
-        let mut flags = diagnostics.row_flags(rows.clone());
         let overlay = reading.edits.overlay();
+        let map = overlay.map();
+        if map.is_identity() {
+            return Self::physical_flags(&reading, diagnostics, &overlay, rows);
+        }
+        let mode = diagnostics.marked_rows_and_mode().1;
+        let mut flags = Vec::with_capacity(rows.len());
+        for segment in map.segments(rows.clone()) {
+            match segment {
+                Segment::Original(range) => flags.extend(Self::physical_flags(
+                    &reading,
+                    diagnostics,
+                    &overlay,
+                    to_usize(range.start)..to_usize(range.end),
+                )),
+                Segment::Inserted(range) => {
+                    flags.extend(range.map(|n| inserted_flags(&reading, &overlay, n, mode)));
+                }
+            }
+        }
+        flags.resize(rows.len(), RowFlags::default());
+        flags
+    }
+
+    /// [`row_flags`](Self::row_flags) of physical rows `rows`.
+    fn physical_flags(
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        overlay: &Overlay,
+        rows: Range<usize>,
+    ) -> Vec<RowFlags> {
+        let mut flags = diagnostics.row_flags(rows.clone());
         if !overlay.is_empty() {
             let (marked, mode) = diagnostics.marked_rows_and_mode();
             for (row, edits) in overlay.rows_in(rows.start..rows.end.min(marked)) {
-                let len = Self::edited_len(&reading, row, edits);
+                let len = Self::edited_len(reading, row, edits);
                 flags[row - rows.start] = edited_flags(len, edits, mode);
             }
         }
@@ -1090,16 +1277,109 @@ impl Document {
         };
         let report = diagnostics.report();
         let overlay = reading.edits.overlay();
-        if overlay.is_empty() {
-            return self.search_kind(
+        let step = |physical: usize| {
+            self.step_physical(
                 &reading,
                 diagnostics,
                 &report,
+                &overlay,
                 kind,
-                start,
+                physical,
                 direction,
                 search,
-            );
+            )
+        };
+        let map = overlay.map();
+        let Some(len) = map.len() else {
+            return step(start);
+        };
+        // Rows inserted or deleted (task 2.4a): the file's rows from where
+        // `start` is among them, passing over deleted ones, then any
+        // inserted row between `start` and what they found.
+        let mode = diagnostics.marked_rows_and_mode().1;
+        let inserted = |n: u32| inserted_place(&reading, &overlay, n, kind, mode);
+        let rows = map.physical_rows().unwrap_or(0);
+        if direction == Direction::Forward {
+            let mut physical = map.physical_at_or_after(start);
+            let found = loop {
+                let Some(place) = step(physical)? else {
+                    break None;
+                };
+                let row = u32::try_from(place.row).unwrap_or(u32::MAX);
+                match map.logical_of(row) {
+                    Ok(logical) => break Some((logical, place.column)),
+                    Err(_) if row < rows => physical = to_usize(map.next_live(row + 1)),
+                    Err(_) => break None,
+                }
+            };
+            let end = found.map_or(len, |(logical, _)| logical);
+            let mut logical = start;
+            for segment in map.segments(start..end) {
+                if let Segment::Inserted(range) = &segment {
+                    for (k, n) in range.clone().enumerate() {
+                        if let Some(column) = inserted(n) {
+                            let row = logical + k;
+                            return Ok(Some(Place { row, column }));
+                        }
+                    }
+                }
+                logical += segment.len();
+            }
+            Ok(found.map(|(row, column)| Place { row, column }))
+        } else {
+            let to = start.min(len);
+            let mut physical = map.physical_at_or_after(to);
+            let found = loop {
+                let Some(place) = step(physical)? else {
+                    break None;
+                };
+                let row = u32::try_from(place.row).unwrap_or(u32::MAX);
+                match map.logical_of(row) {
+                    Ok(logical) => break Some((logical, place.column)),
+                    Err(_) => match map.live_end_before(row) {
+                        0 => break None,
+                        end => physical = to_usize(end),
+                    },
+                }
+            };
+            let begin = found.map_or(0, |(logical, _)| logical + 1);
+            let mut logical = begin;
+            let mut segments = Vec::new();
+            for segment in map.segments(begin..to) {
+                let len = segment.len();
+                segments.push((logical, segment));
+                logical += len;
+            }
+            for (logical, segment) in segments.into_iter().rev() {
+                if let Segment::Inserted(range) = &segment {
+                    for (k, n) in range.clone().enumerate().rev() {
+                        if let Some(column) = inserted(n) {
+                            let row = logical + k;
+                            return Ok(Some(Place { row, column }));
+                        }
+                    }
+                }
+            }
+            Ok(found.map(|(row, column)| Place { row, column }))
+        }
+    }
+
+    /// [`step_to_kind`](Self::step_to_kind) over the file's rows, by
+    /// physical row: from physical row `start`, the place's row physical.
+    #[allow(clippy::too_many_arguments)]
+    fn step_physical(
+        &self,
+        reading: &Reading,
+        diagnostics: &Diagnostics,
+        report: &Report,
+        overlay: &Overlay,
+        kind: DiagnosticKind,
+        start: usize,
+        direction: Direction,
+        search: u64,
+    ) -> Result<Option<Place>, ReadError> {
+        if overlay.is_empty() {
+            return self.search_kind(reading, diagnostics, report, kind, start, direction, search);
         }
         // With edits: the next occurrence in the file's own rows, unless an
         // edited row before it has the kind now. An edited row the file's
@@ -1107,7 +1387,7 @@ impl Document {
         let (marked, mode) = diagnostics.marked_rows_and_mode();
         let has = |row: usize, edits: &RowEdits| match kind {
             DiagnosticKind::RaggedRows => {
-                mode.is_some_and(|mode| Self::edited_len(&reading, row, edits) != mode)
+                mode.is_some_and(|mode| Self::edited_len(reading, row, edits) != mode)
             }
             other => edits.kinds().contains(Kinds::of(other)),
         };
@@ -1115,7 +1395,7 @@ impl Document {
         let mut at = start;
         loop {
             let found =
-                self.search_kind(&reading, diagnostics, &report, kind, at, direction, search)?;
+                self.search_kind(reading, diagnostics, report, kind, at, direction, search)?;
             let edited = if forward {
                 let end = found.map_or(marked, |place| place.row + 1).min(marked);
                 overlay
@@ -1129,7 +1409,7 @@ impl Document {
                     .find(|&(row, edits)| has(row, edits))
             };
             if let Some((row, _)) = edited {
-                return Self::place(&reading, kind, row);
+                return Self::place(reading, kind, row);
             }
             let Some(place) = found else {
                 return Ok(None);
@@ -1613,20 +1893,41 @@ fn first_screen(
     options: OpenOptions,
     edits: &Overlay,
 ) -> FirstScreen {
-    let rows = (0..paint.head_rows.min(options.first_screen_rows))
-        .filter_map(|r| {
-            let row = paint.parser.parse_row(&paint.head_index, r, head)?;
-            let view = RowView::new(&paint.parser, head, 0, &row, edits.row(r));
-            Some(row_cells(&view, options.max_chars))
-        })
-        .collect();
+    // Logical rows, through the piece list (rows inserted or deleted).
+    let map = edits.map();
+    let row_count = map.rows_within(paint.head_rows);
+    let mut rows = Vec::new();
+    for segment in map.segments(0..row_count.min(options.first_screen_rows)) {
+        match segment {
+            Segment::Original(range) => {
+                rows.extend(range.filter_map(|r| {
+                    let r = to_usize(r);
+                    let row = paint.parser.parse_row(&paint.head_index, r, head)?;
+                    let view = RowView::new(&paint.parser, head, 0, &row, edits.row(r));
+                    Some(row_cells(&view, options.max_chars))
+                }));
+            }
+            Segment::Inserted(range) => {
+                rows.extend(range.filter_map(|n| {
+                    let (row, row_edits) = inserted_row(edits, n)?;
+                    let view = RowView::inserted(&paint.parser, row, row_edits);
+                    Some(row_cells(&view, options.max_chars))
+                }));
+            }
+        }
+    }
+    let estimate = estimate_from_head(&paint.head_index, paint.head_rows, head, len);
     FirstScreen {
         generation,
         detection: paint.detection.clone(),
         rows,
-        row_count: paint.head_rows,
-        estimated_row_count: estimate_from_head(&paint.head_index, paint.head_rows, head, len),
-        column_count: paint.head_index.field_count_mode().unwrap_or(0),
+        row_count,
+        estimated_row_count: map.shift(estimate),
+        column_count: if map.len() == Some(0) {
+            0
+        } else {
+            paint.head_index.field_count_mode().unwrap_or(0)
+        },
     }
 }
 
@@ -1650,7 +1951,7 @@ fn start_jobs(
     let index_job = start_index(
         context,
         generation,
-        &index,
+        (&index, &edits),
         indexer,
         detection.encoding,
         &diagnostics,
@@ -1702,7 +2003,7 @@ fn edits_after(old: &Reading, detection: &Detection) -> Result<Arc<EditStore>, D
 fn start_index(
     context: &Context<'_>,
     generation: u64,
-    index: &Arc<RowIndex>,
+    (index, edits): (&Arc<RowIndex>, &Arc<EditStore>),
     indexer: Indexer,
     encoding: Encoding,
     diagnostics: &DiagnosticsSlot,
@@ -1710,6 +2011,7 @@ fn start_index(
     let source = Arc::clone(context.source);
     let progress = context.progress.cloned();
     let readers = Arc::clone(index);
+    let edits = Arc::clone(edits);
     let slot = Arc::clone(diagnostics);
     context
         .scheduler
@@ -1724,7 +2026,7 @@ fn start_index(
                 // so this fails only if the job was cancelled.
                 let checkpoint = job.checkpoint();
                 if let Some(progress) = &progress {
-                    progress(index_progress(generation, &readers, p));
+                    progress(index_progress(generation, &readers, p, &edits));
                 }
                 checkpoint
             };
@@ -1891,15 +2193,15 @@ fn cells(
         .collect()
 }
 
-/// Every cell of a row as it reads now. A row with no edits takes the same
-/// path as before edits existed ([`cells`]).
+/// Every cell of a row as it reads now. A row of the file with no edits
+/// takes the same path as before edits existed ([`cells`]).
 fn row_cells(view: &RowView<'_>, max_chars: usize) -> Vec<Cell> {
-    if view.edits().is_none() {
+    if let Some(parsed) = view.plain() {
         return cells(
             view.parser(),
             view.bytes(),
             view.base(),
-            view.parsed().fields(),
+            parsed.fields(),
             max_chars,
         );
     }
@@ -1919,13 +2221,19 @@ fn edited_cells(view: &RowView<'_>, columns: Range<usize>, max_chars: usize) -> 
         .collect()
 }
 
-/// A progress report for the app.
-fn index_progress(generation: u64, index: &RowIndex, progress: Progress) -> IndexProgress {
+/// A progress report for the app, in logical rows (`edits`' rows inserted
+/// and deleted).
+fn index_progress(
+    generation: u64,
+    index: &RowIndex,
+    progress: Progress,
+    edits: &EditStore,
+) -> IndexProgress {
     let complete = index.status() == Status::Complete;
     IndexProgress {
         generation,
-        rows: progress.rows,
-        estimated_rows: index.estimated_row_count().unwrap_or(0).max(progress.rows),
+        rows: edits.rows_within(progress.rows),
+        estimated_rows: edits.shift(index.estimated_row_count().unwrap_or(0).max(progress.rows)),
         bytes_scanned: u64::try_from(progress.bytes_scanned).unwrap_or(u64::MAX),
         bytes_total: u64::try_from(progress.bytes_total).unwrap_or(u64::MAX),
         complete,
@@ -1964,4 +2272,52 @@ fn estimate_from_head(head_index: &RowIndex, head_rows: usize, head: &[u8], len:
     usize::try_from(estimate)
         .unwrap_or(usize::MAX)
         .max(head_rows)
+}
+
+/// Inserted row `n` and its edits, if it is in the document.
+fn inserted_row(overlay: &Overlay, n: u32) -> Option<(&InsertedRow, Option<&RowEdits>)> {
+    let row = overlay.inserted(n)?;
+    let edits = overlay.edits(RowId::inserted(n)).map(AsRef::as_ref);
+    Some((row.as_ref(), edits))
+}
+
+/// Inserted row `n`'s marks (task 2.4a), from its cells as they read now,
+/// against the most common field count `mode`: ragged if its length
+/// differs, marked if ragged or it holds a NUL.
+fn inserted_flags(reading: &Reading, overlay: &Overlay, n: u32, mode: Option<usize>) -> RowFlags {
+    let Some((row, edits)) = inserted_row(overlay, n) else {
+        return RowFlags::default();
+    };
+    let view = RowView::inserted(&reading.parser, row, edits);
+    let ragged = mode.is_some_and(|mode| view.len() != mode);
+    RowFlags {
+        marked: ragged || view.first_with(DiagnosticKind::NulBytes).is_some(),
+        ragged,
+    }
+}
+
+/// Where `kind` is in inserted row `n`, if it is: the column to select, as
+/// [`Document::place`] says it.
+fn inserted_place(
+    reading: &Reading,
+    overlay: &Overlay,
+    n: u32,
+    kind: DiagnosticKind,
+    mode: Option<usize>,
+) -> Option<usize> {
+    let (row, edits) = inserted_row(overlay, n)?;
+    let view = RowView::inserted(&reading.parser, row, edits);
+    match kind {
+        DiagnosticKind::RaggedRows => {
+            let cells = view.len();
+            mode.filter(|&mode| cells != mode)
+                .map(|mode| cells.min(mode))
+        }
+        DiagnosticKind::NulBytes => view.first_with(kind),
+        _ => None,
+    }
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }

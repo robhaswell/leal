@@ -393,6 +393,7 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
+        check_rows(&overlay)?;
         check_encodable(&overlay, &extent)?;
         let mut sink = Collect::default();
         let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
@@ -428,6 +429,7 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
+        check_rows(&overlay)?;
         check_encodable(&overlay, &extent)?;
         let progress = SaveShared::default();
         let mut census = (!extent.converts()).then(CensusStream::default);
@@ -527,6 +529,7 @@ impl Document {
             SaveKind::SaveAs | SaveKind::SaveAsUtf8 => existing_at(&destination)?,
         };
         let extent = extent_of(&reading, kind)?;
+        check_rows(&overlay)?;
         check_encodable(&overlay, &extent)?;
 
         // 4: the new file. Its length is known once it is written; until
@@ -984,11 +987,15 @@ fn may_replace(destination: &Path, existing: &Existing) -> Result<(), SaveError>
 /// edit since touched, or that `written` (the edits the save wrote) had
 /// edited in its row.
 fn touched_cells(old: &Reading, written: &Overlay, version: usize) -> Vec<(usize, Vec<usize>)> {
-    let (touched, _) = old.edits.since(version);
+    // Rows can't be inserted or deleted while a save runs (ADR-0014
+    // decision 1), so every row touched is a row of the file, where it was.
+    let (touched, _, _) = old.edits.since(version);
     touched
         .into_iter()
-        .map(|(row, now)| {
-            let mut columns: Vec<usize> = now
+        .filter_map(|touched| {
+            let row = usize::try_from(touched.id.physical()?).ok()?;
+            let mut columns: Vec<usize> = touched
+                .edits
                 .iter()
                 .flat_map(|edits| edits.cells().iter().map(|&(column, _)| column))
                 .collect();
@@ -1000,7 +1007,7 @@ fn touched_cells(old: &Reading, written: &Overlay, version: usize) -> Vec<(usize
             );
             columns.sort_unstable();
             columns.dedup();
-            (row, columns)
+            Some((row, columns))
         })
         .collect()
 }
@@ -1168,6 +1175,16 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
 
 /// Every edited value written must be encodable in the encoding written
 /// (F5): checked before anything is written, naming each cell that isn't.
+/// Until task 2.4c, a save with rows inserted or deleted is refused before
+/// anything is written: the writer doesn't walk the piece list yet.
+fn check_rows(overlay: &Overlay) -> Result<(), SaveError> {
+    if overlay.map().is_identity() {
+        Ok(())
+    } else {
+        Err(SaveError::RowsChanged)
+    }
+}
+
 fn check_encodable(overlay: &Overlay, extent: &Extent<'_>) -> Result<(), SaveError> {
     let encoding = extent.target;
     let cells: Vec<(usize, usize)> = overlay
