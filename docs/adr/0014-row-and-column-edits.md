@@ -55,6 +55,17 @@ was rejected.
      quotes every field. ADR-0004 decision 2 names only inserted rows and
      columns.
 
+## Added during task 2.4b (decided by Rob, 2026-10-03)
+
+5. **Deleting the column that holds a short row's last hatched edit gives
+   the row its own bytes back.** A row `a` with `x` typed into its third
+   (missing) column reads `a,,x`; deleting that column makes it `a` again,
+   not `a,`. The padding existed only to reach the edit. Refines ADR-0005
+   decision 2. After a save the padding is a real field and stays.
+6. **A row that edits and column deletes leave with no cells is a blank
+   line,** and column inserts skip it, as they skip every blank line
+   (ADR-0004 decision 5).
+
 ## Consequences
 
 - **DESIGN §3.6:** add when structural edits are allowed; that their undo
