@@ -144,6 +144,74 @@ fn a_column_insert_and_delete_follow_rule_6() {
     assert_eq!(document.full_value(4, 2).unwrap().as_deref(), Some("new"));
 }
 
+/// A row whose own last field a column delete took isn't the same shape,
+/// though every cell left is its own field in its place.
+#[test]
+fn a_row_missing_its_own_last_field_is_not_the_same_shape() {
+    let dir = Dir::new("columns-shape");
+    let document = open_with(&dir, "a.csv", b"h1,h2,h3,h4,h5\na,b\n", false);
+    set_cell(&document, 1, 2, "x");
+    insert(&document, 3, "v");
+    delete(&document, 1);
+    set_cell(&document, 1, 1, "");
+    delete(&document, 2);
+    assert_eq!(texts(&document)[1], ["a"]);
+    assert_eq!(ids(&document, 1), [CellId::Field(0)]);
+    assert!(!same_shape(&document, 1), "field b was deleted");
+}
+
+/// ADR-0014 decision 6: a row that edits and column deletes leave with no
+/// cells is a blank line, which a column insert skips; undo brings it all
+/// back.
+#[test]
+fn a_row_left_with_no_cells_gains_no_inserted_column() {
+    let dir = Dir::new("columns-emptied");
+    let document = open_with(&dir, "a.csv", b"a,b,c\n\nd,e,f\n", false);
+    let mut done = vec![set_cell(&document, 1, 2, "x")];
+    done.push(delete(&document, 0));
+    done.push(delete(&document, 1));
+    assert_eq!(texts(&document)[1], Vec::<String>::new());
+    done.push(insert(&document, 0, "z"));
+    assert_eq!(texts(&document), rows_of(&[&["z", "b"], &[], &["z", "e"]]));
+    // A row of one field emptied by a delete, too.
+    let other = open_with(&dir, "b.csv", b"a,b\nc\n", false);
+    delete(&other, 0);
+    insert(&other, 0, "z");
+    assert_eq!(texts(&other), rows_of(&[&["z", "b"], &[]]));
+    for command in done.iter().rev() {
+        document.apply(&command.inverse()).unwrap();
+    }
+    assert!(!document.has_edits());
+    assert_eq!(
+        texts(&document),
+        rows_of(&[&["a", "b", "c"], &[""], &["d", "e", "f"]])
+    );
+}
+
+/// An edit a column delete hides isn't counted as an edited cell until the
+/// delete is undone.
+#[test]
+fn edits_a_column_delete_hides_are_not_counted() {
+    let dir = Dir::new("columns-counted");
+    let document = open_with(&dir, "a.csv", FILE, false);
+    set_cell(&document, 1, 1, "one");
+    set_cell(&document, 2, 3, "far");
+    assert_eq!(document.edited_cells(), 2);
+    let deleted = delete(&document, 1);
+    assert_eq!(
+        document.edited_cells(),
+        1,
+        "the hatched one moved, one hidden"
+    );
+    let inserted = insert(&document, 0, "z");
+    set_cell(&document, 0, 0, "zz");
+    assert_eq!(document.edited_cells(), 2, "an inserted cell edited counts");
+    document.set_cell(0, 0, "z").unwrap().unwrap();
+    document.apply(&inserted.inverse()).unwrap();
+    document.apply(&deleted.inverse()).unwrap();
+    assert_eq!(document.edited_cells(), 2);
+}
+
 #[test]
 fn past_the_widest_row_is_refused() {
     let dir = Dir::new("columns-widest");
@@ -215,9 +283,10 @@ fn every_column_can_be_deleted() {
         document.delete_column(0),
         Err(EditError::NoSuchColumn { .. })
     ));
-    // A column inserted into rows with none.
+    // Rows with no cells are blank lines, which a column insert skips
+    // (ADR-0014 decision 6).
     let again = insert(&document, 0, "z");
-    assert_eq!(texts(&document), [vec!["z"], vec!["z"]]);
+    assert_eq!(texts(&document), [Vec::<String>::new(), Vec::new()]);
     for command in [&again, &second, &first] {
         document.apply(&command.inverse()).unwrap();
     }
@@ -341,6 +410,41 @@ fn a_column_command_from_other_edits_applies_by_value() {
     ));
 }
 
+/// By value, an insert applies to exactly the rows it was recorded with:
+/// one that is gone, or is a blank line now (ADR-0014 decision 6), is
+/// refused.
+#[test]
+fn a_column_insert_by_value_needs_every_recorded_row() {
+    let dir = Dir::new("columns-replay-rows");
+    let bytes = b"a\nb,c\n";
+    let document = open_with(&dir, "a.csv", bytes, false);
+    let inserted = insert(&document, 0, "z");
+    assert_eq!(texts(&document), rows_of(&[&["z", "a"], &["z", "b", "c"]]));
+    // One recorded row gone.
+    let fewer = open_with(&dir, "b.csv", bytes, false);
+    fewer.delete_rows(1, 1).unwrap().unwrap();
+    let replay = fewer.replay(std::slice::from_ref(&inserted));
+    assert!(
+        matches!(replay.refused[..], [(0, EditError::ValueChanged { .. })]),
+        "{:?}",
+        replay.refused
+    );
+    assert_eq!(texts(&fewer), rows_of(&[&["a"]]));
+    // One recorded row left with no cells: a blank line now.
+    let emptied = open_with(&dir, "c.csv", bytes, false);
+    delete(&emptied, 0);
+    let replay = emptied.replay(std::slice::from_ref(&inserted));
+    assert!(
+        matches!(
+            replay.refused[..],
+            [(0, EditError::ValueChanged { row: 0, column: 0 })]
+        ),
+        "{:?}",
+        replay.refused
+    );
+    assert_eq!(texts(&emptied), rows_of(&[&[], &["c"]]));
+}
+
 #[test]
 fn quoting_census_judges_each_column_now() {
     let dir = Dir::new("columns-quoting");
@@ -349,7 +453,8 @@ fn quoting_census_judges_each_column_now() {
     let census = |document: &Document| {
         let reading = document.current();
         let overlay = reading.edits.overlay();
-        crate::save::ColumnQuoting::census(&reading, &overlay).unwrap()
+        let go = || Ok::<(), crate::save::SaveError>(());
+        crate::save::ColumnQuoting::census(&reading, &overlay, &go).unwrap()
     };
     let now = census(&document);
     assert!(!now.every_field());
@@ -363,6 +468,63 @@ fn quoting_census_judges_each_column_now() {
     // Deleting the rows with unquoted names makes that column quoted.
     document.delete_rows(0, 2).unwrap();
     assert!(census(&document).quoted(2));
+}
+
+/// The census stops once no row can change its answers (the file doesn't
+/// quote every field, and every column up to the widest row's end has an
+/// unquoted field), with a checkpoint before each batch of rows, which can
+/// cancel it.
+#[test]
+fn quoting_census_stops_early_and_can_be_cancelled() {
+    use crate::save::{ColumnQuoting, SaveError};
+    use std::cell::Cell;
+    let dir = Dir::new("columns-census-stop");
+    let census = |document: &Document, stop_at: Option<usize>| {
+        let reading = document.current();
+        let overlay = reading.edits.overlay();
+        let checkpoints = Cell::new(0);
+        let checkpoint = || {
+            checkpoints.set(checkpoints.get() + 1);
+            match stop_at {
+                Some(n) if checkpoints.get() > n => Err(SaveError::Cancelled),
+                _ => Ok(()),
+            }
+        };
+        let census = ColumnQuoting::census(&reading, &overlay, &checkpoint);
+        (census, checkpoints.get())
+    };
+    let mut bytes = Vec::new();
+    for row in 0..10_000 {
+        bytes.extend_from_slice(format!("{row},\"n{row}\",x\n").as_bytes());
+    }
+    // Column 1 quotes every field: it never settles, so every batch is read.
+    let document = open_with(&dir, "quoted.csv", &bytes, false);
+    let (whole, checkpoints) = census(&document, None);
+    let whole = whole.unwrap();
+    assert_eq!(checkpoints, 3, "three batches of 4,096 rows");
+    assert!(!whole.quoted(0) && whole.quoted(1) && !whole.quoted(2));
+    let (cancelled, _) = census(&document, Some(1));
+    assert!(
+        matches!(cancelled, Err(SaveError::Cancelled)),
+        "{cancelled:?}"
+    );
+    // Every column has an unquoted field in the first batch: it stops
+    // there, with the same answers.
+    let mut bytes = b"a,b,c,d\n".to_vec();
+    for row in 0..10_000 {
+        bytes.extend_from_slice(format!("{row},\"n{row}\",x\n").as_bytes());
+    }
+    let document = open_with(&dir, "settled.csv", &bytes, false);
+    let (early, checkpoints) = census(&document, None);
+    let early = early.unwrap();
+    assert_eq!(checkpoints, 1);
+    assert!(!early.every_field() && (0..5).all(|c| !early.quoted(c)));
+    // A column inserted has no original field, so it never settles.
+    insert(&document, 1, "v");
+    let (whole, checkpoints) = census(&document, None);
+    assert_eq!(checkpoints, 3);
+    let whole = whole.unwrap();
+    assert!((0..6).all(|c| !whole.quoted(c)));
 }
 
 /// The marks of unedited rows follow the columns: a deleted column takes a

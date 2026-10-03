@@ -994,7 +994,9 @@ impl SearchState {
     /// versions of the file (p1-review fid-2).
     fn turn(&self, job: &Job) -> Poll<Result<SearchSummary, JobError>> {
         let polled = self.search_on(job);
-        if polled.is_ready() {
+        // Completed, `search_on` cleared it with `complete`, and a catch-up
+        // job may have set it again since: only a failed turn clears it.
+        if matches!(polled, Poll::Ready(Err(_))) {
             self.turning.store(false, Ordering::Release);
         }
         polled
@@ -1086,6 +1088,10 @@ impl SearchState {
             }
             found.complete = true;
             found.restarted = false;
+            // Under the counts' lock, with `complete`: a column operation
+            // that starts the search again after this sees the turn over,
+            // so a catch-up job searches the rows again.
+            self.turning.store(false, Ordering::Release);
             found.searched = found.searched.max(available);
             // The header row is searched like any row, but left out of the
             // answers, so it isn't counted.
@@ -1322,9 +1328,13 @@ impl SearchState {
             };
             self.turning.store(true, Ordering::Release);
             let polled = self.search_on(job);
-            self.turning.store(false, Ordering::Release);
+            let done = matches!(polled, Poll::Ready(Ok(_)));
+            if !done {
+                // Done, `search_on` cleared it under the counts' lock.
+                self.turning.store(false, Ordering::Release);
+            }
             // A row that couldn't be read is searched again next time.
-            return Ok(matches!(polled, Poll::Ready(Ok(_))));
+            return Ok(done);
         }
         let version = self.reading.edits.version();
         {

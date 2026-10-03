@@ -93,11 +93,16 @@ pub(crate) struct ColumnOp {
 impl ColumnOp {
     /// Whether it applies to a row of `len` cells (oracle rule 6, ADR-0004
     /// decision 5), `blank` if the row is a blank line of the file,
-    /// unedited.
+    /// unedited. A row that edits and deletes have left with no cells is a
+    /// blank line too, which an insert skips (ADR-0014 decision 6); a
+    /// restore, which is only ever by value, puts back what a delete took
+    /// from it, so its rule takes it in (the rows it differs for are given
+    /// layouts of their own anyway).
     pub(crate) fn applies(&self, len: usize, blank: bool) -> bool {
         !blank
             && match self.kind {
-                OpKind::Insert(_) | OpKind::Restore(_) => len >= self.at,
+                OpKind::Insert(_) => len > 0 && len >= self.at,
+                OpKind::Restore(_) => len >= self.at,
                 OpKind::Delete => len > self.at,
             }
     }
@@ -476,13 +481,17 @@ impl<'a> Layout<'a> {
 
     /// The id a hatched edit at logical column `c`, past the row's end,
     /// takes in a default layout: past every cell, so no operation reaches
-    /// it (an explicit layout makes up its own, [`fresh_appended`]).
+    /// it (an explicit layout makes up its own, [`fresh_appended`]). With
+    /// no operation it is the id [`get`](Self::get) reads there once the
+    /// edit is made: a field's, if the row was edited from a stale first
+    /// 64 KB (task 1.9) with more fields than it is read with now.
     pub(crate) fn hatched(&self, c: usize) -> Option<CellId> {
         match self {
             Layout::Default {
                 fold: Fold::Identity { .. },
+                fields,
                 ..
-            } => Some(CellId::base(c, 0)),
+            } => Some(CellId::base(c, *fields)),
             Layout::Default { fold, fields, .. } => {
                 let j = c.checked_sub(fold.len())? + fields;
                 Some(CellId::base(j, 0))
@@ -612,9 +621,38 @@ mod tests {
         assert!(op.applies(3, false));
         assert!(!op.applies(2, false));
         assert!(!op.applies(5, true), "never a blank line");
+        let op = insert(0, 0, 0);
+        assert!(op.applies(1, false));
+        assert!(!op.applies(0, false), "a row with no cells is a blank line");
         let op = delete(0, 3);
         assert!(op.applies(4, false));
         assert!(!op.applies(3, false));
+    }
+
+    /// A hatched edit with no column operation takes the id `get` reads
+    /// back at its column, also when the row was edited with more fields
+    /// (a stale first 64 KB, task 1.9) than it is read with now.
+    #[test]
+    fn a_hatched_edit_reads_back_where_it_was_made() {
+        let none = Columns::default();
+        let cells: Vec<(CellId, Arc<str>)> = vec![(CellId::Field(0), Arc::from("e"))];
+        let parts = |cells| Parts {
+            fields: 4,
+            blank: false,
+            cells,
+            layout: None,
+        };
+        let layout = Layout::of_parts(&none, Own::original(2, false), Some(parts(&cells)));
+        assert_eq!(layout.get(3), None);
+        let id = layout.hatched(3).unwrap();
+        let mut edited = cells.clone();
+        edited.push((id, Arc::from("v")));
+        edited.sort_unstable_by_key(|&(id, _)| id);
+        let after = Layout::of_parts(&none, Own::original(2, false), Some(parts(&edited)));
+        assert_eq!(after.get(3), Some(id));
+        // Read with as many fields as it was edited with, it is hatched.
+        let layout = Layout::of_parts(&none, Own::original(4, false), Some(parts(&cells)));
+        assert_eq!(layout.hatched(5), Some(CellId::Appended(5)));
     }
 
     #[test]

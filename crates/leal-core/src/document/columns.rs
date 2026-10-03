@@ -23,6 +23,7 @@ use std::sync::atomic::Ordering;
 
 use super::structural::{open_quote_row, whole_file};
 use super::{Document, Reading, RowBytes, RowView};
+use crate::diagnostics::Diagnostics;
 use crate::edit::{
     CellId, Changed, Column, ColumnChange, ColumnOp, ColumnSource, Columns, Command, Edit,
     EditError, Lineage, OpId, OpKind, Overlay, Own as EditOwn, RowEdits, RowId, Segment,
@@ -54,7 +55,9 @@ impl Document {
     /// `value`, as one command for the app's undo history (undo takes the
     /// cells out again). It goes into every row with at least `at` cells
     /// (oracle rule 6, ADR-0004 decision 5): a shorter row, or a blank
-    /// line, is left as it is. `at` may be the widest row's length, which
+    /// line, is left as it is, as is a row that edits and column deletes
+    /// have left with no cells (ADR-0014 decision 6). `at` may be the
+    /// widest row's length, which
     /// adds a column after the last. A search starts again
     /// (ADR-0014 decision 2).
     ///
@@ -79,8 +82,8 @@ impl Document {
     /// Deletes logical column `at` from every row that has it, as one
     /// command (undo puts the same cells back, edits and original bytes
     /// included). Deleting a row's last hatched cell takes the padding
-    /// before it too, so the row's own bytes come back (ADR-0005 decision
-    /// 2). A search starts again.
+    /// before it too, so the row's own bytes come back (ADR-0014 decision
+    /// 5, refining ADR-0005 decision 2). A search starts again.
     ///
     /// # Errors
     ///
@@ -177,23 +180,61 @@ impl Document {
     }
 }
 
+impl Document {
+    /// The per-column quoting census of the document as it reads now
+    /// ([`ColumnQuoting::census`]), for the benchmarks
+    /// (`column_edits/census`): how many of the first `columns` columns a
+    /// new field would be quoted in. Never in the app (`just
+    /// check-no-test-exports`).
+    ///
+    /// # Errors
+    ///
+    /// A row can't be read.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn bench_quoting_census(&self, columns: usize) -> Result<usize, ReadError> {
+        let reading = self.current();
+        let overlay = reading.edits.overlay();
+        let go = || Ok::<(), ReadError>(());
+        let census = ColumnQuoting::census(&reading, &overlay, &go)?;
+        Ok((0..columns).filter(|&column| census.quoted(column)).count())
+    }
+}
+
 impl ColumnQuoting {
     /// The census for per-column quoting of new fields (ADR-0005 decision
     /// 3, ADR-0014 decision 4), for the writer (task 2.4c): one pass over
-    /// the file's rows, each as `overlay` lays it out, a batch at a time.
+    /// the file's rows, each as `overlay` lays it out, a batch at a time,
+    /// with a `checkpoint` before each (its error, a cancel, stops it).
     /// Every row counts for whether the file quotes every field; the rows
     /// still in the document count for their columns now.
-    #[cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
-    pub(in crate::document) fn census(
+    ///
+    /// It reads every row: about half a second per million rows (the
+    /// `column_edits/census` bench). So the writer makes it only when a
+    /// save writes a new field (an inserted row's or column's), and it
+    /// stops early once the answer can't change: the file doesn't quote
+    /// every field, and every column up to the widest row's end has an
+    /// unquoted non-empty field, so no column quotes every field. A
+    /// census stopped early answers [`quoted`](Self::quoted) and
+    /// [`every_field`](Self::every_field) as a whole one would.
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        expect(dead_code, reason = "task 2.4c's writer")
+    )]
+    pub(in crate::document) fn census<E: From<ReadError>>(
         reading: &Reading,
         overlay: &Overlay,
-    ) -> Result<ColumnQuoting, ReadError> {
+        checkpoint: &dyn Fn() -> Result<(), E>,
+    ) -> Result<ColumnQuoting, E> {
         const BATCH: usize = 4096;
         let mut census = ColumnQuoting::new();
         let map = overlay.map();
         let rows = Document::rows_index(reading).1;
+        // Unknown until every row is marked: no early stop then.
+        let widest = widest(reading, overlay);
         let mut start = 0;
         while start < rows {
+            checkpoint()?;
             let batch = start..rows.min(start + BATCH);
             Document::read_physical(reading, overlay, batch.clone(), &mut |view| {
                 census.add_file_row(&view);
@@ -205,6 +246,9 @@ impl ColumnQuoting {
                     census.add(&view);
                 }
             })?;
+            if widest.is_some_and(|widest| census.settled(widest)) {
+                break;
+            }
             start = batch.end;
         }
         Ok(census)
@@ -467,51 +511,15 @@ fn plan(
         fresh: Vec::new(),
         misfit: None,
     };
-    let map = overlay.map();
-    let segments = match map.len() {
-        Some(len) => map.segments(0..len),
-        None => vec![Segment::Original(
-            0..u32::try_from(physical).unwrap_or(u32::MAX),
-        )],
-    };
-    let mut logical = 0usize;
-    for segment in segments {
-        match segment {
-            Segment::Original(range) => {
-                let rows = to_usize(range.start)..to_usize(range.end);
-                let edited: Vec<(usize, &Arc<RowEdits>)> = overlay
-                    .rows_in(rows.clone())
-                    .filter_map(|(row, _)| Some((row, overlay.row_arc(row)?)))
-                    .collect();
-                let mut next_edited = edited.iter().peekable();
-                let first = logical;
-                diagnostics.for_each_code(rows.clone(), &mut |row, code| {
-                    let here = first + (row - rows.start);
-                    if let Some(&(_, edits)) = next_edited.next_if(|(r, _)| *r == row) {
-                        walk.edited(here, original_id(row), edits);
-                    } else {
-                        let blank = code.fields.is_none();
-                        let own = EditOwn::original(code.fields.unwrap_or(1), blank);
-                        walk.unedited(here, original_id(row), own);
-                    }
-                });
-                logical += rows.len();
-            }
-            Segment::Inserted(range) => {
-                for n in range {
-                    let id = RowId::inserted(n);
-                    match (overlay.edits(id), overlay.inserted(n)) {
-                        (Some(edits), _) => walk.edited(logical, id, edits),
-                        (None, Some(row)) => {
-                            walk.unedited(logical, id, EditOwn::inserted(n, row.fields().len()));
-                        }
-                        (None, None) => {}
-                    }
-                    logical += 1;
-                }
-            }
-        }
-    }
+    each_row(
+        overlay,
+        diagnostics,
+        physical,
+        &mut |logical, id, shape| match shape {
+            Shape::Unedited(own) => walk.unedited(logical, id, own),
+            Shape::Edited(edits) => walk.edited(logical, id, edits),
+        },
+    );
     let widest = walk.widest;
     let past = if op.inserts() {
         at > widest
@@ -524,6 +532,12 @@ fn plan(
     if let Some(row) = walk.misfit {
         // By value, a row it applied to is too short for it now.
         return Err(EditError::ValueChanged { row, column: at });
+    }
+    if let Decide::Rows(runs) = decide
+        && count(&walk.applied) != count(runs)
+    {
+        // By value, a row it applied to isn't there now.
+        return Err(EditError::ValueChanged { row: 0, column: at });
     }
     let Walk {
         applied,
@@ -551,6 +565,96 @@ fn plan(
         rows,
         applied,
     })
+}
+
+/// How many rows `runs` hold.
+fn count(runs: &[Range<u32>]) -> usize {
+    runs.iter().map(|run| to_usize(run.end - run.start)).sum()
+}
+
+/// A logical row as the walk over the marks sees it.
+enum Shape<'a> {
+    /// No edits: its own cells, laid out by default.
+    Unedited(EditOwn),
+    /// Its edits.
+    Edited(&'a Arc<RowEdits>),
+}
+
+/// Hands each logical row of `overlay` to `each`, in order, with its id
+/// and shape: the file's rows with no edits by their field counts in the
+/// marks (`physical` rows, all marked), so no row is read.
+fn each_row<'a>(
+    overlay: &'a Overlay,
+    diagnostics: &Diagnostics,
+    physical: usize,
+    each: &mut dyn FnMut(usize, RowId, Shape<'a>),
+) {
+    let map = overlay.map();
+    let segments = match map.len() {
+        Some(len) => map.segments(0..len),
+        None => vec![Segment::Original(
+            0..u32::try_from(physical).unwrap_or(u32::MAX),
+        )],
+    };
+    let mut logical = 0usize;
+    for segment in segments {
+        match segment {
+            Segment::Original(range) => {
+                let rows = to_usize(range.start)..to_usize(range.end);
+                let edited: Vec<(usize, &Arc<RowEdits>)> = overlay
+                    .rows_in(rows.clone())
+                    .filter_map(|(row, _)| Some((row, overlay.row_arc(row)?)))
+                    .collect();
+                let mut next_edited = edited.iter().peekable();
+                let first = logical;
+                diagnostics.for_each_code(rows.clone(), &mut |row, code| {
+                    let here = first + (row - rows.start);
+                    if let Some(&(_, edits)) = next_edited.next_if(|(r, _)| *r == row) {
+                        each(here, original_id(row), Shape::Edited(edits));
+                    } else {
+                        let blank = code.fields.is_none();
+                        let own = EditOwn::original(code.fields.unwrap_or(1), blank);
+                        each(here, original_id(row), Shape::Unedited(own));
+                    }
+                });
+                logical += rows.len();
+            }
+            Segment::Inserted(range) => {
+                for n in range {
+                    let id = RowId::inserted(n);
+                    match (overlay.edits(id), overlay.inserted(n)) {
+                        (Some(edits), _) => each(logical, id, Shape::Edited(edits)),
+                        (None, Some(row)) => {
+                            let own = EditOwn::inserted(n, row.fields().len());
+                            each(logical, id, Shape::Unedited(own));
+                        }
+                        (None, None) => {}
+                    }
+                    logical += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The longest row of `overlay` now, in cells, from the marks (`None`
+/// until every row has been marked).
+fn widest(reading: &Reading, overlay: &Overlay) -> Option<usize> {
+    let diagnostics = reading.diagnostics.get()?;
+    let physical = reading.index.row_count();
+    if diagnostics.marked_rows_and_mode().0 < physical {
+        return None;
+    }
+    let columns = overlay.columns();
+    let mut widest = 0;
+    each_row(overlay, diagnostics, physical, &mut |_, id, shape| {
+        let len = match shape {
+            Shape::Unedited(own) => columns.fold_len(own),
+            Shape::Edited(edits) => edits.len_in(columns, id.inserted_index()),
+        };
+        widest = widest.max(len);
+    });
+    Some(widest)
 }
 
 /// [`plan`]'s walk over every logical row.
@@ -590,14 +694,16 @@ impl Walk<'_> {
         }
     }
 
-    /// Records logical row `logical`, `len` cells long, as applied to if
-    /// `applies`.
-    fn record(&mut self, logical: usize, len: usize, applies: bool) {
+    /// Records logical row `logical`, `len` cells long and a blank line if
+    /// `blank`, as applied to if `applies`. By value, a row too short for
+    /// the operation now, or a blank line now (which gets no inserted
+    /// cell), is a misfit; a restore pads a row too short for it instead.
+    fn record(&mut self, logical: usize, len: usize, blank: bool, applies: bool) {
         if !applies {
             return;
         }
         let restores = matches!(self.op.kind, OpKind::Restore(_));
-        if !restores && !self.op.applies(len, false) && self.misfit.is_none() {
+        if !restores && !self.op.applies(len, blank) && self.misfit.is_none() {
             self.misfit = Some(logical);
         }
         let row = u32::try_from(logical).unwrap_or(u32::MAX);
@@ -613,7 +719,7 @@ impl Walk<'_> {
         self.widest = self.widest.max(len);
         let rule = self.op.applies(len, own.blank);
         let applies = self.applies(logical, rule);
-        self.record(logical, len, applies);
+        self.record(logical, len, own.blank, applies);
         if applies != rule {
             self.fresh.push((id, own, applies));
         }
@@ -625,11 +731,10 @@ impl Walk<'_> {
         let layout = edits.layout_in(self.columns, inserted);
         let len = layout.len();
         self.widest = self.widest.max(len);
-        let rule = self
-            .op
-            .applies(len, edits.is_blank_in(self.columns, inserted));
+        let blank = edits.is_blank_in(self.columns, inserted);
+        let rule = self.op.applies(len, blank);
         let applies = self.applies(logical, rule);
-        self.record(logical, len, applies);
+        self.record(logical, len, blank, applies);
         let by_default = edits.layout().is_none() && {
             let own = edits.own(inserted);
             applies == self.op.applies(self.columns.fold_len(own), own.blank)
@@ -664,7 +769,9 @@ fn pad(ids: &mut Vec<CellId>, op: &ColumnOp, fields: usize, cells: &[(CellId, Ar
 }
 
 /// Takes the hatched cells at the end of `ids` that hold nothing: padding
-/// is only ever before an edited hatched cell (ADR-0005 decision 2).
+/// is only ever before an edited hatched cell (ADR-0005 decision 2), so a
+/// delete of a row's last one gives the row its own bytes back (ADR-0014
+/// decision 5).
 fn trim(ids: &mut Vec<CellId>, edits: &RowEdits) {
     while let Some(&id @ CellId::Appended(_)) = ids.last() {
         if edits.get(id).is_some() {

@@ -340,6 +340,34 @@ impl RowEdits {
         shown
     }
 
+    /// How many of the edited cells the row shows under `columns`
+    /// (inserted row `n` if `inserted`): [`shown`](Self::shown)'s length,
+    /// without making the list.
+    pub(crate) fn shown_len(&self, columns: &Columns, inserted: Option<u32>) -> usize {
+        let is_shown = |id: CellId, layout: &Layout<'_>| match (layout, id) {
+            (
+                Layout::Default {
+                    fold: Fold::Identity { .. },
+                    ..
+                },
+                id,
+            ) => !matches!(id, CellId::Inserted(_)),
+            (Layout::Default { .. }, CellId::Appended(j)) => {
+                layout.tail_position(to_usize(j)).is_some()
+            }
+            (Layout::Default { fold, .. }, id) => (0..fold.len()).any(|c| fold.get(c) == Some(id)),
+            (Layout::Explicit(ids), id) => ids.contains(&id),
+        };
+        if columns.is_empty() && self.layout.is_none() {
+            return self.cells.len();
+        }
+        let layout = self.layout_in(columns, inserted);
+        self.cells
+            .iter()
+            .filter(|&&(id, _)| is_shown(id, &layout))
+            .count()
+    }
+
     /// Whether these edits read the same as `other`'s under `columns`: the
     /// same cells in the same places, with the same values, hidden ones
     /// included, though hatched cells may have other ids (an undo by value
@@ -640,8 +668,11 @@ struct EditState {
     /// (a save's rebase, a re-read with another split) carries on from its
     /// version, so a document's edit versions only ever increase.
     start: usize,
-    /// How many cells are edited.
-    cells: usize,
+    /// How many cells are edited and shown, or `None` once a column
+    /// insert or delete may have changed which are shown: counted again
+    /// when asked ([`EditStore::cells`]), not by the operation, which would
+    /// cost it a look at every edited row's cells.
+    cells: Option<usize>,
     /// The next inserted row's number.
     next_inserted: u32,
     /// The next column operation's number.
@@ -669,11 +700,20 @@ fn log_run(log: &mut Vec<(RowId, u32)>, ends: &mut Vec<usize>, first: RowId, cou
     ends.push(total);
 }
 
-/// `cells` edited cells, once a row's edits `before` are `after`.
-fn counted(cells: usize, before: Option<&Arc<RowEdits>>, after: Option<&Arc<RowEdits>>) -> usize {
-    let before = before.map_or(0, |e| e.cells.len());
-    let after = after.map_or(0, |e| e.cells.len());
-    cells - before + after
+/// `cells` edited cells, once row `id`'s edits `before` are `after`, under
+/// `columns`: only the cells the row shows count, not those a column
+/// delete hides.
+fn counted(
+    cells: usize,
+    columns: &Columns,
+    id: RowId,
+    before: Option<&Arc<RowEdits>>,
+    after: Option<&Arc<RowEdits>>,
+) -> usize {
+    let shown = |edits: Option<&Arc<RowEdits>>| {
+        edits.map_or(0, |e| e.shown_len(columns, id.inserted_index()))
+    };
+    cells - shown(before) + shown(after)
 }
 
 impl EditStore {
@@ -856,9 +896,25 @@ impl EditStore {
         self.read().overlay.is_empty()
     }
 
-    /// How many cells are edited.
+    /// How many cells are edited (and shown: not those a column delete
+    /// hides). After a column insert or delete, the first call counts
+    /// them again, a look at every edited row.
     pub(crate) fn cells(&self) -> usize {
-        self.read().cells
+        if let Some(cells) = self.read().cells {
+            return cells;
+        }
+        // Not `write`, which counts an edit's copy of the overlay: nothing
+        // here changes it.
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        let overlay = &state.overlay;
+        let columns = &overlay.columns;
+        let cells = overlay
+            .rows
+            .iter()
+            .map(|(id, edits)| edits.shown_len(columns, id.inserted_index()))
+            .sum();
+        state.cells = Some(cells);
+        cells
     }
 
     /// Replaces each row's edits (`None`: it has none any more), as one
@@ -877,7 +933,10 @@ impl EditStore {
         let overlay = Arc::make_mut(overlay);
         for (id, edits) in rows {
             let edits = edits.map(Arc::new);
-            *cells = counted(*cells, overlay.rows.get(&id), edits.as_ref());
+            if let Some(cells) = cells {
+                let columns = &overlay.columns;
+                *cells = counted(*cells, columns, id, overlay.rows.get(&id), edits.as_ref());
+            }
             overlay.set(id, edits);
             log_run(log, ends, id, 1);
         }
@@ -890,16 +949,17 @@ impl EditStore {
     /// search starts again anyway.
     pub(crate) fn change_columns(&self, change: ColumnChange, next_op: u32) {
         let mut state = self.write();
-        let mut cells = state.cells;
         let overlay = Arc::make_mut(&mut state.overlay);
         overlay.columns = change.columns;
         let mut touched = Vec::with_capacity(change.edits.len());
         for (id, edits) in change.edits {
-            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
             overlay.set(id, edits);
             touched.push(id);
         }
-        state.cells = cells;
+        // Which edits a row shows changes in rows the operation left
+        // alone too (a delete hides the edits in its column): they are
+        // counted again when next asked.
+        state.cells = None;
         if touched.is_empty() {
             touched.push(RowId::original(0));
         }
@@ -916,7 +976,10 @@ impl EditStore {
         let overlay = Arc::make_mut(&mut state.overlay);
         overlay.map = change.map;
         for (id, edits) in change.edits {
-            cells = counted(cells, overlay.rows.get(&id), edits.as_ref());
+            if let Some(cells) = &mut cells {
+                let columns = &overlay.columns;
+                *cells = counted(*cells, columns, id, overlay.rows.get(&id), edits.as_ref());
+            }
             overlay.set(id, edits);
         }
         for (n, row) in change.inserted {

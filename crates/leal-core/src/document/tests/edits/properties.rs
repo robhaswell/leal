@@ -169,12 +169,13 @@ fn structural_step<'a>(
     Ok(())
 }
 
-/// A row of `fields` fields' length after `columns` (oracle rule 6).
+/// A row of `fields` fields' length after `columns` (oracle rule 6; a row
+/// left with no cells is a blank line, ADR-0014 decision 6).
 fn folded(fields: usize, columns: &[ColumnOp]) -> usize {
     columns
         .iter()
         .fold(fields, |len, &(insert, at)| match (insert, len) {
-            (true, len) if len >= at => len + 1,
+            (true, len) if len >= at && len > 0 => len + 1,
             (false, len) if len > at => len - 1,
             (_, len) => len,
         })
@@ -376,7 +377,74 @@ fn run<'a>(
                 }
             }
         }
+        check_sources(document, &state.oracle, step)?;
     }
+    Ok(())
+}
+
+/// After every step: each cell's identity and what it reads as against
+/// where the oracle says it comes from (an original field, by index; an
+/// edited or new value; padding), each row of the file's `same_shape`
+/// against the oracle's, and the edited cells counted (not those a column
+/// delete hides).
+fn check_sources(
+    document: &Document,
+    oracle: &Oracle<'_>,
+    step: &Step,
+) -> Result<(), TestCaseError> {
+    use crate::document::view::ViewCell;
+    use crate::edit::CellId;
+    let reading = document.current();
+    let rows = document.row_count();
+    prop_assert_eq!(rows, oracle.row_count());
+    let got = Document::read_rows_of(&reading, 0..rows, |view| {
+        let cells: Vec<(Option<CellId>, Option<CellSource>)> = (0..view.len())
+            .map(|c| {
+                let id = view.cell_id(c);
+                let source = match (id, view.cell(c)) {
+                    (Some(CellId::Field(k)), Some(ViewCell::Field(_))) => {
+                        Some(CellSource::Original { field: k as usize })
+                    }
+                    (_, Some(ViewCell::Edited(_) | ViewCell::New(_))) => Some(CellSource::Edited),
+                    (_, Some(ViewCell::Padding)) => Some(CellSource::Padding),
+                    (_, Some(ViewCell::Field(_)) | None) => None,
+                };
+                (id, source)
+            })
+            .collect();
+        let edited = (0..view.len())
+            .filter(|&c| matches!(view.cell(c), Some(ViewCell::Edited(_))))
+            .count();
+        (cells, view.same_shape(), edited)
+    })
+    .unwrap();
+    let mut edited = 0;
+    for (row, (cells, same_shape, row_edited)) in got.iter().enumerate() {
+        let expected: Vec<Option<CellSource>> = (0..oracle.row_len(row))
+            .map(|c| oracle.cell_source(row, c))
+            .collect();
+        let sources: Vec<Option<CellSource>> = cells.iter().map(|&(_, source)| source).collect();
+        prop_assert_eq!(
+            &sources,
+            &expected,
+            "row {} ids {:?} after {:?}",
+            row,
+            cells,
+            step
+        );
+        if let Some(expected) = oracle.same_shape(row) {
+            prop_assert_eq!(
+                *same_shape,
+                expected,
+                "row {} ids {:?} after {:?}",
+                row,
+                cells,
+                step
+            );
+        }
+        edited += row_edited;
+    }
+    prop_assert_eq!(document.edited_cells(), edited, "after {:?}", step);
     Ok(())
 }
 
@@ -811,10 +879,22 @@ fn replaying_the_history_into_a_fresh_document_gives_the_same_cells() {
         prop_assert!(replay.refused.is_empty());
         let rows = document.row_count();
         prop_assert_eq!(fresh.row_count(), rows);
-        prop_assert_eq!(
-            fresh.rows(0..rows, 1000).unwrap(),
-            document.rows(0..rows, 1000).unwrap()
-        );
+        // By value, a cell may be an empty field where the document has
+        // none: a blank line's hatched edit, its row deleted and the delete
+        // undone (an inserted row's own value in the replay), then set
+        // back to `""`, as after a save. Otherwise the same cells.
+        let trimmed = |document: &Document| -> Vec<Vec<String>> {
+            let rows = document.rows(0..rows, 1000).unwrap().into_iter();
+            rows.map(|row| {
+                let mut texts: Vec<String> = row.into_iter().map(|cell| cell.text).collect();
+                while texts.last().is_some_and(String::is_empty) {
+                    texts.pop();
+                }
+                texts
+            })
+            .collect()
+        };
+        prop_assert_eq!(trimmed(&fresh), trimmed(&document));
         // Undoing the replayed history in reverse order leaves no edits.
         for command in replay.commands.iter().rev() {
             fresh.apply(&command.inverse()).unwrap();

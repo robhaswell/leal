@@ -1,4 +1,7 @@
-#![cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
+#![cfg_attr(
+    not(any(test, feature = "test-hooks")),
+    expect(dead_code, reason = "task 2.4c's writer")
+)]
 //! Per-column quoting of new fields (ADR-0004 decision 2, ADR-0005
 //! decision 3, ADR-0014 decision 4; task 2.4b), for the writer (task 2.4c).
 //!
@@ -72,6 +75,18 @@ impl ColumnQuoting {
         }
         self.any_row = true;
         self.every_field &= row.iter().all(|field| field.quoted());
+    }
+
+    /// Whether no row still to come can change the answers: the file
+    /// doesn't quote every field, and each of columns `0..widest` (the
+    /// widest row's end) has a non-empty field that isn't quoted, so none
+    /// quotes every field.
+    pub(crate) fn settled(&self, widest: usize) -> bool {
+        !self.every_field
+            && self.columns.len() >= widest
+            && self.columns[..widest]
+                .iter()
+                .all(|&(seen, quoted)| seen && !quoted)
     }
 
     /// Whether the file quotes every field.

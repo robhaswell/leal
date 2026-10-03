@@ -495,7 +495,7 @@ fn corpus_case(name: &str) -> (Vec<u8>, Layout, Delimiter, Encoding) {
     (case.bytes, layout, d, enc)
 }
 
-/// Rule 12 (task 2.4b): padding is only before an edited hatched cell, so
+/// Rule 12 (ADR-0014 decision 5): padding is only before an edited hatched cell, so
 /// deleting the column of a row's last one takes the padding too, and the
 /// row's own bytes come back; padding before a cell that stays, stays.
 #[test]

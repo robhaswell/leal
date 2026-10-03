@@ -145,7 +145,10 @@ impl<'a> RowView<'a> {
     }
 
     /// The row's id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        expect(dead_code, reason = "task 2.4c's writer")
+    )]
     pub(crate) fn id(&self) -> RowId {
         self.id
     }
@@ -195,9 +198,9 @@ impl<'a> RowView<'a> {
         self.layout().get(column)
     }
 
-    /// Whether the row's cells are its own fields in their places, then
-    /// hatched cells: no column operation moved anything in it, so it can
-    /// be written field by field (task 2.4c).
+    /// Whether the row's cells are all its own fields in their places,
+    /// then hatched cells: no column operation moved or took anything in
+    /// it, so it can be written field by field (task 2.4c).
     #[cfg_attr(not(test), expect(dead_code, reason = "task 2.4c's writer"))]
     pub(crate) fn same_shape(&self) -> bool {
         let fields = self.own.len();
@@ -209,11 +212,16 @@ impl<'a> RowView<'a> {
                         && (0..fields).all(|k| fold.get(k) == Some(CellId::base(k, fields)))
                 }
             },
-            Layout::Explicit(ids) => ids.iter().enumerate().all(|(k, &id)| match id {
-                CellId::Field(f) => usize::try_from(f).is_ok_and(|f| f == k),
-                CellId::Appended(_) => k >= fields,
-                CellId::Inserted(_) => false,
-            }),
+            // Every field still there (a delete may have taken its last
+            // one, padding and all), in its place.
+            Layout::Explicit(ids) => {
+                ids.len() >= fields
+                    && ids.iter().enumerate().all(|(k, &id)| match id {
+                        CellId::Field(f) => usize::try_from(f).is_ok_and(|f| f == k),
+                        CellId::Appended(_) => k >= fields,
+                        CellId::Inserted(_) => false,
+                    })
+            }
         }
     }
 

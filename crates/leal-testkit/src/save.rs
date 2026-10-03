@@ -35,7 +35,9 @@
 //!    original bytes come back (§3.6).
 //! 6. Column insert and delete apply to every row that has that position:
 //!    an insert at `c` needs at least `c` fields, a delete at `c` needs more
-//!    than `c`. Shorter (ragged) rows are left alone.
+//!    than `c`. Shorter (ragged) rows are left alone, and so are blank
+//!    lines: an original one (ADR-0004 decision 5), and a row that edits
+//!    and column deletes have left with no cells (ADR-0014 decision 6).
 //! 7. If an edited value can't be encoded, saving fails naming the cells
 //!    (§3.7, F5). UTF-16 files are read-only in v1, so saving them fails.
 //!    [`Document::save_as_utf8`] (ADR-0008 decision 7) writes the same
@@ -69,8 +71,9 @@
 //!     `""` removes the edit and the row's padding with it (F3). Padding
 //!     is only ever before an edited hatched cell, so a column delete that
 //!     takes a row's last one takes the padding left at the row's end too
-//!     (task 2.4b): the row's own bytes come back, as if the hatched cell
-//!     had been set back to `""`. Past an unterminated quote, rule 10
+//!     (ADR-0014 decision 5): the row's own bytes come back, as if the
+//!     hatched cell had been set back to `""`. After a save the padding is
+//!     a field of the file and stays. Past an unterminated quote, rule 10
 //!     refuses it.
 //!
 //! Rules 8, 9 and 11 are the "smallest extra change next to the edit" that
@@ -451,6 +454,24 @@ impl<'a> Document<'a> {
         })
     }
 
+    /// Whether document row `row`, a row of the file, has all its own
+    /// fields in their places (edited or not), then only hatched cells: no
+    /// column insert or delete moved or took anything in it. `None` for an
+    /// inserted row or past the end.
+    #[must_use]
+    pub fn same_shape(&self, row: usize) -> Option<bool> {
+        let r = self.rows.get(row)?;
+        let fields = self.layout.rows[r.source?].fields.len();
+        Some(
+            r.cells.len() >= fields
+                && r.cells.iter().enumerate().all(|(k, cell)| match cell {
+                    Cell::Original(f) => *f == k,
+                    Cell::Edited { field, .. } => *field == Some(k),
+                    Cell::Appended(_) => k >= fields,
+                }),
+        )
+    }
+
     /// The original row behind document row `row`, or `None` for an
     /// inserted row or past the end.
     #[must_use]
@@ -599,8 +620,11 @@ impl<'a> Document<'a> {
                 let layout = self.layout;
                 for r in &mut self.rows {
                     // ADR-0004 decision 5: a blank line is too short for
-                    // every column, so it never gains one.
-                    if r.cells.len() >= *at && !r.is_blank_line(layout) {
+                    // every column, so it never gains one. Nor does a row
+                    // left with no cells, which is a blank line too
+                    // (ADR-0014 decision 6).
+                    let blank = r.cells.is_empty() || r.is_blank_line(layout);
+                    if r.cells.len() >= *at && !blank {
                         let cell = Cell::Edited {
                             field: None,
                             value: value.clone(),
@@ -618,7 +642,8 @@ impl<'a> Document<'a> {
                     if r.cells.len() > *column && !r.is_blank_line(layout) {
                         r.cells.remove(*column);
                         // Rule 12: padding is only before an edited
-                        // hatched cell.
+                        // hatched cell, so it goes with the row's last one
+                        // (ADR-0014 decision 5).
                         while r.cells.last() == Some(&Cell::Appended(None)) {
                             r.cells.pop();
                         }
@@ -1310,6 +1335,20 @@ mod tests {
             out(save(bytes, &[], &[ins0])),
             "\"x,y\",a,b,c\n\"x,y\",1,2\n"
         );
+    }
+
+    /// ADR-0014 decision 6: a row that column deletes have left with no
+    /// cells is a blank line, which a column insert skips. It is still
+    /// written as `""` (rule 8).
+    #[test]
+    fn a_row_left_with_no_cells_gains_no_inserted_column() {
+        let bytes = b"a,b\nc\n";
+        let del0 = Edit::DeleteColumn { column: 0 };
+        let ins0 = Edit::InsertColumn {
+            at: 0,
+            value: "z".into(),
+        };
+        assert_eq!(out(save(bytes, &[], &[del0, ins0])), "z,b\n\"\"\n");
     }
 
     #[test]
