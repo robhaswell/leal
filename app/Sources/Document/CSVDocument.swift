@@ -202,6 +202,27 @@ final class CSVDocument: NSDocument {
         return attributes?[.modificationDate] as? Date
     }
 
+    /// **Save As UTF-8** (task 2.3): the core writes the UTF-8 copy at
+    /// `url`, and the document then *is* that copy (ADR-0008 decision 1), as
+    /// after Save As: the window reads it as a Reload would, and `NSDocument`
+    /// follows it (its URL and modification date), so its title, proxy icon
+    /// and recent documents name the copy. Returns whether it was saved: not
+    /// if the document failed or closed meanwhile.
+    ///
+    /// SEAM(2.5): the core's document already reads the copy after the save
+    /// (its rebase); task 2.5's after-a-save path adopts that reading
+    /// instead of opening the copy again.
+    ///
+    /// - Throws: the save's `SaveFailure`, or the Reload's open error.
+    @discardableResult
+    func saveAsUTF8(to url: URL) async throws -> Bool {
+        guard let model, try await model.saveAsUTF8(to: url) != nil else { return false }
+        let modified = await FileWork.run { Self.modificationDate(of: url) }
+        guard try await model.reloadInBackground(from: url) else { return false }
+        followReload(of: model, modified: modified)
+        return true
+    }
+
     /// `NSDocument` is told the file Leal shows after a Reload.
     private func followReload(of model: DocumentModel, modified: Date?) {
         if fileURL != model.url {
@@ -215,6 +236,7 @@ final class CSVDocument: NSDocument {
         let controller = DocumentWindowController(model: model, scheduler: environment.scheduler)
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
         controller.content.onReload = { [weak self] in try await self?.reloadInBackground() }
+        controller.content.onSaveAsUTF8 = { [weak self] url in try await self?.saveAsUTF8(to: url) ?? false }
         watchWindow(controller.window)
         if let opening {
             self.opening = nil

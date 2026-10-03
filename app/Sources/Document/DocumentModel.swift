@@ -1337,6 +1337,34 @@ final class DocumentModel: GridDataSource {
         return true
     }
 
+    /// **Save As UTF-8** (task 2.3, ADR-0008 decision 7): the core writes
+    /// the document to `url` in UTF-8, on a thread of its own, in a new
+    /// folder on `url`'s volume that `FileManager` makes (which a sandboxed
+    /// app may write to), and then reads that file. The main thread never
+    /// waits for it (DESIGN §3.9); cancelling the task cancels the save.
+    /// Returns `nil` if the document has failed or closed.
+    ///
+    /// - Throws: the `SaveFailure` the save ended with.
+    func saveAsUTF8(to url: URL) async throws -> SaveOutcome? {
+        guard failure == nil, let handle else { return nil }
+        // Asking FileManager about a volume can block (a share): not here.
+        let (folder, volume) = await FileWork.run {
+            (TemporaryFolders.volumeFolder(for: url), TemporaryFolders.volume(for: url.deletingLastPathComponent()))
+        }
+        let options = SaveOptions(
+            destination: url.path(percentEncoded: false),
+            kind: .saveAsUtf8,
+            folder: folder,
+            volume: volume,
+            overwriteChanged: false,
+            firstScreenRows: 1,
+            maxChars: GridMetrics.maxCellCharacters
+        )
+        coreCalls += 1
+        let job = try handle.save(options: options)
+        return try await job.outcome()
+    }
+
     /// A Reload was asked for: the re-readings are off from now, before its
     /// task has even started, until `reloadEnded`.
     func willReload() {

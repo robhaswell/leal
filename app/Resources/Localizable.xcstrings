@@ -13,6 +13,17 @@
     "%@ (file attribute)" : {
       "comment" : "Status bar: the encoding, from the file's com.apple.TextEncoding attribute"
     },
+    "%@ cells hold bytes that aren’t %@ text, the first at %@, so they can’t be converted. Leal never replaces them." : {
+      "comment" : "Alert text: Save As UTF-8 refused several cells; how many, the file's encoding, and where the first is",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ cells hold bytes that aren’t %2$@ text, the first at %3$@, so they can’t be converted. Leal never replaces them."
+          }
+        }
+      }
+    },
     "%@ cells, the first at %@" : {
       "comment" : "Details popover: cells with this kind; their count, and where the first is",
       "localizations" : {
@@ -119,6 +130,17 @@
         }
       }
     },
+    "%@, column %@" : {
+      "comment" : "Where a cell is: its row (as in \"row 3\" or \"the header row\"), then its column number",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, column %2$@"
+          }
+        }
+      }
+    },
     "1 cell, at %@" : {
       "comment" : "Details popover: one cell has this kind (mockup 03b); where, such as row 17"
     },
@@ -148,9 +170,6 @@
     },
     "1 row has a different number of fields to the other %@" : {
       "comment" : "Details popover: one ragged row; the number of rows with the usual field count"
-    },
-    "A later version of Leal saves a UTF-8 copy of the file that you can edit." : {
-      "comment" : "Alert: the UTF-16 banner's button before task 2.3"
     },
     "A later version of Leal saves a copy of what it shows, wherever you choose." : {
       "comment" : "Alert: the drive banner's Save As button before task 2.5"
@@ -357,6 +376,9 @@
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
     },
+    "Leal couldn’t read all of the file. Try again, or reopen it first." : {
+      "comment" : "Alert text: Save As UTF-8 failed for another reason"
+    },
     "Leal couldn’t read the rest of the file, so it shows the rows it had read. File ▸ Reload from Disk tries again." : {
       "comment" : "Status bar tooltip: a read error stopped Leal before the end of the file"
     },
@@ -368,6 +390,9 @@
     },
     "Leal guessed the encoding from the start of the file." : {
       "comment" : "Status bar tooltip: encoding source"
+    },
+    "Leal may not write the file at that place." : {
+      "comment" : "Alert text: Save As UTF-8 onto a file Leal may not write"
     },
     "Leal read the encoding from the file’s byte order mark." : {
       "comment" : "Status bar tooltip: encoding source"
@@ -383,6 +408,9 @@
     },
     "Mixed line endings" : {
       "comment" : "Diagnostic kind: some rows end with LF, some with CRLF (DESIGN §3.5)\nStatus bar: some rows end with another line ending (mockup 03a)"
+    },
+    "More than %@" : {
+      "comment" : "Alert text: how many cells Save As UTF-8 refused, when it stopped counting"
     },
     "NUL bytes" : {
       "comment" : "Diagnostic kind (DESIGN §3.5)"
@@ -505,9 +533,6 @@
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
     },
-    "Save As UTF-8 isn’t available yet." : {
-      "comment" : "Alert: the UTF-16 banner's button before task 2.3"
-    },
     "Save As UTF-8…" : {
       "comment" : "Banner button on a UTF-16 file"
     },
@@ -544,6 +569,9 @@
     "Show the irregularities (%@ kinds)" : {
       "comment" : "Tooltip of the status bar's diagnostics badge"
     },
+    "Something other than a file is at that place." : {
+      "comment" : "Alert text: Save As UTF-8 onto a folder or similar"
+    },
     "Something went wrong inside Leal. Close the file and open it again." : {
       "comment" : "Error after a panic in the Rust core: the document can't be used any more"
     },
@@ -559,8 +587,25 @@
     "That encoding doesn’t match the file’s byte order mark." : {
       "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
     },
+    "The UTF-8 copy wasn’t saved." : {
+      "comment" : "Alert title: Save As UTF-8 failed (task 2.3)"
+    },
+    "The cell at %@ holds bytes that aren’t %@ text, so they can’t be converted. Leal never replaces them." : {
+      "comment" : "Alert text: Save As UTF-8 refused one cell; where it is, as in \"row 3, column 2\", and the file's encoding",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "The cell at %1$@ holds bytes that aren’t %2$@ text, so they can’t be converted. Leal never replaces them."
+          }
+        }
+      }
+    },
     "The change couldn’t be made." : {
       "comment" : "Error: an edit, undo or redo wasn't applied"
+    },
+    "The copy would be too large for Leal to open again." : {
+      "comment" : "Alert text: Save As UTF-8's file would be over 4 GiB (ADR-0012 decision 2)"
     },
     "The drive it’s on was disconnected." : {
       "comment" : "Open error: the removable drive holding the file vanished"
@@ -573,6 +618,9 @@
     },
     "The drive with this file was disconnected. Leal shows the rows it had read; Save is off until the drive is back, and Save As keeps a copy." : {
       "comment" : "Banner: the file's removable drive was disconnected before Leal had read it all (ADR-0006)"
+    },
+    "The file at that place is locked." : {
+      "comment" : "Alert text: Save As UTF-8 onto a locked file"
     },
     "The file changed on its drive while Leal was reading it, so Leal shows only what it had read before the change." : {
       "comment" : "Status bar tooltip: the file changed while Leal read it (1.1a, task 1.9)"
@@ -674,6 +722,9 @@
     },
     "UTF-16 files are read-only in this version of Leal." : {
       "comment" : "Tooltip of the lock glyph by a read-only file's title"
+    },
+    "UTF-8" : {
+      "comment" : "Save As UTF-8: added to the suggested file name, as in \"people (UTF-8).csv\""
     },
     "Undo" : {
       "comment" : "Edit menu"

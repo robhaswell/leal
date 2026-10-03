@@ -992,15 +992,82 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     // MARK: Saving (ADR-0006)
 
-    /// SEAM(2.3): Save As UTF-8 is built in task 2.3.
+    /// **Save As UTF-8…**, the UTF-16 banner's button (mockup 06a, task 2.3,
+    /// ADR-0008 decision 7): a save panel, then the core writes the file in
+    /// UTF-8 there, and the window shows that copy, which can be edited.
+    /// Bytes that can't be converted are named, and nothing is written.
     @objc func saveAsUTF8(_ sender: Any?) {
-        showNotYet(
-            String(localized: "Save As UTF-8 isn’t available yet.", comment: "Alert: the UTF-16 banner's button before task 2.3"),
-            String(
-                localized: "A later version of Leal saves a UTF-8 copy of the file that you can edit.",
-                comment: "Alert: the UTF-16 banner's button before task 2.3"
-            )
-        )
+        scheduler.noteUserInput()
+        guard savingAsUTF8 == nil, let window = view.window else { return }
+        chooseUTF8Destination(Self.utf8CopyName(of: model.url), model.url.deletingLastPathComponent(), window) { [weak self] url in
+            guard let self, let url else { return }
+            self.startSavingAsUTF8(to: url)
+        }
+    }
+
+    /// Where Save As UTF-8 writes: the save panel, as a sheet, with `name`
+    /// in `folder` suggested; `nil` if cancelled. Tests answer for
+    /// themselves.
+    var chooseUTF8Destination: (_ name: String, _ folder: URL, _ window: NSWindow, _ done: @escaping @MainActor (URL?) -> Void) -> Void = { name, folder, window, done in
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = name
+        panel.directoryURL = folder
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.beginSheetModal(for: window) { response in
+            let url = response == .OK ? panel.url : nil
+            MainActor.assumeIsolated { done(url) }
+        }
+    }
+
+    /// **Save As UTF-8**, through the `NSDocument`
+    /// (`CSVDocument.saveAsUTF8(to:)`), so it follows the copy. Returns
+    /// whether it saved. Without one, the model saves and reloads.
+    var onSaveAsUTF8: ((URL) async throws -> Bool)?
+    /// A Save As UTF-8, while it is under way.
+    private(set) var savingAsUTF8: Task<Void, Never>?
+
+    /// The name Save As UTF-8 suggests: the file's own, with "(UTF-8)".
+    static func utf8CopyName(of url: URL) -> String {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let suffix = String(localized: "UTF-8", comment: "Save As UTF-8: added to the suggested file name, as in \"people (UTF-8).csv\"")
+        let name = "\(stem) (\(suffix))"
+        return url.pathExtension.isEmpty ? name : "\(name).\(url.pathExtension)"
+    }
+
+    private func startSavingAsUTF8(to url: URL) {
+        let save = onSaveAsUTF8
+        let model = model
+        savingAsUTF8 = Task { [weak self] in
+            do {
+                if let save {
+                    _ = try await save(url)
+                } else if try await model.saveAsUTF8(to: url) != nil {
+                    try await model.reloadInBackground(from: url)
+                }
+            } catch let failure as SaveFailure {
+                self?.showSaveAsUTF8Failure(failure)
+            } catch {
+                // Saved, but the copy couldn't be read back.
+                self?.showReloadError(error)
+            }
+            self?.savingAsUTF8 = nil
+        }
+    }
+
+    /// Why Save As UTF-8 didn't save. Nothing was written either way.
+    private func showSaveAsUTF8Failure(_ failure: SaveFailure) {
+        guard let window = view.window, let message = SaveText.saveAsUTF8Failure(failure, headerRows: model.headerRows) else { return }
+        let alert = NSAlert()
+        alert.messageText = message.title
+        alert.informativeText = message.detail
+        showAlert(alert, window)
+    }
+
+    /// Shows `alert` as a sheet on `window`. Tests replace it, so that no
+    /// sheet is shown.
+    var showAlert: (_ alert: NSAlert, _ window: NSWindow) -> Void = { alert, window in
+        alert.beginSheetModal(for: window)
     }
 
     /// The drive banners' Save As…: Save is refused (`DocumentModel.canSave`)

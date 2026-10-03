@@ -1,0 +1,124 @@
+import AppKit
+import LealFFI
+import XCTest
+
+@testable import Leal
+
+/// Task 2.3 against the real core, hosted (and sandboxed) in Leal.app: the
+/// UTF-16 banner's **Save As UTF-8…** (mockup 06a) saves a UTF-8 copy
+/// through the core, and the window then shows the copy, which isn't
+/// read-only; bytes that can't be converted are named, and nothing is
+/// written (ADR-0008 decision 7, F5).
+@MainActor
+final class SaveAsUTF8Tests: XCTestCase {
+    private var directory: URL!
+    private var savedEnvironment: (() throws -> DocumentEnvironment)?
+
+    override func setUp() async throws {
+        directory = FileManager.default.temporaryDirectory.appending(path: "leal-utf8-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let environment = DocumentEnvironment(
+            scheduler: try Scheduler(),
+            temp: TempLocations(
+                scratchDir: directory.appending(path: "scratch").path(percentEncoded: false),
+                recordsDir: directory.appending(path: "records").path(percentEncoded: false)
+            )
+        )
+        savedEnvironment = CSVDocument.environment
+        CSVDocument.environment = { environment }
+    }
+
+    override func tearDown() async throws {
+        if let savedEnvironment { CSVDocument.environment = savedEnvironment }
+        for document in NSDocumentController.shared.documents {
+            document.close()
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// `text` as UTF-16 LE with its BOM, at `name` in the test's folder.
+    private func utf16File(_ name: String, _ text: String) throws -> (URL, Data) {
+        var data = Data([0xFF, 0xFE])
+        data.append(try XCTUnwrap(text.data(using: .utf16LittleEndian)))
+        let url = directory.appending(path: name)
+        try data.write(to: url)
+        return (url, data)
+    }
+
+    private func open(_ url: URL) throws -> (CSVDocument, DocumentModel, DocumentWindowController) {
+        let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+        document.makeWindowControllers()
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        _ = controller.window
+        return (document, try XCTUnwrap(document.model), controller)
+    }
+
+    func testTheBannerButtonSavesAUTF8CopyAndTheWindowShowsIt() async throws {
+        let (url, data) = try utf16File("legacy.csv", "id\tname\r\n1\tZoë 😀\r\n")
+        let (document, model, controller) = try open(url)
+        let content = controller.content
+        XCTAssertTrue(model.isReadOnly)
+        XCTAssertNotNil(controller.lock)
+        let banner = try XCTUnwrap(content.readOnlyBanner)
+
+        let copy = directory.appending(path: "legacy (UTF-8).csv")
+        var suggested: (name: String, folder: URL)?
+        content.chooseUTF8Destination = { name, folder, _, done in
+            suggested = (name, folder)
+            done(copy)
+        }
+        try XCTUnwrap(banner.button).performClick(nil)
+        await content.savingAsUTF8?.value
+
+        XCTAssertEqual(suggested?.name, "legacy (UTF-8).csv")
+        XCTAssertEqual(suggested?.folder.standardizedFileURL, directory.standardizedFileURL)
+        XCTAssertEqual(try Data(contentsOf: copy), Data("\u{FEFF}id\tname\r\n1\tZoë 😀\r\n".utf8))
+        XCTAssertEqual(try Data(contentsOf: url), data, "the UTF-16 file is untouched")
+        // The window is the copy now, in UTF-8, and not read-only.
+        XCTAssertEqual(document.fileURL?.standardizedFileURL, copy.standardizedFileURL)
+        XCTAssertEqual(model.url.standardizedFileURL, copy.standardizedFileURL)
+        XCTAssertEqual(model.interpretation.encoding, .utf8)
+        XCTAssertFalse(model.isReadOnly)
+        XCTAssertNil(controller.lock)
+        XCTAssertNil(content.readOnlyBanner)
+        XCTAssertEqual(model.cell(row: 0, column: 1), .text("Zoë 😀", truncated: false))
+        document.close()
+    }
+
+    /// An unpaired surrogate: the alert names its cell, nothing is written,
+    /// and the window still shows the UTF-16 file.
+    func testBytesThatCantBeConvertedAreNamedAndNothingIsWritten() async throws {
+        let (url, _) = try utf16File("broken.csv", "id\tname\r\n1\tX\r\n")
+        var bytes = try Data(contentsOf: url)
+        let x = try XCTUnwrap(bytes.firstIndex(of: UInt8(ascii: "X")))
+        bytes.replaceSubrange(x..<x + 2, with: [0x3D, 0xD8])
+        try bytes.write(to: url)
+        let (document, model, controller) = try open(url)
+        let content = controller.content
+        let copy = directory.appending(path: "broken (UTF-8).csv")
+        content.chooseUTF8Destination = { _, _, _, done in done(copy) }
+        var shown: NSAlert?
+        content.showAlert = { alert, _ in shown = alert }
+        content.saveAsUTF8(nil)
+        await content.savingAsUTF8?.value
+
+        let alert = try XCTUnwrap(shown)
+        XCTAssertEqual(alert.messageText, "The UTF-8 copy wasn’t saved.")
+        XCTAssertEqual(
+            alert.informativeText,
+            "The cell at row 1, column 2 holds bytes that aren’t UTF-16 LE text, so they can’t be converted. Leal never replaces them."
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)))
+        XCTAssertEqual(document.fileURL?.standardizedFileURL, url.standardizedFileURL)
+        XCTAssertTrue(model.isReadOnly)
+        XCTAssertNotNil(content.readOnlyBanner)
+        document.close()
+    }
+
+    /// The suggested name keeps the extension, and a file without one gets
+    /// none.
+    func testTheSuggestedNameSaysUTF8() {
+        XCTAssertEqual(DocumentViewController.utf8CopyName(of: URL(filePath: "/a/people.tsv")), "people (UTF-8).tsv")
+        XCTAssertEqual(DocumentViewController.utf8CopyName(of: URL(filePath: "/a/people")), "people (UTF-8)")
+    }
+}

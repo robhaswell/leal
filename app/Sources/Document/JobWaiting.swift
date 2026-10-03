@@ -22,3 +22,19 @@ extension Job {
         }
     }
 }
+
+extension SaveJob {
+    /// Waits for the save, and cancels it if the waiting Swift task is
+    /// cancelled, as `Job.finish()` does (ADR-0005 decision 6). Before the
+    /// new file is in place a cancelled save leaves nothing behind; after,
+    /// it finishes.
+    ///
+    /// - Throws: the `SaveFailure` the save ended with.
+    func outcome() async throws -> SaveOutcome {
+        try await withTaskCancellationHandler {
+            try await wait()
+        } onCancel: {
+            cancel()
+        }
+    }
+}
