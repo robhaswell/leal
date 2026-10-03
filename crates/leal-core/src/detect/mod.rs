@@ -201,8 +201,12 @@ pub struct Detection {
     /// Whether the encoding is from a `com.apple.TextEncoding` attribute
     /// Leal wrote itself (ADR-0013 decision 2): its interpretation
     /// attribute records the same encoding, with a fingerprint the file
-    /// still matches. It holds even where a byte doesn't decode, so
-    /// [`review`] doesn't second-guess it.
+    /// still matches, and that held where the ordinary rule would not
+    /// have: a byte of the first paint's bytes doesn't decode, or the file
+    /// is longer than them, so a later byte may not. [`review`] then
+    /// doesn't second-guess it. (Where the tag is honoured anyway, because
+    /// it is UTF-8 or Windows-1252 or the whole file decodes, this is
+    /// false: Leal's mark changed nothing.)
     pub own_encoding_tag: bool,
 }
 
@@ -305,8 +309,14 @@ pub fn detect(
         choices.encoding,
         &mut notes,
     )?;
-    let own_encoding_tag =
-        encoding_source == EncodingSource::Attribute && own_encoding == Some(encoding);
+    // Only where Leal's mark changed the outcome: UTF-8 and Windows-1252
+    // are honoured without a decoding check, and a tag that decodes the
+    // whole file is honoured anyway. A longer file's later bytes may not
+    // decode (the review looks), so there the mark may matter.
+    let own_encoding_tag = encoding_source == EncodingSource::Attribute
+        && own_encoding == Some(encoding)
+        && !matches!(encoding, Encoding::Utf8 | Encoding::Windows1252)
+        && (cut || !decodes(body, encoding));
     let units = Units::new(body, encoding);
 
     // The delimiter: chosen, remembered, or guessed.

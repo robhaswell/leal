@@ -520,6 +520,36 @@ fn an_own_mark_holds_its_tag_over_an_unassigned_byte() {
     assert_eq!(d.notes, []);
 }
 
+/// The mark counts only where it changed the outcome: a tag that decodes
+/// the whole file is honoured anyway; in a file longer than the first
+/// paint, a later byte may not decode, so the mark may matter.
+#[test]
+fn an_own_mark_is_not_set_where_the_tag_decodes_anyway() {
+    let bytes = b"id,name\n1,\xE1b\n".to_vec();
+    let mark = Interpretation {
+        file: Some(Fingerprint::of(&bytes)),
+        encoding: Some(Encoding::Windows1253),
+        ..Interpretation::default()
+    };
+    let d = detect_own(&bytes, &mark, Encoding::Windows1253, Choices::default());
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::Windows1253, EncodingSource::Attribute, false)
+    );
+
+    let mut long = bytes.clone();
+    long.extend_from_slice(&ascii_rows(FIRST_PAINT_BYTES));
+    let mark = Interpretation {
+        file: Some(Fingerprint::of(&long)),
+        ..mark
+    };
+    let d = detect_own(&long, &mark, Encoding::Windows1253, Choices::default());
+    assert_eq!(
+        (d.encoding, d.encoding_source, d.own_encoding_tag),
+        (Encoding::Windows1253, EncodingSource::Attribute, true)
+    );
+}
+
 #[test]
 fn a_utf16_bom_beats_an_own_mark() {
     let mut bytes = b"\xFF\xFE".to_vec();
