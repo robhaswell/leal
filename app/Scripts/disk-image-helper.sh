@@ -29,14 +29,17 @@
 # xcodebuild process that ran the pre-action (its parent). The helper
 # detaches every image it attached: on `done`, on `stop`, on SIGTERM and
 # SIGINT, as soon as that xcodebuild has gone (an interrupted run), and after
-# 20 minutes at most. `start` also detaches what an earlier helper of this
+# 20 minutes without a request (the time runs from the last request, not from
+# the start: the pre-action runs before xcodebuild compiles, and a slow build
+# must not use it up). `start` also detaches what an earlier helper of this
 # checkout left behind, if that helper is gone. Never kills anything by name.
 
 set -uo pipefail
 
 container_tmp="$HOME/Library/Containers/io.github.robhaswell.leal/Data/tmp"
 script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-lifetime=1200
+# How long the helper waits for the next request, once it has had one.
+idle_timeout=1200
 attempts=5
 transient='Resource busy|Resource temporarily unavailable|no mountable file systems|Device not configured'
 
@@ -234,10 +237,19 @@ watch() {
     trap cleanup EXIT
     trap 'exit 0' TERM INT
     log "watching $work for xcodebuild $owner"
-    local deadline=$((SECONDS + lifetime)) watched=yes
+    # The idle time runs from the last request (or detach, or done). With
+    # no xcodebuild to watch (`owner` is none), it runs from the start until
+    # the first request, so the helper can't outlive a run it can't see.
+    local last_request="" watched=yes started=$SECONDS
     [ "$owner" = none ] && watched=no
-    while [ "$SECONDS" -lt "$deadline" ]; do
+    while :; do
         [ -e "$stop" ] && break
+        if [ -n "$last_request" ]; then
+            [ $((SECONDS - last_request)) -ge "$idle_timeout" ] && { log "idle for $idle_timeout s"; break; }
+        elif [ "$watched" = no ] && [ $((SECONDS - started)) -ge "$idle_timeout" ]; then
+            log "no request for $idle_timeout s"
+            break
+        fi
         # The run was interrupted: its post-action will never come.
         if [ "$watched" = yes ] && ! kill -0 "$owner" 2> /dev/null; then
             log "xcodebuild $owner has gone"
@@ -251,7 +263,10 @@ watch() {
                 [ -e "$request" ] || continue
                 # Claim it; another helper of this checkout may have got
                 # there first.
-                mv "$request" "$(dirname "$request")/claimed" 2> /dev/null && serve "$(dirname "$request")"
+                if mv "$request" "$(dirname "$request")/claimed" 2> /dev/null; then
+                    serve "$(dirname "$request")"
+                    last_request=$SECONDS
+                fi
             done
             for detach in "$work"/*/detach; do
                 [ -e "$detach" ] || continue
@@ -260,9 +275,10 @@ watch() {
                 grep -qxF "$folder/volume.dmg" "$attached" || continue
                 rm -f "$detach"
                 pull "$folder"
+                last_request=$SECONDS
             done
             for done_file in "$work"/*/done; do
-                [ -e "$done_file" ] && grep -qxF "$(dirname "$done_file")/volume.dmg" "$attached" && finish "$(dirname "$done_file")"
+                [ -e "$done_file" ] && grep -qxF "$(dirname "$done_file")/volume.dmg" "$attached" && { finish "$(dirname "$done_file")"; last_request=$SECONDS; }
             done
         fi
         sleep 0.05
@@ -275,7 +291,7 @@ case "${1:-}" in
         work="$container_tmp/leal-disk-images/$(checkout_key)"
         # The xcodebuild that runs this action (and, later, the post-action),
         # whose end ends the helper; "none" if there is none, when only the
-        # stop file and the lifetime do.
+        # stop file and the idle timeout do.
         owner="$(owner_pid)"
         owner="${owner:-none}"
         sweep >> "$dir/helper.log" 2>&1

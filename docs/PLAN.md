@@ -688,16 +688,20 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     and titles. Handle both before a paste can reach far columns. (2.1
     notes, "Left for later")
 - [ ] **2.6a Tidy-up** — nits collected from reviews (CLAUDE.md, token budget).
-  - The `snapshot` test helper's 5 ms run-loop wait in `GridStripsTests`
+  - [x] The `snapshot` test helper's 5 ms run-loop wait in `GridStripsTests`
     (make the deferred flush deterministic).
-  - `testANewReadingRedrawsEverythingWhateverTheChange` uses a 100 ms sleep.
-  - The read-ahead's wanted range is reset per strip during full redraws
+  - [x] `testANewReadingRedrawsEverythingWhateverTheChange` uses a 100 ms sleep.
+  - [x] The read-ahead's wanted range is reset per strip during full redraws
     (performance).
-  - Per-edit `updateBanners` / `statusBar.show` cost.
-  - The queued single alert in `DocumentViewController` replaces an earlier
+  - [x] Per-edit `updateBanners` / `statusBar.show` cost.
+  - [x] The queued single alert in `DocumentViewController` replaces an earlier
     one.
-  - `own_encoding_tag` is true even when the tag decodes.
-  - Investigate the occasional slow launch (433 and 479 ms, against a
+  - [x] `own_encoding_tag` is true even when the tag decodes.
+  - [x] The disk-image helper's fixed 20-minute deadline
+    (`app/Scripts/disk-image-helper.sh`) ran from the scheme's pre-action,
+    before xcodebuild compiled, so a slow build could use it all up; it is
+    now an idle timeout that runs from the last request.
+  - [ ] Investigate the occasional slow launch (433 and 479 ms, against a
     median of about 160 ms; probably the first launch after a build).
 - [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.

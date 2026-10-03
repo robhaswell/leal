@@ -79,18 +79,35 @@ final class GridStripsTests: XCTestCase {
         rep.size = rect.size
         view.cacheDisplay(in: rect, to: rep)
         if laterFrame, !(view is StripContentView) {
-            // A frame later: a strip that draws a row for the first time
+            // Frames later: a strip that draws a row for the first time
             // can ask for ink it spills past its edge (or past what was
             // drawn of it) to be drawn, in the next frame
-            // (`GridView.spills`; `GridStrips.invalidate`). (A grid view's
-            // own snapshot waits for that itself.) The strips' snapshot
-            // (`drawSnapshot`) flushes what was deferred, but without a
-            // turn of the run loop here a later check (an edit back to
-            // spilling) differs.
-            RunLoop.main.run(until: Date().addingTimeInterval(0.005))
-            view.cacheDisplay(in: rect, to: rep)
+            // (`GridView.spills`; `GridStrips.invalidate`), which a
+            // run-loop turn would bring (`GridStrips.scheduleDeferred`).
+            // Here that is done at once: what was deferred is asked for
+            // again, and the view drawn again, until nothing is left. (A
+            // grid view's own snapshot, `GridStrips.drawSnapshot`, does
+            // that itself.)
+            for _ in 0..<5 {
+                let flushed = flushDeferred(in: view)
+                view.cacheDisplay(in: rect, to: rep)
+                guard flushed else { break }
+            }
         }
         return rep
+    }
+
+    /// Asks again for what the strips of the grids in `view` deferred to
+    /// the next frame. Whether any did.
+    private func flushDeferred(in view: NSView) -> Bool {
+        var flushed = false
+        if let grid = view as? GridContainerView {
+            for strips in [grid.strips, grid.gutterStrips] {
+                if strips?.flushDeferred() == true { flushed = true }
+            }
+        }
+        for subview in view.subviews where flushDeferred(in: subview) { flushed = true }
+        return flushed
     }
 
     /// Lets AppKit tell views what changed (an appearance, as it does
@@ -1096,8 +1113,11 @@ final class GridStripsDocumentTests: XCTestCase {
         model.setHeaderRow(false)
         XCTAssertNotEqual(model.readingID, reading, "a new reading")
         try await waitUntil("read again") { model.isIndexComplete }
-        // Anything the window was not told of is settled.
-        try await Task.sleep(for: .milliseconds(100))
+        // Anything the window was not told of is settled: the review, the
+        // diagnostics and the refined sizing have all arrived.
+        try await waitUntil("settled") {
+            model.review != nil && model.diagnostics?.complete == true && model.isSizingRefined
+        }
         model.onChange = listener
         model.cellsChanged(rows: 200..<201)
         controller.content.view.layoutSubtreeIfNeeded()

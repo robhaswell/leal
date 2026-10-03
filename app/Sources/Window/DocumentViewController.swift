@@ -198,7 +198,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         drawnReading = model.readingID
         model.onChange = { [weak self] change in self?.modelChanged(change) }
         updateBanners()
-        statusBar.show(model.status)
+        showStatus()
         if model.rowCount > 0 {
             grid.activeCell = CellPosition(row: 0, column: 0)
         }
@@ -265,11 +265,74 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             onFailure?()
         case let .cells(rows):
             grid.cellsChanged(rows: rows)
+            // An edit rarely changes what the banners or the status bar
+            // show (a new row does, to the row count): skip them then.
+            if !bannerInputsChanged(), model.status == shownStatus {
+                updateDetails()
+                updateReadOnly()
+                return
+            }
         }
         updateBanners()
-        statusBar.show(model.status)
+        showStatus()
         updateDetails()
         updateReadOnly()
+    }
+
+    /// The status the status bar shows.
+    private var shownStatus: StatusSummary?
+
+    private func showStatus() {
+        let status = model.status
+        shownStatus = status
+        statusBar.show(status)
+    }
+
+    /// Everything `updateBanners` reads, as it was when it last ran.
+    private struct BannerInputs: Equatable {
+        var generation: UInt64
+        var failed: Bool
+        var changedOnDisk: Bool
+        var original: OriginalState
+        var storage: SourceStorage
+        var readStopped: Bool
+        var readOnly: Bool
+        var bannerKinds: Int
+        var showsDiagnostics: Bool
+        var delimiter: String?
+        var encoding: String?
+        var dismissed: Set<String>
+        var canSaveAsUTF8: Bool
+        var canReinterpret: Bool
+        var minimumContentHeight: CGFloat
+    }
+
+    private var shownBannerInputs: BannerInputs?
+
+    private var bannerInputs: BannerInputs {
+        BannerInputs(
+            generation: model.generation,
+            failed: model.isFailed,
+            changedOnDisk: model.changedOnDisk,
+            original: model.original.state,
+            storage: model.storage,
+            readStopped: model.readStopped,
+            readOnly: model.isReadOnly,
+            bannerKinds: Int(model.diagnostics?.bannerKinds ?? 0),
+            showsDiagnostics: model.diagnostics?.showsBanner == true,
+            delimiter: model.review?.delimiterSuggestion.map { "\($0)" },
+            encoding: model.review?.encodingSuggestion.map { "\($0)" },
+            dismissed: dismissed,
+            canSaveAsUTF8: canSaveAsUTF8,
+            canReinterpret: canReinterpret,
+            minimumContentHeight: minimumContentHeight
+        )
+    }
+
+    /// Whether anything the banners show has changed since they were last
+    /// updated.
+    private func bannerInputsChanged() -> Bool {
+        shownBannerInputs != bannerInputs
     }
 
     /// Tells the window whether the file is read-only, when that changes:
@@ -285,6 +348,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// Shows the banners the document's state calls for, in their order.
     func updateBanners() {
+        defer { shownBannerInputs = bannerInputs }
         if bannerGeneration != model.generation {
             // A new reading of the file: suggestions and the diagnostics
             // banner start afresh. The file's banners are about the file,
@@ -1089,9 +1153,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         readOnlyBanner?.button?.isEnabled = canSaveAsUTF8
     }
 
-    /// An alert that came while the view had no window, shown when it has
-    /// one again.
-    private var queuedAlert: NSAlert?
+    /// The alerts that came while the view had no window, shown in order
+    /// when it has one again.
+    private var queuedAlerts: [NSAlert] = []
 
     /// The name Save As UTF-8 suggests: the file's own, with "(UTF-8)".
     static func utf8CopyName(of url: URL) -> String {
@@ -1140,7 +1204,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// Shows `alert` on the window, or once the view has one again.
     private func present(_ alert: NSAlert) {
         guard let window = view.window else {
-            queuedAlert = alert
+            queuedAlerts.append(alert)
             return
         }
         showAlert(alert, window)
@@ -1148,10 +1212,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        if let alert = queuedAlert {
-            queuedAlert = nil
-            present(alert)
-        }
+        let alerts = queuedAlerts
+        queuedAlerts = []
+        for alert in alerts { present(alert) }
     }
 
     /// Shows `alert` as a sheet on `window`. Tests replace it, so that no

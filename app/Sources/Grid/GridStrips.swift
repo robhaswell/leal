@@ -231,17 +231,20 @@ final class GridStrips: NSObject, CALayerDelegate {
         guard !deferredScheduled else { return }
         deferredScheduled = true
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.flushDeferred() }
+            MainActor.assumeIsolated { _ = self?.flushDeferred() }
         }
     }
 
-    func flushDeferred() {
+    /// Asks again for what was deferred. Whether there was any.
+    @discardableResult
+    func flushDeferred() -> Bool {
         deferredScheduled = false
         let parts = deferred
         deferred = []
         for (index, part) in parts {
             if let strip = strips[index] { markDirty(strip, part: part) }
         }
+        return !parts.isEmpty
     }
 
     /// Redraws every strip.

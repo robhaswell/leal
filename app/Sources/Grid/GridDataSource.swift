@@ -138,10 +138,16 @@ final class CellTileCache {
     /// asked for again ahead (a vanished drive would fail every frame).
     /// The draw still reads one it needs, and reports the error then.
     private var failedAhead: Set<Key> = []
-    /// The rows wanted since the last draw (`prepare` starts it again,
-    /// later calls widen it), which a queued read checks before
-    /// it starts: one the scroll has left behind is skipped.
+    /// The rows wanted since the last frame (the first `prepare` of a
+    /// frame starts it again, later calls widen it), which a queued read
+    /// checks before it starts: one the scroll has left behind is skipped.
     private let wanted = WantedRange()
+    /// A frame's first `prepare` has started `wanted` again, and the
+    /// run-loop turn it is drawn in is not over: the strips of a full
+    /// redraw are drawn one after another in it, and each widens the
+    /// range instead of resetting it, so the reads ahead of the first
+    /// are not skipped.
+    private var frameStarted = false
     /// The most fields any row read so far has had.
     private(set) var widestRow = 0
     /// How many reads there have been, for tests.
@@ -302,11 +308,18 @@ final class CellTileCache {
                 _ = tile(for: Key(rowBlock: rowBlock, columnBlock: columnBlock), loadedRows: loadedRows)
             }
         }
-        // The tiles next to it, above and below, and either side. A draw
-        // starts what is wanted again: a read queued for rows the scroll
-        // has left is skipped.
+        // The tiles next to it, above and below, and either side. A frame
+        // starts what is wanted again (once, however many strips it draws):
+        // a read queued for rows the scroll has left is skipped.
         let block = Self.rowsPerTile
-        readAhead(rows: max(0, rows.lowerBound - block)..<(rows.upperBound + block), columns: columns, loadedRows: loadedRows, startsWanted: true)
+        let startsFrame = !frameStarted
+        if startsFrame {
+            frameStarted = true
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.frameStarted = false }
+            }
+        }
+        readAhead(rows: max(0, rows.lowerBound - block)..<(rows.upperBound + block), columns: columns, loadedRows: loadedRows, startsWanted: startsFrame)
         readAhead(rows: rows, columns: max(0, columns.lowerBound - Self.columnsPerTile)..<(columns.upperBound + Self.columnsPerTile), loadedRows: loadedRows)
     }
 

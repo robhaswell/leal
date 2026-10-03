@@ -208,6 +208,9 @@ final class DocumentModel: GridDataSource {
     private var tiles: CellTileCache!
     private var tasks: [Task<Void, Never>] = []
     private var refinedSizingStarted = false
+    /// The refined sizing of this reading has arrived (its last change to
+    /// the columns), for tests that wait for the model to settle.
+    private(set) var isSizingRefined = false
     private var columnUpdateScheduled = false
 
     private let cellMeasurer = TextMeasurer(font: GridFonts.cell)
@@ -1043,6 +1046,7 @@ final class DocumentModel: GridDataSource {
             for (column, width) in widths.enumerated() where column < columnWidths.count && !resizedColumns.contains(column) {
                 columnWidths[column] = width
             }
+            isSizingRefined = true
             onChange?(.columns)
         case let .failure(error):
             switch error as? LealError {
@@ -1151,6 +1155,7 @@ final class DocumentModel: GridDataSource {
         widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false
+        isSizingRefined = false
         if let current = call({ try $0.progress() }) { progress = current }
         applyFirstScreen(screen)
         onChange?(.content)
@@ -1283,6 +1288,7 @@ final class DocumentModel: GridDataSource {
         flagBlocks.removeAll()
         tiles.removeAll()
         refinedSizingStarted = false
+        isSizingRefined = false
         refreshDriveState()
         onChange?(.rows)
         startWaiting()
@@ -1468,6 +1474,7 @@ final class DocumentModel: GridDataSource {
         widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false
+        isSizingRefined = false
         storage = .clone
         changedOnDisk = false
         readStopped = false
