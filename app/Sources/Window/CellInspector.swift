@@ -198,9 +198,9 @@ final class InspectorTextView: LiteralTextView {
         return super.performKeyEquivalent(with: event)
     }
 
-    /// ⌘↩ (Return or Enter, with ⌘ and nothing else).
+    /// ⌘↩ (Return or Enter, with ⌘ and nothing else; Caps Lock on or off).
     static func isCommit(_ event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function, .capsLock])
         return event.type == .keyDown && modifiers == .command && (event.keyCode == 36 || event.keyCode == 76)
     }
 }

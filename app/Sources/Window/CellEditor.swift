@@ -100,14 +100,18 @@ class LiteralTextView: NSTextView {
     /// on: in the in-cell editor they commit the edit, then insert a row
     /// below or duplicate the row (in the inspector ⌘↩ commits only:
     /// `InspectorTextView`). ⌘ (or ⇧⌘) and the keypad's Enter, which isn't
-    /// the menu items' key, do the same there, as they do in the grid.
+    /// the menu items' key, do the same there, as they do in the grid; in
+    /// the inspector ⇧⌘ and the keypad's Enter duplicates too, rather than
+    /// reaching the text.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if window?.firstResponder === self, let key = GridView.rowCommandKey(event) {
             if key == .delete {
                 interpretKeyEvents([event])
                 return true
             }
-            if isFieldEditor, event.keyCode == Self.keypadEnter {
+            // In the inspector only ⇧⌘ and the keypad's Enter gets here:
+            // it takes ⌘ and the keypad's Enter as commit (`isCommit`).
+            if event.keyCode == Self.keypadEnter {
                 let command = StructureCommand(key)
                 return tryToPerform(DocumentViewController.action(command), with: self)
             }
@@ -126,9 +130,10 @@ class LiteralTextView: NSTextView {
         super.keyDown(with: event)
     }
 
-    /// ⇧↩ (Return or Enter, with Shift and nothing else).
+    /// ⇧↩ (Return or Enter, with Shift and nothing else; Caps Lock on or
+    /// off).
     static func isShiftReturn(_ event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function, .capsLock])
         return event.type == .keyDown && modifiers == .shift && (event.keyCode == 36 || event.keyCode == 76)
     }
 
@@ -889,7 +894,8 @@ enum EditText {
             String(localized: "This cell is too far past the end of its row to edit.", comment: "Callout: a cell too far right can't be edited")
         case .unreadable:
             String(localized: "This row can’t be read: its drive or share isn’t available.", comment: "Callout: a cell whose row can't be read can't be edited")
-        case .noSuchRow, .noSuchColumn:
+        // A cell edit never refuses `.tooManyRows`: that is Duplicate Row's.
+        case .noSuchRow, .noSuchColumn, .tooManyRows:
             String(localized: "This cell isn’t in the file.", comment: "Callout: a cell that isn't in the file can't be edited")
         case .valueChanged, .otherLineage:
             String(localized: "The cell changed meanwhile, so the edit wasn’t made.", comment: "Callout: an edit refused because the cell changed")

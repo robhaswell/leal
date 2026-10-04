@@ -4,8 +4,9 @@
 
 use super::*;
 
-use crate::edit::{Command, Edit, EditError};
+use crate::edit::{Command, DUPLICATE_ROW_LIMIT, Edit, EditError};
 use crate::find::Query;
+use crate::save::{SaveKind, SaveRequest};
 
 const FILE: &[u8] = b"name,n\na,1\nb,2\nc,3\nd,4\n";
 
@@ -582,13 +583,22 @@ fn a_replayed_hatched_cell_made_missing_in_a_row_put_back_is_emptied() {
     );
 }
 
+/// Saves `document` over its own file and returns the bytes written.
+fn saved(document: &Arc<Document>) -> Vec<u8> {
+    let path = document.original().path.clone();
+    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+    job.wait().as_ref().unwrap();
+    std::fs::read(&path).unwrap()
+}
+
 /// Task 2.5a, Duplicate Row: copies of the rows, as they read (edits
 /// included), go after the last, as one command, undone and redone by
-/// identity; a copy's own edits stay its own; it is replayed by value.
+/// identity; a copy's own edits stay its own; it is replayed by value,
+/// and the replay saves the same bytes as the document it was made in.
 #[test]
 fn duplicated_rows_are_copies_after_the_last() {
     let dir = Dir::new("rows-duplicate");
-    let document = open_with(&dir, "a.csv", FILE, true);
+    let document = Arc::new(open_with(&dir, "a.csv", FILE, true));
     let edit = set_cell(&document, 2, 1, "two");
     let duplicate = document.duplicate_rows(1, 2).unwrap().unwrap();
     assert!(matches!(
@@ -614,7 +624,7 @@ fn duplicated_rows_are_copies_after_the_last() {
     document.apply(&duplicate).unwrap();
     assert_eq!(texts(&document), doubled);
     // Replayed into the file opened afresh: by value.
-    let fresh = open_with(&dir, "b.csv", FILE, true);
+    let fresh = Arc::new(open_with(&dir, "b.csv", FILE, true));
     let replay = fresh.replay(&[edit.clone(), duplicate.clone()]);
     assert!(replay.refused.is_empty(), "{:?}", replay.refused);
     assert_eq!(texts(&fresh), doubled);
@@ -622,6 +632,50 @@ fn duplicated_rows_are_copies_after_the_last() {
     document.apply(&edit.inverse()).unwrap();
     assert!(!document.has_edits());
     assert_eq!(document.duplicate_rows(1, 0).unwrap(), None);
+    // Saved, the replay's bytes are the document's.
+    document.apply(&edit).unwrap();
+    document.apply(&duplicate).unwrap();
+    let expected: &[u8] = b"name,n\na,1\nb,two\na,1\nb,two\nc,3\nd,4\n";
+    assert_eq!(saved(&document), expected);
+    assert_eq!(saved(&fresh), expected);
+}
+
+/// Task 2.5a: Duplicate Row copies at most `DUPLICATE_ROW_LIMIT` rows at
+/// once (it reads them on the main thread); more, the whole file selected
+/// say, is refused, asked first or made, and nothing changes.
+#[test]
+fn duplicating_more_than_the_limit_is_refused() {
+    let dir = Dir::new("rows-duplicate-limit");
+    let bytes: Vec<u8> = (0..=DUPLICATE_ROW_LIMIT)
+        .flat_map(|row| format!("{row},x\n").into_bytes())
+        .collect();
+    let document = open_with(&dir, "a.csv", &bytes, false);
+    assert_eq!(document.row_count(), DUPLICATE_ROW_LIMIT + 1);
+    let all = DUPLICATE_ROW_LIMIT + 1;
+    assert!(matches!(
+        document.can_duplicate_rows(0, all),
+        Err(EditError::TooManyRows { count }) if count == all
+    ));
+    assert!(matches!(
+        document.duplicate_rows(0, all),
+        Err(EditError::TooManyRows { count }) if count == all
+    ));
+    // Past the end too: the limit is said first.
+    assert!(matches!(
+        document.can_duplicate_rows(5, all),
+        Err(EditError::TooManyRows { .. })
+    ));
+    assert!(!document.has_edits());
+    assert_eq!(document.row_count(), all);
+    assert!(document.can_duplicate_rows(1, DUPLICATE_ROW_LIMIT).is_ok());
+    let command = document
+        .duplicate_rows(1, DUPLICATE_ROW_LIMIT)
+        .unwrap()
+        .unwrap();
+    assert_eq!(document.row_count(), all + DUPLICATE_ROW_LIMIT);
+    assert_eq!(texts(&document)[all], ["1", "x"]);
+    document.apply(&command.inverse()).unwrap();
+    assert!(!document.has_edits());
 }
 
 /// Task 2.5a: Duplicate Row is refused where a row insert after the rows

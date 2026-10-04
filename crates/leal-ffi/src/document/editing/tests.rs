@@ -291,6 +291,16 @@ fn rows_inserted_and_deleted_undo_redo_and_replay() {
         document.can_duplicate_rows(2, 2).unwrap(),
         Some(EditRefusal::NoSuchRow)
     );
+    // More than the limit (the whole file selected, say): refused.
+    assert_eq!(duplicate_row_limit(), 10_000);
+    assert_eq!(
+        document.can_duplicate_rows(0, 10_001).unwrap(),
+        Some(EditRefusal::TooManyRows)
+    );
+    assert_eq!(
+        document.duplicate_rows(0, 10_001),
+        Err(refused(&path, EditRefusal::TooManyRows, None, None))
+    );
     assert_eq!(
         document.duplicate_rows(2, 1),
         Err(refused(

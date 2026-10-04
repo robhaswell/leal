@@ -33,7 +33,8 @@ extension DocumentModel {
 
     /// Why grid rows `rows` can't be duplicated now, or `nil` if they can:
     /// as for rows inserted after them (the last an unterminated quote's
-    /// row, say).
+    /// row, say), or more than the core copies at once (⌘A, a whole
+    /// column: `duplicateRowLimit()`).
     func rowDuplicateRefusal(_ rows: ClosedRange<Int>) -> EditRefusal? {
         let at = logicalRow(gridRow: rows.lowerBound)
         let count = UInt64(rows.count)

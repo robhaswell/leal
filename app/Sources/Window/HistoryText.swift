@@ -36,7 +36,7 @@ enum HistoryText {
         switch refusal {
         case .stillReading, .notReadYet, .unreadable, .saving:
             true
-        case .noSuchRow, .tooFarRight, .afterUnterminatedQuote, .valueChanged, .otherLineage, .noSuchColumn:
+        case .noSuchRow, .tooFarRight, .afterUnterminatedQuote, .valueChanged, .otherLineage, .noSuchColumn, .tooManyRows:
             false
         }
     }
@@ -145,7 +145,8 @@ enum HistoryText {
         switch refusal {
         case .valueChanged, .otherLineage:
             String(localized: "the cell changed", comment: "Why an edit couldn't be recovered: the file changed there")
-        case .noSuchRow, .noSuchColumn, .tooFarRight:
+        // A replay never refuses `.tooManyRows`: that is Duplicate Row's.
+        case .noSuchRow, .noSuchColumn, .tooFarRight, .tooManyRows:
             String(localized: "it isn’t in the file any more", comment: "Why an edit couldn't be recovered: the row or column is gone")
         case .notReadYet, .unreadable, .stillReading, .saving:
             String(localized: "the row couldn’t be read", comment: "Why an edit couldn't be recovered: its row couldn't be read")

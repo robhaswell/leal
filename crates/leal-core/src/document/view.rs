@@ -474,8 +474,9 @@ impl<'a> RowView<'a> {
     }
 
     /// The row's cells as values for a copy of it (Duplicate Row, task
-    /// 2.5a), each written as this row writes it now, so the copy's line
-    /// is this row's: an unedited field of the file as its bytes
+    /// 2.5a), each written as this row writes it now, so the copy's fields
+    /// are this row's (its line ending is the file's most common one): an
+    /// unedited field of the file as its bytes
     /// ([`put_back`](Self::put_back)); an edited field of the file, or a
     /// hatched cell, as an edited field ([`Value::Copied`]); padding as
     /// padding; a new cell (an inserted row's own value, a column

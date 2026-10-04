@@ -70,7 +70,8 @@ struct GridSelection: Equatable, Sendable {
 
     /// The same cells of the copies of `rows` (Duplicate Row, task 2.5a),
     /// which follow them: each corner's row (within `rows`) moved down by
-    /// their count, its column kept.
+    /// their count, its column kept. `throughLastRow` is dropped: the
+    /// copies end where they end, not at the file's last row.
     func copied(_ rows: ClosedRange<Int>) -> GridSelection {
         func copy(_ cell: CellPosition) -> CellPosition {
             CellPosition(row: min(max(cell.row, rows.lowerBound), rows.upperBound) + rows.count, column: cell.column)

@@ -13,8 +13,8 @@ use std::sync::{Arc, PoisonError};
 
 use super::{Document, Reading};
 use crate::edit::{
-    CellId, Command, Edit, EditError, InsertedRow, Lineage, Overlay, Own as EditOwn, Piece,
-    RowChange, RowEdits, RowId, RowMap, RowSource, Rows, Value,
+    CellId, Command, DUPLICATE_ROW_LIMIT, Edit, EditError, InsertedRow, Lineage, Overlay,
+    Own as EditOwn, Piece, RowChange, RowEdits, RowId, RowMap, RowSource, Rows, Value,
 };
 use crate::index::Status;
 use crate::rows::RowParser;
@@ -70,26 +70,36 @@ impl Document {
 
     /// Duplicates logical rows `at..at + count` (Duplicate Row, task
     /// 2.5a): a copy of each, in order, goes after the last, as one
-    /// command (undo deletes the copies). Each copy is written as its row
-    /// is written now, so its line is that row's, byte for byte: unedited
-    /// fields as their bytes, quotes and all; edited cells as the row
-    /// writes them; with the file's line ending (`RowView::copy_values`).
-    /// Undone and redone like any row insert: by identity, and by value
-    /// after a save or in a replay (ADR-0014 decisions 3 and 8). `None` if
-    /// `count` is 0. It reads the rows copied: fast enough for the main
-    /// thread for a selection's rows.
+    /// command (undo deletes the copies). Each copy's fields are written as
+    /// its row writes them now: unedited fields as their bytes, quotes and
+    /// all; edited cells as the row writes them (`RowView::copy_values`).
+    /// Its line ending is the file's most common one, as an inserted row's
+    /// (DESIGN §3.7 rule 3), so in a file of mixed endings a copy's may
+    /// differ from its row's; a blank line's copy is `""` (ADR-0014
+    /// decision 9). Undone and redone like any row insert: by identity,
+    /// and by value after a save or in a replay (ADR-0014 decisions 3 and
+    /// 8). `None` if `count` is 0.
+    ///
+    /// It reads and copies the rows on the caller's thread, so it takes at
+    /// most [`DUPLICATE_ROW_LIMIT`] rows: 10,000 rows of the reference
+    /// file take about 16 ms, the undo included
+    /// (`row_edits/duplicate_10k_rows`).
     ///
     /// # Errors
     ///
     /// As for [`insert_rows`](Self::insert_rows): [`EditError::NoSuchRow`]
     /// if a row isn't there, [`EditError::AfterUnterminatedQuote`] if the
     /// last is an unterminated quote's row (the copies would be inside the
-    /// quote), and [`EditError::Read`] if a row can't be read.
+    /// quote); [`EditError::TooManyRows`] past [`DUPLICATE_ROW_LIMIT`], and
+    /// [`EditError::Read`] if a row can't be read.
     pub fn duplicate_rows(&self, at: usize, count: usize) -> Result<Option<Command>, EditError> {
         if count == 0 {
             return Ok(None);
         }
         self.change_rows(|reading| {
+            if count > DUPLICATE_ROW_LIMIT {
+                return Err(EditError::TooManyRows { count });
+            }
             let end = rows_there(reading, at, count)?;
             let parser = &reading.parser;
             let copies = Self::read_rows_of(reading, at..end, |view| view.copy_values(parser))
@@ -109,12 +119,16 @@ impl Document {
     /// # Errors
     ///
     /// As [`duplicate_rows`](Self::duplicate_rows) would refuse them
-    /// (without reading them): [`EditError::NoSuchRow`] for no rows.
+    /// (without reading them): [`EditError::NoSuchRow`] for no rows,
+    /// [`EditError::TooManyRows`] for more than [`DUPLICATE_ROW_LIMIT`].
     pub fn can_duplicate_rows(&self, at: usize, count: usize) -> Result<(), EditError> {
         if count == 0 {
             return Err(EditError::NoSuchRow { row: at });
         }
         self.can_change_rows()?;
+        if count > DUPLICATE_ROW_LIMIT {
+            return Err(EditError::TooManyRows { count });
+        }
         let end = rows_there(&self.current(), at, count)?;
         self.can_insert_rows(end)
     }

@@ -198,6 +198,8 @@ pub enum EditRefusal {
     /// No row has the column: a column is inserted at most just past the
     /// widest row, and deleted only where a row has it.
     NoSuchColumn,
+    /// More rows than `duplicate_row_limit()` to duplicate at once.
+    TooManyRows,
     /// The row couldn't be read (its drive or share went away).
     Unreadable,
 }
@@ -277,6 +279,14 @@ impl From<EditCommand> for Command {
     }
 }
 
+/// The most rows **Duplicate Row** copies at once (task 2.5a), for its
+/// tooltip when more are selected. See `leal_core::edit::DUPLICATE_ROW_LIMIT`.
+#[uniffi::export]
+#[must_use]
+pub fn duplicate_row_limit() -> u64 {
+    to_u64(edit::DUPLICATE_ROW_LIMIT)
+}
+
 /// The command that undoes `command`: what [`Document::undo`] applies. The
 /// app's recovery journal (task 2.5.2) records an undo as this, so a replay
 /// applies what the undo did (ADR-0008 decision 5).
@@ -304,6 +314,7 @@ fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
         EditError::StillReading => (EditRefusal::StillReading, None, None),
         EditError::Saving => (EditRefusal::Saving, None, None),
         EditError::NoSuchColumn { column } => (EditRefusal::NoSuchColumn, None, Some(column)),
+        EditError::TooManyRows { .. } => (EditRefusal::TooManyRows, None, None),
         EditError::Read { row, .. } => (EditRefusal::Unreadable, Some(row), None),
     }
 }
@@ -432,14 +443,16 @@ impl Document {
 
     /// Duplicates logical rows `at..at + count` (**Duplicate Row**, task
     /// 2.5a): a copy of each goes after the last, in order, as one command
-    /// for the undo manager (undo deletes the copies). A copy is written as
-    /// its row is now, byte for byte, with the file's line ending. `nil` if
-    /// `count` is 0. It reads the rows: fast enough for the main thread for
-    /// a selection's.
+    /// for the undo manager (undo deletes the copies). A copy's fields are
+    /// written as its row writes them now; its line ending is the file's
+    /// most common one, as an inserted row's. `nil` if `count` is 0. It
+    /// reads the rows, at most `duplicate_row_limit()` of them (about 16 ms
+    /// for 10,000 rows of the reference file).
     ///
     /// # Errors
     ///
-    /// As for [`insert_rows`](Self::insert_rows), and
+    /// As for [`insert_rows`](Self::insert_rows),
+    /// [`EditRefusal::TooManyRows`] past `duplicate_row_limit()`, and
     /// [`EditRefusal::Unreadable`] if a row can't be read.
     pub fn duplicate_rows(&self, at: u64, count: u64) -> Result<Option<EditCommand>, LealError> {
         self.call(|| {
@@ -452,8 +465,9 @@ impl Document {
 
     /// Whether logical rows `at..at + count` can be duplicated now, for
     /// enabling **Duplicate Row**: `nil` if they can, otherwise why not
-    /// (as [`can_change_rows`](Self::can_change_rows), a row that isn't
-    /// there, or the last being an unterminated quote's row).
+    /// (as [`can_change_rows`](Self::can_change_rows), more rows than
+    /// `duplicate_row_limit()`, a row that isn't there, or the last being
+    /// an unterminated quote's row).
     ///
     /// # Errors
     ///

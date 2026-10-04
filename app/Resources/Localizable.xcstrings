@@ -414,6 +414,9 @@
     "Duplicate Rows" : {
       "comment" : "Edit menu with several rows selected (⇧⌘↩): a copy of each after the last, and the Undo menu's Undo Duplicate Rows"
     },
+    "Duplicate up to %@ rows at a time." : {
+      "comment" : "Tooltip: Duplicate Row is off with more rows selected than it copies at once (task 2.5a); the limit"
+    },
     "Edit" : {
       "comment" : "Menu title"
     },

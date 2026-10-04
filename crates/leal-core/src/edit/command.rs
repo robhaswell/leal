@@ -13,6 +13,13 @@ use crate::source::ReadError;
 /// columns.
 pub const COLUMN_LIMIT: usize = 1 << 20;
 
+/// The most rows Duplicate Row copies at once (task 2.5a): it reads and
+/// copies them on the main thread, so a whole-file selection (Select All, a
+/// whole column) is refused rather than copying a large file in memory
+/// while the window waits. 10,000 rows of the reference file take about 16
+/// ms, the undo included (`row_edits/duplicate_10k_rows`).
+pub const DUPLICATE_ROW_LIMIT: usize = 10_000;
+
 /// Which set of edits a command belongs to: a document's edits, while the
 /// file is split into cells one way (ADR-0008 decision 4).
 ///
@@ -258,6 +265,11 @@ pub enum EditError {
         /// The column.
         column: usize,
     },
+    /// More rows than [`DUPLICATE_ROW_LIMIT`] to duplicate at once.
+    TooManyRows {
+        /// How many were asked for.
+        count: usize,
+    },
     /// The row couldn't be read (see `Document::rows`).
     Read {
         /// The row.
@@ -294,6 +306,10 @@ impl fmt::Display for EditError {
                 f.write_str("rows and columns can't be inserted or deleted while saving")
             }
             EditError::NoSuchColumn { column } => write!(f, "no row has column {column}"),
+            EditError::TooManyRows { count } => write!(
+                f,
+                "{count} rows can't be duplicated at once: at most {DUPLICATE_ROW_LIMIT}"
+            ),
             EditError::Read { row, error } => write!(f, "row {row} couldn't be read: {error}"),
         }
     }

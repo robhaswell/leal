@@ -15,12 +15,17 @@
 //!   thread (DESIGN §1's 16 ms for an edit includes it).
 //! - `row_edits/delete_1k_rows_100k_row_edits`: 1,000 rows deleted and the
 //!   delete undone, which puts the same rows back.
+//! - `row_edits/duplicate_10k_rows`: Duplicate Row's most rows at once
+//!   (`DUPLICATE_ROW_LIMIT`, task 2.5a) copied from the middle of the file,
+//!   before the 100,000 edits, and the copies undone: what Duplicate Row
+//!   costs the main thread at worst.
 
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
+use leal_core::edit::DUPLICATE_ROW_LIMIT;
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
 
@@ -68,6 +73,15 @@ fn row_edits(c: &mut Criterion) {
     common::canary(c, "row_edits", Side::Before);
     let mut group = c.benchmark_group("row_edits");
     group.bench_function("screen", |b| b.iter(read_screen));
+    group.bench_function("duplicate_10k_rows", |b| {
+        b.iter(|| {
+            let command = document
+                .duplicate_rows(black_box(FIRST_ROW), DUPLICATE_ROW_LIMIT)
+                .expect("a duplicate")
+                .expect("a change");
+            document.apply(&command.inverse()).expect("an undo");
+        });
+    });
 
     // On screen: every other row deleted, and a row inserted after each
     // one left, from the bottom up so the places stay put.

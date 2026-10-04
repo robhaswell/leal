@@ -84,7 +84,9 @@ mod value;
 pub(crate) use columns::{
     CellId, ColumnOp, Columns, Fold, Layout, OpId, OpKind, Own, Parts, TABLE, fresh_appended,
 };
-pub use command::{COLUMN_LIMIT, CellChange, Command, Edit, EditError, Lineage, Replay};
+pub use command::{
+    COLUMN_LIMIT, CellChange, Command, DUPLICATE_ROW_LIMIT, Edit, EditError, Lineage, Replay,
+};
 pub(crate) use overlay::{
     ColumnChange, EditStore, InsertedRow, Kinds, Overlay, OverlayRow, RowChange, RowEdits,
 };

@@ -127,9 +127,12 @@ final class StructureTests: XCTestCase {
         return try Data(contentsOf: try XCTUnwrap(opened.document.fileURL))
     }
 
-    private func key(_ characters: String, code: UInt16, window: NSWindow, shift: Bool = false, repeating: Bool = false) throws -> NSEvent {
-        try XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: shift ? [.command, .shift] : .command, timestamp: 0, windowNumber: window.windowNumber,
+    private func key(
+        _ characters: String, code: UInt16, window: NSWindow, shift: Bool = false, repeating: Bool = false, also: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        let flags: NSEvent.ModifierFlags = shift ? [.command, .shift] : .command
+        return try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: flags.union(also), timestamp: 0, windowNumber: window.windowNumber,
             context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: repeating, keyCode: code
         ))
     }
@@ -308,10 +311,11 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(undo.undoActionName, "Duplicate Row")
     }
 
-    /// The copy's line is its row's, byte for byte: quotes, an escaped
-    /// quote, spaces, an edited cell quoted as its field was, the file's
-    /// CRLF; undone and redone after a save (by value, ADR-0014 decisions
-    /// 3 and 8), the file goes back to its bytes, then to the copy's.
+    /// The copy's fields are its row's, byte for byte: quotes, an escaped
+    /// quote, spaces, an edited cell quoted as its field was; its line
+    /// ending is the file's most common (here every row's CRLF). Undone
+    /// and redone after a save (by value, ADR-0014 decisions 3 and 8), the
+    /// file goes back to its bytes, then to the copy's.
     func testADuplicateSavesItsRowsBytes() async throws {
         let text = "id,name,note\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
         let opened = try await open(file("dup-bytes.csv", text))
@@ -339,6 +343,112 @@ final class StructureTests: XCTestCase {
             String(decoding: saved, as: UTF8.self),
             "id,name,note\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
         )
+    }
+
+    /// Duplicate Row copies at most 10,000 rows at once (the core reads
+    /// them on the main thread): with more selected (⌘A, or a whole column
+    /// to the last row) it is off, saying so, and its key beeps with the
+    /// reason; 10,000 can be.
+    func testDuplicateIsOffPastTenThousandRows() async throws {
+        var text = "id,name\n"
+        for row in 0..<10_001 { text += "\(row),n\(row)\n" }
+        let opened = try await open(file("many.csv", text))
+        let (model, content, grid) = (opened.model, opened.content, opened.grid)
+        XCTAssertEqual(model.rowCount, 10_001)
+        let reason = "Duplicate up to 10,000 rows at a time."
+        grid.select(CellPosition(row: 0, column: 1))
+        grid.selectAll()
+        XCTAssertEqual(validate(opened, .duplicateRows).0, false)
+        XCTAssertEqual(validate(opened, .duplicateRows).1, reason)
+        XCTAssertTrue(validate(opened, .deleteRows).0, "only Duplicate Row has a limit")
+        opened.window.makeFirstResponder(grid.gridView)
+        grid.gridView.keyDown(with: try key("\r", code: 36, window: opened.window, shift: true))
+        grid.gridView.keyDown(with: try key("\u{3}", code: 76, window: opened.window, shift: true))
+        XCTAssertEqual(model.rowCount, 10_001, "⇧⌘↩ beeps")
+        XCTAssertEqual(content.lastAnnouncement, reason)
+        content.duplicateRows(nil)
+        XCTAssertEqual(model.rowCount, 10_001, "refused by the core too")
+        XCTAssertFalse(opened.undo.canUndo)
+
+        // A whole column, to the last row (⇧⌘↓).
+        grid.select(CellPosition(row: 0, column: 0))
+        grid.extend(to: CellPosition(row: 10_000, column: 0), throughLastRow: true)
+        XCTAssertEqual(validate(opened, .duplicateRows).1, reason)
+
+        // 10,000 rows can be.
+        grid.select(CellPosition(row: 1, column: 0))
+        grid.extend(to: CellPosition(row: 10_000, column: 0))
+        XCTAssertEqual(validate(opened, .duplicateRows).0, true)
+        content.duplicateRows(nil)
+        XCTAssertEqual(model.rowCount, 20_001)
+        XCTAssertEqual(value(model, 10_001, 1), "n1")
+        XCTAssertEqual(opened.undo.undoActionName, "Duplicate Rows")
+    }
+
+    /// A duplicate refused on the keypad's path (⇧⌘ and its Enter, in the
+    /// grid where the item is off, and in the in-cell editor, where it runs
+    /// the command and the core refuses it) leaves no step: Redo, and its
+    /// name, are still there.
+    func testARefusedDuplicateByTheKeypadKeepsRedo() async throws {
+        let opened = try await open(file("open-redo.csv", "a,b\n1,2\n3,\"never closed\n4,5\n"))
+        let (model, content, window, undo) = (opened.model, opened.content, opened.window, opened.undo)
+        _ = model.setCell(.cell(CellPosition(row: 0, column: 0)), to: "9")
+        undo.undo()
+        XCTAssertEqual(undo.redoActionName, "Typing")
+        opened.grid.select(CellPosition(row: 1, column: 0))
+        window.makeFirstResponder(opened.grid.gridView)
+        opened.grid.gridView.keyDown(with: try key("\u{3}", code: 76, window: window, shift: true))
+        XCTAssertEqual(model.rowCount, 2)
+        XCTAssertTrue(undo.canRedo)
+        XCTAssertEqual(undo.redoActionName, "Typing")
+
+        content.editActiveCell()
+        await content.cellEditor.loading?.value
+        let editor = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
+        XCTAssertTrue(editor.performKeyEquivalent(with: try key("\u{3}", code: 76, window: window, shift: true)))
+        XCTAssertEqual(model.rowCount, 2, "the core refused it")
+        XCTAssertTrue(undo.canRedo)
+        XCTAssertEqual(undo.redoActionName, "Typing")
+        XCTAssertFalse(undo.canUndo)
+        undo.redo()
+        XCTAssertEqual(value(model, 0, 0), "9")
+    }
+
+    /// In the inspector, ⇧⌘ and the keypad's Enter commits the edit, then
+    /// duplicates the row, as ⇧⌘↩ does there: it puts in no line break.
+    func testShiftCommandKeypadEnterInTheInspectorDuplicates() async throws {
+        let opened = try await open(file("inspector.csv", csv))
+        let (model, content, window) = (opened.model, opened.content, opened.window)
+        content.setInspectorShown(true)
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        window.makeFirstResponder(text)
+        text.insertText("Marlowe", replacementRange: NSRange(location: 0, length: (text.string as NSString).length))
+        XCTAssertTrue(text.performKeyEquivalent(with: try key("\u{3}", code: 76, window: window, shift: true, also: .numericPad)))
+        XCTAssertEqual(column(model, 1), ["Marlowe", "Marlowe", "Ostrava", "Halden"], "committed, then copied; no line break")
+        XCTAssertEqual(opened.undo.undoActionName, "Duplicate Row")
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 1))
+    }
+
+    /// Caps Lock doesn't change the keys: ⌘↩, ⇧⌘↩ and ⌘⌫ are still the
+    /// row commands', ⇧↩ still a line break, the inspector's ⌘↩ still
+    /// commits.
+    func testCapsLockLeavesTheKeysAlone() throws {
+        let window = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: true)
+        XCTAssertEqual(GridView.rowCommandKey(try key("\r", code: 36, window: window, also: .capsLock)), .insertBelow)
+        XCTAssertEqual(GridView.rowCommandKey(try key("\u{3}", code: 76, window: window, also: [.capsLock, .numericPad])), .insertBelow)
+        XCTAssertEqual(GridView.rowCommandKey(try key("\r", code: 36, window: window, shift: true, also: .capsLock)), .duplicate)
+        XCTAssertEqual(GridView.rowCommandKey(try key("\u{7f}", code: 51, window: window, also: .capsLock)), .delete)
+        XCTAssertNil(GridView.rowCommandKey(try key("\r", code: 36, window: window, also: [.capsLock, .option])))
+        XCTAssertTrue(InspectorTextView.isCommit(try key("\r", code: 36, window: window, also: .capsLock)))
+        XCTAssertFalse(InspectorTextView.isCommit(try key("\r", code: 36, window: window, shift: true, also: .capsLock)))
+        let shiftReturn = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift, .capsLock], timestamp: 0, windowNumber: 0,
+            context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+        ))
+        XCTAssertTrue(LiteralTextView.isShiftReturn(shiftReturn))
+        XCTAssertFalse(LiteralTextView.isShiftReturn(try key("\r", code: 36, window: window, shift: true, also: .capsLock)))
     }
 
     // MARK: Columns

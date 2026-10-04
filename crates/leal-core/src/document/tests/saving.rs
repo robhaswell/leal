@@ -2791,3 +2791,164 @@ fn a_duplicate_is_undone_and_redone_after_a_save() {
     save(&document, &path, SaveKind::Save).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), doubled);
 }
+
+/// Task 2.5a: a copy's line ending is the file's most common one, as an
+/// inserted row's (DESIGN §3.7 rule 3), not its row's: in a file of mixed
+/// endings a copy of an LF row is CRLF, and of a CRLF row LF. A copy of
+/// the last row, which has no final newline, is the last row, with none;
+/// its row gets the file's ending (ADR-0004 decision 4). A blank line's
+/// copy is `""` (ADR-0014 decision 9).
+#[test]
+fn a_duplicated_rows_line_ending_is_the_files() {
+    let saved = saved_after(
+        "dup-mixed-crlf",
+        b"a,b\r\n1,2\n3,4\r\n5,6\r\n",
+        |document| {
+            document.duplicate_rows(1, 1).unwrap().unwrap();
+        },
+    );
+    assert_eq!(saved, b"a,b\r\n1,2\n1,2\r\n3,4\r\n5,6\r\n");
+    let saved = saved_after("dup-mixed-lf", b"a\n1\r\n2\n3\n", |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"a\n1\r\n1\n2\n3\n");
+    let saved = saved_after("dup-last", b"a,b\r\n1,\"x\"", |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"a,b\r\n1,\"x\"\r\n1,\"x\"");
+    let saved = saved_after("dup-blank", b"a\n\nb\n", |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"a\n\n\"\"\nb\n");
+}
+
+/// Task 2.5a: a copy of a Windows-1252 row keeps its bytes on Save (an
+/// edited cell in the file's encoding), and is converted with the rest by
+/// Save As UTF-8; a UTF-16 file's copy (Save is off for UTF-16) likewise.
+#[test]
+fn a_duplicated_row_is_saved_in_the_files_encoding_or_as_utf8() {
+    let file: &[u8] = b"caf\xE9,x\r\nna\xEFve,\"q\"\r\n";
+    let saved = saved_after("dup-1252", file, |document| {
+        assert_eq!(document.detection().encoding, Encoding::Windows1252);
+        set(document, 0, 1, "\u{e9}t\u{e9}");
+        document.duplicate_rows(0, 2).unwrap().unwrap();
+    });
+    assert_eq!(
+        saved,
+        b"caf\xE9,\xE9t\xE9\r\nna\xEFve,\"q\"\r\ncaf\xE9,\xE9t\xE9\r\nna\xEFve,\"q\"\r\n"
+    );
+
+    let dir = Dir::new("dup-1252-utf8");
+    let scheduler = scheduler();
+    let path = dir.file("w.csv", file);
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 0, 1, "\u{e9}t\u{e9}");
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    let copy = dir.0.join("u8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "caf\u{e9},\u{e9}t\u{e9}\r\nna\u{ef}ve,\"q\"\r\nna\u{ef}ve,\"q\"\r\n".as_bytes()
+    );
+    assert_identical(file, &std::fs::read(&path).unwrap());
+
+    let utf16 = dir.file("u.csv", &utf16le("a,b\r\n1,\"x \u{e9}\"\r\n2,z\r\n"));
+    let document = open_at(&utf16, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Utf16Le);
+    document.duplicate_rows(1, 2).unwrap().unwrap();
+    let copy = dir.0.join("u16-8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "\u{feff}a,b\r\n1,\"x \u{e9}\"\r\n2,z\r\n1,\"x \u{e9}\"\r\n2,z\r\n".as_bytes()
+    );
+}
+
+/// Task 2.5a and ADR-0004 decision 8: rows directly before an open
+/// unterminated quote's row can be duplicated (the copies go before it);
+/// once an edit closes the quote, its row can be too, and undoing that
+/// edit is then refused, as it would put the copy inside the quote.
+#[test]
+fn rows_before_an_open_quote_and_a_closed_one_are_duplicated() {
+    let file: &[u8] = b"a\nb,c\nd,\"open\nquote";
+    let saved = saved_after("dup-before-quote", file, |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+        document.duplicate_rows(0, 2).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"a\nb,c\na\nb,c\nb,c\nd,\"open\nquote");
+
+    let dir = Dir::new("dup-closed-quote");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", file);
+    let document = open_at(&path, &dir, &scheduler);
+    assert!(matches!(
+        document.duplicate_rows(2, 1),
+        Err(EditError::AfterUnterminatedQuote { .. })
+    ));
+    let close = set(&document, 2, 1, "closed");
+    assert!(document.can_duplicate_rows(2, 1).is_ok());
+    document.duplicate_rows(2, 1).unwrap().unwrap();
+    assert!(matches!(
+        document.apply(&close.inverse()),
+        Err(EditError::AfterUnterminatedQuote { .. })
+    ));
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"a\nb,c\nd,\"closed\"\nd,\"closed\""
+    );
+}
+
+/// Task 2.5a: a copy takes part in later column inserts and deletes as an
+/// inserted row does: its unedited fields keep their bytes, and deleting
+/// the column of a copied hatched cell ends the copy where its row ends,
+/// as it does the row (ADR-0014 decision 5), not with a trailing
+/// delimiter.
+#[test]
+fn a_copy_then_columns_inserted_and_deleted() {
+    let saved = saved_after("dup-columns", b"a,b\r\n1,\"x\"\r\n2,y\r\n", |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+        document.insert_column(2, "n").unwrap().unwrap();
+        document.delete_column(0).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"b,n\r\n\"x\",n\r\n\"x\",n\r\ny,n\r\n");
+    let saved = saved_after("dup-padding", b"\"a\",\"b\",\"c\"\n\"1\"\n", |document| {
+        set(document, 1, 2, "z");
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+        document.delete_column(2).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"\"a\",\"b\"\n\"1\"\n\"1\"\n");
+}
+
+/// Task 2.5a: in a file that quotes every field, a copy of a short row's
+/// typed-in (hatched) cell is quoted as the row's is. Undone and redone
+/// across saves (by value, ADR-0014 decision 8), the copy follows the
+/// saved file's quoting: that file's padding is an unquoted empty field,
+/// so it no longer quotes every field, and the redone copy's typed-in
+/// value is written unquoted, as a hatched cell's would be.
+#[test]
+fn a_copied_hatched_cell_in_a_quoted_file_across_saves() {
+    let dir = Dir::new("dup-hatched-saves");
+    let path = dir.file("a.csv", b"\"a\",\"b\",\"c\"\n\"1\"\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 2, "z");
+    let duplicate = document.duplicate_rows(1, 1).unwrap().unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\"a\",\"b\",\"c\"\n\"1\",,\"z\"\n\"1\",,\"z\"\n"
+    );
+    document.apply(&duplicate.inverse()).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\"a\",\"b\",\"c\"\n\"1\",,\"z\"\n"
+    );
+    document.apply(&duplicate).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"\"a\",\"b\",\"c\"\n\"1\",,\"z\"\n\"1\",,z\n"
+    );
+}

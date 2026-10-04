@@ -309,6 +309,11 @@ enum StructureText {
                     comment: "Tooltip: Insert Row is off after an unterminated quote (ADR-0004 decision 8)"
                 )
             }
+        case .tooManyRows:
+            String(
+                localized: "Duplicate up to \(Int(duplicateRowLimit()).formatted()) rows at a time.",
+                comment: "Tooltip: Duplicate Row is off with more rows selected than it copies at once (task 2.5a); the limit"
+            )
         case .noSuchRow, .notReadYet, .tooFarRight, .valueChanged, .otherLineage, .noSuchColumn, .unreadable:
             nil
         }

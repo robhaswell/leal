@@ -443,9 +443,10 @@ final class GridView: StripContentView, NSMenuItemValidation {
     }
 
     /// Which row command's key `event` is (DESIGN §4.2): ⌘↩ (Return or
-    /// Enter), ⇧⌘↩, or ⌘⌫, with no other modifier. `nil` for any other key.
+    /// Enter), ⇧⌘↩, or ⌘⌫, with no other modifier (Caps Lock on or off).
+    /// `nil` for any other key.
     static func rowCommandKey(_ event: NSEvent) -> RowCommandKey? {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function, .capsLock])
         guard event.type == .keyDown else { return nil }
         switch (event.keyCode, modifiers) {
         case (36, .command), (76, .command): return .insertBelow

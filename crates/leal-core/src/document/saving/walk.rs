@@ -382,16 +382,14 @@ impl<'w, 's> Walk<'w, 's> {
                     .and_then(Value::copied_quoting),
                 CellId::Inserted(_) | CellId::Appended(_) => None,
             };
-            let cells: Vec<NewCell<'_>> = (0..layout.len())
+            let mut cells: Vec<NewCell<'_>> = (0..layout.len())
                 .map(|column| match view.cell_in(&layout, column) {
                     Some((CellId::Appended(_), ViewCell::Edited(value))) => NewCell::Hatched(value),
-                    Some((id, ViewCell::New(value))) if copied(id).is_some() => NewCell::Edited {
-                        value,
-                        quoted: copied(id).unwrap_or(false),
+                    Some((id, ViewCell::New(value))) => match copied(id) {
+                        Some(quoted) => NewCell::Edited { value, quoted },
+                        None => NewCell::New(value),
                     },
-                    Some((_, ViewCell::New(value) | ViewCell::Edited(value))) => {
-                        NewCell::New(value)
-                    }
+                    Some((_, ViewCell::Edited(value))) => NewCell::New(value),
                     Some((_, ViewCell::Raw(raw))) => self.raw_bytes(raw.bytes()).map_or_else(
                         || {
                             unconvertible.push(column);
@@ -411,6 +409,12 @@ impl<'w, 's> Walk<'w, 's> {
                 self.out_row += 1;
                 self.prev = Prev::Ending(ending);
                 continue;
+            }
+            // Padding exists only to reach a hatched cell: with that cell's
+            // column deleted, a copy of a short row (Duplicate Row) ends
+            // where its row does (ADR-0014 decision 5).
+            while matches!(cells.last(), Some(NewCell::Padding)) {
+                cells.pop();
             }
             if cells.iter().any(|cell| matches!(cell, NewCell::New(_))) {
                 self.census()?;
