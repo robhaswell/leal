@@ -433,7 +433,9 @@ final class GridView: StripContentView, NSMenuItemValidation {
             return
         }
         if let insert = Self.rowCommandKey(event) {
-            // Not Return's edit, nor a beep with no reason given.
+            // Not Return's edit, nor a beep with no reason given. A held
+            // ⌘⌫ deletes once, not a row each repeat.
+            if !insert, event.isARepeat { return }
             onRowCommandKey?(insert)
             return
         }

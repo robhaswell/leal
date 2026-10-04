@@ -98,14 +98,24 @@ class LiteralTextView: NSTextView {
     /// the start of the line, as in any text field, and never reaches Edit
     /// > Delete Row (task 2.5a), which would take it first. ⌘↩ goes on: in
     /// the in-cell editor it commits the edit, then inserts a row below
-    /// (the inspector's commits only: `InspectorTextView`).
+    /// (the inspector's commits only: `InspectorTextView`). ⌘ and the
+    /// keypad's Enter, which isn't the menu item's key, does the same as
+    /// ⌘↩ there, as it does in the grid.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if window?.firstResponder === self, GridView.rowCommandKey(event) == false {
-            interpretKeyEvents([event])
-            return true
+        if window?.firstResponder === self, let insert = GridView.rowCommandKey(event) {
+            if !insert {
+                interpretKeyEvents([event])
+                return true
+            }
+            if isFieldEditor, event.keyCode == Self.keypadEnter {
+                return tryToPerform(#selector(DocumentViewController.insertRowBelow(_:)), with: self)
+            }
         }
         return super.performKeyEquivalent(with: event)
     }
+
+    /// The keypad's Enter key.
+    static let keypadEnter: UInt16 = 76
 }
 
 /// The in-cell editor (task 2.5.1, ADR-0001): an ordinary `NSTextField`

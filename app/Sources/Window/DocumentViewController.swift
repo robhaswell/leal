@@ -38,6 +38,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// Reload and Revert to Saved wait for it, so they never replace the
     /// core document a Save As is about to write from (task 2.5.3c review).
     var documentIsSaving: () -> Bool = { false }
+    /// The document's undo manager (`CSVDocument.history`, the window's
+    /// too: `windowWillReturnUndoManager`), for a step of several commands
+    /// (Delete Columns, task 2.5a).
+    var undoHistory: () -> UndoManager? = { nil }
+    /// The key window, which may be a sheet over this one (Go to Row's):
+    /// its text field keeps ⌘↩ and ⌘⌫ (`availability`). Tests stand one in.
+    var keyWindow: () -> NSWindow? = { NSApp.keyWindow }
     /// **Save As…** (task 2.5.3c), through the `NSDocument`
     /// (`CSVDocument.chooseSaveAs`): the file banners' Save As….
     var onSaveAs: (() -> Void)?

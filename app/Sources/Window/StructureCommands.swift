@@ -41,7 +41,11 @@ struct StructureAvailability: Equatable {
 extension DocumentViewController {
     @objc func insertRowAbove(_ sender: Any?) { run(.insertRowAbove) }
     @objc func insertRowBelow(_ sender: Any?) { run(.insertRowBelow) }
-    @objc func deleteRows(_ sender: Any?) { run(.deleteRows) }
+    @objc func deleteRows(_ sender: Any?) {
+        // A held ⌘⌫ deletes one row (or selection), not a row each repeat.
+        if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return }
+        run(.deleteRows)
+    }
     @objc func insertColumnBefore(_ sender: Any?) { run(.insertColumnBefore) }
     @objc func insertColumnAfter(_ sender: Any?) { run(.insertColumnAfter) }
     @objc func deleteColumns(_ sender: Any?) { run(.deleteColumns) }
@@ -80,7 +84,7 @@ extension DocumentViewController {
         guard !model.isFailed, !isReplacingDocument else { return .off }
         // The key window's too: a menu's action reaches this window from
         // a sheet over it (Go to Row's field).
-        for window in [view.window, NSApp.keyWindow] {
+        for window in [view.window, keyWindow()] {
             if let text = window?.firstResponder as? NSText, !(text is LiteralTextView) { return .off }
         }
         let cell = grid.activeCell
@@ -171,24 +175,33 @@ extension DocumentViewController {
     }
 
     /// Deletes `columns`, last first, each a command of the core's, as one
-    /// undo step ("Delete Columns"). One the core refuses stops the rest;
-    /// those already deleted stay deleted, and undo as one.
+    /// undo step ("Delete Columns") in the document's history (the
+    /// window's undo manager, which a window not shown yet hasn't). The
+    /// last is asked about first, so a refusal opens no group: an empty
+    /// one would be a nameless Undo, and would clear Redo. One the core
+    /// refuses part-way stops the rest; those already deleted stay
+    /// deleted, and undo as one.
     private func deleteAsOneStep(_ columns: ClosedRange<Int>) -> EditOutcome {
-        guard columns.count > 1, let undo = view.window?.undoManager else {
-            return model.deleteColumn(columns.lowerBound)
-        }
+        guard columns.count > 1 else { return model.deleteColumn(columns.lowerBound) }
+        if let refusal = model.columnDeleteRefusal(columns.upperBound) { return .refused(refusal) }
+        let undo = undoHistory()
+        undo?.beginUndoGrouping()
         var outcome = EditOutcome.unchanged
         var deleted = 0
-        undo.beginUndoGrouping()
         for column in columns.reversed() {
             outcome = model.deleteColumn(column)
             guard case .edited = outcome else { break }
             deleted += 1
         }
-        // Named while the group is open: with none open, the undo
-        // manager raises.
-        if deleted > 1 { undo.setActionName(StructureText.deleteColumns) }
-        undo.endUndoGrouping()
+        if let undo {
+            // Named while the group is open: with none open, the undo
+            // manager raises.
+            if deleted > 1 { undo.setActionName(StructureText.deleteColumns) }
+            undo.endUndoGrouping()
+            // Nothing deleted after all (a failure): the empty group goes,
+            // so Undo isn't a nameless step.
+            if deleted == 0 { undo.undoNestedGroup() }
+        }
         return outcome
     }
 

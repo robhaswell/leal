@@ -96,9 +96,10 @@ final class DocumentModel: GridDataSource {
     /// tests set it, to make the document fail while it opens.
     static var afterFirstPaintForTesting: ((LealFFI.Document) throws -> Void)?
 
-    /// Makes `setCell` refuse as the core would, with nothing changed. Only
-    /// tests set it: the core refuses an edit the editor opened on only
-    /// when the file changes under it, which closes the editor.
+    /// Makes `setCell` and the row and column commands refuse as the core
+    /// would, with nothing changed. Only tests set it: the core refuses an
+    /// edit the editor opened on only when the file changes under it,
+    /// which closes the editor.
     var refusalForTesting: EditRefusal?
     /// Opens the core's document in place of `openDocument`. Only tests set
     /// it, to open a file as if on a removable drive that vanishes, or
@@ -1020,8 +1021,9 @@ final class DocumentModel: GridDataSource {
     /// command was undone or redone (task 2.5.2). Every row after the
     /// change moved, so every tile and row flag is read again; the row
     /// count comes from the core. A column moves the widths after it, and
-    /// the titles, column count and sample are read again. The window
-    /// hears where the change was (`StructureChange`).
+    /// the titles, column count and sample are read again; so are the
+    /// titles after rows' change at the header row. The window hears where
+    /// the change was (`StructureChange`).
     func structureChanged(by structural: StructuralEdit, direction: CommandDirection) {
         guard failure == nil else { return }
         // An undo inserts what a delete took, and the reverse.
@@ -1040,10 +1042,15 @@ final class DocumentModel: GridDataSource {
             }
             updateColumnCount()
             if refinedSizingStarted { measureAgainAfterEdit() }
+        } else if interpretation.header, structural.firstRow() == 0 {
+            // Rows at logical row 0 (an undo or redo of rows taken or put
+            // there before the header row was turned on): a new header row.
+            reloadHeaderTitles()
         }
         onChange?(.structure(StructureChange(
             column: structural.isColumn() ? column ?? 0 : nil,
-            row: Int(clamping: structural.firstRow()) - headerOffset,
+            // The header row's change is the first data row's.
+            row: max(0, Int(clamping: structural.firstRow()) - headerOffset),
             inserted: inserted
         )))
     }

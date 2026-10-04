@@ -127,10 +127,10 @@ final class StructureTests: XCTestCase {
         return try Data(contentsOf: try XCTUnwrap(opened.document.fileURL))
     }
 
-    private func key(_ characters: String, code: UInt16, window: NSWindow) throws -> NSEvent {
+    private func key(_ characters: String, code: UInt16, window: NSWindow, repeating: Bool = false) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0, windowNumber: window.windowNumber,
-            context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code
+            context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: repeating, keyCode: code
         ))
     }
 
@@ -285,9 +285,129 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(model.columnCount, 3)
         XCTAssertEqual((0..<3).map { model.headerTitle(column: $0).text }, ["id", "name", "qty"])
         XCTAssertFalse(model.hasUnsavedEdits, "one step put both back")
+        XCTAssertEqual(undo.redoActionName, "Delete Columns", "the group's name, not its last command's")
         undo.redo()
+        XCTAssertEqual(undo.undoActionName, "Delete Columns")
         XCTAssertEqual(model.columnCount, 1)
         XCTAssertEqual(column(model, 0), ["3", "5", "8"])
+    }
+
+    /// Several columns are one step in the document's history even with
+    /// the view in no window (its own undo manager is the window's), and a
+    /// refusal, foreseen or not, leaves no step: no nameless Undo, and
+    /// Redo as it was when foreseen.
+    func testDeleteColumnsIsOneStepOrNone() async throws {
+        let opened = try await open(file("step.csv", csv))
+        let (model, content, undo) = (opened.model, opened.content, opened.undo)
+        _ = model.setCell(.cell(CellPosition(row: 0, column: 0)), to: "10")
+        _ = model.setCell(.cell(CellPosition(row: 1, column: 0)), to: "20")
+        undo.undo()
+        let (undoName, redoName) = (undo.undoActionName, undo.redoActionName)
+        XCTAssertTrue(undo.canRedo)
+
+        // Refused (a save runs): asked first, so no group was opened.
+        opened.grid.select(CellPosition(row: 0, column: 0))
+        opened.grid.extend(to: CellPosition(row: 0, column: 1))
+        debugHoldNextSave()
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
+        content.deleteColumns(nil)
+        XCTAssertEqual(model.columnCount, 3)
+        XCTAssertEqual(content.lastAnnouncement, "Wait for the save to finish.")
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        XCTAssertTrue(saved)
+        XCTAssertEqual(undo.undoActionName, undoName)
+        XCTAssertEqual(undo.redoActionName, redoName)
+        XCTAssertTrue(undo.canRedo, "Redo kept")
+
+        // Refused by the command itself, past the question: the empty
+        // group goes again.
+        opened.grid.select(CellPosition(row: 0, column: 0))
+        opened.grid.extend(to: CellPosition(row: 0, column: 1))
+        model.refusalForTesting = .saving
+        content.deleteColumns(nil)
+        model.refusalForTesting = nil
+        XCTAssertEqual(model.columnCount, 3)
+        XCTAssertEqual(undo.undoActionName, undoName, "no nameless step")
+
+        // No window: still both, as one step of the document's history.
+        opened.window.contentView = NSView()
+        XCTAssertNil(content.view.window)
+        content.deleteColumns(nil)
+        XCTAssertEqual(model.columnCount, 1)
+        XCTAssertEqual(undo.undoActionName, "Delete Columns")
+        undo.undo()
+        XCTAssertEqual(model.columnCount, 3)
+        XCTAssertEqual(undo.redoActionName, "Delete Columns")
+    }
+
+    /// Rows deleted (or put back) at logical row 0 before the header row
+    /// was turned on: undone and redone with it on, the header titles are
+    /// read again (they were the old row's), and the change is the first
+    /// data row's (not row −1).
+    func testUndoingRowsAtTheHeaderRowReadsItsTitlesAgain() async throws {
+        let opened = try await open(file("header.csv", "1,2\n3,4\n5,6\n"))
+        let (model, content, undo) = (opened.model, opened.content, opened.undo)
+        XCTAssertFalse(model.interpretation.header)
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.deleteRows(nil)
+        XCTAssertEqual(column(model, 0), ["3", "5"])
+        content.toggleHeaderRow(nil)
+        try await waitUntil("read with a header row") {
+            model.interpretation.header && model.isIndexComplete && model.headerTitle(column: 0).text == "3"
+        }
+        XCTAssertEqual(column(model, 0), ["5"])
+        var changes: [StructureChange] = []
+        let heard = model.onChange
+        model.onChange = { change in
+            if case let .structure(structure) = change { changes.append(structure) }
+            heard?(change)
+        }
+
+        undo.undo()
+        XCTAssertEqual((0..<2).map { model.headerTitle(column: $0).text }, ["1", "2"])
+        XCTAssertEqual(column(model, 0), ["3", "5"])
+        XCTAssertEqual(changes.last, StructureChange(column: nil, row: 0, inserted: true))
+        XCTAssertEqual(opened.grid.activeCell?.row, 0)
+        undo.redo()
+        XCTAssertEqual((0..<2).map { model.headerTitle(column: $0).text }, ["3", "4"])
+        XCTAssertEqual(column(model, 0), ["5"])
+        XCTAssertEqual(changes.last, StructureChange(column: nil, row: 0, inserted: false))
+    }
+
+    // MARK: Undo and redo after a save
+
+    /// A row delete and a two-column delete, each saved, undone and saved,
+    /// redone and saved: the file goes back to its own bytes, then to the
+    /// delete's again (undo by value after a save, ADR-0014 decision 3).
+    func testUndoAndRedoAfterASaveWriteTheBytesBack() async throws {
+        let cases: [(String, (Opened) -> Void, String)] = [
+            ("delete row", { opened in
+                opened.grid.select(CellPosition(row: 1, column: 1))
+                opened.content.deleteRows(nil)
+            }, "id,name,qty\r\n1,Marlow,3\r\n3,Halden,8\r\n"),
+            ("delete columns", { opened in
+                opened.grid.select(CellPosition(row: 0, column: 0))
+                opened.grid.extend(to: CellPosition(row: 0, column: 1))
+                opened.content.deleteColumns(nil)
+            }, "qty\r\n3\r\n5\r\n8\r\n"),
+        ]
+        for (index, (name, act, deleted)) in cases.enumerated() {
+            let opened = try await open(file("again-\(index).csv", csv))
+            act(opened)
+            var saved = try await save(opened)
+            XCTAssertEqual(String(decoding: saved, as: UTF8.self), deleted, name)
+            opened.undo.undo()
+            XCTAssertTrue(opened.model.hasUnsavedEdits, name)
+            saved = try await save(opened)
+            XCTAssertEqual(String(decoding: saved, as: UTF8.self), csv, "\(name): undone")
+            opened.undo.redo()
+            saved = try await save(opened)
+            XCTAssertEqual(String(decoding: saved, as: UTF8.self), deleted, "\(name): redone")
+            opened.document.close()
+        }
     }
 
     // MARK: Find (ADR-0014 decision 2)
@@ -310,6 +430,16 @@ final class StructureTests: XCTestCase {
         XCTAssertTrue(find.search === search, "not restarted")
         XCTAssertEqual(find.highlight(row: 0, column: 1)?.ranges, [NSRange(location: 0, length: 6)])
         XCTAssertNil(find.highlight(row: 1, column: 1), "the row after moved up, with its highlights")
+
+        // Its undo and redo: caught up with too, the same search.
+        opened.undo.undo()
+        XCTAssertNil(find.pendingStep)
+        try await waitUntil("caught up with the undo") { find.progress?.catchingUp == false && find.matchCount == 2 }
+        XCTAssertTrue(find.search === search, "not restarted by the undo")
+        XCTAssertEqual(find.highlight(row: 1, column: 2)?.ranges, [NSRange(location: 0, length: 6)])
+        opened.undo.redo()
+        try await waitUntil("caught up with the redo") { find.progress?.catchingUp == false && find.matchCount == 1 }
+        XCTAssertTrue(find.search === search, "not restarted by the redo")
 
         // An inserted row is searched too, once typed into.
         content.insertRowBelow(nil)
@@ -469,13 +599,41 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(column(model, 1), ["Marlowe", "", "Ostrava", "Halden"])
         XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 1))
 
+        // ⌘ and the keypad's Enter in the in-cell editor: as ⌘↩, the edit
+        // committed, then a row inserted below.
+        content.editActiveCell()
+        await content.cellEditor.loading?.value
+        let again = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
+        again.insertText("Bree", replacementRange: NSRange(location: 0, length: (again.string as NSString).length))
+        XCTAssertTrue(again.performKeyEquivalent(with: try key("\u{3}", code: 76, window: window)))
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(column(model, 1), ["Marlowe", "Bree", "", "Ostrava", "Halden"])
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 2, column: 1))
+
         // ⌘ and the keypad's Enter in the grid.
         window.makeFirstResponder(opened.grid.gridView)
         opened.grid.gridView.keyDown(with: try key("\u{3}", code: 76, window: window))
-        XCTAssertEqual(model.rowCount, 5)
+        XCTAssertEqual(model.rowCount, 6)
         XCTAssertFalse(content.cellEditor.isEditing, "not Return's edit")
         opened.grid.gridView.keyDown(with: try key("\u{7f}", code: 51, window: window))
-        XCTAssertEqual(model.rowCount, 4)
+        XCTAssertEqual(model.rowCount, 5)
+        // A held ⌘⌫'s repeats delete nothing more.
+        opened.grid.gridView.keyDown(with: try key("\u{7f}", code: 51, window: window, repeating: true))
+        XCTAssertEqual(model.rowCount, 5)
+
+        // A sheet over the window (Go to Row's) with its field focused:
+        // the field keeps the keys.
+        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: true)
+        let field = NSTextField(frame: NSRect(x: 10, y: 10, width: 120, height: 24))
+        sheet.contentView?.addSubview(field)
+        sheet.makeFirstResponder(field)
+        XCTAssertTrue(sheet.firstResponder is NSText)
+        content.keyWindow = { sheet }
+        for command in StructureCommand.allCases {
+            XCTAssertFalse(validate(opened, command).0, "\(command) leaves its keys to the sheet's field")
+        }
+        content.keyWindow = { nil }
+        XCTAssertTrue(validate(opened, .deleteRows).0)
 
         content.showFind(nil)
         XCTAssertTrue(window.firstResponder is NSText)

@@ -53,6 +53,10 @@ final class DocumentUndoManager: UndoManager {
     /// A refused step is being put back: the undo or redo that does it is
     /// allowed whatever `isAvailable` says.
     private var puttingBack = false
+    /// The name of the step being undone or redone: the steps it registers
+    /// meanwhile, for the other way, take it, so a group of commands keeps
+    /// its own name ("Redo Delete Columns", not the last command's).
+    private var stepName: String?
 
     override init() {
         super.init()
@@ -65,16 +69,20 @@ final class DocumentUndoManager: UndoManager {
     override func undo() {
         guard willUndoOrRedo?() ?? true else { return NSSound.beep() }
         guard canUndo else { return }
+        stepName = undoActionName
         super.undo()
         finishPuttingBack()
+        stepName = nil
         didUndoOrRedo?()
     }
 
     override func redo() {
         guard willUndoOrRedo?() ?? true else { return NSSound.beep() }
         guard canRedo else { return }
+        stepName = redoActionName
         super.redo()
         finishPuttingBack()
+        stepName = nil
         didUndoOrRedo?()
     }
 
@@ -91,7 +99,7 @@ final class DocumentUndoManager: UndoManager {
     func putBack(named name: String, _ action: @escaping @MainActor () -> Void) {
         guard isUndoing || isRedoing else { return }
         registerUndo(withTarget: self) { [unowned self] _ in registerStep(named: name, action) }
-        setActionName(name)
+        setActionName(stepName(or: name))
         putBackOnUndoStack = isUndoing
     }
 
@@ -114,8 +122,14 @@ final class DocumentUndoManager: UndoManager {
         let ownGroup = !isUndoing && !isRedoing
         if ownGroup { beginUndoGrouping() }
         registerUndo(withTarget: self) { _ in action() }
-        setActionName(name)
+        setActionName(stepName(or: name))
         if ownGroup { endUndoGrouping() }
+    }
+
+    /// The step being undone or redone's name, if any, else `name`.
+    private func stepName(or name: String) -> String {
+        guard isUndoing || isRedoing, let stepName, !stepName.isEmpty else { return name }
+        return stepName
     }
 }
 

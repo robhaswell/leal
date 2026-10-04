@@ -85,6 +85,7 @@ extension DocumentModel {
     /// Makes a command in the core, and hands it to `commandApplied`.
     private func make(_ body: (LealFFI.Document) throws -> EditCommand?) -> EditOutcome {
         guard failure == nil, let handle = backgroundHandle() else { return .failed }
+        if let refusal = refusalForTesting { return .refused(refusal) }
         let command: EditCommand?
         do {
             command = try body(handle)
@@ -107,7 +108,8 @@ extension DocumentModel {
 struct StructureChange: Equatable, Sendable {
     /// The column, for a column's insert or delete; `nil` for rows.
     let column: Int?
-    /// The first row's grid row, for rows (−1 for the header row).
+    /// The first row's grid row, for rows (0 for a change at the header
+    /// row).
     let row: Int
     /// Whether it inserted, rather than deleted.
     let inserted: Bool

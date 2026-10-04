@@ -282,6 +282,7 @@ final class CSVDocument: NSDocument {
         controller.content.onSaveAs = { [weak self] in self?.chooseSaveAs(.saveAs) }
         controller.content.onCancelSave = { [weak self] in self?.cancelSave() ?? false }
         controller.content.documentIsSaving = { [weak self] in self?.saving != nil }
+        controller.content.undoHistory = { [weak self] in self?.history.undoManager }
         controller.content.confirmDiscardingEdits = { [weak self] reason, answer in
             guard let self else { return answer(true) }
             confirmDiscardingEdits(reason) { [weak self] proceed in

@@ -235,11 +235,14 @@ final class FindModel: GridHighlighter {
             searchAgain()
             return
         }
+        // A Next waiting for the search, or a cell waiting to be the
+        // current match, was from before the rows moved.
+        pendingStep = nil
+        awaitingCurrent = nil
         tiles.removeAll()
         if let latest = model.call({ _ in try search.progress() }) { progress = latest }
         if let cell = activeCell { noteCurrent(cell) }
         if progress?.catchingUp == true { watchCatchUp(search) }
-        retryPendingStep()
         onChange?()
     }
 
