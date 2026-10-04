@@ -55,6 +55,26 @@ final class SaveTests: XCTestCase {
 
     private let csv = "id,name,qty\r\n1,Marlow,3\r\n2,\"Ostrava\",5\r\n3,Halden,8\r\n"
 
+    /// Every file the save might have made a temporary one in: the test
+    /// folder and its scratch and records folders, and the item-replacement
+    /// folder on the file's volume (the folder Foundation hands out for
+    /// `url`, which is made, looked at and removed again).
+    private func temporaryFiles(near url: URL) throws -> Set<String> {
+        let fm = FileManager.default
+        var found = Set<String>()
+        for folder in [directory!, directory.appending(path: "scratch"), directory.appending(path: "records")] {
+            let walker = fm.enumerator(at: folder, includingPropertiesForKeys: nil)
+            while let item = walker?.nextObject() as? URL { found.insert(item.path(percentEncoded: false)) }
+        }
+        let made = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: url, create: true)
+        defer { try? fm.removeItem(at: made) }
+        let shared = made.deletingLastPathComponent()
+        for item in (try? fm.contentsOfDirectory(at: shared, includingPropertiesForKeys: nil)) ?? [] where item != made {
+            found.insert(item.path(percentEncoded: false))
+        }
+        return found
+    }
+
     private func file(_ name: String, _ bytes: Data) throws -> URL {
         let url = directory.appending(path: name)
         try bytes.write(to: url)
@@ -280,6 +300,31 @@ final class SaveTests: XCTestCase {
         XCTAssertEqual(opened.document.history.journal.count, 1)
         XCTAssertTrue(alerts.isEmpty)
         XCTAssertNil(opened.model.saveJob)
+    }
+
+    /// A cancelled save leaves no temporary files behind: not in the
+    /// folders next to the file, nor in the scratch and records folders, nor
+    /// in the item-replacement folders on the file's volume.
+    func testCancellingAHeldSaveLeavesNoTemporaryFiles() async throws {
+        let url = try file("leftovers.csv", csv)
+        let opened = try await open(url)
+        set(opened.model, 0, 1, "cancelled")
+        let before = try temporaryFiles(near: url)
+        debugHoldNextSave()
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        try await waitUntil("the save took its snapshot") {
+            opened.model.saveJob?.progress().snapshotVersion != nil
+        }
+        opened.content.cancelOperation(nil)
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        try await waitUntil("the save's job ended") { opened.model.saveJob == nil }
+
+        XCTAssertFalse(saved)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), csv)
+        let after = try temporaryFiles(near: url)
+        XCTAssertEqual(after.subtracting(before).sorted(), [], "the cancelled save left files behind")
     }
 
     /// Closing's Save (`saveDocument(withDelegate:…)`, as `NSDocument`'s
@@ -524,6 +569,12 @@ final class SaveTests: XCTestCase {
         while Date().timeIntervalSince(started) < 1 {
             enabled = items.map { document.validateUserInterfaceItem(NSMenuItem(title: "", action: $0, keyEquivalent: "")) }
             _ = controller.hasEditedDocuments
+            // What NSDocument itself reads, inside the synchronous file
+            // access that waits for the save's asynchronous one.
+            _ = document.fileURL
+            _ = document.isDocumentEdited
+            _ = document.fileModificationDate
+            _ = document.changeCountToken(for: .saveOperation)
         }
         let asked = Date().timeIntervalSince(started)
         let saved = await saving.value
@@ -709,6 +760,10 @@ final class SaveTests: XCTestCase {
             }
         }
         defer { release.signal() }
+        // Let the other writer go after 5 s even if the cancel doesn't
+        // work, so a reverted fix fails the "stops without waiting" check
+        // below rather than hanging the test.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { release.signal() }
         await FileWork.run { entered.wait() }
 
         opened.document.save(nil)
