@@ -847,6 +847,7 @@ impl Document {
             original,
             reread,
             reread_error,
+            onto_open_file: own_file,
         })
     }
 

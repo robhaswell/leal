@@ -32,6 +32,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// Reload or Revert to Saved, through the `NSDocument`: `answer` hears
     /// whether to go on. Without one, the edits go without asking.
     var confirmDiscardingEdits: ((_ reason: RereadReason, _ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
+    /// Whether the `NSDocument` has a save under way or queued
+    /// (`CSVDocument.saving`): a Save As waiting for its turn or for file
+    /// coordination, which the model doesn't know of yet (`isSaving`).
+    /// Reload and Revert to Saved wait for it, so they never replace the
+    /// core document a Save As is about to write from (task 2.5.3c review).
+    var documentIsSaving: () -> Bool = { false }
     /// **Save As…** (task 2.5.3c), through the `NSDocument`
     /// (`CSVDocument.chooseSaveAs`): the file banners' Save As….
     var onSaveAs: (() -> Void)?
@@ -649,22 +655,27 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // Opening the file reads it, which on a network share can block:
         // always off the main thread (task 2.0, ADR-0009). The window shows
         // the old snapshot until the new one is ready.
-        guard reloading == nil, savingAsUTF8 == nil else { return }
-        // Not while a save replaces the file (task 2.5.3a).
-        guard !model.isSaving else { return NSSound.beep() }
+        guard reloading == nil, savingAsUTF8 == nil, !model.isReloading else { return }
+        // Not while a save replaces the file (task 2.5.3a), or one is
+        // queued or waits for its turn at the file (task 2.5.3c review).
+        guard !isSaving else { return NSSound.beep() }
         // An edit still open is committed first (or, if the core refuses
         // it, stays open, and the file isn't read again).
         guard commitEditing() else { return NSSound.beep() }
         // Reload throws unsaved edits away: ask first (ADR-0008 decision 4).
         if model.hasUnsavedEdits, let confirm = confirmDiscardingEdits {
             confirm(reason) { [weak self] proceed in
-                guard proceed, let self, reloading == nil, savingAsUTF8 == nil, !model.isSaving else { return }
+                guard proceed, let self, reloading == nil, savingAsUTF8 == nil, !model.isReloading, !isSaving else { return }
                 startReload()
             }
             return
         }
         startReload()
     }
+
+    /// A save is under way, in the model or still queued in the
+    /// `NSDocument` (`documentIsSaving`).
+    private var isSaving: Bool { model.isSaving || documentIsSaving() }
 
     /// Reads the file again, off the main thread.
     private func startReload() {
@@ -853,7 +864,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case #selector(reloadFromDisk(_:)):
             // There must be a file to open again, and no Reload or save
             // under way.
-            return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil && !model.isSaving
+            return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil && !isSaving
                 && model.original.state != .deleted && model.original.state != .unavailable
         default:
             return true

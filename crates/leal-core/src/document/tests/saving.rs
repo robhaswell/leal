@@ -663,7 +663,19 @@ fn a_save_as_onto_its_own_file_through_a_link_is_a_save() {
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nx,2\n");
     assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
     assert_eq!(saved.path.file_name(), path.file_name());
+    assert!(saved.onto_open_file);
     assert_eq!(document.original().path.file_name(), path.file_name());
+
+    // Save As UTF-8 there too: it says it saved onto the open file.
+    set(&document, 1, 0, "y");
+    let saved = save(&document, &link, SaveKind::SaveAsUtf8).unwrap();
+    assert!(saved.onto_open_file);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("a,b\ny,2\n")
+    );
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
 }
 
 /// Save As onto the document's own file under a name that differs only in

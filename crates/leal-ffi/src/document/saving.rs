@@ -194,6 +194,11 @@ pub struct SaveOutcome {
     pub first_screen: Option<FirstScreen>,
     /// Why it couldn't be read back, for the log.
     pub reread_error: Option<String>,
+    /// Whether a Save As (or Save As UTF-8) wrote onto the document's own
+    /// file, however its destination was spelled (a symbolic link, another
+    /// case): the document keeps its name, and `path` is the file a link
+    /// leads to. `false` for Save.
+    pub onto_open_file: bool,
 }
 
 /// Why a save didn't happen. The user's file is then as it was. See
@@ -535,6 +540,7 @@ impl SaveJob {
             original: saved.original.clone().into(),
             first_screen: saved.reread.clone().map(FirstScreen::from),
             reread_error: saved.reread_error.clone(),
+            onto_open_file: saved.onto_open_file,
         })
     }
 }

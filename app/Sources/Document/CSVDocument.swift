@@ -281,6 +281,7 @@ final class CSVDocument: NSDocument {
         }
         controller.content.onSaveAs = { [weak self] in self?.chooseSaveAs(.saveAs) }
         controller.content.onCancelSave = { [weak self] in self?.cancelSave() ?? false }
+        controller.content.documentIsSaving = { [weak self] in self?.saving != nil }
         controller.content.confirmDiscardingEdits = { [weak self] reason, answer in
             guard let self else { return answer(true) }
             confirmDiscardingEdits(reason) { [weak self] proceed in
@@ -422,7 +423,12 @@ final class CSVDocument: NSDocument {
         // the reading is adopted stops it (`EditedDuringReload`), so it is
         // never thrown away unasked (task 2.5.3c review).
         let version = model.editVersion
+        // Reading again from now, not from when the task starts: Save, Save
+        // As and Duplicate are off at once (`isRereading`). Every way out
+        // of the task ends it.
+        model.willReload()
         Task { [weak self] in
+            defer { model.reloadEnded() }
             do {
                 try await self?.reloadInBackground(editVersion: version)
             } catch {
@@ -847,14 +853,17 @@ final class CSVDocument: NSDocument {
     /// started on (`isCurrent`).
     private func noteWritten(_ saved: DocumentModel.Saved, kind: SaveKind, model: DocumentModel) {
         guard self.model === model, !model.isFailed, Self.isCurrent(saved, model: model) else { return }
-        if kind != .save {
+        // Onto its own file (a link, another case), the document keeps its
+        // name: the core reports where a link leads.
+        let renamed = kind != .save && !saved.outcome.ontoOpenFile
+        if renamed {
             let url = URL(filePath: saved.outcome.path)
             if fileURL != url { fileURL = url }
             if let type = Self.fileType(for: url) { fileType = type }
         }
         fileModificationDate = saved.outcome.modified
         if let version = saved.snapshotVersion, let token = history.token(atVersion: version) {
-            updateChangeCount(withToken: token, for: kind == .save ? .saveOperation : .saveAsOperation)
+            updateChangeCount(withToken: token, for: renamed ? .saveAsOperation : .saveOperation)
         }
     }
 
@@ -862,7 +871,9 @@ final class CSVDocument: NSDocument {
     /// Reload or Revert replaced it while the save ran (task 2.5.3c
     /// review). The window then shows the file the Reload read, and a Save
     /// As it ran isn't followed: the document stays where it was, and the
-    /// copy written is left as it is.
+    /// copy written is left as it is. Reload and Revert wait for every save,
+    /// queued ones too (`documentIsSaving`, `waitForSave`), so this is a
+    /// guard only, and the log line is all it says.
     private static func isCurrent(_ saved: DocumentModel.Saved, model: DocumentModel) -> Bool {
         guard saved.handle == model.readingID.handle else {
             Logger.document.error("A save ended after a Reload replaced the document it saved: not followed")

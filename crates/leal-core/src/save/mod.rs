@@ -373,6 +373,10 @@ pub struct Saved {
     pub reread: Option<FirstScreen>,
     /// Why the saved file couldn't be read back, for the log.
     pub reread_error: Option<String>,
+    /// Whether a Save As wrote onto the document's own file, however its
+    /// destination was spelled (a symbolic link, another case): the
+    /// document keeps its name, as after a Save. `false` for Save.
+    pub onto_open_file: bool,
 }
 
 /// What a save is doing.

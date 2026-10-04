@@ -163,6 +163,10 @@ final class SaveAsTests: XCTestCase {
             == b.resolvingSymlinksInPath().standardizedFileURL.path(percentEncoded: false)
     }
 
+    private func menuItem(_ action: Selector) -> NSMenuItem {
+        NSMenuItem(title: "", action: action, keyEquivalent: "")
+    }
+
     private func contents(_ url: URL) throws -> String {
         try String(contentsOf: url, encoding: .utf8)
     }
@@ -668,6 +672,13 @@ final class SaveAsTests: XCTestCase {
         set(model, 0, 1, "Marlow")
         XCTAssertFalse(model.hasUnsavedEdits)
         try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        // Reading again from the call, not from when its task runs: Save,
+        // Save As and Duplicate are off at once.
+        XCTAssertTrue(model.isReloading)
+        XCTAssertTrue(document.isRereading)
+        XCTAssertFalse(document.validateUserInterfaceItem(menuItem(#selector(NSDocument.save(_:)))))
+        let copy = directory.appending(path: "appkit copy.csv")
+        let refused = document.saveAs(to: copy)
         // Before the revert's task has run.
         set(model, 0, 1, "During")
         try await waitUntil("read again") { threads.onMainThread.count == opens + 1 }
@@ -675,6 +686,53 @@ final class SaveAsTests: XCTestCase {
         XCTAssertEqual(value(model, 0, 1), "During")
         XCTAssertEqual(value(model, 0, 0), "1", "the new reading isn't adopted")
         XCTAssertTrue(document.isDocumentEdited)
+        let savedAs = await refused.value
+        XCTAssertFalse(savedAs)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)))
+
+        // A revert whose reading never starts (the document failed before
+        // its task ran) ends its reading too.
+        set(model, 0, 1, "Marlow")
+        XCTAssertFalse(model.hasUnsavedEdits)
+        try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        XCTAssertTrue(model.isReloading)
+        document.isOnScreen = { _ in false }
+        model.fail(RevertTestFailure())
+        try await waitUntil("the revert is over") { !model.isReloading }
+    }
+
+    private struct RevertTestFailure: Error {}
+
+    /// Reload and Revert to Saved wait for a Save As that is queued or
+    /// waiting its turn, not only for one the model knows of (`isSaving`):
+    /// with no unsaved edits nothing asks first, and a Reload would replace
+    /// the core document the Save As then writes from, which it would no
+    /// longer follow (task 2.5.3c review).
+    func testReloadAndRevertWaitForAQueuedSaveAs() async throws {
+        let url = try file("queued.csv", csv)
+        let (document, model, content) = try await open(url)
+        XCTAssertFalse(model.hasUnsavedEdits)
+        let reload = menuItem(#selector(DocumentViewController.reloadFromDisk(_:)))
+        XCTAssertTrue(content.validateMenuItem(reload))
+        let copy = directory.appending(path: "queued copy.csv")
+        let task = document.saveAs(to: copy)
+        // Queued: its body hasn't run, and the model knows nothing of it.
+        XCTAssertNotNil(document.saving)
+        XCTAssertFalse(model.isSaving)
+        XCTAssertFalse(content.validateMenuItem(reload))
+        XCTAssertFalse(document.validateUserInterfaceItem(menuItem(#selector(NSDocument.revertToSaved(_:)))))
+        content.reloadFromDisk(nil)
+        XCTAssertNil(content.reloading)
+        XCTAssertFalse(model.isReloading)
+        document.revertToSaved(nil)
+        XCTAssertNil(content.reloading)
+        XCTAssertFalse(model.isReloading)
+
+        let saved = await task.value
+        XCTAssertTrue(saved)
+        XCTAssertTrue(same(document.fileURL, copy), "the document follows the copy")
+        XCTAssertTrue(same(model.url, copy))
+        XCTAssertTrue(content.validateMenuItem(reload))
     }
 
     // MARK: Revert to Saved (ADR-0008 decisions 4 and 10)

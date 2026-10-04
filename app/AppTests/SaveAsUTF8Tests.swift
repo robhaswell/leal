@@ -88,6 +88,34 @@ final class SaveAsUTF8Tests: XCTestCase {
         document.close()
     }
 
+    /// Save As UTF-8 onto the document's own file, opened through a
+    /// symbolic link: the file is converted where it is, the link stays a
+    /// link, and the document keeps its name, not the name the link leads
+    /// to (task 2.5.3c review).
+    func testSaveAsUTF8OntoItsOwnFileThroughALinkKeepsItsName() async throws {
+        let (target, _) = try utf16File("target.csv", "id\tname\r\n1\tZoë\r\n")
+        let link = directory.appending(path: "link.csv")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let (document, model, controller) = try open(link)
+        XCTAssertTrue(model.isReadOnly)
+
+        let saved = try await document.saveAsUTF8(to: link)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(try Data(contentsOf: target), Data("\u{FEFF}id\tname\r\n1\tZoë\r\n".utf8))
+        let attributes = try FileManager.default.attributesOfItem(atPath: link.path(percentEncoded: false))
+        XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSymbolicLink, "the link stays a link")
+        XCTAssertEqual(document.fileURL?.lastPathComponent, "link.csv")
+        XCTAssertEqual(document.displayName, "link.csv")
+        XCTAssertEqual(model.url.lastPathComponent, "link.csv")
+        XCTAssertEqual(model.interpretation.encoding, .utf8)
+        XCTAssertFalse(model.isReadOnly)
+        XCTAssertNil(controller.lock)
+        XCTAssertFalse(document.isDocumentEdited)
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path(percentEncoded: false)).filter { $0.hasSuffix(".csv") }
+        XCTAssertEqual(Set(names), ["target.csv", "link.csv"])
+        document.close()
+    }
+
     /// An unpaired surrogate: the alert names its cell, nothing is written,
     /// and the window still shows the UTF-16 file.
     func testBytesThatCantBeConvertedAreNamedAndNothingIsWritten() async throws {

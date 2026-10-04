@@ -1942,13 +1942,21 @@ final class DocumentModel: GridDataSource {
     /// the document no longer reads it. After Save As UTF-8 the copy is
     /// read in UTF-8 (its first screen says how), so the window is no
     /// longer read-only.
+    ///
+    /// A Save As onto the document's own file (`ontoOpenFile`: through a
+    /// symbolic link, or by another case) keeps the document's URL, as a
+    /// Save does: `outcome.path` is where a link leads, not a new name.
     private func followSaveAs(_ outcome: SaveOutcome, kind: SaveKind) {
-        url = URL(filePath: outcome.path)
-        original = outcome.original
-        isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
-        shareRecheck?.cancel()
-        shareRecheck = nil
-        lastDisconnection = nil
+        if outcome.ontoOpenFile {
+            original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
+        } else {
+            url = URL(filePath: outcome.path)
+            original = outcome.original
+            isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
+            shareRecheck?.cancel()
+            shareRecheck = nil
+            lastDisconnection = nil
+        }
         if kind == .saveAsUtf8, let screen = outcome.firstScreen {
             interpretation = screen.interpretation
         }
