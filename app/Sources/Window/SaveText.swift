@@ -356,4 +356,43 @@ extension SaveText {
             choices: [.duplicate, .cancel]
         )
     }
+
+    // MARK: After a save (task 2.5.3b)
+
+    /// The save kept the file it replaced (`SaveOutcome.keptOldFile`): the
+    /// swap took out a file it couldn't check, which may be another app's
+    /// version. Leal moved it to its Recovered folder as `keptAs`.
+    static func keptOldFile(name: String, keptAs: String) -> Message {
+        Message(
+            title: keptTitle(name: name),
+            detail: String(
+                localized: "Another app may have changed the file as Leal saved it. Its version is in Leal’s Recovered folder, as “\(keptAs)”.",
+                comment: "Alert text: where the kept old file now is; the name it was kept as"
+            )
+        )
+    }
+
+    /// As `keptOldFile`, but it couldn't be moved to the Recovered folder:
+    /// it is still in the save's temporary folder, at `path`.
+    static func keptOldFileNotMoved(name: String, path: String) -> Message {
+        Message(
+            title: keptTitle(name: name),
+            detail: String(
+                localized: "Another app may have changed the file as Leal saved it. Its version is at \(path), in a temporary folder: move it somewhere safe.",
+                comment: "Alert text: the kept old file couldn't be moved to the Recovered folder; where it is"
+            )
+        )
+    }
+
+    private static func keptTitle(name: String) -> String {
+        String(
+            localized: "Leal saved “\(name)” and kept the version it replaced.",
+            comment: "Alert title: a save kept the old file, which may hold another app's changes; the file's name"
+        )
+    }
+
+    /// The button that shows the kept file in Finder.
+    static var showInFinder: String {
+        String(localized: "Show in Finder", comment: "Button: show the file a save kept in Finder")
+    }
 }

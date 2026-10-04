@@ -41,6 +41,11 @@ enum DocumentChange: Equatable, Sendable {
     /// one, task 2.5.2): every row after the change moved, and the column
     /// count and widths may be different.
     case structure
+    /// A save rebased the document onto the file it wrote (task 2.5.3b):
+    /// a new reading of the same values. Every cell is drawn again (the
+    /// edited-cell marks of saved edits go), and the selection, scroll
+    /// position, column widths and an open editor stay.
+    case saved
 }
 
 /// How the reading under the edits changed (task 2.5.2), for the edit
@@ -226,6 +231,17 @@ final class DocumentModel: GridDataSource {
     private(set) var diagnostics: DiagnosticsReport?
     /// What the review (P2) suggests, once it has finished.
     private(set) var review: ReviewResult?
+    /// The reading shown is the one a save made of the file it wrote (task
+    /// 2.5.3b), not one read again since.
+    private(set) var readingFromSave = false
+    /// After a save, the index says it is complete at once (its index and
+    /// field counts come from the save's plan), but its pass still builds
+    /// the diagnostics (task 2.4c): only a complete report is taken.
+    private var awaitingCompleteDiagnostics = false
+    /// The review of a save's reading has finished (task 2.5.3b): it may
+    /// add the interpretation attribute to the saved file
+    /// (`CSVDocument.rememberReviewedInterpretation`).
+    var onSavedReadingReviewed: (() -> Void)?
     /// Row flags read from the core, by block of `flagBlockRows` grid rows.
     private var flagBlocks: [Int: [RowFlags]] = [:]
     /// A drive-state check is queued (see `call`).
@@ -613,6 +629,9 @@ final class DocumentModel: GridDataSource {
         self.review = review
         reviewedLineEnding = review?.lineEnding ?? reviewedLineEnding
         onChange?(.progress)
+        if readingFromSave, review?.delimiterSuggestion != nil {
+            onSavedReadingReviewed?()
+        }
     }
 
     /// Reads where the bytes are, whether the file changed while read, and
@@ -723,6 +742,12 @@ final class DocumentModel: GridDataSource {
     private func refreshDiagnostics() {
         if let held = diagnostics, held.generation == generation, held.complete { return }
         guard let report = call({ try $0.diagnostics() }), report.generation == generation else { return }
+        if awaitingCompleteDiagnostics {
+            // A save's reading: its `IndexProgress` was complete at once,
+            // its diagnostics aren't until its index pass ends (task 2.4c).
+            guard report.complete else { return }
+            awaitingCompleteDiagnostics = false
+        }
         diagnostics = report
         // The marks grew, and ragged rows may have changed with the mode.
         flagBlocks.removeAll()
@@ -1408,6 +1433,8 @@ final class DocumentModel: GridDataSource {
         tasks.removeAll()
         interpretation = screen.interpretation
         generation = screen.generation
+        readingFromSave = false
+        awaitingCompleteDiagnostics = false
         fileColumnCount = Int(screen.columnCount)
         reviewedLineEnding = nil
         review = nil
@@ -1551,6 +1578,8 @@ final class DocumentModel: GridDataSource {
         for task in tasks { task.cancel() }
         tasks.removeAll()
         generation = report.generation
+        readingFromSave = false
+        awaitingCompleteDiagnostics = false
         progress = report
         diagnostics = nil
         review = nil
@@ -1821,17 +1850,59 @@ final class DocumentModel: GridDataSource {
     /// again (edits made during the save are still unsaved), and the file
     /// is as the watcher sees it now, so `diverged` no longer asks.
     ///
-    /// SEAM(2.5.3b): adopting the core's rebased reading (its generation,
-    /// tiles, row flags, diagnostics, Find) and `keptOldFile`. Until then
-    /// the tiles keep their edited-cell marks until they are read again.
+    ///
+    /// The core now reads the file it wrote (ADR-0008 decision 1), as a new
+    /// reading: the model adopts it (`adoptSaved`). Not if it couldn't read
+    /// the file back (`firstScreen` is `nil`): it still reads the old
+    /// snapshot, with the edits.
     func saved(_ outcome: SaveOutcome) {
         guard failure == nil else { return }
         // Not `apply(original:)`: the path the core reports is the one it
         // wrote, a symbolic link followed, which isn't a move.
         original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
-        refreshDriveState()
         refreshUnsavedEdits()
-        onChange?(.progress)
+        if outcome.firstScreen != nil, let current = call({ try $0.progress() }), current.generation != generation {
+            adoptSaved(current)
+        } else {
+            refreshDriveState()
+            onChange?(.progress)
+        }
+    }
+
+    /// Adopts the reading a save made of the file it wrote (task 2.5.3b), as
+    /// after a re-read (`restarted`): its generation, so nothing read from
+    /// the old one is used (tiles, with their edited-cell marks, and row
+    /// flags), and its jobs, whose diagnostics and review are awaited
+    /// afresh. The diagnostics are taken only once complete
+    /// (`awaitingCompleteDiagnostics`). The interpretation, columns, their
+    /// widths and the undo stack stay: the values are the same. If the
+    /// core read the file again as the save ended (a drive back), this is
+    /// that reading.
+    private func adoptSaved(_ report: IndexProgress) {
+        generation = report.generation
+        readingFromSave = true
+        awaitingCompleteDiagnostics = true
+        progress = report
+        diagnostics = nil
+        review = nil
+        readStopped = false
+        indexStopped = false
+        reviewedLineEnding = nil
+        flagBlocks.removeAll()
+        tiles.removeAll()
+        // Sizing under way reads the old reading, so its result would be
+        // dropped: it starts again on the new one.
+        if refinedSizingStarted, !isSizingRefined {
+            refinedSizingStarted = false
+            remeasuring = false
+        } else if remeasuring || sizingAfterEdit != nil {
+            remeasuring = false
+            measureAgainAfterEdit()
+        }
+        refreshDriveState()
+        onChange?(.saved)
+        startWaiting()
+        progressArrived(report)
     }
 
     /// A Reload was asked for: the re-readings are off from now, before its
@@ -1910,6 +1981,8 @@ final class DocumentModel: GridDataSource {
         reference.model = self
         interpretation = screen.interpretation
         generation = screen.generation
+        readingFromSave = false
+        awaitingCompleteDiagnostics = false
         fileColumnCount = Int(screen.columnCount)
         progress = IndexProgress(
             generation: screen.generation,

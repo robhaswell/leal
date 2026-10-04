@@ -48,8 +48,15 @@ final class CoordinatedWrite: @unchecked Sendable {
     /// - Throws: `CancellationError`, or the coordinator's error if it
     ///   couldn't give access.
     static func begin(replacing url: URL, presenter: (any NSFilePresenter)?) async throws -> CoordinatedWrite {
+        try await begin(url, options: .forReplacing, presenter: presenter)
+    }
+
+    /// As `begin(replacing:presenter:)`, for a write of another kind: of
+    /// the file's metadata only (`.contentIndependentMetadataOnly`, an
+    /// extended attribute after a save, task 2.5.3b).
+    static func begin(_ url: URL, options: NSFileCoordinator.WritingOptions, presenter: (any NSFilePresenter)?) async throws -> CoordinatedWrite {
         let held = Coordinator(presenter: presenter)
-        let intent = NSFileAccessIntent.writingIntent(with: url, options: .forReplacing)
+        let intent = NSFileAccessIntent.writingIntent(with: url, options: options)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 held.coordinator.coordinate(with: [intent], queue: queue) { error in

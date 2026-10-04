@@ -154,6 +154,10 @@ final class CSVDocument: NSDocument {
             }
             opened.onCommand = { [weak self] command, direction in self?.commandApplied(command, as: direction) }
             opened.onReadingChanged = { [weak self] change in self?.readingChanged(change) }
+            opened.onSavedReadingReviewed = { [weak self, weak opened] in
+                guard let self, let opened else { return }
+                rememberReviewedInterpretation(model: opened)
+            }
             history.reset(choices: opened.choices)
             model = opened
         } catch {
@@ -777,13 +781,96 @@ final class CSVDocument: NSDocument {
             Logger.document.error("Saved, but couldn’t read the file back: \(error, privacy: .public)")
         }
         if let kept = outcome.keptOldFile {
-            // SEAM(2.5.3b): move it somewhere lasting and tell the user.
-            Logger.document.error("Saved; the old file was kept at \(kept, privacy: .private)")
+            keptOldFile = Task { await keepOldFile(kept) }
         }
         if let version = saved.snapshotVersion {
             history.savedThrough(version: version)
         }
         model.saved(outcome)
+    }
+
+    // MARK: After a save (task 2.5.3b)
+
+    /// Moving the last kept old file and telling the user (`keepOldFile`),
+    /// for tests: where it is now, or `nil` if it couldn't be moved.
+    private(set) var keptOldFile: Task<URL?, Never>?
+    /// The last recording of the interpretation attribute after a save's
+    /// review (`rememberReviewedInterpretation`), for tests: whether it
+    /// wrote it.
+    private(set) var remembering: Task<Bool, Never>?
+
+    /// A save kept the old file at `path` (`SaveOutcome.keptOldFile`): it
+    /// may hold another app's version. It is in the save's temporary
+    /// folder, which the system may empty, so it is moved at once to
+    /// Leal's Recovered folder (`RecoveredFiles`), off the main thread,
+    /// and the user is told where it is, with Show in Finder. If it can't
+    /// be moved, the user is told where it is instead. Returns where it
+    /// is now, or `nil` if it couldn't be moved.
+    @discardableResult
+    func keepOldFile(_ path: String) async -> URL? {
+        let name = fileName
+        let folder = Result { try RecoveredFiles.folder() }
+        let moved = await FileWork.run(qos: .utility) { () -> Result<URL, any Error> in
+            Result { try RecoveredFiles.keep(path, in: folder.get()) }
+        }
+        let message: SaveText.Message
+        let shown: URL
+        switch moved {
+        case let .success(url):
+            Logger.document.error("Saved; the old file was kept and moved to \(url.path(percentEncoded: false), privacy: .private)")
+            message = SaveText.keptOldFile(name: name, keptAs: url.lastPathComponent)
+            shown = url
+        case let .failure(error):
+            Logger.document.error("Saved; the old file was kept at \(path, privacy: .private) and couldn’t be moved: \(String(describing: error), privacy: .public)")
+            message = SaveText.keptOldFileNotMoved(name: name, path: path)
+            shown = URL(filePath: path)
+        }
+        if let window = windowControllers.first?.window {
+            let alert = NSAlert()
+            alert.messageText = message.title
+            alert.informativeText = message.detail
+            alert.addButton(withTitle: SaveText.button(.ok))
+            alert.addButton(withTitle: SaveText.showInFinder)
+            showSheet(alert, window) { response in
+                if response == .alertSecondButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([shown])
+                }
+            }
+        }
+        return try? moved.get()
+    }
+
+    /// The review of a save's reading suggests another delimiter (ADR-0008
+    /// decision 8's whole-file part): the core records the delimiter and
+    /// header in the saved file's interpretation attribute, if the file is
+    /// still the one saved (`rememberReviewedInterpretation`), so a reopen
+    /// reads it as the document does. Off the main thread, inside a
+    /// coordinated write of the file's metadata, with the document as
+    /// presenter so it doesn't hear of its own write. Not while another
+    /// save runs: its own reading is reviewed in turn.
+    private func rememberReviewedInterpretation(model: DocumentModel) {
+        guard self.model === model, !model.isSaving, let url = fileURL else { return }
+        var handle = model.backgroundHandle()
+        guard handle != nil else { return }
+        remembering = Task { [weak self] in
+            let write = try? await CoordinatedWrite.begin(url, options: .contentIndependentMetadataOnly, presenter: self)
+            let core = handle
+            let result = await FileWork.run(qos: .utility) { () -> Result<Bool, any Error> in
+                Result { try core?.rememberReviewedInterpretation() ?? false }
+            }
+            write?.end()
+            // Off the main thread: it may hold the last reference to the
+            // core's document (`CoreRelease`).
+            CoreRelease.later(&handle)
+            switch result {
+            case let .success(wrote):
+                if wrote { Logger.document.info("Recorded the delimiter after the saved file’s review") }
+                return wrote
+            case let .failure(error):
+                Logger.document.error("Couldn’t record the delimiter after a save: \(String(describing: error), privacy: .public)")
+                return false
+            }
+        }
     }
 
     /// Says why Save didn't write the file and offers what the user can

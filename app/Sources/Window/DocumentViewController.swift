@@ -306,6 +306,26 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // cells it was made from (`CopyPromise` holds its own core job).
             if isFindBarShown { find.restart(from: grid.activeCell) }
             updateInspector()
+        case .saved:
+            // The file Leal just wrote, read as a new reading (task
+            // 2.5.3b): the same values, so the selection, scroll position,
+            // widths, an open editor and the inspector stay. Every cell was
+            // drawn again above (the reading changed), so the saved edits'
+            // marks go. Find searches the new reading; the old reading's
+            // search is let go either way. A copy promised to the
+            // pasteboard keeps the cells it was made from (`CopyPromise`).
+            if grid.geometry.columnCount != model.columnCount {
+                grid.setColumnWidths(model.columnWidths)
+            }
+            grid.reloadData()
+            grid.headerView.invalidateContent()
+            detailsPopover?.close()
+            navigation.reset()
+            if isFindBarShown {
+                find.restart(from: grid.activeCell)
+            } else {
+                find.stop()
+            }
         case .failed:
             grid.invalidateContent()
             detailsPopover?.close()
@@ -431,8 +451,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         if bannerGeneration != model.generation {
             // A new reading of the file: suggestions and the diagnostics
             // banner start afresh. The file's banners are about the file,
-            // not the reading.
-            dismissed = dismissed.filter { $0.hasPrefix("drive") || $0.hasPrefix("file") }
+            // not the reading. Not after Leal's own save (task 2.5.3b): the
+            // file is the one the user had, with their edits, so a banner
+            // they closed stays closed.
+            if !model.readingFromSave {
+                dismissed = dismissed.filter { $0.hasPrefix("drive") || $0.hasPrefix("file") }
+            }
             bannerGeneration = model.generation
         }
         guard !model.isFailed else {
