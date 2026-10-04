@@ -220,7 +220,11 @@ final class CSVDocument: NSDocument {
     /// everything that touches the file (its modification date, and the
     /// core's open) off the main thread. The window's Reload comes here for
     /// such a file.
-    func reloadInBackground() async throws {
+    ///
+    /// `editVersion`: the edit version the caller checked the edits at (by
+    /// default, the one when the model's Reload starts): an edit made since
+    /// stops the new reading being adopted (`EditedDuringReload`).
+    func reloadInBackground(editVersion: UInt64? = nil) async throws {
         guard let model else { return }
         if let failure = model.failure { throw failure }
         let target = model.url
@@ -228,7 +232,7 @@ final class CSVDocument: NSDocument {
         // Only if the new snapshot was adopted: one that wasn't (the
         // document failed or closed meanwhile) mustn't move NSDocument's
         // idea of the file.
-        if try await model.reloadInBackground(from: target) {
+        if try await model.reloadInBackground(from: target, editVersion: editVersion) {
             followReload(of: model, modified: modified)
         }
     }
@@ -279,7 +283,13 @@ final class CSVDocument: NSDocument {
         controller.content.onCancelSave = { [weak self] in self?.cancelSave() ?? false }
         controller.content.confirmDiscardingEdits = { [weak self] reason, answer in
             guard let self else { return answer(true) }
-            confirmDiscardingEdits(reason, answer)
+            confirmDiscardingEdits(reason) { [weak self] proceed in
+                // Not if a Save was queued while the question showed: it
+                // isn't the model's yet (`isSaving`), but it will write.
+                let queued = self?.saving != nil
+                if proceed, queued { NSSound.beep() }
+                answer(proceed && !queued)
+            }
         }
         watchWindow(controller.window)
         if let opening {
@@ -408,9 +418,13 @@ final class CSVDocument: NSDocument {
             Logger.document.error("Not reverted: there are unsaved edits, or the file is being saved or read")
             return
         }
+        // The edit version now, with the check above: an edit made before
+        // the reading is adopted stops it (`EditedDuringReload`), so it is
+        // never thrown away unasked (task 2.5.3c review).
+        let version = model.editVersion
         Task { [weak self] in
             do {
-                try await self?.reloadInBackground()
+                try await self?.reloadInBackground(editVersion: version)
             } catch {
                 Logger.document.error("Revert failed: \(String(describing: error), privacy: .public)")
             }

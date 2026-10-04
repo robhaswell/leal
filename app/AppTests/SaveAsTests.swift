@@ -646,6 +646,37 @@ final class SaveAsTests: XCTestCase {
         XCTAssertTrue(recent.isEmpty)
     }
 
+    /// AppKit's `revert(toContentsOf:ofType:)` leaves unsaved edits alone,
+    /// and an edit made after it checked, before its reading is adopted,
+    /// stops the reading (`EditedDuringReload`) instead of being thrown
+    /// away.
+    func testAppKitsRevertNeverThrowsEditsAway() async throws {
+        let url = try file("appkit.csv", csv)
+        let threads = OpenThreads()
+        hookOpens(threads)
+        let (document, model, _) = try await open(url)
+        let opens = threads.onMainThread.count
+        try Data("id,name,qty\n9,Other,1\n".utf8).write(to: url)
+
+        set(model, 0, 1, "Marlowe")
+        try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        XCTAssertFalse(model.isReloading)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(threads.onMainThread.count, opens, "not read again")
+        XCTAssertEqual(value(model, 0, 1), "Marlowe")
+
+        set(model, 0, 1, "Marlow")
+        XCTAssertFalse(model.hasUnsavedEdits)
+        try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        // Before the revert's task has run.
+        set(model, 0, 1, "During")
+        try await waitUntil("read again") { threads.onMainThread.count == opens + 1 }
+        try await waitUntil("the reading is over") { !model.isReloading }
+        XCTAssertEqual(value(model, 0, 1), "During")
+        XCTAssertEqual(value(model, 0, 0), "1", "the new reading isn't adopted")
+        XCTAssertTrue(document.isDocumentEdited)
+    }
+
     // MARK: Revert to Saved (ADR-0008 decisions 4 and 10)
 
     /// Revert asks before discarding the edits, then reads the file again
