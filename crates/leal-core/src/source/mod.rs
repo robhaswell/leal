@@ -568,7 +568,13 @@ impl Source {
         let (file, identity) = open_regular(path)?;
         let attributes = RawAttributes::read(&file);
 
-        let kind = volume_kind(&file, &identity, temp, &volume, options.volume);
+        let kind = volume_kind(
+            || volume::flags(&file),
+            identity.device,
+            temp,
+            &volume,
+            options.volume,
+        );
         // The one routing decision for ADR-0006 option C: removable drives
         // and network shares (ADR-0009) are both read with ordinary reads
         // and copied in the background, never mapped from their volume.
@@ -1197,25 +1203,22 @@ fn share_rules(options: &Options) -> ShareRules {
 /// What kind of volume `folder` is on (a save's destination's folder),
 /// as for a file there ([`volume_kind`]), with what the app knows about it.
 ///
+/// The folder is looked at (`stat`, `statfs`), never opened: the app
+/// sandbox lets the app look at the folder of a file the user opened, but
+/// not open it (task 2.5.3a's save fix: opening it failed with `EPERM`).
+///
 /// # Errors
 ///
-/// If the folder can't be opened.
+/// If the folder can't be looked at.
 pub(crate) fn kind_of_folder(
     folder: &Path,
     temp: &TempFolders,
     volume: &VolumeInfo,
 ) -> io::Result<VolumeKind> {
-    let file = File::open(folder)?;
-    let metadata = file.metadata()?;
-    let identity = FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    };
+    let device = fs::metadata(folder)?.dev();
     Ok(volume_kind(
-        &file,
-        &identity,
+        || volume::flags_at(folder),
+        device,
         temp,
         volume,
         VolumeCheck::Detect,
@@ -1224,10 +1227,11 @@ pub(crate) fn kind_of_folder(
 
 /// What kind of volume the file is on, for how to read it: a fixed volume
 /// is mapped; a removable drive (ADR-0006) or a network share (ADR-0009)
-/// is read with ordinary reads and copied in the background.
+/// is read with ordinary reads and copied in the background. `flags` asks
+/// the volume for its mount flags; `device` is the file's `st_dev`.
 fn volume_kind(
-    file: &File,
-    identity: &FileIdentity,
+    flags: impl FnOnce() -> io::Result<volume::VolumeFlags>,
+    device: u64,
     temp: &TempFolders,
     volume: &VolumeInfo,
     check: VolumeCheck,
@@ -1244,7 +1248,7 @@ fn volume_kind(
     // A share first, before the shortcut below: a network home folder puts
     // the scratch directory on the share too, and its files are still on a
     // share (task 2.0 review). One `fstatfs`, about a microsecond.
-    let flags = volume::flags(file).ok();
+    let flags = flags().ok();
     if flags.is_some_and(|flags| !flags.local || flags.network_type) {
         return VolumeKind::Network;
     }
@@ -1257,7 +1261,7 @@ fn volume_kind(
         .scratch()
         .ancestors()
         .find_map(|folder| fs::metadata(folder).ok())
-        .is_some_and(|scratch| scratch.dev() == identity.device);
+        .is_some_and(|scratch| scratch.dev() == device);
     if on_scratch_volume {
         return VolumeKind::Fixed;
     }

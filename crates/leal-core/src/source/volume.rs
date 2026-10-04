@@ -50,12 +50,25 @@ pub(super) struct VolumeFlags {
 /// The mount flags of the volume `file` is on.
 pub(super) fn flags(file: &File) -> std::io::Result<VolumeFlags> {
     let (flags, type_name) = sys::volume_flags(file)?;
+    Ok(decode(flags, &type_name))
+}
+
+/// The mount flags of the volume the item at `path` is on, without
+/// opening it (`statfs`): the sandbox lets the app look at a folder it may
+/// not open.
+pub(super) fn flags_at(path: &std::path::Path) -> std::io::Result<VolumeFlags> {
+    let (flags, type_name) = sys::volume_flags_at(path)?;
+    Ok(decode(flags, &type_name))
+}
+
+/// `statfs`'s mount flags and file system type name, as [`VolumeFlags`].
+fn decode(flags: u32, type_name: &str) -> VolumeFlags {
     let local = u32::try_from(libc::MNT_LOCAL).unwrap_or(0);
-    Ok(VolumeFlags {
+    VolumeFlags {
         local: flags & local != 0,
         removable: flags & MNT_REMOVABLE != 0,
-        network_type: is_network_file_system(&type_name),
-    })
+        network_type: is_network_file_system(type_name),
+    }
 }
 
 /// Whether `type_name` (an `f_fstypename`) is a network file system.

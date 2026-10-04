@@ -183,7 +183,30 @@ pub(super) fn volume_flags(file: &File) -> io::Result<(u32, String)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fstatfs` returned 0, so it filled in the whole struct.
-    let stats = unsafe { stats.assume_init() };
+    Ok(flags_and_type(&unsafe { stats.assume_init() }))
+}
+
+/// As [`volume_flags`], for the volume the item at `path` is on, from
+/// `statfs(2)`: without opening it, which the app sandbox allows for a
+/// folder it may not read, such as the folder of a file the user opened
+/// (task 2.5.3a's save fix).
+pub(super) fn volume_flags_at(path: &Path) -> io::Result<(u32, String)> {
+    let path = c_path(path)?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `statfs` reads the NUL-terminated string, which lives until
+    // the call returns, and writes one `struct statfs` to the pointer,
+    // which points at uninitialised memory of exactly that type and size,
+    // owned by this function.
+    let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `statfs` returned 0, so it filled in the whole struct.
+    Ok(flags_and_type(&unsafe { stats.assume_init() }))
+}
+
+/// A `struct statfs`'s mount flags and file system type name.
+fn flags_and_type(stats: &libc::statfs) -> (u32, String) {
     // `f_fstypename` is a fixed array of C chars, NUL-terminated when the
     // name is shorter than the array. Read up to the NUL, or the whole
     // array, without trusting it to have one.
@@ -193,7 +216,7 @@ pub(super) fn volume_flags(file: &File) -> io::Result<(u32, String)> {
         .take_while(|&&c| c != 0)
         .map(|&c| c.to_ne_bytes()[0])
         .collect();
-    Ok((stats.f_flags, String::from_utf8_lossy(&name).into_owned()))
+    (stats.f_flags, String::from_utf8_lossy(&name).into_owned())
 }
 
 /// Whether the calling thread is the process's main thread

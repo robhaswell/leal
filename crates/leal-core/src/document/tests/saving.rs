@@ -1839,6 +1839,42 @@ fn the_apps_replacement_folder_holds_the_new_file_and_goes() {
     assert_eq!(leftovers(&dir.0, &["a.csv", "scratch", "records"]), [""; 0]);
 }
 
+/// The app sandbox lets the app replace a file the user opened, through
+/// the app's replacement folder, but not open the file's folder (task
+/// 2.5.3a's save fix: `open` failed with `EPERM`, "looking at the
+/// folder"). Here a folder that can be written and searched but not read
+/// (`-wx`) stands in: the save only looks at it (`stat`, `statfs`).
+#[test]
+fn a_folder_that_cant_be_opened_doesnt_stop_a_save() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new("save-folder-not-readable");
+    let scheduler = scheduler();
+    let user = dir.0.join("user");
+    std::fs::create_dir(&user).unwrap();
+    let path = user.join("a.csv");
+    std::fs::write(&path, b"a,b\r\n1,\"2\"\r\n").unwrap();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 0, "x");
+    let folder = dir.0.join("(A Document Being Saved By Leal)");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o300)).unwrap();
+    assert!(
+        std::fs::File::open(&user).is_err(),
+        "the folder can't be opened"
+    );
+    let mut request = SaveRequest::new(&path, SaveKind::Save);
+    request.folder = Some(folder.clone());
+    let job = document.save(request);
+    let saved = job.wait().cloned();
+    std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let saved = saved.unwrap();
+    assert_eq!(saved.placed, crate::source::Placed::Swapped);
+    assert_eq!(saved.kept, None);
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\r\nx,\"2\"\r\n");
+    assert_eq!(leftovers(&user, &["a.csv"]), [""; 0]);
+    assert!(!folder.exists());
+}
+
 /// A replacement folder on another volume (here a disk image) can't hold
 /// the new file, which a rename couldn't move: it is removed, and the new
 /// file is made in a hidden folder beside the destination instead.
