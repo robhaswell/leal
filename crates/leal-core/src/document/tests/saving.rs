@@ -2361,6 +2361,44 @@ fn deletes_undone_after_a_save_put_the_bytes_back() {
     assert_eq!(std::fs::read(&copy).unwrap(), "a,\"bé\"\nd,e\n".as_bytes());
 }
 
+/// Task 2.4c: a field a delete undone after a save put back as its bytes
+/// goes into a later reading as that reading reads it: after a redo, Save
+/// As UTF-8 and another undo, a Windows-1252 field comes back converted to
+/// UTF-8, not as its Windows-1252 bytes. The undo is a replay, whose
+/// command (an insert of inserted rows, or a column's `Restore`) holds the
+/// field's bytes, and is the one redone and undone again.
+#[test]
+fn fields_put_back_as_bytes_are_converted_by_a_later_save_as_utf8() {
+    for column in [false, true] {
+        let dir = Dir::new(&format!("undo-bytes-again-{column}"));
+        let path = dir.file("a.csv", b"a,b\xe9\nd,e\n");
+        let scheduler = scheduler();
+        let document = open_as(&path, &dir, &scheduler, Encoding::Windows1252);
+        let command = if column {
+            document.delete_column(1)
+        } else {
+            document.delete_rows(0, 1)
+        };
+        let command = command.unwrap().unwrap();
+        save(&document, &path, SaveKind::Save).unwrap();
+        let replay = document.replay(&[command.inverse()]);
+        assert!(replay.refused.is_empty(), "column {column}");
+        let [undo] = replay.commands.as_slice() else {
+            panic!("column {column}: {} commands", replay.commands.len());
+        };
+        document.apply(&undo.inverse()).unwrap();
+        let copy = dir.0.join("u8.csv");
+        save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+        document.apply(undo).unwrap();
+        save(&document, &copy, SaveKind::Save).unwrap();
+        assert_eq!(
+            std::fs::read(&copy).unwrap().escape_ascii().to_string(),
+            "a,bé\nd,e\n".as_bytes().escape_ascii().to_string(),
+            "column {column}"
+        );
+    }
+}
+
 /// ADR-0014 decision 3: a column command undone after a save works by
 /// value: a delete's cells are put back (`Restore`), an insert's are
 /// taken out if they still read as it left them.

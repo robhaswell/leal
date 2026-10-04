@@ -113,7 +113,8 @@ impl Rows {
                     for n in first..first + len {
                         if let Some(row) = inserted.get(&n) {
                             let edits = edits.get(&RowId::inserted(n)).map(|e| e.as_ref());
-                            values.push(inserted_values(n, row, edits, &self.columns));
+                            let row = inserted_values(n, row, edits, &self.columns);
+                            values.push(row.iter().map(|value| value.fit(parser)).collect());
                         }
                     }
                 }
@@ -123,7 +124,6 @@ impl Rows {
     }
 }
 
-/// An inserted row's cells as it reads with `edits`.
 /// Inserted row `n`'s values as it reads with `edits` under `columns`.
 pub(crate) fn inserted_values(
     n: u32,
@@ -229,7 +229,7 @@ impl Column {
             return Ok(vec![Value::Text(Arc::clone(value)); self.rows()]);
         }
         if let Some(values) = &self.restored {
-            return Ok(values.to_vec());
+            return Ok(values.iter().map(|value| value.fit(parser)).collect());
         }
         match &self.origin {
             Some(origin) => origin.values(&self.applied, self.op.at, parser),

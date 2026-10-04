@@ -92,4 +92,4 @@ pub use rows::RowId;
 pub(crate) use rows::{Piece, RowMap, Segment, Slot};
 pub(crate) use structural::{Changed, ColumnSource, RowSource};
 pub use structural::{Column, Rows};
-pub(crate) use value::{RawField, Value};
+pub(crate) use value::{RawField, ReadAs, Value};

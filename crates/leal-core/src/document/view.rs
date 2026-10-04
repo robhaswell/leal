@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::diagnostics::{DiagnosticKind, field_has, value_has};
 use crate::edit::{
-    CellId, Columns, Fold, InsertedRow, Kinds, Layout, OpKind, OverlayRow, Own, RawField, RowEdits,
-    RowId, Value,
+    CellId, Columns, Fold, InsertedRow, Kinds, Layout, OpKind, OverlayRow, Own, RawField, ReadAs,
+    RowEdits, RowId, Value,
 };
 use crate::rows::{FieldSpan, ParsedRow, RowParser};
 
@@ -322,7 +322,6 @@ impl<'a> RowView<'a> {
         }
     }
 
-    /// Cell `column`, or `None` past the row's end.
     /// Cell `column`'s id and cell, with the row's
     /// [`layout`](Self::layout) worked out already: for a walk over every
     /// cell of a row (a row written whole, task 2.4c).
@@ -335,6 +334,7 @@ impl<'a> RowView<'a> {
         Some((id, self.cell_of(id)))
     }
 
+    /// Cell `column`, or `None` past the row's end.
     pub(crate) fn cell(&self, column: usize) -> Option<ViewCell<'a>> {
         if self.edits.is_none() && self.columns.is_empty() {
             return self.own_cell(column);
@@ -446,32 +446,33 @@ impl<'a> RowView<'a> {
         Some(self.value_of(self.cell(column)?))
     }
 
-    /// [`value`](Self::value), of a cell of this row.
     /// `cell`, one of this row's, as a value to put back by value into a
     /// reading `parser` reads (ADR-0014 decision 3, task 2.4c): one of the
     /// file's fields, unedited, as its bytes, converted to UTF-8 if Save
     /// As UTF-8 came between; otherwise, or if that can't be done (a field
     /// whose bytes aren't text, converted; an unterminated quote's field,
-    /// which would swallow what follows it), as text.
+    /// which would swallow what follows it), as text. A field put back
+    /// already goes in as [`Value::fit`] has it.
     pub(crate) fn put_back(&self, cell: ViewCell<'a>, parser: &RowParser) -> Value {
         let raw = match cell {
             ViewCell::Field(field) if !field.unterminated() => {
                 let start = field.start() - self.base;
-                Some((&self.bytes[start..start + field.len()], self.parser))
+                RawField::read(
+                    &self.bytes[start..start + field.len()],
+                    ReadAs::of(self.parser),
+                    parser,
+                )
             }
-            ViewCell::Raw(raw) => {
-                let start = raw.field().start() - raw.base();
-                Some((&raw.bytes()[start..start + raw.field().len()], self.parser))
-            }
+            ViewCell::Raw(raw) => return RawField::fit(raw, parser),
             _ => None,
         };
-        raw.and_then(|(bytes, from)| raw_field(bytes, from, parser))
-            .map_or_else(
-                || Value::Text(Arc::from(self.value_of(cell).as_ref())),
-                |raw| Value::Raw(Arc::new(raw)),
-            )
+        raw.map_or_else(
+            || Value::Text(Arc::from(self.value_of(cell).as_ref())),
+            |raw| Value::Raw(Arc::new(raw)),
+        )
     }
 
+    /// [`value`](Self::value), of a cell of this row.
     pub(crate) fn value_of(&self, cell: ViewCell<'a>) -> Cow<'a, str> {
         match cell {
             ViewCell::Field(field) => self.parser.display_value_in(self.bytes, self.base, field),
@@ -538,40 +539,4 @@ impl<'a> RowView<'a> {
         }
         flagged
     }
-}
-
-/// A field's bytes `raw`, as `from` read them, as a field `to` reads the
-/// same way (the same dialect, and the same encoding, or UTF-8 converted
-/// from it): `None` if it can't be.
-fn raw_field(raw: &[u8], from: &RowParser, to: &RowParser) -> Option<RawField> {
-    let (a, b) = (from.dialect(), to.dialect());
-    if (a.delimiter, a.quote) != (b.delimiter, b.quote) {
-        return None;
-    }
-    let bytes: Box<[u8]> = if from.encoding() == to.encoding() {
-        Box::from(raw)
-    } else if to.encoding() == crate::dialect::Encoding::Utf8 {
-        crate::save::Transcoder::convert(raw, from.encoding())?
-            .into_owned()
-            .into_boxed_slice()
-    } else {
-        return None;
-    };
-    let base = b.bom_len;
-    let span = base..base + bytes.len();
-    let parsed = to.parse_in(&bytes, base, span.clone())?;
-    let [field] = parsed.fields() else {
-        return None;
-    };
-    if field.span() != span || field.unterminated() {
-        return None;
-    }
-    let mut kinds = Kinds::default();
-    for &(kind, bit) in &Kinds::FIELD_KINDS {
-        if field_has(kind, to.encoding(), &bytes, base, field) {
-            kinds.insert(bit);
-        }
-    }
-    let text = to.display_value_in(&bytes, base, field).into_owned();
-    Some(RawField::new(bytes, base, *field, &text, kinds))
 }

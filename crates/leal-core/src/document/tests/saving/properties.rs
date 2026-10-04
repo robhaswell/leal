@@ -368,14 +368,18 @@ fn open_and_edit(
     Ok((document, opened, chosen_encoding, oracle, made))
 }
 
-/// Undoes every command in `made` after the save that wrote `saved`, by
-/// value, and the same undos on an oracle of the saved file: the next
-/// save is the same, splice for splice (ADR-0012 decision 4, ADR-0014
-/// decision 3). Returns whether a row command was undone.
+/// Undoes every command in `made` after the save that wrote `saved` (to
+/// `path`), by value, and the same undos on an oracle of the saved file:
+/// the next save is the same, splice for splice (ADR-0012 decision 4,
+/// ADR-0014 decision 3). Then redoes those undos, saves as UTF-8 and undoes
+/// them again: the file saved is the oracle's undone file as UTF-8, so a
+/// field an undo put back as its bytes goes into the UTF-8 reading
+/// converted (task 2.4c). Returns whether a row command was undone.
 fn check_undo_after_save(
-    document: &Document,
+    document: &Arc<Document>,
     case: &EditCase,
     saved: &SavedFile,
+    path: &Path,
     made: &[Made],
 ) -> Result<bool, TestCaseError> {
     let layout = saved.layout.as_ref().unwrap();
@@ -385,8 +389,19 @@ fn check_undo_after_save(
         case.file.delimiter(),
         case.file.encoding,
     );
+    // Each undo as a replay, which gives the command it made: an insert
+    // of the rows a delete took, or a column's `Restore`, holding the
+    // fields it put back as their bytes.
+    let mut undos = Vec::new();
     for made in made.iter().rev() {
-        let got = document.apply(&made.command.inverse());
+        let replay = document.replay(&[made.command.inverse()]);
+        let got = match replay.refused.into_iter().next() {
+            Some((_, error)) => Err(error),
+            None => Ok(replay.commands),
+        };
+        if let Ok(commands) = &got {
+            undos.extend(commands.iter().cloned());
+        }
         let expected = made
             .undo
             .iter()
@@ -425,9 +440,49 @@ fn check_undo_after_save(
         }
         (expected, plan) => prop_assert!(false, "oracle {:?}, plan {:?}", expected, plan),
     }
+    let structural = made.iter().any(|made| made.command.is_structural());
+    if structural && let Ok(expected) = oracle.save_as_utf8() {
+        check_undo_after_save_as_utf8(document, path, &undos, &expected)?;
+    }
     Ok(made
         .iter()
         .any(|made| made.command.is_structural() && !made.command.is_column()))
+}
+
+/// [`check_undo_after_save`]'s undos (`undos`, the commands they made)
+/// redone, the file saved as UTF-8 next to `path`, and the undos made
+/// again: saved, the file is `expected`, the oracle's undone file as UTF-8.
+fn check_undo_after_save_as_utf8(
+    document: &Arc<Document>,
+    path: &Path,
+    undos: &[Command],
+    expected: &SavedFile,
+) -> Result<(), TestCaseError> {
+    for undo in undos.iter().rev() {
+        document.apply(&undo.inverse()).map_err(fail)?;
+    }
+    let copy = path.with_extension("undo-utf8.csv");
+    match document
+        .save(SaveRequest::new(&copy, SaveKind::SaveAsUtf8))
+        .wait()
+    {
+        Ok(_) => {}
+        // The redone file has a field that can't be converted, that the
+        // undos took out.
+        Err(SaveError::Unconvertible { .. }) => return Ok(()),
+        Err(error) => return Err(fail(error)),
+    }
+    for undo in undos {
+        document.apply(undo).map_err(fail)?;
+    }
+    document
+        .save(SaveRequest::new(&copy, SaveKind::Save))
+        .wait()
+        .map_err(fail)?;
+    let written = std::fs::read(&copy).unwrap();
+    let _ = std::fs::remove_file(&copy);
+    check_identical(&expected.bytes, &written)?;
+    Ok(())
 }
 
 /// How a case is saved: Save over the file; Save over it after another
@@ -674,7 +729,7 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
     drop(reading);
     check_rows(&document, &oracle, &saved)?;
     check_reopen(&document, &path, &oracle, &saved, encoding)?;
-    covered.rows = check_undo_after_save(&document, case, &saved, &made)?;
+    covered.rows = check_undo_after_save(&document, case, &saved, &path, &made)?;
     covered.columns = made.iter().any(|made| made.command.is_column());
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&opened);
