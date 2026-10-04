@@ -533,7 +533,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - `RowIndex::shifted` can't serve once rows move: the rebase waits for
       the index pass, or builds the index from the plan;
     - the save's carry-over maps rows through the piece list.
-- [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
+- [x] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
   Save / Save As / Revert, safe-save with metadata preserved. Split into
   parts of about a day (CLAUDE.md, token budget). The parts are named
   2.5.1 to 2.5.3 so as not to clash with 2.5a below; the bullets in each
@@ -604,11 +604,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       command on its stack, disable Undo/Redo for it while the save runs
       with the reason, and offer it again when the save ends. (2.4,
       ADR-0014 decision 1)
-  - [ ] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save over
+  - [x] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save over
     the core's save job, the rebase after it, Revert, the failures. Split
     into three parts of about a day (CLAUDE.md, token budget); the bullets
     in each part are its acceptance criteria.
-    - [ ] **2.5.3a App: Save** — the save job inside a file coordination, the
+    - [x] **2.5.3a App: Save** — the save job inside a file coordination, the
       refusals and their wording, progress, the guards on Treat As and the
       like while it runs.
       - Override NSDocument's save to start the core's job, inside an
@@ -653,7 +653,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       - Show the save's `SavePhase::Checking` (bytes of the file read, for the
         census of a column's quoting) as its own step before writing, with
         its own progress. (2.4c)
-    - [ ] **2.5.3b App: after a save** — adopting the core's rebased reading,
+    - [x] **2.5.3b App: after a save** — adopting the core's rebased reading,
       `keptOldFile`, and the attributes written on save.
       - Leal's own save is not an outside change. After a successful save the
         document is rebased onto the file just written: a new snapshot (clone,
@@ -693,7 +693,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       - The whole-file delimiter review's part of ADR-0008 decision 8
         (`SEAM(2.5)`): write the interpretation attribute when the rebased
         reading's review suggests another delimiter. (2.2)
-    - [ ] **2.5.3c App: Save As and Revert** — Save As (incomplete copies
+    - [x] **2.5.3c App: Save As and Revert** — Save As (incomplete copies
       included), Revert through Reload, `restarted()`, and the sandbox and
       SMB checks.
       - When a save ends with `SaveJob.restarted()` set (a drive back during
