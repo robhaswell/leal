@@ -1207,6 +1207,14 @@ fn share_rules(options: &Options) -> ShareRules {
 /// sandbox lets the app look at the folder of a file the user opened, but
 /// not open it (task 2.5.3a's save fix: opening it failed with `EPERM`).
 ///
+/// It looks twice, by path: `stat` for the device, then `statfs` for the
+/// mount flags. With nothing open to hold the folder, it could be replaced
+/// between the two (a different volume mounted over it, or the folder
+/// swapped for one on another volume), so the two answers could describe
+/// different folders. That is acceptable: the result only decides how the
+/// snapshot is copied (a mapped read or a background copy), never what is
+/// saved, so a wrong guess costs speed or an unneeded copy, not data.
+///
 /// # Errors
 ///
 /// If the folder can't be looked at.
