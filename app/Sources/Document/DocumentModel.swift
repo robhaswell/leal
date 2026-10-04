@@ -71,6 +71,11 @@ final class DocumentModel: GridDataSource {
     /// Called after first paint inside `init`, on the core's document. Only
     /// tests set it, to make the document fail while it opens.
     static var afterFirstPaintForTesting: ((LealFFI.Document) throws -> Void)?
+
+    /// Makes `setCell` refuse as the core would, with nothing changed. Only
+    /// tests set it: the core refuses an edit the editor opened on only
+    /// when the file changes under it, which closes the editor.
+    var refusalForTesting: EditRefusal?
     /// Opens the core's document in place of `openDocument`. Only tests set
     /// it, to open a file as if on a removable drive that vanishes, or
     /// whose file changes, part-way through (`debugOpenDocumentWithFault`,

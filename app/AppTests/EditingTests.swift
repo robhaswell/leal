@@ -797,6 +797,162 @@ final class EditingTests: XCTestCase {
         XCTAssertNil(callout.superview, "a note: it goes at the next selection change")
     }
 
+    /// The commands the model hears of, in order, with the window's own
+    /// hearing kept (undo).
+    private final class Heard {
+        var directions: [CommandDirection] = []
+    }
+
+    private func listen(to model: DocumentModel) -> Heard {
+        let heard = Heard()
+        let original = model.onCommand
+        model.onCommand = { command, direction in
+            heard.directions.append(direction)
+            original?(command, direction)
+        }
+        return heard
+    }
+
+    /// Opens a file with an edit still being typed in the in-cell editor:
+    /// "Bob" over the name in the first row.
+    private func typingEdit(_ name: String) async throws -> (DocumentModel, DocumentViewController, Heard) {
+        let (_, model, content) = try await open(try file(name, "id,name\n1,Ada\n2,Bo\n"))
+        let heard = listen(to: model)
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        try type("Bob", in: content)
+        XCTAssertTrue(content.cellEditor.isEditing)
+        XCTAssertEqual(heard.directions, [], "nothing is committed yet")
+        return (model, content, heard)
+    }
+
+    private func assertCommitted(_ model: DocumentModel, _ content: DocumentViewController, _ heard: Heard, line: UInt = #line) {
+        XCTAssertEqual(heard.directions, [.edit], "the open edit is committed before the command acts", line: line)
+        XCTAssertFalse(content.cellEditor.isEditing, line: line)
+    }
+
+    /// Each command that reads the file again or moves the search commits
+    /// an open edit first (`commitEditing`), as it would be lost with the
+    /// editor otherwise. Each assertion fails if the call is removed.
+    func testReloadCommitsAnOpenEdit() async throws {
+        let (model, content, heard) = try await typingEdit("reload.csv")
+        content.reloadFromDisk(nil)
+        assertCommitted(model, content, heard)
+        await content.reloading?.value
+    }
+
+    func testTreatAsCommitsAnOpenEdit() async throws {
+        let (model, content, heard) = try await typingEdit("treat.csv")
+        content.treatAs(.semicolon)
+        assertCommitted(model, content, heard)
+    }
+
+    func testReopenWithEncodingCommitsAnOpenEdit() async throws {
+        let (model, content, heard) = try await typingEdit("reopen.csv")
+        content.reopen(encoding: .windows1252)
+        assertCommitted(model, content, heard)
+    }
+
+    func testTheHeaderToggleCommitsAnOpenEdit() async throws {
+        let (model, content, heard) = try await typingEdit("toggle.csv")
+        let header = model.interpretation.header
+        content.toggleHeaderRow(nil)
+        assertCommitted(model, content, heard)
+        XCTAssertNotEqual(model.interpretation.header, header)
+    }
+
+    func testFindNextCommitsAnOpenEdit() async throws {
+        let (model, content, heard) = try await typingEdit("next.csv")
+        content.showFindBar()
+        content.findBar.field.stringValue = "Bob"
+        content.findNext(nil)
+        assertCommitted(model, content, heard)
+        try await waitUntil("found") { content.find.matchCount == 1 }
+    }
+
+    /// A commit the core refuses leaves the editor open with what was
+    /// typed: `commitEditing` says it didn't commit, so the command that
+    /// asked doesn't go on; when the focus leaves the editor, it comes
+    /// back to it, rather than sit open without it (the nit).
+    func testARefusedCommitKeepsTheTypedText() async throws {
+        let (model, content, heard) = try await typingEdit("refused.csv")
+        let delimiter = model.interpretation.delimiter
+        model.refusalForTesting = .valueChanged
+        XCTAssertFalse(content.commitEditing())
+        XCTAssertTrue(content.cellEditor.isEditing)
+        XCTAssertEqual(try fieldEditor(content).string, "Bob", "the typed text stays")
+        XCTAssertEqual(value(model, 0, 1), utf8("Ada"))
+        XCTAssertEqual(heard.directions, [])
+        content.treatAs(.semicolon)
+        XCTAssertEqual(model.interpretation.delimiter, delimiter, "the command that asked didn't go on")
+        XCTAssertTrue(content.cellEditor.isEditing)
+
+        // The focus leaves the editor: the commit is refused again, and the
+        // editor takes the focus back, with its text.
+        let window = try XCTUnwrap(content.view.window)
+        window.makeFirstResponder(content.grid.gridView)
+        try await waitUntil("the focus is back", timeout: 5) {
+            content.cellEditor.field.currentEditor().map { window.firstResponder === $0 } ?? false
+        }
+        XCTAssertTrue(content.cellEditor.isEditing)
+        XCTAssertEqual(try fieldEditor(content).string, "Bob")
+
+        // Once the core allows it, the edit commits.
+        model.refusalForTesting = nil
+        XCTAssertTrue(content.commitEditing())
+        XCTAssertEqual(value(model, 0, 1), utf8("Bob"))
+        XCTAssertEqual(heard.directions, [.edit])
+    }
+
+    // MARK: The window's shared field editor, and the defaults
+
+    /// Turning a substitution off in the cell editor (`super`'s setter)
+    /// might write the app's defaults, and turn smart quotes off in the
+    /// window's shared field editor, which the find bar uses. It doesn't.
+    func testTheCellEditorLeavesTheSharedFieldEditorAndTheDefaultsAlone() async throws {
+        let (_, _, content) = try await open(try file("shared.csv", "id,name\n1,Ada\n"))
+        let window = try XCTUnwrap(content.view.window)
+        let shared = try XCTUnwrap(window.fieldEditor(true, for: nil) as? NSTextView)
+        let keys = [
+            "NSAutomaticQuoteSubstitutionEnabled", "NSAutomaticDashSubstitutionEnabled",
+            "NSAutomaticTextReplacementEnabled", "NSAutomaticSpellingCorrectionEnabled",
+            "NSAutomaticDataDetectionEnabled", "NSAutomaticLinkDetectionEnabled",
+            "NSAutomaticTextCompletionEnabled", "NSSmartInsertDeleteEnabled",
+        ]
+        func flags(_ view: NSTextView) -> [Bool] {
+            [
+                view.isAutomaticQuoteSubstitutionEnabled, view.isAutomaticDashSubstitutionEnabled,
+                view.isAutomaticTextReplacementEnabled, view.isAutomaticSpellingCorrectionEnabled,
+                view.isAutomaticDataDetectionEnabled, view.isAutomaticLinkDetectionEnabled,
+                view.isAutomaticTextCompletionEnabled, view.smartInsertDeleteEnabled,
+                view.enabledTextCheckingTypes != 0,
+            ]
+        }
+        func stored() -> [String] {
+            keys.map { key in UserDefaults.standard.object(forKey: key).map { "\($0)" } ?? "unset" }
+        }
+        let domain = Bundle.main.bundleIdentifier ?? ""
+        let flagsBefore = flags(shared)
+        let storedBefore = stored()
+        let domainBefore = UserDefaults.standard.persistentDomain(forName: domain) as NSDictionary?
+
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        let editor = try fieldEditor(content)
+        XCTAssertTrue(editor is LiteralTextView)
+        XCTAssertFalse(editor === shared)
+        editor.toggleAutomaticQuoteSubstitution(nil)
+        editor.toggleAutomaticDashSubstitution(nil)
+        editor.toggleAutomaticTextReplacement(nil)
+        editor.toggleAutomaticSpellingCorrection(nil)
+        editor.toggleAutomaticDataDetection(nil)
+        editor.toggleAutomaticLinkDetection(nil)
+        editor.toggleSmartInsertDelete(nil)
+        XCTAssertFalse(editor.isAutomaticQuoteSubstitutionEnabled, "and the editor itself stays off")
+
+        XCTAssertEqual(flags(shared), flagsBefore, "the shared field editor's substitutions")
+        XCTAssertEqual(stored(), storedBefore, "the defaults")
+        XCTAssertEqual(UserDefaults.standard.persistentDomain(forName: domain) as NSDictionary?, domainBefore, "the app's defaults domain")
+    }
+
     // MARK: Cell edit to screen (DESIGN §1, < 16 ms)
 
     /// The time from Return to the transaction that draws the edit, for

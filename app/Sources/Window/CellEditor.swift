@@ -29,6 +29,10 @@ class LiteralTextView: NSTextView {
         isAutomaticLinkDetectionEnabled = false
         isAutomaticTextCompletionEnabled = false
         enabledTextCheckingTypes = super.enabledTextCheckingTypes
+        inlinePredictionType = .no
+        if #available(macOS 15.0, *) {
+            writingToolsBehavior = .none
+        }
     }
 
     override var isAutomaticQuoteSubstitutionEnabled: Bool {
@@ -69,6 +73,20 @@ class LiteralTextView: NSTextView {
     override var isAutomaticTextCompletionEnabled: Bool {
         get { false }
         set { super.isAutomaticTextCompletionEnabled = false }
+    }
+
+    /// Inline predictions (macOS 14) would suggest text to complete, and a
+    /// Tab or Return might take it.
+    override var inlinePredictionType: NSTextInputTraitType {
+        get { .no }
+        set { super.inlinePredictionType = .no }
+    }
+
+    /// Writing Tools (macOS 15) rewrite text: not in a cell.
+    @available(macOS 15.0, *)
+    override var writingToolsBehavior: NSWritingToolsBehavior {
+        get { .none }
+        set { super.writingToolsBehavior = .none }
     }
 
     override var enabledTextCheckingTypes: NSTextCheckingTypes {
@@ -543,7 +561,19 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     /// field does, without waiting on the encoding check.
     func controlTextDidEndEditing(_ notification: Notification) {
         guard !ending, session != nil else { return }
-        _ = commit(move: nil, refocus: false, confirmed: true)
+        if !commit(move: nil, refocus: false, confirmed: true) {
+            takeBackFocus()
+        }
+    }
+
+    /// A commit the core refused when the focus left: the editor stays open
+    /// with its text, so it gets the focus back (once this resignation is
+    /// over), to commit again or cancel, rather than sit open without it.
+    private func takeBackFocus() {
+        Task { @MainActor [weak self] in
+            guard let self, session != nil, let window = grid.window, field.currentEditor() == nil else { return }
+            window.makeFirstResponder(field)
+        }
     }
 
     // MARK: Ending

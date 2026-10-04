@@ -164,6 +164,7 @@ extension DocumentModel {
     /// shows the cell catches up (`valuesChanged`), and the command goes to
     /// `commandApplied`, the one place undo hears of it.
     func setCell(_ place: EditPlace, to value: String) -> EditOutcome {
+        if let refusal = refusalForTesting { return .refused(refusal) }
         guard failure == nil, let handle = backgroundHandle() else { return .failed }
         let row = logicalRow(place)
         let command: EditCommand?
