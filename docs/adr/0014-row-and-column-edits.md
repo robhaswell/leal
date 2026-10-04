@@ -80,6 +80,19 @@ was rejected.
    replaced unasked (ADR-0004 decision 9, DESIGN §3.5). Clarified during
    task 2.4c.
 
+## Added during task 2.5a (decided by Rob, 2026-10-04)
+
+9. **A duplicated blank line is saved as `""`.** Duplicate Row's copy of
+   a blank line is a new row, and a new row is never zero bytes (ADR-0004
+   decision 6), so it is written as `""`: after a save and reopen, a row
+   with one empty field, not a second blank line. Decision 6 treats a row
+   emptied by edits the same way: no cells, written as `""`.
+   - **Why:** a zero-byte new row would read back as a blank line, or
+     vanish at the end of the file. Keeping a copy blank would need a kind
+     of inserted row that only Duplicate Row makes.
+   - **Also:** a copy's line ending is the file's most common one, as any
+     new row's (DESIGN §3.7 rule 3), not its row's.
+
 ## Consequences
 
 - **DESIGN §3.6:** add when structural edits are allowed; that their undo

@@ -984,7 +984,7 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Go to row | ⌘L |
 | Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste) |
 | Insert row below / delete row | ⌘↩ / ⌘⌫ |
-| Duplicate row (a copy below, byte for byte; the selected column stays) | ⇧⌘↩ |
+| Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |
 | Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |
 
