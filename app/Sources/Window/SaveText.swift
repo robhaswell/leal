@@ -106,3 +106,241 @@ enum SaveText {
         )
     }
 }
+
+// MARK: Save (task 2.5.3a)
+
+/// What the user can do when Save stops (task 2.5.3a): each a button of
+/// the alert that says why.
+enum SaveChoice: Equatable, Sendable {
+    /// Write over a file that changed elsewhere (`overwriteChanged`).
+    case saveAnyway
+    /// Clear the file's locked flag, then save again.
+    case unlock
+    /// Keep the changes in a copy elsewhere.
+    case duplicate
+    /// Save a UTF-8 copy (ADR-0008 decision 7).
+    case saveAsUTF8
+    /// Save elsewhere.
+    case saveAs
+    /// Save again.
+    case tryAgain
+    case cancel
+    case ok
+}
+
+extension SaveText {
+    /// Why Save stopped, or what it asks before writing, and the choices
+    /// it offers, the first being the default and the last the way out.
+    struct Refusal: Equatable {
+        let title: String
+        let detail: String
+        let choices: [SaveChoice]
+    }
+
+    /// The most cells an alert names one by one; the rest are counted.
+    static let namedCells = 8
+
+    /// What Save asks before writing over a file that changed elsewhere:
+    /// the watcher saw a change (`OriginalStatus.diverged`, which stays set
+    /// after Keep Editing), or the core's check before writing found one
+    /// (`ChangedElsewhere`). Asked once, never with `NSDocument`'s own.
+    static func changedElsewhere(name: String) -> Refusal {
+        Refusal(
+            title: String(
+                localized: "“\(name)” changed on disk since Leal opened or last saved it.",
+                comment: "Alert title: Save would write over a file another app changed; the file's name"
+            ),
+            detail: String(
+                localized: "Another app changed or replaced it. Saving now replaces that version with what Leal shows.",
+                comment: "Alert text: Save would write over a file another app changed"
+            ),
+            choices: [.saveAnyway, .cancel]
+        )
+    }
+
+    /// Why Save didn't write the file, and what the user can do; `nil` if
+    /// it says nothing (cancelled, or the document failed, which its own
+    /// alert says). Nothing was written either way. The core's own words
+    /// (English) are for the log, never shown.
+    static func saveFailure(_ failure: SaveFailure, name: String, headerRows: Int) -> Refusal? {
+        let title = String(localized: "“\(name)” wasn’t saved.", comment: "Alert title: Save failed; the file's name")
+        switch failure {
+        case .Cancelled, .DocumentFailed:
+            return nil
+        case .ChangedElsewhere:
+            return changedElsewhere(name: name)
+        case .Locked:
+            return Refusal(
+                title: String(localized: "“\(name)” is locked.", comment: "Alert title: Save refused a locked file; the file's name"),
+                detail: String(
+                    localized: "Unlock it to save your changes there, or keep them in a duplicate.",
+                    comment: "Alert text: Save refused a locked file; the buttons are Unlock, Duplicate and Cancel"
+                ),
+                choices: [.unlock, .duplicate, .cancel]
+            )
+        case .NotWritable:
+            return Refusal(
+                title: String(
+                    localized: "You don’t have permission to save “\(name)”.",
+                    comment: "Alert title: Save refused a file Leal may not write; the file's name"
+                ),
+                detail: String(
+                    localized: "Keep your changes in a duplicate, or ask the file’s owner for permission to write it.",
+                    comment: "Alert text: Save refused a file Leal may not write; the buttons are Duplicate and Cancel"
+                ),
+                choices: [.duplicate, .cancel]
+            )
+        case let .Unencodable(encoding, cells, more):
+            return unencodable(name: name, encoding: StatusText.encodingName(encoding), cells: cells, more: more, headerRows: headerRows)
+        case .Missing:
+            return Refusal(
+                title: String(localized: "“\(name)” can’t be found.", comment: "Alert title: Save found no file where it was; the file's name"),
+                detail: String(
+                    localized: "It was moved, renamed or deleted since Leal opened it. Save As keeps your changes in a new file.",
+                    comment: "Alert text: Save found no file where it was; the buttons are Save As… and Cancel"
+                ),
+                choices: [.saveAs, .cancel]
+            )
+        case .Moving:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "The file is being moved or replaced, perhaps by another app. Try again in a moment.",
+                    comment: "Alert text: Save found the file in the middle of a rename; the buttons are Try Again and Cancel"
+                ),
+                choices: [.tryAgain, .cancel]
+            )
+        case .Unavailable:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "The drive or server it’s on isn’t connected. Connect it and try again, or use Save As to keep your changes elsewhere.",
+                    comment: "Alert text: Save found the file's volume not mounted; the buttons are Save As… and Cancel"
+                ),
+                choices: [.saveAs, .cancel]
+            )
+        case .Incomplete, .DriveDisconnected, .ChangedOnDisk, .DeletedElsewhere:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "Leal doesn’t have all of the file, so saving over it would lose rows. Save As keeps a copy of what Leal has.",
+                    comment: "Alert text: Save refused because Leal couldn't read the whole file (its drive went, or it changed while read)"
+                ),
+                choices: [.saveAs, .cancel]
+            )
+        case .ReadOnly:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "Leal saves UTF-16 files only as a UTF-8 copy.",
+                    comment: "Alert text: Save of a UTF-16 file (ADR-0013 decision 1); the buttons are Save As UTF-8… and Cancel"
+                ),
+                choices: [.saveAsUTF8, .cancel]
+            )
+        case .TooLarge:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "The file would be too large for Leal to open again.",
+                    comment: "Alert text: Save's file would be over 4 GiB (ADR-0012 decision 2)"
+                ),
+                choices: [.ok]
+            )
+        case .NotAFile:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "Something other than a file, such as a folder, is where the file was.",
+                    comment: "Alert text: Save found a folder or similar at the file's place"
+                ),
+                choices: [.ok]
+            )
+        case .Io:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "Leal couldn’t write the file. Check that the drive has room and that you may write to that folder.",
+                    comment: "Alert text: Save failed writing the file (a full disk, no permission); the details are in the log"
+                ),
+                choices: [.ok]
+            )
+        case .Unconvertible, .Internal:
+            return Refusal(
+                title: title,
+                detail: String(
+                    localized: "Something went wrong inside Leal. Try again, or reopen the file first.",
+                    comment: "Alert text: Save failed because of a problem in Leal itself; the details are in the log"
+                ),
+                choices: [.ok]
+            )
+        }
+    }
+
+    /// Save refused values the file's encoding can't hold (F5): the cells,
+    /// the first `namedCells` one by one, then how many more ("and more"
+    /// once the core stopped counting, at 1,000), and Save As UTF-8.
+    private static func unencodable(name: String, encoding: String, cells: [CellPlace], more: Bool, headerRows: Int) -> Refusal {
+        let title = String(
+            localized: "Some cells can’t be saved in \(encoding).",
+            comment: "Alert title: Save refused values the file's encoding can't represent; the encoding"
+        )
+        var lines = cells.prefix(namedCells).map { "• " + capitalized(cell($0, headerRows: headerRows)) }
+        let rest = cells.count - min(cells.count, namedCells)
+        if more {
+            lines.append(String(localized: "and more", comment: "After a list of cells Save refused, when there are more than Leal counted"))
+        } else if rest > 0 {
+            lines.append(String(localized: "and \(rest) more", comment: "After a list of cells Save refused: how many more"))
+        }
+        let why = String(
+            localized: "They hold characters \(encoding) can’t represent, and Leal never replaces them. Change them, or save a UTF-8 copy of “\(name)”.",
+            comment: "Alert text after the cells Save refused; the encoding and the file's name; the buttons are Save As UTF-8… and Cancel"
+        )
+        return Refusal(title: title, detail: (lines + ["", why]).joined(separator: "\n"), choices: [.saveAsUTF8, .cancel])
+    }
+
+    /// `text` with its first letter capitalised, for the start of a line.
+    private static func capitalized(_ text: String) -> String {
+        guard let first = text.first else { return text }
+        return first.uppercased() + text.dropFirst()
+    }
+
+    /// A choice's button.
+    static func button(_ choice: SaveChoice) -> String {
+        switch choice {
+        case .saveAnyway: String(localized: "Save Anyway", comment: "Button: write over a file another app changed")
+        case .unlock: String(localized: "Unlock", comment: "Button: unlock a locked file, then save")
+        case .duplicate: String(localized: "Duplicate", comment: "Button: keep the changes in a copy of a file Leal can't save")
+        case .saveAsUTF8: String(localized: "Save As UTF-8…", comment: "Button: save a UTF-8 copy (ADR-0008 decision 7)")
+        case .saveAs: String(localized: "Save As…", comment: "Button: save the document elsewhere")
+        case .tryAgain: String(localized: "Try Again", comment: "Button: save again")
+        case .cancel: String(localized: "Cancel", comment: "Button: don't save")
+        case .ok: String(localized: "OK", comment: "Button: dismiss an alert")
+        }
+    }
+
+    /// Save after a UTF-8 copy was saved but the window stayed on this
+    /// file (an edit made meanwhile): Leal now holds the copy's reading,
+    /// so only Save As UTF-8 can save the edits (`readsUTF8Copy`).
+    static func utf8CopyOnly(name: String) -> Refusal {
+        Refusal(
+            title: String(localized: "“\(name)” wasn’t saved.", comment: "Alert title: Save failed; the file's name"),
+            detail: String(
+                localized: "Since its UTF-8 copy was saved, Leal can save your changes only as a UTF-8 copy. Reload the file to save it in place again, which discards them.",
+                comment: "Alert text: Save after Save As UTF-8 whose copy the window didn't switch to; the buttons are Save As UTF-8… and Cancel"
+            ),
+            choices: [.saveAsUTF8, .cancel]
+        )
+    }
+
+    /// Unlocking the file failed.
+    static func unlockFailed(name: String) -> Refusal {
+        Refusal(
+            title: String(localized: "Leal couldn’t unlock “\(name)”.", comment: "Alert title: Unlock failed; the file's name"),
+            detail: String(
+                localized: "You may not be allowed to change it. Keep your changes in a duplicate instead.",
+                comment: "Alert text: Unlock failed; the buttons are Duplicate and Cancel"
+            ),
+            choices: [.duplicate, .cancel]
+        )
+    }
+}

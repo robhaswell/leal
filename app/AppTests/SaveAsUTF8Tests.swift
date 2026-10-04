@@ -183,6 +183,10 @@ final class SaveAsUTF8Tests: XCTestCase {
         XCTAssertEqual(document.fileURL?.standardizedFileURL, url.standardizedFileURL, "still the UTF-16 file")
         XCTAssertEqual(model.url.standardizedFileURL, url.standardizedFileURL)
         XCTAssertTrue(model.isReadOnly)
+        // The core reads the copy now: Save stays off, asking for Save As
+        // UTF-8 (task 2.5.3a), until a Reload.
+        XCTAssertEqual(document.readsUTF8Copy?.standardizedFileURL, copy.standardizedFileURL)
+        XCTAssertFalse(document.canSave)
         XCTAssertTrue(document.isDocumentEdited)
         XCTAssertEqual(model.fullValue(.cell(cell)), "Zoe")
         XCTAssertEqual(model.fullValue(.cell(CellPosition(row: 1, column: 1))), "Ada L")

@@ -155,6 +155,46 @@ final class RemovableDriveTests: XCTestCase {
         }
     }
 
+    /// Save on an APFS and an exFAT drive (task 2.5.3a): the new file is
+    /// written in an item-replacement folder on the drive, then swapped in
+    /// (APFS) or renamed over the file (exFAT, which can't swap); the bytes
+    /// are right, the document is clean, and nothing of Leal's is left on
+    /// the drive.
+    func testSaveOnARemovableDriveWritesTheFileAndLeavesNothing() async throws {
+        let contents = Data("id,name\n1,Marlow\n2,Ostrava\n".utf8)
+        for fs in ["APFS", "ExFAT"] {
+            let image = try await attach(fs: fs, format: "UDRW", size: "64m", file: "drive.csv", contents: contents)
+            let url = image.root.appending(path: "drive.csv")
+            let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+            document.makeWindowControllers()
+            var alerts: [String] = []
+            document.showSheet = { alert, _, done in
+                alerts.append(alert.messageText)
+                done(NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + alert.buttons.count - 1))
+            }
+            let model = try XCTUnwrap(document.model)
+            try await waitUntil("\(fs): copied and indexed") { model.isIndexComplete && model.storage == .copy }
+            guard case .edited = model.setCell(.cell(CellPosition(row: 1, column: 1)), to: "Tromsø") else {
+                return XCTFail("\(fs): not edited")
+            }
+            document.save(nil)
+            let saving = try XCTUnwrap(document.saving)
+            let saved = await saving.value
+
+            XCTAssertTrue(saved, "\(fs): \(alerts)")
+            XCTAssertEqual(alerts, [])
+            XCTAssertEqual(try Data(contentsOf: url), Data("id,name\n1,Marlow\n2,Tromsø\n".utf8), fs)
+            XCTAssertFalse(document.isDocumentEdited, fs)
+            document.close()
+            CoreRelease.finish()
+            try await waitUntil("\(fs): the copies are removed") { records().isEmpty }
+            XCTAssertEqual(Self.leftovers(on: image.root), [], "\(fs): nothing of Leal's is left on the drive")
+            let hidden = (try? FileManager.default.contentsOfDirectory(atPath: image.root.path(percentEncoded: false))) ?? []
+            XCTAssertEqual(hidden.filter { $0.hasPrefix(".leal-save") }, [], "\(fs): the item-replacement folder was used")
+            try image.forceDetach()
+        }
+    }
+
     /// Leal's temporary folders on a volume (`NSIRD_…` in `.TemporaryItems`).
     private static func leftovers(on root: URL) -> [String] {
         let items = root.appending(path: ".TemporaryItems")

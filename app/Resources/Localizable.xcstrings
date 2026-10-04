@@ -244,6 +244,9 @@
     "Another app changed it while Leal was reading it." : {
       "comment" : "Open error: the file changed while it was being read without a snapshot"
     },
+    "Another app changed or replaced it. Saving now replaces that version with what Leal shows." : {
+      "comment" : "Alert text: Save would write over a file another app changed"
+    },
     "Another app changed this file after Leal opened it. Leal shows the version it opened; File ▸ Reload from Disk shows the new one." : {
       "comment" : "Status bar tooltip: the file changed on disk (task 1.9)"
     },
@@ -260,7 +263,7 @@
       "comment" : "Diagnostic kind: the file starts with a BOM (DESIGN §3.5)"
     },
     "Cancel" : {
-      "comment" : "Button: cancel\nGo to Row sheet's cancel button"
+      "comment" : "Button: cancel\nButton: don't save\nGo to Row sheet's cancel button"
     },
     "Cell editor" : {
       "comment" : "VoiceOver name of the in-cell editor (task 2.5.1)"
@@ -276,6 +279,9 @@
     },
     "Changed while reading" : {
       "comment" : "Status bar: the file changed on its drive while Leal read it (1.1a)"
+    },
+    "Checking the file before saving…" : {
+      "comment" : "Status bar: a save reads every row first, to quote new cells the way the file's columns are quoted (task 2.4c)"
     },
     "Clear Menu" : {
       "comment" : "File > Open Recent"
@@ -367,6 +373,9 @@
     "Drive not connected" : {
       "comment" : "Status bar: the open file's drive was ejected after Leal had copied the file (task 1.9)"
     },
+    "Duplicate" : {
+      "comment" : "Button: keep the changes in a copy of a file Leal can't save"
+    },
     "Edit" : {
       "comment" : "Menu title"
     },
@@ -411,6 +420,9 @@
     },
     "Find…" : {
       "comment" : "Edit > Find: show the find bar (⌘F, mockup 04a)"
+    },
+    "Finishing saving…" : {
+      "comment" : "Status bar: the save is flushing the new file and putting it in place"
     },
     "Go" : {
       "comment" : "Go to Row sheet's button"
@@ -518,6 +530,9 @@
     "It was edited while the file was being read again, so your edits were kept. Reload again to discard them." : {
       "comment" : "Alert text: a Reload wasn't adopted because of edits made meanwhile"
     },
+    "It was moved, renamed or deleted since Leal opened it. Save As keeps your changes in a new file." : {
+      "comment" : "Alert text: Save found no file where it was; the buttons are Save As… and Cancel"
+    },
     "It was stopped." : {
       "comment" : "Background job error: the job was cancelled"
     },
@@ -529,6 +544,9 @@
     },
     "Keep Editing" : {
       "comment" : "Banner button: keep the version Leal opened, and hide the banner (task 1.9)"
+    },
+    "Keep your changes in a duplicate, or ask the file’s owner for permission to write it." : {
+      "comment" : "Alert text: Save refused a file Leal may not write; the buttons are Duplicate and Cancel"
     },
     "Leal can’t save UTF-16 files. Save As UTF-8 saves a copy with your edits." : {
       "comment" : "Tooltip of the lock glyph by a UTF-16 file's title: Save is off (ADR-0013 decision 1)"
@@ -563,11 +581,20 @@
     "Leal couldn’t undo “%@”." : {
       "comment" : "Alert title: the core refused an undo; the action's name, such as Typing"
     },
+    "Leal couldn’t unlock “%@”." : {
+      "comment" : "Alert title: Unlock failed; the file's name"
+    },
     "Leal couldn’t write the copy there. Check that the drive has room and that you may write to that folder." : {
       "comment" : "Alert text: Save As UTF-8 failed writing the file (a full disk, no permission); the details are in the log"
     },
+    "Leal couldn’t write the file. Check that the drive has room and that you may write to that folder." : {
+      "comment" : "Alert text: Save failed writing the file (a full disk, no permission); the details are in the log"
+    },
     "Leal didn’t reload “%@”." : {
       "comment" : "Alert title: a Reload wasn't adopted because the document was edited while the file was read; the file's name"
+    },
+    "Leal doesn’t have all of the file, so saving over it would lose rows. Save As keeps a copy of what Leal has." : {
+      "comment" : "Alert text: Save refused because Leal couldn't read the whole file (its drive went, or it changed while read)"
     },
     "Leal guessed the encoding from the start of the file." : {
       "comment" : "Status bar tooltip: encoding source"
@@ -597,6 +624,9 @@
     },
     "Leal read the encoding from the file’s encoding attribute, which the app that saved it set." : {
       "comment" : "Status bar tooltip: encoding source"
+    },
+    "Leal saves UTF-16 files only as a UTF-8 copy." : {
+      "comment" : "Alert text: Save of a UTF-16 file (ADR-0013 decision 1); the buttons are Save As UTF-8… and Cancel"
     },
     "Leal’s remembered encoding for this file isn’t one Leal reads, so Leal ignored it." : {
       "comment" : "Status bar tooltip: an ignored attribute"
@@ -636,6 +666,9 @@
     },
     "Not Now" : {
       "comment" : "Button: don't save the recovered document now"
+    },
+    "OK" : {
+      "comment" : "Button: dismiss an alert"
     },
     "Open Recent" : {
       "comment" : "File menu"
@@ -707,6 +740,9 @@
     "Reading from the network" : {
       "comment" : "Status bar: the file is on a network share, and Leal is still copying it (ADR-0009)"
     },
+    "Reading the file before saving…" : {
+      "comment" : "Status bar: a save waits for Leal to finish reading the whole file"
+    },
     "Reading the whole value to edit it…" : {
       "comment" : "Cell inspector: a long value is read in full before it can be edited (ADR-0008 decision 3)"
     },
@@ -755,23 +791,29 @@
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
     },
+    "Save Anyway" : {
+      "comment" : "Button: write over a file another app changed"
+    },
     "Save As UTF-8 only" : {
       "comment" : "Status bar: a UTF-16 file can be edited but only saved as a UTF-8 copy (ADR-0013 decision 1)"
     },
     "Save As UTF-8…" : {
-      "comment" : "Banner button on a UTF-16 file"
+      "comment" : "Banner button on a UTF-16 file\nButton: save a UTF-8 copy (ADR-0008 decision 7)"
     },
     "Save As isn’t available yet." : {
       "comment" : "Alert: the drive banner's Save As button before task 2.5"
     },
     "Save As…" : {
-      "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)\nButton: save a copy of the recovered document"
+      "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)\nButton: save a copy of the recovered document\nButton: save the document elsewhere"
     },
     "Save a copy of what was recovered to keep it." : {
       "comment" : "Alert text after Recover changes, offering Save As"
     },
     "Save or revert your changes first." : {
       "comment" : "Error: the file can't be read with another delimiter or encoding while it has unsaved edits\nTooltip of Treat As and Reopen with Encoding while they are off: the document has unsaved edits, which are tied to how the file is split into cells (ADR-0008 decision 4)"
+    },
+    "Saving…" : {
+      "comment" : "Status bar: the file is being saved"
     },
     "Searching…" : {
       "comment" : "Find bar count while a search has found nothing yet"
@@ -797,17 +839,26 @@
     "Show the irregularities (%@ kinds)" : {
       "comment" : "Tooltip of the status bar's diagnostics badge"
     },
+    "Since its UTF-8 copy was saved, Leal can save your changes only as a UTF-8 copy. Reload the file to save it in place again, which discards them." : {
+      "comment" : "Alert text: Save after Save As UTF-8 whose copy the window didn't switch to; the buttons are Save As UTF-8… and Cancel"
+    },
+    "Some cells can’t be saved in %@." : {
+      "comment" : "Alert title: Save refused values the file's encoding can't represent; the encoding"
+    },
     "Some of the file’s bytes aren’t %@ text, so they can’t be converted. Leal never replaces them." : {
       "comment" : "Alert text: Save As UTF-8 refused cells without saying which; the file's encoding"
     },
     "Something other than a file is at that place." : {
       "comment" : "Alert text: Save As UTF-8 onto a folder or similar"
     },
+    "Something other than a file, such as a folder, is where the file was." : {
+      "comment" : "Alert text: Save found a folder or similar at the file's place"
+    },
     "Something went wrong inside Leal. Close the file and open it again." : {
       "comment" : "Error after a panic in the Rust core: the document can't be used any more"
     },
     "Something went wrong inside Leal. Try again, or reopen the file first." : {
-      "comment" : "Alert text: Save As UTF-8 failed because of a problem in Leal itself; the details are in the log"
+      "comment" : "Alert text: Save As UTF-8 failed because of a problem in Leal itself; the details are in the log\nAlert text: Save failed because of a problem in Leal itself; the details are in the log"
     },
     "Switch" : {
       "comment" : "Suggestion banner button: read the file with the suggested delimiter (DESIGN §3.2)"
@@ -853,6 +904,9 @@
     "The drive it’s on was disconnected." : {
       "comment" : "Open error: the removable drive holding the file vanished"
     },
+    "The drive or server it’s on isn’t connected. Connect it and try again, or use Save As to keep your changes elsewhere." : {
+      "comment" : "Alert text: Save found the file's volume not mounted; the buttons are Save As… and Cancel"
+    },
     "The drive was disconnected before Leal had read the whole file. Save is off until it’s back; Save As keeps a copy." : {
       "comment" : "Status bar tooltip: the removable drive was disconnected (ADR-0006)"
     },
@@ -880,6 +934,9 @@
     "The file doesn’t exist." : {
       "comment" : "Open error: nothing at the path"
     },
+    "The file is being moved or replaced, perhaps by another app. Try again in a moment." : {
+      "comment" : "Alert text: Save found the file in the middle of a rename; the buttons are Try Again and Cancel"
+    },
     "The file is being saved." : {
       "comment" : "Why an undo or redo can't happen yet: a save runs"
     },
@@ -894,6 +951,9 @@
     },
     "The file starts with a %@ byte order mark" : {
       "comment" : "Details popover: the file has a BOM; its encoding, such as UTF-8"
+    },
+    "The file would be too large for Leal to open again." : {
+      "comment" : "Alert text: Save's file would be over 4 GiB (ADR-0012 decision 2)"
     },
     "The file’s encoding attribute couldn’t be read, so Leal ignored it." : {
       "comment" : "Status bar tooltip: an ignored attribute"
@@ -923,6 +983,17 @@
     },
     "The undo history was cleared. Your edits are still there." : {
       "comment" : "After a refused undo or redo, the undo history is cleared"
+    },
+    "They hold characters %@ can’t represent, and Leal never replaces them. Change them, or save a UTF-8 copy of “%@”." : {
+      "comment" : "Alert text after the cells Save refused; the encoding and the file's name; the buttons are Save As UTF-8… and Cancel",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "They hold characters %1$@ can’t represent, and Leal never replaces them. Change them, or save a UTF-8 copy of “%2$@”."
+          }
+        }
+      }
     },
     "This cell can’t be edited right now. Try again in a moment." : {
       "comment" : "Callout: a cell that can't be edited while the file is read or saved"
@@ -999,6 +1070,9 @@
     "Treat the file as separated by another delimiter" : {
       "comment" : "Status bar tooltip of the delimiter menu"
     },
+    "Try Again" : {
+      "comment" : "Button: save again"
+    },
     "Try again in a moment." : {
       "comment" : "After an undo or redo refused for now: it is still in the Edit menu"
     },
@@ -1010,6 +1084,12 @@
     },
     "Undo" : {
       "comment" : "Edit menu"
+    },
+    "Unlock" : {
+      "comment" : "Button: unlock a locked file, then save"
+    },
+    "Unlock it to save your changes there, or keep them in a duplicate." : {
+      "comment" : "Alert text: Save refused a locked file; the buttons are Unlock, Duplicate and Cancel"
     },
     "Unterminated quote" : {
       "comment" : "Diagnostic kind (DESIGN §3.5)"
@@ -1024,7 +1104,10 @@
       "comment" : "Menu title"
     },
     "Wait for the save to finish." : {
-      "comment" : "Error: the file can't be read another way while it is being saved"
+      "comment" : "Error: the file can't be read another way while it is being saved\nTooltip: Reload, Treat As, Reopen with Encoding and the Header row are off while the file is being saved"
+    },
+    "Waiting to save…" : {
+      "comment" : "Status bar: a save waits for another save of the same file to finish"
     },
     "Window" : {
       "comment" : "Menu title"
@@ -1044,6 +1127,12 @@
     "You don’t have permission to open it." : {
       "comment" : "Open error: the file can't be read (EACCES or EPERM)"
     },
+    "You don’t have permission to save “%@”." : {
+      "comment" : "Alert title: Save refused a file Leal may not write; the file's name"
+    },
+    "You may not be allowed to change it. Keep your changes in a duplicate instead." : {
+      "comment" : "Alert text: Unlock failed; the buttons are Duplicate and Cancel"
+    },
     "Your unsaved edits will be lost. This can’t be undone." : {
       "comment" : "Alert text: Reload would throw unsaved edits away"
     },
@@ -1054,7 +1143,10 @@
       "comment" : "Why an edit couldn't be recovered: an unterminated quote (ADR-0004 decision 8)"
     },
     "and %lld more" : {
-      "comment" : "After a list of edits that couldn't be recovered: how many more"
+      "comment" : "After a list of cells Save refused: how many more\nAfter a list of edits that couldn't be recovered: how many more"
+    },
+    "and more" : {
+      "comment" : "After a list of cells Save refused, when there are more than Leal counted"
     },
     "invalid bytes shown as �" : {
       "comment" : "Cell inspector: the value has bytes that aren't valid text (DESIGN §3.5)"
@@ -1077,6 +1169,9 @@
     "value truncated: the first %@ shown" : {
       "comment" : "Cell inspector: a very long value is shown only in part; how many characters are shown"
     },
+    "“%@” can’t be found." : {
+      "comment" : "Alert title: Save found no file where it was; the file's name"
+    },
     "“%@” can’t be saved in %@, so Save won’t be able to save this file. Save As UTF-8 can. Return keeps it." : {
       "comment" : "Callout on a cell being edited: a character the file's encoding can't hold (task 2.3); the character, the encoding's name",
       "localizations" : {
@@ -1087,6 +1182,15 @@
           }
         }
       }
+    },
+    "“%@” changed on disk since Leal opened or last saved it." : {
+      "comment" : "Alert title: Save would write over a file another app changed; the file's name"
+    },
+    "“%@” is locked." : {
+      "comment" : "Alert title: Save refused a locked file; the file's name"
+    },
+    "“%@” wasn’t saved." : {
+      "comment" : "Alert title: Save failed; the file's name"
     },
     "⌘↩ commits · Esc cancels" : {
       "comment" : "Cell inspector: how to commit or cancel an edit (mockup 05a)"

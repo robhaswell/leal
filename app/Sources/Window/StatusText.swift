@@ -43,6 +43,47 @@ struct StatusSummary: Equatable, Sendable {
     /// Some cell reads differently from the file (task 2.5.2): **Treat
     /// as** and **Reopen with encoding** are off (ADR-0008 decision 4).
     var unsavedEdits = false
+    /// A save is under way (task 2.5.3a): its step and how far it has got.
+    /// The file isn't read again meanwhile.
+    var saving: SavingStatus?
+}
+
+/// What a save under way is doing, for the status bar (task 2.5.3a).
+struct SavingStatus: Equatable, Sendable {
+    enum Step: Equatable, Sendable {
+        /// Waiting for another save of the document.
+        case waiting
+        /// Waiting for the whole file to be read (indexed or copied).
+        case reading
+        /// Writing the new file.
+        case writing
+        /// Reading every row before writing on, to decide how new fields
+        /// are quoted (`SavePhase.checking`, docs/tasks/2.4c.md): a step of
+        /// its own, with its own progress.
+        case checking
+        /// Its metadata, the flush and putting it in place.
+        case finishing
+    }
+
+    var step: Step
+    /// How far the step has got, 0 to 1; `nil` where it can't say.
+    var fraction: Double?
+
+    init(step: Step, fraction: Double?) {
+        self.step = step
+        self.fraction = fraction
+    }
+
+    init(_ progress: SaveProgress) {
+        let fraction = progress.total > 0 ? min(1, Double(progress.written) / Double(progress.total)) : nil
+        switch progress.phase {
+        case .queued: self.init(step: .waiting, fraction: nil)
+        case .indexing: self.init(step: .reading, fraction: fraction)
+        case .writing: self.init(step: .writing, fraction: fraction)
+        case .checking: self.init(step: .checking, fraction: fraction)
+        case .flushing, .replacing, .finished: self.init(step: .finishing, fraction: 1)
+        }
+    }
 }
 
 /// One of the status bar's segments.
@@ -75,6 +116,9 @@ enum StatusText {
     /// menus (ADR-0005 decision 8).
     static func items(_ status: StatusSummary) -> [StatusItem] {
         var items = [StatusItem(text: counts(status))]
+        if let saving = status.saving {
+            items.append(StatusItem(text: savingText(saving.step)))
+        }
         items.append(StatusItem(text: delimiter(status.delimiter), role: .delimiter))
         if let ending = status.lineEnding {
             items.append(StatusItem(text: lineEnding(ending)))
@@ -411,6 +455,32 @@ enum StatusText {
     }
 
     /// "31%".
+    /// What a save under way is doing (task 2.5.3a), the status bar's
+    /// second segment while it runs.
+    static func savingText(_ step: SavingStatus.Step) -> String {
+        switch step {
+        case .waiting:
+            String(localized: "Waiting to save…", comment: "Status bar: a save waits for another save of the same file to finish")
+        case .reading:
+            String(localized: "Reading the file before saving…", comment: "Status bar: a save waits for Leal to finish reading the whole file")
+        case .writing:
+            String(localized: "Saving…", comment: "Status bar: the file is being saved")
+        case .checking:
+            String(
+                localized: "Checking the file before saving…",
+                comment: "Status bar: a save reads every row first, to quote new cells the way the file's columns are quoted (task 2.4c)"
+            )
+        case .finishing:
+            String(localized: "Finishing saving…", comment: "Status bar: the save is flushing the new file and putting it in place")
+        }
+    }
+
+    /// Why the file can't be read another way (Reload, Treat As, Reopen
+    /// with Encoding, the Header row) while a save runs.
+    static var waitForSave: String {
+        String(localized: "Wait for the save to finish.", comment: "Tooltip: Reload, Treat As, Reopen with Encoding and the Header row are off while the file is being saved")
+    }
+
     static func percent(_ fraction: Double) -> String {
         min(1, max(0, fraction)).formatted(.percent.precision(.fractionLength(0)))
     }

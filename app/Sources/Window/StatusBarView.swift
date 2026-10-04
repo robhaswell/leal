@@ -117,20 +117,26 @@ final class StatusBarView: NSView {
         }
         shownStatus = status
         segments.toolTip = StatusText.help(status)
-        progress.isHidden = !status.indexing
-        percent.isHidden = !status.indexing
-        progress.doubleValue = status.fractionIndexed
-        percent.stringValue = StatusText.percent(status.fractionIndexed)
-        headerToggle.isHidden = status.header || status.indexing
+        // A save's progress, while one runs, in place of the index's (task
+        // 2.5.3a): its own steps, `Checking` included, each from 0.
+        let fraction = status.saving.map { $0.fraction } ?? status.fractionIndexed
+        let busy = status.indexing || status.saving != nil
+        progress.isHidden = !busy
+        percent.isHidden = !busy || fraction == nil
+        progress.doubleValue = fraction ?? 0
+        percent.stringValue = StatusText.percent(fraction ?? 0)
+        headerToggle.isHidden = status.header || busy
         // After a change while reading, the file can't be read another way
-        // until it is reloaded: the menus and the toggle are off, and say so.
-        let reread = !status.changedOnDisk
+        // until it is reloaded, nor while it is saved: the menus and the
+        // toggle are off, and say so.
+        let reread = !status.changedOnDisk && status.saving == nil
+        let rereadReason = status.changedOnDisk ? StatusText.reloadFirst : StatusText.waitForSave
         headerToggle.isEnabled = reread
-        headerToggle.toolTip = reread ? Self.headerToggleHelp : StatusText.reloadFirst
+        headerToggle.toolTip = reread ? Self.headerToggleHelp : rereadReason
         // Edits are tied to how the file is split: no other delimiter or
         // encoding while there are any (ADR-0008 decision 4).
         let split = reread && !status.unsavedEdits
-        let splitReason = reread ? StatusText.saveOrRevertFirst : StatusText.reloadFirst
+        let splitReason = reread ? StatusText.saveOrRevertFirst : rereadReason
         delimiterButton?.isEnabled = split
         delimiterButton?.toolTip = split ? StatusText.treatAsHelp : splitReason
         encodingButton?.isEnabled = split
@@ -151,8 +157,12 @@ final class StatusBarView: NSView {
         badge.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.22).cgColor
     }
 
-    /// Whether the indexing progress bar shows, for tests.
+    /// Whether the progress bar (indexing, or a save) shows, for tests.
     var isShowingProgress: Bool { !progress.isHidden }
+    /// The progress bar's value and percentage, for tests.
+    var progressShown: (value: Double, percent: String?) {
+        (progress.doubleValue, percent.isHidden ? nil : percent.stringValue)
+    }
 
     /// The left side's text, segments joined by " · ", for tests.
     var text: String { shown.map(\.text).joined(separator: "  ·  ") }

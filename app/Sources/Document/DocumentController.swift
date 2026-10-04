@@ -289,9 +289,9 @@ enum PendingOpens {
     /// would otherwise ask the file system for on the main thread.
     struct Facts: Sendable {
         /// Its modification date, read before the core's snapshot.
-        /// SEAM(2.5): `nil` if the `stat` failed; Save's check before writing
-        /// (ADR-0008 decision 9) must then look at the file afresh rather
-        /// than take it as unchanged.
+        /// `nil` if the `stat` failed. Save never relies on it: the core's
+        /// check before writing always opens the file afresh and compares
+        /// its own identity of it (ADR-0008 decision 9, task 2.5.3a).
         let modified: Date?
         /// Its type identifier, for a file whose name doesn't say CSV.
         let typeIdentifier: String?

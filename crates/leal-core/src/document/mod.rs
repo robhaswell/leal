@@ -74,6 +74,9 @@ mod tests;
 mod values;
 mod view;
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use saving::{AT_SWAP, BEFORE_ADOPT, ChunkHook};
 pub use saving::{SAVE_CHUNK_BYTES, SaveJob};
 
 /// A document read again after its removable drive came back

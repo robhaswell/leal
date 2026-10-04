@@ -613,13 +613,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // always off the main thread (task 2.0, ADR-0009). The window shows
         // the old snapshot until the new one is ready.
         guard reloading == nil, savingAsUTF8 == nil else { return }
+        // Not while a save replaces the file (task 2.5.3a).
+        guard !model.isSaving else { return NSSound.beep() }
         // An edit still open is committed first (or, if the core refuses
         // it, stays open, and the file isn't read again).
         guard commitEditing() else { return NSSound.beep() }
         // Reload throws unsaved edits away: ask first (ADR-0008 decision 4).
         if model.hasUnsavedEdits, let confirm = confirmDiscardingEdits {
             confirm { [weak self] proceed in
-                guard proceed, let self, reloading == nil, savingAsUTF8 == nil else { return }
+                guard proceed, let self, reloading == nil, savingAsUTF8 == nil, !model.isSaving else { return }
                 startReload()
             }
             return
@@ -779,7 +781,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// user can act on: it changed while Leal read it, so Reload first. The
     /// core refuses to read it again then (`ChangedOnDisk`).
     private var rereadReason: String? {
-        model.changedOnDisk && !model.isFailed ? StatusText.reloadFirst : nil
+        if model.isFailed { return nil }
+        if model.changedOnDisk { return StatusText.reloadFirst }
+        return model.isSaving ? StatusText.waitForSave : nil
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -811,9 +815,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             menuItem.title = isInspectorShown ? MainMenu.hideInspector : MainMenu.showInspector
             return !model.isFailed
         case #selector(reloadFromDisk(_:)):
-            // There must be a file to open again, and no Reload or Save As
-            // UTF-8 under way.
-            return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil
+            // There must be a file to open again, and no Reload or save
+            // under way.
+            return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil && !model.isSaving
                 && model.original.state != .deleted && model.original.state != .unavailable
         default:
             return true
@@ -1428,11 +1432,20 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// The edit version as the save starts goes with it: an edit made
     /// after it keeps the window on this file (`EditedDuringReload`).
     var onSaveAsUTF8: ((URL, UInt64) async throws -> Bool)?
+    /// Stops the document's Save under way (`CSVDocument.cancelSave`).
+    var onCancelSave: (() -> Void)?
+
+    /// ⌘. or Escape while a Save runs stops it (task 2.5.3a): nothing is
+    /// written, and the edits stay unsaved. Otherwise as usual.
+    override func cancelOperation(_ sender: Any?) {
+        guard model.isSaving, let onCancelSave else { return super.cancelOperation(sender) }
+        onCancelSave()
+    }
     /// A Save As UTF-8, while it is under way. Reload, Treat As and Reopen
     /// with Encoding are off meanwhile: each would read the file again
     /// while the save replaces it.
-    /// SEAM(2.5): the save's progress (`SaveJob.progress`) isn't shown yet;
-    /// 2.5's save progress in the status bar shows this one's too.
+    /// Its progress shows in the status bar, as Save's does (task 2.5.3a,
+    /// `DocumentModel.save`).
     private(set) var savingAsUTF8: Task<Void, Never>? {
         didSet {
             updateSaveAsUTF8Button()

@@ -129,28 +129,33 @@ const POLL: Duration = Duration::from_millis(20);
 const ROWS_PER_CHECKPOINT: usize = 256;
 
 /// What a test hook is called with: each checkpoint's number, from 0, and
-/// [`AT_SWAP`] just before the new file goes into place.
-#[cfg(test)]
-pub(crate) type ChunkHook = Arc<dyn Fn(usize) + Send + Sync>;
+/// [`AT_SWAP`] just before the new file goes into place. TEST HOOK, not
+/// for product code (`test-hooks`: the app's tests hold a save part-way
+/// through leal-ffi's `debug_hold_next_save`).
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub type ChunkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// What a test hook is called with just before the new file goes into
 /// place, under the watcher's lock.
-#[cfg(test)]
-pub(crate) const AT_SWAP: usize = usize::MAX;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub const AT_SWAP: usize = usize::MAX;
 
 /// What a test hook is called with once the new reading is made, before
 /// it takes the writer lock to become current.
-#[cfg(test)]
-pub(crate) const BEFORE_ADOPT: usize = usize::MAX - 1;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub const BEFORE_ADOPT: usize = usize::MAX - 1;
 
 /// No such points outside tests.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 const AT_SWAP: usize = 0;
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 const BEFORE_ADOPT: usize = 0;
 
 /// No hook outside tests.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-hooks")))]
 type ChunkHook = std::convert::Infallible;
 
 /// How many rows the check for "the file quotes every field" reads at once.
@@ -364,10 +369,12 @@ impl Document {
         self.start_save(request, None)
     }
 
-    /// [`save`](Self::save), calling `hook` with each checkpoint's number
-    /// first (tests: they hold the save part-way).
-    #[cfg(test)]
-    pub(crate) fn save_hooked(self: &Arc<Self>, request: SaveRequest, hook: ChunkHook) -> SaveJob {
+    /// TEST HOOK, not for product code: [`save`](Self::save), calling
+    /// `hook` with each checkpoint's number first (tests: they hold the
+    /// save part-way).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn save_hooked(self: &Arc<Self>, request: SaveRequest, hook: ChunkHook) -> SaveJob {
         self.start_save(request, Some(hook))
     }
 
@@ -380,7 +387,7 @@ impl Document {
             .spawn(Priority::P1, Interval::Save, move |job| {
                 let checkpoints = Cell::new(0);
                 let checkpoint = || {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     if let Some(hook) = &hook {
                         hook(checkpoints.get());
                     }
@@ -388,11 +395,11 @@ impl Document {
                     job.checkpoint().map_err(|_| SaveError::Cancelled)
                 };
                 let reached = |point: usize| {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     if let Some(hook) = &hook {
                         hook(point);
                     }
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-hooks")))]
                     let _ = (&hook, point);
                 };
                 let result = document.save_now(&request, &checkpoint, &reached, &progress);

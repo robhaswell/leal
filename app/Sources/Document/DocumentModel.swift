@@ -1371,8 +1371,9 @@ final class DocumentModel: GridDataSource {
     /// with Encoding, the Header row): not once it changed while it was
     /// read, when the first 64 KB Leal holds may be from the old version.
     /// The core refuses then (`ChangedOnDisk`); the window turns the three
-    /// off and says to Reload first.
-    var canReinterpret: Bool { failure == nil && !changedOnDisk && !isReloading }
+    /// off and says to Reload first. Nor while a Reload or a save runs (the
+    /// core refuses with `Saving`).
+    var canReinterpret: Bool { failure == nil && !changedOnDisk && !isReloading && !isSaving }
 
     /// Whether the file may be read with another delimiter or encoding
     /// (Treat As, Reopen with Encoding): as `canReinterpret`, and not while
@@ -1648,17 +1649,64 @@ final class DocumentModel: GridDataSource {
     /// wouldn't start it, as one: `DocumentFailed` (the document fails, as
     /// for any core call) or `Internal`.
     func saveAsUTF8(to url: URL) async throws -> SaveOutcome? {
+        try await save(to: url, kind: .saveAsUtf8)?.outcome
+    }
+
+    // MARK: Saving (task 2.5.3a)
+
+    /// A finished save: its outcome, and the edit version its snapshot of
+    /// the edits was taken at (the edits up to it are in the file).
+    struct Saved {
+        let outcome: SaveOutcome
+        let snapshotVersion: UInt64?
+    }
+
+    /// The save under way (Save, or Save As UTF-8): while it runs the file
+    /// isn't read again (Reload, Treat As, Reopen with Encoding and the
+    /// Header row are off, `canReinterpret`), and the status bar shows how
+    /// far it has got (`saveProgress`).
+    private(set) var saveJob: SaveJob?
+    /// The save's progress as last looked at (every `savePollInterval`),
+    /// for the status bar; `nil` before the first look.
+    private(set) var saveProgress: SaveProgress?
+    /// How often the status bar's save progress is looked at.
+    nonisolated static let savePollInterval: Duration = .milliseconds(100)
+    var isSaving: Bool { saveJob != nil }
+
+    /// Saves through the core (ADR-0012): `kind` to `url`. The core writes
+    /// on a thread of its own and the main thread never waits for it
+    /// (DESIGN §3.9); cancelling the task cancels the save
+    /// (`SaveJob.outcome()`). Edits carry on meanwhile.
+    ///
+    /// The new file is written in an item-replacement folder `FileManager`
+    /// makes on `url`'s volume, which a sandboxed app may write to; a
+    /// second one is for the snapshot of the saved file. Where it can't
+    /// make one (some shares, FAT), or makes one on another volume, the
+    /// core falls back to a hidden folder of its own next to the file, and
+    /// for the snapshot to a copy on the internal disk (a share never gets
+    /// one: `TemporaryFolders.volume(for:)`). Folders the core didn't take
+    /// over (a refusal before writing) are removed afterwards.
+    ///
+    /// Returns `nil` if the document has failed or closed.
+    ///
+    /// - Throws: the `SaveFailure` the save ended with, or why the core
+    ///   wouldn't start it, as one: `DocumentFailed` (the document fails, as
+    ///   for any core call) or `Internal`.
+    func save(to url: URL, kind: SaveKind, overwriteChanged: Bool = false) async throws -> Saved? {
         guard failure == nil, let handle else { return nil }
         // Asking FileManager about a volume can block (a share): not here.
         let (folder, volume) = await FileWork.run {
             (TemporaryFolders.volumeFolder(for: url), TemporaryFolders.volume(for: url.deletingLastPathComponent()))
         }
+        let made = [folder, volume.folder].compactMap { $0 }
+        defer { Self.removeLeftovers(made) }
+        guard failure == nil, self.handle === handle else { return nil }
         let options = SaveOptions(
             destination: url.path(percentEncoded: false),
-            kind: .saveAsUtf8,
+            kind: kind,
             folder: folder,
             volume: volume,
-            overwriteChanged: false,
+            overwriteChanged: overwriteChanged,
             firstScreenRows: 1,
             maxChars: GridMetrics.maxCellCharacters
         )
@@ -1673,7 +1721,55 @@ final class DocumentModel: GridDataSource {
             }
             throw SaveFailure.Internal(message: String(describing: error))
         }
-        return try await job.outcome()
+        saveJob = job
+        saveProgress = nil
+        onChange?(.progress)
+        let watching = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.savePollInterval)
+                guard let self, saveJob === job, !Task.isCancelled else { return }
+                saveProgress = job.progress()
+                onChange?(.progress)
+            }
+        }
+        defer {
+            watching.cancel()
+            if saveJob === job {
+                saveJob = nil
+                saveProgress = nil
+                onChange?(.progress)
+            }
+        }
+        let outcome = try await job.outcome()
+        return Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion)
+    }
+
+    /// After a save that wrote the file: the dirty state is the core's
+    /// again (edits made during the save are still unsaved), and the file
+    /// is as the watcher sees it now, so `diverged` no longer asks.
+    ///
+    /// SEAM(2.5.3b): adopting the core's rebased reading (its generation,
+    /// tiles, row flags, diagnostics, Find) and `keptOldFile`. Until then
+    /// the tiles keep their edited-cell marks until they are read again.
+    func saved(_ outcome: SaveOutcome) {
+        guard failure == nil else { return }
+        // Not `apply(original:)`: the path the core reports is the one it
+        // wrote, a symbolic link followed, which isn't a move.
+        original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
+        refreshDriveState()
+        refreshUnsavedEdits()
+        onChange?(.progress)
+    }
+
+    /// Removes the empty folders a save was given and didn't take over (it
+    /// refused before writing), off the main thread. A folder the core
+    /// took over is gone already, or holds a file it kept: `rmdir` leaves
+    /// anything that isn't empty.
+    nonisolated private static func removeLeftovers(_ folders: [String]) {
+        guard !folders.isEmpty else { return }
+        FileWork.queue.async(qos: .utility) {
+            for folder in folders { _ = rmdir(folder) }
+        }
     }
 
     /// A Reload was asked for: the re-readings are off from now, before its
@@ -1887,7 +1983,8 @@ final class DocumentModel: GridDataSource {
             warningKinds: Int(diagnostics?.bannerKinds ?? 0),
             notes: interpretation.notes,
             encodingChoices: interpretation.encodingChoices,
-            unsavedEdits: failure == nil && hasUnsavedEdits
+            unsavedEdits: failure == nil && hasUnsavedEdits,
+            saving: failure == nil ? saveProgress.map(SavingStatus.init) : nil
         )
     }
 

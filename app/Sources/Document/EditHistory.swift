@@ -167,9 +167,9 @@ final class EditHistory {
 
     /// The change-count token noted at edit version `version` (the last
     /// one noted at or before it), for a save that wrote the edits up to
-    /// that version. SEAM(2.5.3): a save applies it with
+    /// that version. A save applies it with
     /// `updateChangeCount(withToken:for: .saveOperation)`, then calls
-    /// `savedThrough(version:)`.
+    /// `savedThrough(version:)` (`CSVDocument.saveFinished`).
     func token(atVersion version: UInt64) -> Any? {
         tokens.last { $0.version <= version }?.token
     }
@@ -177,7 +177,6 @@ final class EditHistory {
     /// A save wrote the edits up to `version`: the journal keeps only the
     /// commands after it (the earlier ones are in the file now, so a replay
     /// into it would refuse them), and the tokens before it go.
-    /// SEAM(2.5.3).
     func savedThrough(version: UInt64) {
         journal.removeAll { $0.version <= version }
         if let index = tokens.lastIndex(where: { $0.version <= version }) {

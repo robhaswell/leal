@@ -259,20 +259,27 @@ final class CSVDocument: NSDocument {
         let version = version ?? model.editVersion
         guard try await model.saveAsUTF8(to: url) != nil else { return false }
         let modified = await FileWork.run { Self.modificationDate(of: url) }
-        // SEAM(2.5.3): if the window declines the copy (`EditedDuringReload`,
-        // or the model closed or failed meanwhile), the core has already
-        // rebased onto the UTF-8 copy but the window stays on the original
-        // file, so a later save from this window writes to the original
-        // while the core's source is the copy. Task 2.5.3's save path must
-        // reconcile them (point the core back at the original, or adopt the
-        // copy); until then the sheet tells the user to Save As UTF-8 again.
-        guard try await model.reloadInBackground(from: url, editVersion: version) else { return false }
+        // If the window declines the copy (`EditedDuringReload`, or it
+        // couldn't be read back), the core has already rebased onto the
+        // UTF-8 copy but the window stays on the original file: Save would
+        // write the copy's reading over it. So Save is off until a Reload
+        // (`readsUTF8Copy`), and the sheet tells the user to Save As UTF-8
+        // again. SEAM(2.5.3c): adopting the core's rebased reading in
+        // place of this Reload does away with that.
+        do {
+            guard try await model.reloadInBackground(from: url, editVersion: version) else { return false }
+        } catch {
+            if self.model === model, !model.isFailed { readsUTF8Copy = url }
+            throw error
+        }
         followReload(of: model, modified: modified)
         return true
     }
 
     /// `NSDocument` is told the file Leal shows after a Reload.
     private func followReload(of model: DocumentModel, modified: Date?) {
+        // The core reads the window's file again.
+        readsUTF8Copy = nil
         if fileURL != model.url {
             fileURL = model.url
         }
@@ -287,6 +294,7 @@ final class CSVDocument: NSDocument {
         controller.content.onSaveAsUTF8 = { [weak self] url, version in
             try await self?.saveAsUTF8(to: url, editVersion: version) ?? false
         }
+        controller.content.onCancelSave = { [weak self] in self?.cancelSave() }
         controller.content.confirmDiscardingEdits = { [weak self] answer in
             guard let self else { return answer(true) }
             confirmDiscardingEdits(answer)
@@ -317,7 +325,9 @@ final class CSVDocument: NSDocument {
         #endif
     }
 
-    /// Phase 1 is a viewer: there is nothing to save yet.
+    /// Leal never writes through `NSDocument`'s own writing: Save goes
+    /// through the core (`save(withDelegate:didSave:contextInfo:)`).
+    /// SEAM(2.5.3c): Save As and Revert do too.
     override func data(ofType typeName: String) throws -> Data {
         throw NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError)
     }
@@ -325,15 +335,16 @@ final class CSVDocument: NSDocument {
     /// Whether Save may write over the file: not once its removable drive
     /// was disconnected before Leal had read it all, once it changed while
     /// Leal read it, or while its drive isn't connected (ADR-0006, 1.1a,
-    /// 1.9). Save As is always allowed. SEAM(2.5): Save asks before writing
-    /// over a file that changed elsewhere (`model.original.diverged`, which
-    /// stays true after Keep Editing; DESIGN §3.1).
+    /// 1.9). Save As is always allowed. A file that changed elsewhere can
+    /// be saved, after asking (`saveInPlace`).
     /// A UTF-16 file can be edited, but Save is off for it (ADR-0013
-    /// decision 1): Save As UTF-8 is the only way to save it.
-    var canSave: Bool { (model?.canSave ?? false) && model?.isReadOnly == false }
+    /// decision 1): Save As UTF-8 is the only way to save it. So is a
+    /// window whose core document reads a UTF-8 copy it didn't adopt
+    /// (`readsUTF8Copy`).
+    var canSave: Bool { (model?.canSave ?? false) && model?.isReadOnly == false && readsUTF8Copy == nil }
 
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(save(_:)), !canSave {
+        if item.action == #selector(save(_:)), !canSave || saving != nil {
             return false
         }
         return super.validateUserInterfaceItem(item)
@@ -349,13 +360,296 @@ final class CSVDocument: NSDocument {
     }
 
     /// Save is refused while `canSave` is false (ADR-0006): the banner
-    /// offers Save As instead.
+    /// offers Save As instead. AppKit then calls
+    /// `save(withDelegate:didSave:contextInfo:)`.
     override func save(_ sender: Any?) {
         guard canSave else {
             NSSound.beep()
             return
         }
         super.save(sender)
+    }
+
+    // MARK: Save (task 2.5.3a, ADR-0012)
+
+    /// The Save under way, and whether it saved: for tests, and so that
+    /// a second one waits for it.
+    private(set) var saving: Task<Bool, Never>?
+    /// What a Save alert's Duplicate, Save As… and Save As UTF-8… do, in
+    /// place of doing it. Only tests set it.
+    var saveFollowUpForTesting: ((SaveChoice) -> Void)?
+    /// After Save As UTF-8's copy was saved but not adopted (an edit made
+    /// meanwhile, task 2.5.2), the core's document reads the copy while
+    /// the window stays on this file: Save would write the copy's reading
+    /// over it, so Save is off (`canSave`) and asks for Save As UTF-8
+    /// again, until a Reload. The copy's URL.
+    private(set) var readsUTF8Copy: URL?
+    /// How many times Save tries again on its own when the file is in the
+    /// middle of a rename (`Moving`), and how long it waits each time.
+    static let movingRetries = 3
+    static let movingDelay: Duration = .milliseconds(250)
+
+    /// **Save** (ADR-0012, DESIGN §4.3): every Save comes here, ⌘S and
+    /// closing's Save alike, in place of `NSDocument`'s own writing and its
+    /// own checks, so the user sees Leal's prompts only (one about a file
+    /// changed elsewhere, never `NSDocument`'s too). An open edit is
+    /// committed first. Saves run one after another; `didSaveSelector`
+    /// hears whether this one saved. A document without a file (none
+    /// today) goes the usual way, through a save panel.
+    override func save(withDelegate delegate: Any?, didSave didSaveSelector: Selector?, contextInfo: UnsafeMutableRawPointer?) {
+        guard fileURL != nil, model != nil else {
+            return super.save(withDelegate: delegate, didSave: didSaveSelector, contextInfo: contextInfo)
+        }
+        let reply: @MainActor (Bool) -> Void = { [weak self] saved in
+            guard let self else { return }
+            Self.answer(delegate, didSaveSelector, document: self, flag: saved, contextInfo: contextInfo)
+        }
+        guard commitEditing() else {
+            // The core refused the open edit: it stays open, saying why.
+            NSSound.beep()
+            return reply(false)
+        }
+        let previous = saving
+        let task = Task { [weak self] () -> Bool in
+            _ = await previous?.value
+            return await self?.saveInPlace() ?? false
+        }
+        saving = task
+        Task { [weak self] in
+            let saved = await task.value
+            if let self, saving == task { saving = nil }
+            reply(saved)
+        }
+    }
+
+    /// Stops the Save under way (⌘. or Escape while it runs): before the
+    /// new file is in place nothing is written, and the edits stay unsaved.
+    func cancelSave() {
+        saving?.cancel()
+    }
+
+    /// Save, then: asks first if the file changed elsewhere, saves through
+    /// the core, and says why if it couldn't, offering what the user can
+    /// do. Returns whether it saved.
+    private func saveInPlace() async -> Bool {
+        guard let model, !model.isFailed else { return false }
+        guard canSave else {
+            if readsUTF8Copy != nil {
+                if await ask(SaveText.utf8CopyOnly(name: fileName)) == .saveAsUTF8 { followUp(.saveAsUTF8) }
+                return false
+            }
+            let failure: SaveFailure = if model.isReadOnly {
+                .ReadOnly
+            } else if model.original.state == .unavailable {
+                .Unavailable
+            } else {
+                .Incomplete
+            }
+            await refuse(failure, model: model)
+            return false
+        }
+        // The watcher saw a change (it stays seen after Keep Editing). Not
+        // for a file deleted since: the core says it's missing, and a new
+        // file there is a change it asks about.
+        var overwrite = false
+        if model.original.diverged, model.original.state != .deleted {
+            guard await ask(SaveText.changedElsewhere(name: fileName)) == .saveAnyway else { return false }
+            overwrite = true
+        }
+        var moves = 0
+        while !Task.isCancelled {
+            guard let url = fileURL else { return false }
+            let result = await saveCoordinated(url, overwriteChanged: overwrite, model: model)
+            switch result {
+            case let .success(saved?):
+                saveFinished(saved, model: model)
+                return true
+            case .success(nil):
+                // The document failed or closed meanwhile.
+                return false
+            case var .failure(failure):
+                Logger.document.error("Save failed: \(String(describing: failure), privacy: .public)")
+                if case .ChangedElsewhere = failure, await FileWork.run({ !Self.exists(url) }) {
+                    // The watcher saw it deleted: say it's missing, rather
+                    // than ask to write over it and then say so.
+                    failure = .Missing
+                }
+                if case .Moving = failure, moves < Self.movingRetries {
+                    // Another app's save renaming the file a moment ago:
+                    // try again shortly (DESIGN §3.7).
+                    moves += 1
+                    try? await Task.sleep(for: Self.movingDelay)
+                    continue
+                }
+                switch await refuse(failure, model: model) {
+                case .saveAnyway:
+                    overwrite = true
+                case .tryAgain:
+                    moves = 0
+                case .unlock:
+                    let unlocked = await FileWork.run { Self.unlock(url) }
+                    if !unlocked, await ask(SaveText.unlockFailed(name: fileName)) == .duplicate {
+                        followUp(.duplicate)
+                        return false
+                    }
+                    if !unlocked { return false }
+                default:
+                    return false
+                }
+            }
+        }
+        return false
+    }
+
+    /// The file's name, as the window's title has it.
+    private var fileName: String {
+        displayName ?? fileURL?.lastPathComponent ?? ""
+    }
+
+    /// The save itself, as one of the document's file accesses
+    /// (`performAsynchronousFileAccess`, so it never overlaps another),
+    /// inside a coordinated write that replaces the file (`.forReplacing`,
+    /// the document as file presenter: other apps and iCloud Drive get
+    /// notice, and `NSDocument` doesn't react to its own save). The core
+    /// writes on a thread of its own; nothing here blocks the main thread.
+    /// `nil` if the document failed or closed.
+    private func saveCoordinated(_ url: URL, overwriteChanged: Bool, model: DocumentModel) async -> Result<DocumentModel.Saved?, SaveFailure> {
+        let access = await fileAccess()
+        defer { access.done() }
+        let write: CoordinatedWrite
+        do {
+            write = try await CoordinatedWrite.begin(replacing: url, presenter: self)
+        } catch {
+            Logger.document.error("Couldn’t coordinate the save: \(String(describing: error), privacy: .public)")
+            return .failure(.Io(step: "coordinating the save", code: nil, message: String(describing: error)))
+        }
+        defer { write.end() }
+        do {
+            return .success(try await model.save(to: write.url, kind: .save, overwriteChanged: overwriteChanged))
+        } catch let failure as SaveFailure {
+            return .failure(failure)
+        } catch {
+            return .failure(.Internal(message: String(describing: error)))
+        }
+    }
+
+    /// Waits for the document's turn at its file, and returns what ends it.
+    private func fileAccess() async -> FileAccess {
+        await withCheckedContinuation { continuation in
+            performAsynchronousFileAccess { done in
+                continuation.resume(returning: FileAccess(done: done))
+            }
+        }
+    }
+
+    /// The end of one of `NSDocument`'s asynchronous file accesses.
+    private struct FileAccess: @unchecked Sendable {
+        let done: () -> Void
+    }
+
+    /// A save wrote the file: `NSDocument` hears what it now has on disk
+    /// (its modification date, so its own "changed by another
+    /// application" check doesn't fire), the edits up to the save's
+    /// snapshot are saved (the change-count token noted at that version),
+    /// and the journal keeps only the commands after it, which a replay
+    /// into the saved file still applies. Edits made during the save stay
+    /// unsaved: the dirty state is the core's again.
+    private func saveFinished(_ saved: DocumentModel.Saved, model: DocumentModel) {
+        let outcome = saved.outcome
+        if !outcome.skippedMetadata.isEmpty {
+            Logger.document.info("Saved without some of the file’s metadata: \(outcome.skippedMetadata.joined(separator: ", "), privacy: .public)")
+        }
+        if let error = outcome.rereadError {
+            Logger.document.error("Saved, but couldn’t read the file back: \(error, privacy: .public)")
+        }
+        if let kept = outcome.keptOldFile {
+            // SEAM(2.5.3b): move it somewhere lasting and tell the user.
+            Logger.document.error("Saved; the old file was kept at \(kept, privacy: .private)")
+        }
+        fileModificationDate = outcome.modified
+        if let version = saved.snapshotVersion {
+            if let token = history.token(atVersion: version) {
+                updateChangeCount(withToken: token, for: .saveOperation)
+            }
+            history.savedThrough(version: version)
+        }
+        model.saved(outcome)
+        updateDirtyState()
+    }
+
+    /// Says why Save didn't write the file and offers what the user can
+    /// do: returns the choice, after doing it if it leads elsewhere (Save
+    /// As, Duplicate, Save As UTF-8). Says nothing for a cancel, or for a
+    /// failed document, which says so itself.
+    @discardableResult
+    private func refuse(_ failure: SaveFailure, model: DocumentModel) async -> SaveChoice {
+        guard !model.isFailed, let refusal = SaveText.saveFailure(failure, name: fileName, headerRows: model.headerRows) else {
+            return .cancel
+        }
+        let choice = await ask(refusal)
+        switch choice {
+        case .duplicate, .saveAs, .saveAsUTF8:
+            followUp(choice)
+        default:
+            break
+        }
+        return choice
+    }
+
+    /// Shows `refusal` as a sheet and waits for the choice; the way out
+    /// (its last) if there is no window.
+    private func ask(_ refusal: SaveText.Refusal) async -> SaveChoice {
+        let way = refusal.choices.last ?? .cancel
+        guard let window = windowControllers.first?.window else { return way }
+        let alert = NSAlert()
+        alert.messageText = refusal.title
+        alert.informativeText = refusal.detail
+        for choice in refusal.choices {
+            let button = alert.addButton(withTitle: SaveText.button(choice))
+            button.hasDestructiveAction = choice == .saveAnyway
+            if choice == .cancel { button.keyEquivalent = "\u{1b}" }
+        }
+        return await withCheckedContinuation { continuation in
+            showSheet(alert, window) { response in
+                let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+                continuation.resume(returning: refusal.choices.indices.contains(index) ? refusal.choices[index] : way)
+            }
+        }
+    }
+
+    /// Duplicate, Save As… and Save As UTF-8… from a Save alert.
+    /// SEAM(2.5.3c): Save As (and so Duplicate, which keeps the changes
+    /// in a copy the user names: a Leal document is always a file) saves
+    /// through the core.
+    private func followUp(_ choice: SaveChoice) {
+        if let saveFollowUpForTesting { return saveFollowUpForTesting(choice) }
+        switch choice {
+        case .duplicate, .saveAs:
+            saveAs(nil)
+        case .saveAsUTF8:
+            (windowControllers.first as? DocumentWindowController)?.content.saveAsUTF8(nil)
+        default:
+            break
+        }
+    }
+
+    /// Whether anything is at `url` (a link that leads nowhere counts as
+    /// nothing). It touches the file: call it off the main thread.
+    nonisolated private static func exists(_ url: URL) -> Bool {
+        var info = stat()
+        return stat(url.path(percentEncoded: false), &info) == 0
+    }
+
+    /// Clears the file's user locks (immutable and append-only, as the
+    /// Finder's Locked does), for Save's **Unlock**. Returns whether they
+    /// are off. It touches the file: call it off the main thread.
+    nonisolated static func unlock(_ url: URL) -> Bool {
+        let path = url.path(percentEncoded: false)
+        var info = stat()
+        guard stat(path, &info) == 0 else { return false }
+        let locks = UInt32(UF_IMMUTABLE | UF_APPEND)
+        guard info.st_flags & locks != 0 else { return true }
+        return chflags(path, info.st_flags & ~locks) == 0
     }
 
     // MARK: Undo, the journal and dirty state (task 2.5.2)
@@ -480,29 +774,29 @@ final class CSVDocument: NSDocument {
 
     /// Closing commits an open edit first, so it counts as an unsaved
     /// change, then asks as `NSDocument` does (Save, Don't Save, Cancel).
-    /// SEAM(2.5.3): Save then saves through the core.
+    /// Save then saves through the core (`save(withDelegate:didSave:contextInfo:)`).
     override func canClose(withDelegate delegate: Any, shouldClose shouldCloseSelector: Selector?, contextInfo: UnsafeMutableRawPointer?) {
         guard commitEditing() else {
             // The core refused the open edit: it stays open, saying why.
-            return Self.answer(delegate, shouldCloseSelector, document: self, shouldClose: false, contextInfo: contextInfo)
+            return Self.answer(delegate, shouldCloseSelector, document: self, flag: false, contextInfo: contextInfo)
         }
         if isDocumentEdited, let prompt = unsavedChangesPromptForTesting {
             prompt { [weak self] close in
                 guard let self else { return }
-                Self.answer(delegate, shouldCloseSelector, document: self, shouldClose: close, contextInfo: contextInfo)
+                Self.answer(delegate, shouldCloseSelector, document: self, flag: close, contextInfo: contextInfo)
             }
             return
         }
         super.canClose(withDelegate: delegate, shouldClose: shouldCloseSelector, contextInfo: contextInfo)
     }
 
-    /// Calls `canClose`'s delegate, as `NSDocument` does:
-    /// `document:shouldClose:contextInfo:`.
-    private static func answer(_ delegate: Any, _ selector: Selector?, document: NSDocument, shouldClose: Bool, contextInfo: UnsafeMutableRawPointer?) {
+    /// Calls `canClose`'s or Save's delegate, as `NSDocument` does:
+    /// `document:shouldClose:contextInfo:` or `document:didSave:contextInfo:`.
+    private static func answer(_ delegate: Any?, _ selector: Selector?, document: NSDocument, flag: Bool, contextInfo: UnsafeMutableRawPointer?) {
         guard let selector, let object = delegate as? NSObject, object.responds(to: selector) else { return }
         typealias Callback = @convention(c) (NSObject, Selector, NSDocument, Bool, UnsafeMutableRawPointer?) -> Void
         let callback = unsafeBitCast(object.method(for: selector), to: Callback.self)
-        callback(object, selector, document, shouldClose, contextInfo)
+        callback(object, selector, document, flag, contextInfo)
     }
 
     override func close() {
@@ -559,9 +853,9 @@ final class CSVDocument: NSDocument {
     /// changes to put back (ADR-0008 decision 5). The journal alone: the
     /// core's dirty state can't be asked once it has failed.
     ///
-    /// SEAM(2.5.3): the journal must reset on a save (`EditHistory`), or
-    /// Recover changes would replay edits that are already saved, on top of
-    /// the saved file.
+    /// A save resets the journal to the commands after its snapshot
+    /// (`saveFinished`), so Recover changes never replays saved edits on top
+    /// of the saved file.
     var canRecover: Bool {
         !history.journal.isEmpty
     }

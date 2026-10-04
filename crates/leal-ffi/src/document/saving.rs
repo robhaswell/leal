@@ -383,6 +383,12 @@ impl Document {
                 first_screen_rows: to_usize(options.first_screen_rows),
                 max_chars: to_usize(options.max_chars),
             };
+            #[cfg(feature = "test-exports")]
+            let job = match hold::take_next() {
+                Some(hold) => hold.start(&self.document, request),
+                None => self.document.save(request),
+            };
+            #[cfg(not(feature = "test-exports"))]
             let job = self.document.save(request);
             // A panic in the save fails the document (DESIGN §3.9), as one
             // in any of its jobs.
@@ -531,4 +537,103 @@ impl SaveJob {
             reread_error: saved.reread_error.clone(),
         })
     }
+}
+
+/// The next save held part-way, for the app's tests (`test-exports`):
+/// [`debug_hold_next_save`] and [`debug_release_held_save`].
+#[cfg(feature = "test-exports")]
+mod hold {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+
+    use leal_core::document::{self, AT_SWAP, BEFORE_ADOPT, ChunkHook};
+    use leal_core::save::SaveRequest;
+
+    /// A hold: the save waits at it until it is released.
+    #[derive(Default)]
+    pub(super) struct Hold {
+        released: Mutex<bool>,
+        changed: Condvar,
+        /// Whether the save has been held once already.
+        held: AtomicBool,
+    }
+
+    /// The hold the next save takes.
+    static NEXT: Mutex<Option<Arc<Hold>>> = Mutex::new(None);
+    /// The hold last armed, for [`release`].
+    static ARMED: Mutex<Option<Arc<Hold>>> = Mutex::new(None);
+
+    pub(super) fn arm() {
+        let hold = Arc::new(Hold::default());
+        *NEXT.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&hold));
+        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(hold);
+    }
+
+    pub(super) fn take_next() -> Option<Arc<Hold>> {
+        NEXT.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
+    pub(super) fn release() {
+        NEXT.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(hold) = armed {
+            *hold.released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            hold.changed.notify_all();
+        }
+    }
+
+    impl Hold {
+        /// Starts the save, held at its first checkpoint after it took its
+        /// snapshot of the edits (before writing on, so a cancel still
+        /// stops it).
+        pub(super) fn start(
+            self: Arc<Self>,
+            document: &Arc<document::Document>,
+            request: SaveRequest,
+        ) -> document::SaveJob {
+            let started: Arc<OnceLock<document::SaveJob>> = Arc::default();
+            let job_of_hook = Arc::clone(&started);
+            let hook: ChunkHook = Arc::new(move |point| {
+                if point == AT_SWAP || point == BEFORE_ADOPT || self.held.load(Ordering::SeqCst) {
+                    return;
+                }
+                let snapshot_taken = job_of_hook
+                    .get()
+                    .is_some_and(|job| job.progress().snapshot_version.is_some());
+                if !snapshot_taken {
+                    return;
+                }
+                self.held.store(true, Ordering::SeqCst);
+                let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*released {
+                    released = self
+                        .changed
+                        .wait(released)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            });
+            let job = document.save_hooked(request, hook);
+            let _ = started.set(job.clone());
+            job
+        }
+    }
+}
+
+/// TEST HOOK (`test-exports`): the next save any document starts waits,
+/// once it has taken its snapshot of the edits and before it writes on,
+/// until [`debug_release_held_save`]. For the app's tests that the main
+/// thread never waits for a save, and that an edit during one stays
+/// unsaved (task 2.5.3a). A cancel while it waits stops it once released.
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+pub fn debug_hold_next_save() {
+    hold::arm();
+}
+
+/// TEST HOOK (`test-exports`): the save [`debug_hold_next_save`] held goes
+/// on (or, not yet started, doesn't wait when it reaches the hold).
+#[cfg(feature = "test-exports")]
+#[uniffi::export]
+pub fn debug_release_held_save() {
+    hold::release();
 }
