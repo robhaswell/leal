@@ -196,6 +196,24 @@ final class SaveAsTests: XCTestCase {
         }
     }
 
+    /// Opens files through the core as usual, recording on which thread
+    /// (`threads`) and waiting while `gate` is held: a Reload or Revert
+    /// held part-way through reading the file.
+    private func hookOpens(_ threads: OpenThreads, gate: OpenGate? = nil) {
+        DocumentModel.openForTesting = { path, environment, options, observer in
+            threads.record()
+            gate?.passThrough()
+            return try openDocument(
+                path: path,
+                volume: TemporaryFolders.volume(for: URL(filePath: path)),
+                temp: environment.temp,
+                scheduler: environment.scheduler,
+                options: options,
+                observer: observer
+            )
+        }
+    }
+
     // MARK: Save As
 
     /// Save As writes what Save would (the edits, quoted as needed), leaves
@@ -298,6 +316,41 @@ final class SaveAsTests: XCTestCase {
         XCTAssertTrue(try contents(url).contains("1,Marlowe,3"))
         XCTAssertTrue(recent.isEmpty, "Save, not Save As")
         XCTAssertFalse(document.isDocumentEdited)
+    }
+
+    /// Save As to the document's own file by another name for it, a
+    /// symbolic link or (on a volume that ignores case) another case, is a
+    /// Save too: a change made elsewhere asks first, as Save does, and the
+    /// file keeps its name (task 2.5.3c review).
+    func testSaveAsToTheSameFileByAnotherNameIsASave() async throws {
+        let url = try file("Same.csv", csv)
+        let link = directory.appending(path: "link.csv")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: url)
+        let otherCase = directory.appending(path: "SAME.CSV")
+        let caseInsensitive = FileManager.default.fileExists(atPath: otherCase.path(percentEncoded: false))
+        let (document, model, _) = try await open(url)
+        for (index, target) in ([link] + (caseInsensitive ? [otherCase] : [])).enumerated() {
+            set(model, 0, 1, "Marlowe \(index)")
+            let saved = try await saveAs(document, to: target)
+            XCTAssertTrue(saved)
+            XCTAssertTrue(try contents(url).contains("1,Marlowe \(index),3"))
+            XCTAssertTrue(recent.isEmpty, "Save, not Save As")
+            XCTAssertEqual(document.fileURL?.lastPathComponent, "Same.csv")
+            XCTAssertFalse(document.isDocumentEdited)
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path(percentEncoded: false)).filter { $0.hasSuffix(".csv") }
+        XCTAssertEqual(Set(names), ["Same.csv", "link.csv"])
+        let attributes = try FileManager.default.attributesOfItem(atPath: link.path(percentEncoded: false))
+        XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSymbolicLink, "the link stays a link")
+
+        // Changed elsewhere: Save's question, not a silent Save As.
+        set(model, 0, 1, "Mine")
+        try Data((csv + "4,Other,1\r\n").utf8).write(to: url)
+        answers = [1] // Cancel.
+        let saved = try await saveAs(document, to: link)
+        XCTAssertFalse(saved)
+        XCTAssertEqual(alerts.last?.messageText, SaveText.changedElsewhere(name: "Same.csv").title)
+        XCTAssertTrue(try contents(url).contains("4,Other,1"))
     }
 
     /// Save As where it can't write says so in the catalog's words, and
@@ -522,6 +575,77 @@ final class SaveAsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "x.csv").path(percentEncoded: false)))
     }
 
+    // MARK: While the file is read again (task 2.5.3c review)
+
+    /// Save, Save As and Duplicate are off while a Reload reads the file
+    /// again (held in the core's open), and asked anyway they do nothing:
+    /// no panel, nothing written. Once the Reload is over, Save As works.
+    func testSaveAsAndDuplicateWaitForAReload() async throws {
+        let url = try file("reloading.csv", csv)
+        let threads = OpenThreads()
+        let gate = OpenGate()
+        hookOpens(threads, gate: gate)
+        let (document, model, content) = try await open(url)
+        gate.hold()
+        content.reload(.reload)
+        let reloading = try XCTUnwrap(content.reloading)
+        try await waitUntil("the Reload is reading") { gate.isWaiting }
+
+        let items = [
+            #selector(NSDocument.save(_:)), #selector(NSDocument.saveAs(_:)), #selector(NSDocument.duplicate(_:)),
+            #selector(CSVDocument.saveDuplicate(_:)),
+        ].map { NSMenuItem(title: "", action: $0, keyEquivalent: "") }
+        XCTAssertEqual(items.map(document.validateUserInterfaceItem), [false, false, false, false])
+        let copy = directory.appending(path: "reloading copy.csv")
+        destination = copy
+        document.saveAs(nil)
+        document.saveDuplicate(nil)
+        XCTAssertTrue(panels.isEmpty, "no panel")
+        let refused = await document.saveAs(to: copy).value
+        XCTAssertFalse(refused)
+        XCTAssertNil(document.saving)
+
+        gate.release()
+        await reloading.value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)))
+        XCTAssertTrue(same(document.fileURL, url))
+        set(model, 0, 1, "Marlowe")
+        let saved = try await saveAs(document, to: copy)
+        XCTAssertTrue(saved)
+        XCTAssertTrue(same(document.fileURL, copy))
+    }
+
+    /// A Save As that ends after a Reload replaced the core document it
+    /// saved (one that got past the guards above) writes its copy, but the
+    /// document doesn't follow it: it stays the file the Reload read, and
+    /// the model's save ends.
+    func testASaveAsThatEndsAfterAReloadIsNotFollowed() async throws {
+        let url = try file("raced.csv", csv)
+        let (document, model, _) = try await open(url)
+        set(model, 0, 1, "before")
+        debugHoldNextSave()
+        let copy = directory.appending(path: "raced copy.csv")
+        destination = copy
+        document.saveAs(nil)
+        let saving = try XCTUnwrap(document.saving)
+        try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
+        let handle = model.readingID.handle
+        let reloaded = try await model.reloadInBackground()
+        XCTAssertTrue(reloaded)
+        XCTAssertNotEqual(model.readingID.handle, handle)
+
+        debugReleaseHeldSave()
+        _ = await saving.value
+        XCTAssertTrue(try contents(copy).contains("1,before,3"), "the copy is written")
+        XCTAssertTrue(same(document.fileURL, url), "the document doesn't follow it")
+        XCTAssertTrue(same(model.url, url))
+        XCTAssertEqual(document.displayName, "raced.csv")
+        XCTAssertEqual(value(model, 0, 1), "Marlow")
+        XCTAssertFalse(model.isSaving)
+        XCTAssertFalse(model.saveOutcomePending)
+        XCTAssertTrue(recent.isEmpty)
+    }
+
     // MARK: Revert to Saved (ADR-0008 decisions 4 and 10)
 
     /// Revert asks before discarding the edits, then reads the file again
@@ -661,9 +785,11 @@ final class SaveAsTests: XCTestCase {
         _ = document.isDocumentEdited
         _ = document.fileModificationDate
         _ = document.displayName
-        let items = [#selector(NSDocument.saveAs(_:)), #selector(NSDocument.duplicate(_:)), #selector(NSDocument.revertToSaved(_:))]
-            .map { NSMenuItem(title: "", action: $0, keyEquivalent: "") }
-        XCTAssertEqual(items.map(document.validateUserInterfaceItem), [false, false, false])
+        let items = [
+            #selector(NSDocument.saveAs(_:)), #selector(NSDocument.duplicate(_:)), #selector(CSVDocument.saveDuplicate(_:)),
+            #selector(NSDocument.revertToSaved(_:)),
+        ].map { NSMenuItem(title: "", action: $0, keyEquivalent: "") }
+        XCTAssertEqual(items.map(document.validateUserInterfaceItem), [false, false, false, false])
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.5, "nothing waited for the save")
 
         let saved = await saving.value
@@ -688,6 +814,36 @@ private final class OpenThreads: @unchecked Sendable {
     }
 
     var onMainThread: [Bool] { lock.withLock { threads } }
+}
+
+/// Holds the core's opens (`hookOpens`) while held, off the main thread.
+private final class OpenGate: @unchecked Sendable {
+    // @unchecked: the state is only touched with `condition` locked.
+    private let condition = NSCondition()
+    private var held = false
+    private var waiting = false
+
+    func hold() { condition.withLock { held = true } }
+
+    func release() {
+        condition.withLock {
+            held = false
+            condition.broadcast()
+        }
+    }
+
+    /// An open is waiting at the gate.
+    var isWaiting: Bool { condition.withLock { waiting } }
+
+    func passThrough() {
+        condition.withLock {
+            while held {
+                waiting = true
+                condition.wait()
+            }
+            waiting = false
+        }
+    }
 }
 
 /// A delegate for `runModalSavePanel(for:delegate:didSave:contextInfo:)`.

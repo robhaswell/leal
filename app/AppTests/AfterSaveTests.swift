@@ -348,7 +348,7 @@ final class AfterSaveTests: XCTestCase {
         let generation = model.generation
         let place = await DocumentModel.placeForSaving(url)
         let job = try XCTUnwrap(model.startSave(to: url, kind: .save, place: place, overwriteChanged: false).get())
-        let result = await DocumentModel.outcome(of: job)
+        let result = await DocumentModel.outcome(of: job, handle: model.readingID.handle)
         model.saveEnded(job, place: place, outcomeFollows: true)
         let saved = try result.get()
         // In the gap.

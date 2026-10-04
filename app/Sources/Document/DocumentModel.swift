@@ -1708,6 +1708,10 @@ final class DocumentModel: GridDataSource {
         /// The generation the core read the file again at as the save
         /// ended (`SaveJob.restarted()`: a drive back during the save).
         let restarted: UInt64?
+        /// The core document the save was started on (`readingID.handle`):
+        /// if a Reload has replaced it since, the outcome is about a file
+        /// the model no longer shows, and isn't followed.
+        let handle: Int
     }
 
     /// Where a save writes its new file and snapshot: the folders
@@ -1778,7 +1782,7 @@ final class DocumentModel: GridDataSource {
             place.removeLeftovers()
             return nil
         }
-        let result = await Self.outcome(of: job)
+        let result = await Self.outcome(of: job, handle: handleNumber)
         let saved = try? result.get()
         saveEnded(job, place: place, outcomeFollows: saved != nil)
         if let saved { self.saved(saved, kind: kind) }
@@ -1837,12 +1841,14 @@ final class DocumentModel: GridDataSource {
         return .success(job)
     }
 
-    /// Waits for `job`, off the main thread, and cancels it if the waiting
-    /// task is cancelled (`SaveJob.outcome()`): what it saved, or why not.
-    nonisolated static func outcome(of job: SaveJob) async -> Result<Saved, SaveFailure> {
+    /// Waits for `job`, started on core document `handle`
+    /// (`readingID.handle`), off the main thread, and cancels it if the
+    /// waiting task is cancelled (`SaveJob.outcome()`): what it saved, or
+    /// why not.
+    nonisolated static func outcome(of job: SaveJob, handle: Int) async -> Result<Saved, SaveFailure> {
         do {
             let outcome = try await job.outcome()
-            return .success(Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion, restarted: job.restarted()))
+            return .success(Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion, restarted: job.restarted(), handle: handle))
         } catch let failure as SaveFailure {
             return .failure(failure)
         } catch {
@@ -1902,10 +1908,14 @@ final class DocumentModel: GridDataSource {
     /// If the core read the file again as the save ended
     /// (`SaveJob.restarted()`, a drive back during the save), that reading
     /// is taken as `checkOriginal`'s restart is (`restarted`).
+    ///
+    /// Nothing more if a Reload replaced the core document the save was
+    /// started on (`Saved.handle`): the model shows the file it read, and
+    /// doesn't follow a Save As it no longer has the edits of.
     func saved(_ saved: Saved, kind: SaveKind = .save) {
         let outcome = saved.outcome
         saveOutcomePending = false
-        guard failure == nil else { return }
+        guard failure == nil, saved.handle == handleNumber else { return }
         if kind == .save {
             // Not `apply(original:)`: the path the core reports is the one
             // it wrote, a symbolic link followed, which isn't a move.

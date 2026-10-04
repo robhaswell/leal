@@ -343,13 +343,16 @@ final class CSVDocument: NSDocument {
 
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
         switch item.action {
-        case #selector(save(_:)) where !canSave || saving != nil:
+        case #selector(save(_:)) where !canSave || saving != nil || isRereading:
             return false
         case #selector(saveTo(_:)):
             // No Export: it would write through `NSDocument`.
             return false
         case #selector(saveAs(_:)), #selector(duplicate(_:)), #selector(saveDuplicate(_:)):
-            if model == nil || model?.isFailed == true { return false }
+            // Not while a Reload or Revert reads the file again: the
+            // document would follow the copy while the window adopted the
+            // old file's new reading (task 2.5.3c review).
+            if model == nil || model?.isFailed == true || isRereading { return false }
         case #selector(revertToSaved(_:)):
             // Not while the file is read again already.
             if model == nil || model?.isFailed == true || model?.isReloading == true { return false }
@@ -360,6 +363,13 @@ final class CSVDocument: NSDocument {
             return false
         }
         return super.validateUserInterfaceItem(item)
+    }
+
+    /// A Reload or Revert to Saved is reading the file again: the model's,
+    /// or the window's, which is set a moment before the model's starts.
+    /// Save, Save As and Duplicate are off meanwhile.
+    var isRereading: Bool {
+        model?.isReloading == true || (windowControllers.first as? DocumentWindowController)?.content.reloading != nil
     }
 
     /// What waits for a Save under way (task 2.5.3a review): each would
@@ -394,7 +404,7 @@ final class CSVDocument: NSDocument {
         guard let model, !model.isFailed, url.standardizedFileURL == model.url.standardizedFileURL else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError)
         }
-        guard !model.hasUnsavedEdits, saving == nil, !model.isReloading else {
+        guard !model.hasUnsavedEdits, saving == nil, !isRereading else {
             Logger.document.error("Not reverted: there are unsaved edits, or the file is being saved or read")
             return
         }
@@ -465,8 +475,9 @@ final class CSVDocument: NSDocument {
             guard let self else { return }
             Self.answer(delegate, didSaveSelector, document: self, flag: saved, contextInfo: contextInfo)
         }
-        guard commitEditing() else {
-            // The core refused the open edit: it stays open, saying why.
+        guard !isRereading, commitEditing() else {
+            // A Reload or Revert is reading the file again, or the core
+            // refused the open edit (it stays open, saying why).
             NSSound.beep()
             return reply(false)
         }
@@ -700,15 +711,15 @@ final class CSVDocument: NSDocument {
         if Task.isCancelled { return .failure(.Cancelled) }
         let target = write.url
         let place = await DocumentModel.placeForSaving(target)
-        let started = await document.onMain {
+        let (started, handle) = await document.onMain {
             model.waitingToSave(false)
-            return model.startSave(to: target, kind: kind, place: place, overwriteChanged: overwriteChanged)
+            return (model.startSave(to: target, kind: kind, place: place, overwriteChanged: overwriteChanged), model.readingID.handle)
         }
         guard case let .success(job?) = started else {
             place.removeLeftovers()
             return started.map { _ -> DocumentModel.Saved? in nil }
         }
-        let result = await DocumentModel.outcome(of: job)
+        let result = await DocumentModel.outcome(of: job, handle: handle)
         await document.onMain {
             // A save that wrote the file goes on to `saveFinished`, and so
             // to `DocumentModel.saved`.
@@ -817,8 +828,11 @@ final class CSVDocument: NSDocument {
     /// 1): its URL (at the name on disk the core reports) and type, so
     /// the title and proxy icon name it, as `NSDocument`'s own Save As
     /// does inside its file access.
+    ///
+    /// Nothing, too, if a Reload replaced the core document the save was
+    /// started on (`isCurrent`).
     private func noteWritten(_ saved: DocumentModel.Saved, kind: SaveKind, model: DocumentModel) {
-        guard self.model === model, !model.isFailed else { return }
+        guard self.model === model, !model.isFailed, Self.isCurrent(saved, model: model) else { return }
         if kind != .save {
             let url = URL(filePath: saved.outcome.path)
             if fileURL != url { fileURL = url }
@@ -828,6 +842,19 @@ final class CSVDocument: NSDocument {
         if let version = saved.snapshotVersion, let token = history.token(atVersion: version) {
             updateChangeCount(withToken: token, for: kind == .save ? .saveOperation : .saveAsOperation)
         }
+    }
+
+    /// Whether `saved` is about the core document `model` shows: not if a
+    /// Reload or Revert replaced it while the save ran (task 2.5.3c
+    /// review). The window then shows the file the Reload read, and a Save
+    /// As it ran isn't followed: the document stays where it was, and the
+    /// copy written is left as it is.
+    private static func isCurrent(_ saved: DocumentModel.Saved, model: DocumentModel) -> Bool {
+        guard saved.handle == model.readingID.handle else {
+            Logger.document.error("A save ended after a Reload replaced the document it saved: not followed")
+            return false
+        }
+        return true
     }
 
     /// The document type of a file named `url`: TSV or CSV by its
@@ -863,6 +890,11 @@ final class CSVDocument: NSDocument {
         }
         if let error = outcome.rereadError {
             Logger.document.error("Saved, but couldn’t read the file back: \(error, privacy: .public)")
+        }
+        guard saved.handle == model.readingID.handle else {
+            // Read again under the save: only the outcome's end is noted.
+            model.saved(saved, kind: kind)
+            return reporting
         }
         if let version = saved.snapshotVersion {
             history.savedThrough(version: version)
@@ -1240,7 +1272,7 @@ final class CSVDocument: NSDocument {
     /// that the copy will be incomplete ("about N of M rows", ADR-0008
     /// decision 6). `completion` hears whether it saved.
     func chooseSaveAs(_ mode: SaveAsMode, then completion: (@MainActor (Bool) -> Void)? = nil) {
-        guard let model, !model.isFailed, let current = fileURL, commitEditing() else {
+        guard let model, !model.isFailed, !isRereading, let current = fileURL, commitEditing() else {
             NSSound.beep()
             completion?(false)
             return
@@ -1279,12 +1311,37 @@ final class CSVDocument: NSDocument {
     /// so, naming the edits it couldn't keep. Why it couldn't save is
     /// said too, offering Save As UTF-8 where that would. Returns its task,
     /// whose value says whether it saved.
+    ///
+    /// Refused (`false`, nothing written) while a Reload or Revert reads
+    /// the file again (task 2.5.3c review).
     @discardableResult
     func saveAs(to url: URL) -> Task<Bool, Never> {
-        if let fileURL, url.standardizedFileURL == fileURL.standardizedFileURL {
-            return enqueueSave { await $0.saveInPlace() }
+        guard !isRereading else {
+            NSSound.beep()
+            return Task { false }
         }
-        return enqueueSave { await $0.saveAsAndSay(url) }
+        return enqueueSave { document in
+            // The document's own file, however `url` spells it (case,
+            // Unicode normalization, a link): a Save. Decided by identity,
+            // off the main thread; the core decides the same way again
+            // as it saves.
+            if let current = document.fileURL, await FileWork.run({ Self.isSameFile(url, current) }) {
+                return await document.saveInPlace()
+            }
+            return await document.saveAsAndSay(url)
+        }
+    }
+
+    /// Whether `a` and `b` name the same file (its volume and inode,
+    /// symbolic links followed). Any thread: it looks at the files.
+    nonisolated static func isSameFile(_ a: URL, _ b: URL) -> Bool {
+        if a.standardizedFileURL == b.standardizedFileURL { return true }
+        var first = stat()
+        var second = stat()
+        guard stat(a.path(percentEncoded: false), &first) == 0, stat(b.path(percentEncoded: false), &second) == 0 else {
+            return false
+        }
+        return first.st_dev == second.st_dev && first.st_ino == second.st_ino
     }
 
     /// One Save As or Save As UTF-8, queued behind any Save under way; the
