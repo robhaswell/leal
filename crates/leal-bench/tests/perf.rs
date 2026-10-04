@@ -501,7 +501,7 @@ const REFERENCE_ROWS: [&str; 2] = ["afterLoad", "duringLoadWithFind"];
 
 #[test]
 fn robs_run_gives_the_verdicts_in_perf_md() {
-    use Verdict::{Fail, Mixed, Pass};
+    use Verdict::{Fail, Mixed, Pass, Untested};
     let raw = robs_run();
     let expected: Vec<(String, Verdict, Option<&str>)> = vec![
         ("Launch < 300 ms".into(), Mixed, None),
@@ -512,6 +512,7 @@ fn robs_run_gives_the_verdicts_in_perf_md() {
         ),
         ("Open to first rows < 150 ms".into(), Pass, None),
         ("Full index < 500 ms".into(), Pass, None),
+        ("Cell edit to screen < 16 ms".into(), Untested, None),
         (
             "Scrolling: no dropped frames at 120 Hz".into(),
             Fail,
@@ -635,6 +636,7 @@ fn a_run_with_no_scroll_runs() {
         ),
         ("Open to first rows < 150 ms".into(), Pass, None),
         ("Full index < 500 ms".into(), Pass, None),
+        ("Cell edit to screen < 16 ms".into(), Untested, None),
         (
             "Scrolling: no dropped frames at 120 Hz".into(),
             Untested,
@@ -786,4 +788,28 @@ fn strips_figures_are_read_and_appkit_runs_kept_apart() {
     let robs = PerfRun::parse(&robs_run());
     let old = &robs.scroll_runs("afterLoad")[0];
     assert_eq!((old.drawing.as_ref(), old.window_server_ms), (None, None));
+}
+
+/// Task 2.5.1: the edit runs' times are read and judged against 16 ms,
+/// each edit counted.
+#[test]
+fn cell_edits_are_read_and_judged() {
+    let raw = serde_json::json!({ "editsMs": [2.5, 3.0, 4.5] });
+    let run = PerfRun::parse(&raw);
+    assert_eq!(run.edits_ms, vec![2.5, 3.0, 4.5]);
+    let rows = run.rows();
+    let edit = row(&rows, "Cell edit to screen");
+    assert_eq!(edit.verdict, Verdict::Pass);
+    assert_eq!(edit.measured, "3.0 ms (2.5–4.5, 3 edits)");
+
+    let slow = PerfRun::parse(&serde_json::json!({ "editsMs": [2.5, 3.0, 17.0] }));
+    assert_eq!(
+        row(&slow.rows(), "Cell edit to screen").verdict,
+        Verdict::Mixed
+    );
+    let none = PerfRun::parse(&serde_json::json!({}));
+    assert_eq!(
+        row(&none.rows(), "Cell edit to screen").verdict,
+        Verdict::Untested
+    );
 }

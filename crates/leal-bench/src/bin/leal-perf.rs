@@ -4,7 +4,8 @@
 //! ```text
 //! leal-perf --app Leal.app --bench-app Leal.app --file reference.csv
 //!           [--big-file big.csv] [--runs N] [--speed fast|moderate]
-//!           [--no-scroll | --only-scroll] [--compare-drawing] [--out DIR]
+//!           [--no-scroll | --only-scroll | --only-edit] [--compare-drawing]
+//!           [--out DIR]
 //! ```
 //!
 //! Every launch is the way the app ships: `open`, so LaunchServices starts
@@ -23,6 +24,10 @@
 //!   the app has settled. This cold open is judged as part of launch; the
 //!   open budget is judged on opens in a running app (`--bench-app`,
 //!   `-LealReopen`).
+//! - **Cell edit to screen** (task 2.5.1): `--bench-app` with the
+//!   reference file edits cells through the in-cell editor by itself
+//!   (`-LealBenchEdit`), each once the last is on screen; its "Cell edit to
+//!   screen" signposts give the times. `--only-edit` runs only these.
 //! - **Scrolling**: `--bench-app` (a `LEAL_BENCH` build) scrolling itself
 //!   (`ScrollBench`): after the load; from the first rows, with a search
 //!   running (background work pausing as rule 3 says); and on `--big-file`
@@ -52,7 +57,7 @@ use leal_bench::perf::{
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll | --only-scroll] [--compare-drawing] [--out DIR]";
+const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll | --only-scroll | --only-edit] [--compare-drawing] [--out DIR]";
 
 /// The app's sandbox container, where the scroll benchmark writes.
 const CONTAINER_TMP: &str = "Library/Containers/io.github.robhaswell.leal/Data/tmp";
@@ -77,8 +82,10 @@ struct Options {
     find: String,
     settle: Duration,
     scroll: bool,
-    /// Only the scroll runs: no launches, opens or reopens.
+    /// Only the scroll runs: no launches, opens, reopens or edits.
     only_scroll: bool,
+    /// Only the edit runs (task 2.5.1).
+    only_edit: bool,
     /// Each scroll run twice, with strips and with AppKit's drawing.
     compare_drawing: bool,
     out: PathBuf,
@@ -95,6 +102,7 @@ fn options() -> Result<Options, String> {
     let mut settle = Duration::from_secs(5);
     let mut scroll = true;
     let mut only_scroll = false;
+    let mut only_edit = false;
     let mut compare_drawing = false;
     let mut out = PathBuf::from("target/perf");
     let mut args = std::env::args().skip(1);
@@ -115,6 +123,7 @@ fn options() -> Result<Options, String> {
             }
             "--no-scroll" => scroll = false,
             "--only-scroll" => only_scroll = true,
+            "--only-edit" => only_edit = true,
             "--compare-drawing" => compare_drawing = true,
             "--out" => out = PathBuf::from(value()?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -124,6 +133,11 @@ fn options() -> Result<Options, String> {
     if only_scroll && !scroll {
         return Err(format!(
             "--only-scroll and --no-scroll leave nothing to run\n{USAGE}"
+        ));
+    }
+    if only_edit && only_scroll {
+        return Err(format!(
+            "--only-edit and --only-scroll leave nothing to run\n{USAGE}"
         ));
     }
     let absolute =
@@ -137,8 +151,9 @@ fn options() -> Result<Options, String> {
         speed,
         find,
         settle,
-        scroll,
+        scroll: scroll && !only_edit,
         only_scroll,
+        only_edit,
         compare_drawing,
         out,
     })
@@ -169,7 +184,14 @@ fn run() -> Result<(), String> {
     let mut launches = Vec::new();
     let mut opens = Vec::new();
     let mut reopens = Vec::new();
-    if !options.only_scroll {
+    let mut edits = Vec::new();
+    if options.only_edit {
+        let log = LogStream::start()?;
+        for run in 1..=options.runs {
+            eprintln!("leal-perf: edit {run} of {}", options.runs);
+            edits.extend(edit_run(&options, &log)?);
+        }
+    } else if !options.only_scroll {
         let log = LogStream::start()?;
         // Launch and idle memory: no document.
         for run in 1..=options.runs {
@@ -186,6 +208,11 @@ fn run() -> Result<(), String> {
         for run in 1..=options.runs {
             eprintln!("leal-perf: reopen {run} of {}", options.runs);
             reopens.extend(reopen_run(&options, &log)?);
+        }
+        // Cell edits in a running app: the bench build edits cells itself.
+        for run in 1..=options.runs {
+            eprintln!("leal-perf: edit {run} of {}", options.runs);
+            edits.extend(edit_run(&options, &log)?);
         }
     }
 
@@ -274,6 +301,7 @@ fn run() -> Result<(), String> {
         "launches": launches,
         "opens": opens,
         "reopensMs": reopens,
+        "editsMs": edits,
         "scrolls": scrolls,
         "scrollsAppKit": scrolls_appkit,
     });
@@ -535,6 +563,26 @@ fn reopen_run(options: &Options, log: &LogStream) -> Result<Vec<f64>, String> {
         .ok_or("the bench build didn't reopen the file five times within 120 s")?
         .durations_ms("Open to first rows");
     Ok(opens.into_iter().skip(1).collect())
+}
+
+/// One edit run (task 2.5.1): the bench build opens the reference file,
+/// edits `EDITS` cells through the in-cell editor, one at a time, and
+/// quits. Each edit's "Cell edit to screen" signpost is one time.
+fn edit_run(options: &Options, log: &LogStream) -> Result<Vec<f64>, String> {
+    const EDITS: usize = 20;
+    let args = ["-LealBenchEdit".to_owned(), EDITS.to_string()];
+    let launched = Launched::open(&options.bench_app, Some(&options.file), &args)?;
+    let timeline = log.wait_for(launched.pid, Duration::from_secs(120), |t| {
+        t.durations_ms("Cell edit to screen").len() >= EDITS
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while launched.is_running() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    launched.quit();
+    Ok(timeline
+        .ok_or("the bench build didn't edit 20 cells within 120 s")?
+        .durations_ms("Cell edit to screen"))
 }
 
 /// One scroll benchmark run: the bench build opens `file` and scrolls

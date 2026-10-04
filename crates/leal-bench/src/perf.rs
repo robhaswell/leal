@@ -717,6 +717,8 @@ pub struct PerfRun {
     pub opens: Vec<HashMap<String, f64>>,
     /// Each open in a running app, in ms.
     pub reopens_ms: Vec<f64>,
+    /// Each cell edit's time to screen, in ms (task 2.5.1).
+    pub edits_ms: Vec<f64>,
     /// Each scenario's scroll runs, by name ([`SCENARIOS`]).
     pub scrolls: HashMap<String, Vec<ScrollRun>>,
     /// With `--compare-drawing`, each scenario's runs with AppKit's drawing
@@ -767,6 +769,10 @@ impl PerfRun {
                 .as_array()
                 .map(|v| v.iter().filter_map(Value::as_f64).collect())
                 .unwrap_or_default(),
+            edits_ms: raw["editsMs"]
+                .as_array()
+                .map(|v| v.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default(),
             scrolls: scenarios("scrolls"),
             scrolls_appkit: scenarios("scrollsAppKit"),
         }
@@ -788,6 +794,7 @@ impl PerfRun {
         let cold_launch = spread(&self.opens, "launchToFirstRowsMs");
         let reopen = Spread::of(&self.reopens_ms);
         let index = spread(&self.opens, "indexMs");
+        let edit = Spread::of(&self.edits_ms);
         let idle = spread(&self.launches, "footprintMB");
         let idle_rss = spread(&self.launches, "residentMB");
         let reference_machine = is_reference_machine(&self.model);
@@ -818,6 +825,15 @@ impl PerfRun {
                 measured: ms(index),
                 how: "the core's \"Index\" signpost in the app, reference file, with diagnostics".into(),
                 verdict: Verdict::below(index, 500.0),
+                note: None,
+            },
+            Row {
+                budget: "Cell edit to screen < 16 ms".into(),
+                measured: edit.map_or("—".to_owned(), |s| {
+                    s.describe("ms", 1).replace(" runs)", " edits)")
+                }),
+                how: "Return in the in-cell editor to the commit of the transaction that draws the edit (\"Cell edit to screen\" signpost), reference file, after indexing, 20 edits a run (bench build, `-LealBenchEdit`)".into(),
+                verdict: Verdict::below(edit, 16.0),
                 note: None,
             },
             scroll_row(
