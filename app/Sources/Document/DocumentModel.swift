@@ -1620,8 +1620,11 @@ final class DocumentModel: GridDataSource {
         var new: LealFFI.Document? = try await FileWork.run {
             try Self.openReloaded(url: url, environment: environment, options: options, reference: reference, number: number)
         }
-        guard failure == nil, handle != nil, number == handleNumber + 1, let opened = new else {
-            // Let go of it off the main thread, and hold no other reference.
+        // The checks come before any binding of `new`: `CoreRelease` must
+        // drop the last reference, off the main thread (its deinit deletes
+        // a snapshot file, which can block on a share). A `let opened = new`
+        // in the guard would keep one alive here.
+        guard failure == nil, handle != nil, number == handleNumber + 1 else {
             CoreRelease.later(&new)
             return false
         }
@@ -1629,7 +1632,7 @@ final class DocumentModel: GridDataSource {
             CoreRelease.later(&new)
             throw EditedDuringReload()
         }
-        new = nil
+        guard let opened = new.take() else { return false }
         try adoptReloaded(opened, url: url, reference: reference, number: number)
         return true
     }

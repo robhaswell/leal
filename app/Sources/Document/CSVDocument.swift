@@ -259,6 +259,13 @@ final class CSVDocument: NSDocument {
         let version = version ?? model.editVersion
         guard try await model.saveAsUTF8(to: url) != nil else { return false }
         let modified = await FileWork.run { Self.modificationDate(of: url) }
+        // SEAM(2.5.3): if the window declines the copy (`EditedDuringReload`,
+        // or the model closed or failed meanwhile), the core has already
+        // rebased onto the UTF-8 copy but the window stays on the original
+        // file, so a later save from this window writes to the original
+        // while the core's source is the copy. Task 2.5.3's save path must
+        // reconcile them (point the core back at the original, or adopt the
+        // copy); until then the sheet tells the user to Save As UTF-8 again.
         guard try await model.reloadInBackground(from: url, editVersion: version) else { return false }
         followReload(of: model, modified: modified)
         return true
@@ -551,6 +558,10 @@ final class CSVDocument: NSDocument {
     /// Whether the failed document has edits in its journal for Recover
     /// changes to put back (ADR-0008 decision 5). The journal alone: the
     /// core's dirty state can't be asked once it has failed.
+    ///
+    /// SEAM(2.5.3): the journal must reset on a save (`EditHistory`), or
+    /// Recover changes would replay edits that are already saved, on top of
+    /// the saved file.
     var canRecover: Bool {
         !history.journal.isEmpty
     }

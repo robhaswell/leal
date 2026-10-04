@@ -512,7 +512,7 @@
     "It isn’t a regular file." : {
       "comment" : "Open error: the path is a named pipe, socket or device"
     },
-    "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save." : {
+    "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save. Save As UTF-8 again to include them." : {
       "comment" : "Alert text: Save As UTF-8 kept the window on the original because of edits made during the save"
     },
     "It was edited while the file was being read again, so your edits were kept. Reload again to discard them." : {

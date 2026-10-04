@@ -389,17 +389,32 @@ final class UndoTests: XCTestCase {
         XCTAssertEqual(asked, 1)
         XCTAssertEqual(quit.replies, [.terminateLater])
         XCTAssertEqual(quit.reviewed, [false], "Cancel: no quit")
+        XCTAssertFalse(quit.repliedBeforeReturning)
 
         // Quit again: the document was edited before, so AppKit itself
-        // reviews it, and the app delegate has nothing more to ask.
-        quit.terminate()
+        // reviews it (as `terminate` does, called here directly: a real
+        // terminate runs a nested event loop), and the app delegate has
+        // nothing more to ask.
+        let probe = ReviewProbe()
+        controller.reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: probe,
+            didReviewAllSelector: #selector(ReviewProbe.documentController(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
         try await waitUntil("asked again") { asked == 2 }
+        XCTAssertEqual(probe.answers, [false])
         XCTAssertEqual(quit.replies, [.terminateLater], "the review cancelled the quit first")
     }
 
-    /// As above with two documents, each with an edit still being typed:
-    /// both are committed before AppKit counts the edited documents (its
-    /// app-modal question is replaced here).
+    /// As above with two documents, one edited already and the other with
+    /// an edit still being typed: AppKit reviews the edited one on its own,
+    /// before the app delegate is asked, and the `reviewUnsavedDocuments`
+    /// override commits both open edits before AppKit counts the edited
+    /// documents (its app-modal question is replaced here). Without the
+    /// override, AppKit asks only the edited document, and the other's edit
+    /// is still open then.
     func testQuittingCommitsEveryDocumentsOpenEdit() async throws {
         let first = try await open(try file("a.csv", csv))
         let second = try await open(try file("b.csv", csv))
@@ -407,27 +422,48 @@ final class UndoTests: XCTestCase {
         defer { controller.reviewForTesting = nil }
         for opened in [first, second] {
             controller.addDocument(opened.document)
-            opened.content.grid.activeCell = CellPosition(row: 1, column: 2)
-            opened.content.editActiveCell()
-            let editor = try XCTUnwrap(opened.content.cellEditor.field.currentEditor() as? NSTextView)
-            editor.selectAll(nil)
-            editor.insertText("42", replacementRange: editor.selectedRange())
         }
-        XCTAssertFalse(controller.hasEditedDocuments)
+        _ = try set(first.model, 0, 1, "Marlowe")
+        XCTAssertTrue(first.document.isDocumentEdited)
+        second.content.grid.activeCell = CellPosition(row: 1, column: 2)
+        second.content.editActiveCell()
+        let secondEditor = try XCTUnwrap(second.content.cellEditor.field.currentEditor() as? NSTextView)
+        secondEditor.selectAll(nil)
+        secondEditor.insertText("42", replacementRange: secondEditor.selectedRange())
+        XCTAssertFalse(second.document.isDocumentEdited)
         var reviewed: [Bool] = []
-        controller.reviewForTesting = { answer in
+        func snapshot() {
             reviewed = [first, second].map(\.document.isDocumentEdited)
+        }
+        // The stand-in for the question, and (if the override is gone) the
+        // document's own, so a missing override fails here and doesn't ask.
+        controller.reviewForTesting = { answer in
+            snapshot()
             answer(false)
         }
+        for opened in [first, second] {
+            opened.document.unsavedChangesPromptForTesting = { answer in
+                snapshot()
+                answer(false)
+            }
+        }
 
-        let quit = QuitProbe()
-        quit.terminate()
-        try await waitUntil("reviewed") { !quit.reviewed.isEmpty }
+        // AppKit's review of the edited document, as `terminate` starts it
+        // (called here directly: a real terminate runs a nested event loop,
+        // which a review that never answers would hang).
+        let firstReview = ReviewProbe()
+        controller.reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: firstReview,
+            didReviewAllSelector: #selector(ReviewProbe.documentController(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
+        try await waitUntil("reviewed") { !reviewed.isEmpty }
         XCTAssertEqual(reviewed, [true, true])
-        XCTAssertEqual(value(first.model, 1, 2), "42")
         XCTAssertEqual(value(second.model, 1, 2), "42")
-        XCTAssertEqual(quit.replies, [.terminateLater])
-        XCTAssertEqual(quit.reviewed, [false])
+        try await waitUntil("answered") { !firstReview.answers.isEmpty }
+        XCTAssertEqual(firstReview.answers, [false])
 
         // AppKit's own review (Quit with edited documents) commits every
         // document's open edit before it counts them.
@@ -446,6 +482,60 @@ final class UndoTests: XCTestCase {
         )
         XCTAssertEqual(value(second.model, 0, 2), "7")
         XCTAssertEqual(probe.answers, [false])
+    }
+
+    /// Quit with an open edit and nothing edited before: the app delegate
+    /// asks, and the answer comes on a later turn even when the review
+    /// answers at once (the test's stand-in does, as a failed commit does),
+    /// and a second terminate while one waits neither asks again nor
+    /// replaces its reply.
+    func testQuitReplyComesAfterTerminateLaterAndIsNotOverwritten() async throws {
+        var opened = try await open(try file("a.csv", csv))
+        let controller = try XCTUnwrap(NSDocumentController.shared as? DocumentController)
+        controller.addDocument(opened.document)
+        defer { controller.reviewForTesting = nil }
+        func typeAnEdit() throws {
+            opened.content.grid.activeCell = CellPosition(row: 0, column: 1)
+            opened.content.editActiveCell()
+            let editor = try XCTUnwrap(opened.content.cellEditor.field.currentEditor() as? NSTextView)
+            editor.selectAll(nil)
+            editor.insertText("Typed", replacementRange: editor.selectedRange())
+        }
+
+        // Answers at once.
+        try typeAnEdit()
+        controller.reviewForTesting = { answer in answer(true) }
+        let quit = QuitProbe()
+        quit.terminate()
+        XCTAssertEqual(quit.replies, [.terminateLater])
+        XCTAssertFalse(quit.repliedBeforeReturning)
+        XCTAssertTrue(quit.reviewed.isEmpty, "not before the next turn")
+        try await waitUntil("replied") { !quit.reviewed.isEmpty }
+        XCTAssertEqual(quit.reviewed, [true])
+
+        // Waits for the answer: a second terminate leaves it alone. (The
+        // first document is edited now, so AppKit would review it itself.)
+        opened.document.close()
+        opened = try await open(try file("b.csv", csv))
+        controller.addDocument(opened.document)
+        try typeAnEdit()
+        var pending: (@MainActor (Bool) -> Void)?
+        var reviews = 0
+        controller.reviewForTesting = { answer in
+            reviews += 1
+            pending = answer
+        }
+        let again = QuitProbe()
+        again.terminate()
+        again.terminate()
+        XCTAssertEqual(again.replies, [.terminateLater, .terminateLater])
+        XCTAssertEqual(reviews, 1)
+        let answer = try XCTUnwrap(pending)
+        answer(false)
+        try await waitUntil("replied once") { !again.reviewed.isEmpty }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(again.reviewed, [false])
+        XCTAssertFalse(again.repliedBeforeReturning)
     }
 
     // MARK: Dirty state
@@ -736,23 +826,33 @@ final class UndoTests: XCTestCase {
 /// review that doesn't stop the quit can't end the test host.
 @MainActor
 private final class QuitProbe: NSObject, NSApplicationDelegate {
-    /// What `DocumentController.shouldTerminate` returned.
+    /// The real app delegate, whose answer to a terminate this passes on.
+    let appDelegate = AppDelegate()
+    /// What `AppDelegate.applicationShouldTerminate` returned.
     private(set) var replies: [NSApplication.TerminateReply] = []
-    /// What its review answered later.
+    /// What the reply to AppKit said later: whether to go on quitting.
     private(set) var reviewed: [Bool] = []
+    /// Whether a reply came before `applicationShouldTerminate` returned,
+    /// which AppKit mustn't get.
+    private(set) var repliedBeforeReturning = false
 
+    override init() {
+        super.init()
+        appDelegate.replyToTerminate = { [weak self] quit in self?.reviewed.append(quit) }
+    }
+
+    /// Asks as `NSApplication.terminate` does when nothing is edited yet,
+    /// but never calls it: a real terminate waits in a nested event loop,
+    /// which a review that never answers would hang.
     func terminate() {
-        let saved = NSApp.delegate
-        NSApp.delegate = self
-        defer { NSApp.delegate = saved }
-        NSApp.terminate(nil)
+        _ = applicationShouldTerminate(NSApp)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let controller = NSDocumentController.shared as? DocumentController
-        if let reply = controller?.shouldTerminate(reply: { [weak self] quit in self?.reviewed.append(quit) }) {
-            replies.append(reply)
-        }
+        let before = reviewed.count
+        let reply = appDelegate.applicationShouldTerminate(sender)
+        repliedBeforeReturning = repliedBeforeReturning || reviewed.count != before
+        replies.append(reply)
         return .terminateCancel
     }
 }

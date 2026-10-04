@@ -67,7 +67,7 @@ enum HistoryText {
         String(localized: "The UTF-8 copy was saved, but this window still shows “\(name)”.", comment: "Alert title: Save As UTF-8 saved the copy but the window didn't switch to it, because of edits made meanwhile; the original file's name")
     }
 
-    static let editedDuringSaveAsUTF8Detail = String(localized: "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save.", comment: "Alert text: Save As UTF-8 kept the window on the original because of edits made during the save")
+    static let editedDuringSaveAsUTF8Detail = String(localized: "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save. Save As UTF-8 again to include them.", comment: "Alert text: Save As UTF-8 kept the window on the original because of edits made during the save")
 
     // MARK: Reload with edits (ADR-0008 decision 4)
 

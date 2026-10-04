@@ -84,7 +84,15 @@ final class DocumentController: NSDocumentController {
     /// edited before was reviewed already, by AppKit, which committed every
     /// open edit (`reviewUnsavedDocuments`). An open edit the core refuses
     /// stops the quit, as it stops a close.
+    ///
+    /// `reply` is never called before this returns, whatever the review
+    /// does (it may answer at once: an open edit the core refuses, a test's
+    /// stand-in): `NSApplication.reply` must come after `.terminateLater`,
+    /// so the answer is delivered on the main queue's next turn. A quit
+    /// already waiting for its answer keeps it: a second terminate neither
+    /// replaces its `reply` nor starts a second review, and waits for it.
     func shouldTerminate(reply: @escaping (Bool) -> Void) -> NSApplication.TerminateReply {
+        guard quitReply == nil else { return .terminateLater }
         let csv = documents.compactMap { $0 as? CSVDocument }
         let editedBefore = csv.filter(\.isDocumentEdited)
         guard commitOpenEdits() else {
@@ -107,9 +115,16 @@ final class DocumentController: NSDocumentController {
     }
 
     @objc private func quitReviewEnded(_ controller: NSDocumentController, didReviewAll: Bool, contextInfo: UnsafeMutableRawPointer?) {
-        let reply = quitReply
-        quitReply = nil
-        reply?(didReviewAll)
+        // The next turn, not now: the review may have ended before
+        // `shouldTerminate` returned `.terminateLater`. The reply stays
+        // pending until then, so a second terminate can't overwrite it.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, let reply = self.quitReply else { return }
+                self.quitReply = nil
+                reply(didReviewAll)
+            }
+        }
     }
 
     /// AppKit reviews the documents with unsaved changes (Quit, when some

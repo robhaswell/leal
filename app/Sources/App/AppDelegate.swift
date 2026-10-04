@@ -58,12 +58,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CoreRelease.finish()
     }
 
+    /// Tells AppKit whether to go on quitting, after `.terminateLater`.
+    /// Tests replace it: the real one quits the test host.
+    var replyToTerminate: @MainActor (Bool) -> Void = { quit in
+        NSApp.reply(toApplicationShouldTerminate: quit)
+    }
+
     /// Quit commits the edits still being typed, and asks about them
-    /// (`DocumentController.shouldTerminate`).
+    /// (`DocumentController.shouldTerminate`), which also keeps a second
+    /// terminate from overwriting the reply a first is waiting for.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controller = NSDocumentController.shared as? DocumentController else { return .terminateNow }
-        return controller.shouldTerminate { quit in
-            NSApp.reply(toApplicationShouldTerminate: quit)
+        return controller.shouldTerminate { [weak self] quit in
+            MainActor.assumeIsolated { self?.replyToTerminate(quit) }
         }
     }
 
