@@ -977,12 +977,14 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Move | Arrows, Page Up/Down, ⌘↑/⌘↓ |
 | Edit cell | Return, or start typing |
 | Commit / cancel | Return, Tab / Esc |
+| New line in a value (in-cell editor) | ⇧↩ or ⌥↩ |
 | Clear cells | Delete |
 | Undo / redo | ⌘Z / ⇧⌘Z |
 | Find | ⌘F, ⌘G / ⇧⌘G |
 | Go to row | ⌘L |
 | Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste) |
-| Insert / delete row | ⌘↩ / ⌘⌫ |
+| Insert row below / delete row | ⌘↩ / ⌘⌫ |
+| Duplicate row (a copy below, byte for byte; the selected column stays) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |
 | Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |
 
