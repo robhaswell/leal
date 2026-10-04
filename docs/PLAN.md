@@ -761,7 +761,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     when strips never settle; `GridDataSource.readAhead`'s `wanted.set`
     should come before its early returns; queued alerts could skip a failed
     document; `updateWindowMinimum` with no window.
-- [ ] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
+  - [ ] From 2.7's review: trim the fuzz corpus now and then (`cargo fuzz
+    cmin`); `detect`'s target checks only the encoding against the oracle;
+    seed `index`/`detect`/`rows` without the corpus's sidecar files; oracle
+    rule 1's comment should mention UTF-16 BOMs; watch the fuzz runs'
+    memory (about 3 MB per 1,000 runs) in the first nightlies.
+- [x] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
     edit. This narrows ADR-0005 decision 2's literal text; explicitly
