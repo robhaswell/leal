@@ -274,7 +274,9 @@ final class CSVDocument: NSDocument {
     /// 1.9). Save As is always allowed. SEAM(2.5): Save asks before writing
     /// over a file that changed elsewhere (`model.original.diverged`, which
     /// stays true after Keep Editing; DESIGN §3.1).
-    var canSave: Bool { model?.canSave ?? false }
+    /// A UTF-16 file can be edited, but Save is off for it (ADR-0013
+    /// decision 1): Save As UTF-8 is the only way to save it.
+    var canSave: Bool { (model?.canSave ?? false) && model?.isReadOnly == false }
 
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
         if item.action == #selector(save(_:)), !canSave {

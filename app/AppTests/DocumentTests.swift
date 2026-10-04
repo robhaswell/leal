@@ -579,7 +579,7 @@ final class DocumentTests: XCTestCase {
         XCTAssertEqual(controller.content.banners.arrangedSubviews.count, 1)
         XCTAssertEqual(
             StatusText.segments(model.status),
-            ["1 row × 2 columns", "Tab", "CRLF", "UTF-16 LE (BOM)", "Read-only"]
+            ["1 row × 2 columns", "Tab", "CRLF", "UTF-16 LE (BOM)", "Save As UTF-8 only"]
         )
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("Zoë", truncated: false))
         document.close()

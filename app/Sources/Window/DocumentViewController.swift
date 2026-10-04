@@ -90,6 +90,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// The brief "wrapped" sign over the grid (Safari's), when Next or
     /// Previous goes round the end of the file.
     let wrapIndicator = WrapIndicatorView()
+
+    /// The in-cell editor (task 2.5.1).
+    private(set) var cellEditor: CellEditController!
+    /// The inspector's edit of the active cell (task 2.5.1, mockup 05a),
+    /// while its value can be edited.
+    private(set) var inspectorEdit: InspectorEdit?
+    /// A long value being read in full before the inspector can edit it
+    /// (ADR-0008 decision 3).
+    private(set) var inspectorLoading: Task<Void, Never>?
     /// The latest VoiceOver announcement, for tests.
     private(set) var lastAnnouncement: String?
 
@@ -165,13 +174,25 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     override func viewDidLoad() {
         super.viewDidLoad()
         let scheduler = scheduler
+        cellEditor = CellEditController(model: model, grid: grid)
         grid.onUserInput = { [weak self] in
             scheduler.noteUserInput()
             // The user went somewhere: find doesn't move the selection now.
             self?.find.cancelPendingStep()
+            self?.cellEditor.dismissNote()
         }
+        grid.onEdit = { [weak self] in self?.editActiveCell() }
+        grid.onTypeToEdit = { [weak self] event in self?.editActiveCell(typing: event) }
+        grid.onScroll = { [weak self] in self?.cellEditor.gridScrolled() }
+        grid.headerView.menuForColumn = { [weak self] column in self?.headerMenu(column: column) }
+        inspector.textView.delegate = self
+        inspector.textView.onCommit = { [weak self] in self?.commitInspector(refocus: true) }
+        inspector.textView.onCancel = { [weak self] in self?.cancelInspector() }
         grid.onGesture = { [weak self] in self?.model.setInteracting($0) }
-        grid.onColumnResized = { [weak self] column, width in self?.model.columnResized(column, width: width) }
+        grid.onColumnResized = { [weak self] column, width in
+            self?.model.columnResized(column, width: width)
+            self?.cellEditor.relayout()
+        }
         grid.fittingWidth = { [weak self] column in
             guard let self else { return nil }
             return model.fittingWidth(column: column, visibleRows: grid.visibleRows)
@@ -205,6 +226,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     private func modelChanged(_ change: DocumentChange) {
+        switch change {
+        case .content, .rows, .reloaded, .failed:
+            // The values may be different, or gone: an open editor
+            // commits nothing (task 2.5.1).
+            cellEditor.abandon()
+            inspectorEdit = nil
+            inspectorLoading?.cancel()
+            inspectorLoading = nil
+        default:
+            break
+        }
         if model.readingID != drawnReading {
             // Every value may be different: nothing drawn for the old
             // reading stays, in the strips or the laid-out lines.
@@ -222,6 +254,21 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case .columns:
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
+            cellEditor.relayout()
+        case .widths:
+            // An edit widened its column (task 2.5.1).
+            grid.setColumnWidths(model.columnWidths)
+            cellEditor.relayout()
+            return
+        case .header:
+            // An edit to the header row (task 2.5.1): its titles, and the
+            // column count if the header grew.
+            if grid.geometry.columnCount != model.columnCount {
+                grid.setColumnWidths(model.columnWidths)
+            }
+            grid.headerView.invalidateContent()
+            if isInspectorShown { updateInspector() }
+            return
         case .content:
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
@@ -265,6 +312,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             onFailure?()
         case let .cells(rows):
             grid.cellsChanged(rows: rows)
+            // Find and the inspector read the cells as they are now
+            // (ADR-0008 decision 2).
+            if isFindBarShown { find.valuesChanged(rows: rows) }
+            if let cell = grid.activeCell, rows.contains(cell.row), inspectorEdit?.changed != true {
+                updateInspector()
+            }
             // An edit rarely changes what the banners or the status bar
             // show (a new row does, to the row count): skip them then.
             if !bannerInputsChanged(), model.status == shownStatus {
@@ -396,8 +449,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             makeBanner(
                 kind: .info,
                 message: String(
-                    localized: "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it.",
-                    comment: "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
+                    localized: "This file is UTF-16, which Leal can’t save. You can edit it, then save a UTF-8 copy.",
+                    comment: "Banner on a UTF-16 file: it can be edited, and Save As UTF-8 is the only save (ADR-0013 decision 1, mockup 06a)"
                 ),
                 button: String(localized: "Save As UTF-8…", comment: "Banner button on a UTF-16 file"),
                 action: #selector(saveAsUTF8(_:)),
@@ -960,17 +1013,26 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             if view.window?.firstResponder === inspector.textView {
                 view.window?.makeFirstResponder(grid.gridView)
             }
+            // Hiding it commits its edit, as leaving it does.
+            if inspectorEdit?.changed == true { commitInspector(refocus: false, confirmed: true) }
+            inspectorEdit = nil
         }
     }
 
     private func selectionChanged() {
         find.activeCellChanged(grid.activeCell)
+        cellEditor.dismissNote()
         updateInspector()
     }
 
-    /// Shows the active cell's whole value, read off the main thread.
+    /// Shows the active cell's whole value, read off the main thread. An
+    /// edit in the inspector of the cell it showed is committed first.
     func updateInspector() {
         guard isInspectorShown else { return }
+        if inspectorEdit?.changed == true { commitInspector(refocus: false, confirmed: true) }
+        inspectorEdit = nil
+        inspectorLoading?.cancel()
+        inspectorLoading = nil
         inspectorTask?.cancel()
         guard let cell = grid.activeCell, cell.column < model.columnCount else {
             showInInspector(column: "", row: nil, content: .note(InspectorText.noCell))
@@ -991,13 +1053,113 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             case .some: .note(InspectorText.missing)
             case nil: .note(InspectorText.notRead)
             }
-            showInInspector(column: column, row: cell.row + 1, content: content)
+            // The inspector edits what it shows: the core's full display
+            // value (ADR-0008 decision 3), where the core allows an edit. A
+            // missing (hatched) cell is edited in the grid.
+            var editable: InspectorEdit?
+            if case let .value(shown) = content, model.editRefusal(.cell(cell)) == nil {
+                editable = InspectorEdit(cell: cell, original: shown.text, truncated: shown.truncated)
+            }
+            showInInspector(column: column, row: cell.row + 1, content: content, edit: editable)
         }
     }
 
-    private func showInInspector(column: String, row: Int?, content: InspectorContent) {
+    private func showInInspector(column: String, row: Int?, content: InspectorContent, edit: InspectorEdit? = nil) {
         inspectorContent = content
-        inspector.show(column: column, row: row, content: content)
+        inspectorEdit = edit
+        inspector.show(column: column, row: row, content: content, editable: edit != nil)
+    }
+
+    // MARK: Editing (task 2.5.1)
+
+    /// Return, a double-click or typing in the grid: the in-cell editor on
+    /// the active cell.
+    func editActiveCell(typing: NSEvent? = nil) {
+        guard let cell = grid.activeCell, !model.isFailed else { return }
+        cellEditor.begin(.cell(cell), typing: typing)
+    }
+
+    /// A column header's context menu: "Rename Column…", which edits the
+    /// header row's cell in place (docs/tasks/2.1.md, "The header row").
+    func headerMenu(column: Int) -> NSMenu? {
+        guard model.interpretation.header, !model.isFailed else { return nil }
+        let menu = NSMenu()
+        let item = NSMenuItem(title: EditText.renameColumn, action: #selector(renameColumn(_:)), keyEquivalent: "")
+        item.target = self
+        item.tag = column
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc func renameColumn(_ sender: NSMenuItem) {
+        rename(column: sender.tag)
+    }
+
+    /// Edits column `column`'s header-row cell in place.
+    func rename(column: Int) {
+        guard model.interpretation.header, !model.isFailed else { return }
+        cellEditor.begin(.header(column: column))
+    }
+
+    /// ⌘↩ in the inspector (or leaving it): commits its text to the cell it
+    /// shows. As in the in-cell editor, an untouched value is no edit, and
+    /// a character the encoding can't hold is named first (`confirmed`
+    /// skips that).
+    func commitInspector(refocus: Bool, confirmed: Bool = false) {
+        guard var edit = inspectorEdit else { return }
+        let value = inspector.textView.string
+        guard edit.changed, value != edit.original else {
+            if refocus { view.window?.makeFirstResponder(grid.gridView) }
+            return
+        }
+        if !confirmed, edit.warned != value, let bad = model.unencodable(value) {
+            edit.warned = value
+            inspectorEdit = edit
+            inspector.showWarning(EditText.unencodable(bad))
+            return
+        }
+        // Not changed any more, whatever happens: the commit below redraws
+        // the inspector from the cell.
+        edit.changed = false
+        inspectorEdit = edit
+        switch model.setCell(.cell(edit.cell), to: value) {
+        case let .refused(refusal):
+            NSSound.beep()
+            inspector.showWarning(EditText.refusal(refusal))
+        case .edited, .unchanged, .failed:
+            break
+        }
+        if refocus { view.window?.makeFirstResponder(grid.gridView) }
+    }
+
+    /// Esc in the inspector: its text goes back to the cell's value.
+    func cancelInspector() {
+        guard let edit = inspectorEdit else { return }
+        inspectorLoading?.cancel()
+        inspectorLoading = nil
+        inspectorEdit = nil
+        if edit.changed || edit.truncated {
+            updateInspector()
+        } else {
+            inspectorEdit = edit
+        }
+        view.window?.makeFirstResponder(grid.gridView)
+    }
+
+    /// The inspector shows a long value's first 64,000 characters: before
+    /// it can be edited it is read in full (ADR-0008 decision 3).
+    private func loadWholeValueForEditing() {
+        guard let edit = inspectorEdit, edit.truncated, inspectorLoading == nil else { return }
+        inspector.showWarning(InspectorText.loadingWhole)
+        inspectorLoading = Task { [weak self] in
+            guard let self else { return }
+            let value = await model.fullValueInBackground(.cell(edit.cell))
+            guard !Task.isCancelled, grid.activeCell == edit.cell, inspectorEdit?.cell == edit.cell else { return }
+            inspectorLoading = nil
+            guard let value else { return }
+            inspectorEdit = InspectorEdit(cell: edit.cell, original: value, truncated: false)
+            inspector.showWhole(value)
+        }
     }
 
     // MARK: The details popover (mockup 03b)
@@ -1309,8 +1471,8 @@ final class DocumentWindowController: NSWindowController {
         image.symbolConfiguration = .init(pointSize: 12, weight: .regular)
         image.contentTintColor = .secondaryLabelColor
         image.toolTip = String(
-            localized: "UTF-16 files are read-only in this version of Leal.",
-            comment: "Tooltip of the lock glyph by a read-only file's title"
+            localized: "Leal can’t save UTF-16 files. Save As UTF-8 saves a copy with your edits.",
+            comment: "Tooltip of the lock glyph by a UTF-16 file's title: Save is off (ADR-0013 decision 1)"
         )
         // The glyph sits in a plain container, which is the accessory's
         // view. AppKit throws "changing the view's origin is not allowed"
@@ -1326,5 +1488,53 @@ final class DocumentWindowController: NSWindowController {
         accessory.view = container
         accessory.layoutAttribute = .leading
         return accessory
+    }
+}
+
+/// The inspector's edit of a cell (task 2.5.1).
+struct InspectorEdit: Equatable {
+    let cell: CellPosition
+    /// The value shown when it opened: the whole value, or with
+    /// `truncated` its first 64,000 characters, which must be read in full
+    /// before an edit.
+    var original: String
+    var truncated: Bool
+    /// The user changed the text since.
+    var changed = false
+    /// The text whose unencodable character was named.
+    var warned: String?
+}
+
+/// The inspector's text view, as an editor (task 2.5.1).
+extension DocumentViewController: NSTextViewDelegate {
+    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        guard textView === inspector.textView, let edit = inspectorEdit else { return true }
+        if edit.truncated {
+            // Only the start is shown: read the whole value, then edit it.
+            loadWholeValueForEditing()
+            return false
+        }
+        return true
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard notification.object as AnyObject? === inspector.textView, var edit = inspectorEdit else { return }
+        edit.changed = true
+        let text = inspector.textView.string
+        if text.utf16.count <= CellEditController.liveCheckLimit {
+            if let bad = model.unencodable(text) {
+                edit.warned = text
+                inspector.showWarning(EditText.unencodable(bad))
+            } else {
+                edit.warned = nil
+                inspector.showWarning(nil)
+            }
+        }
+        inspectorEdit = edit
+    }
+
+    func textDidEndEditing(_ notification: Notification) {
+        guard notification.object as AnyObject? === inspector.textView, inspectorEdit?.changed == true else { return }
+        commitInspector(refocus: false, confirmed: true)
     }
 }

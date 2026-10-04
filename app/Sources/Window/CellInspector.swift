@@ -5,9 +5,9 @@ import LealFFI
 /// grid, about 190 points tall, showing the active cell's whole value, with
 /// its column, row and size above it. ⌘I shows and hides it.
 ///
-/// Read-only in phase 1: editing (Return for a newline, ⌘↩ to commit, Esc
-/// to cancel) is task 2.5. ⌘↩ is already the inspector's own here, so it
-/// never reaches the grid, where it will insert a row (task 2.5a).
+/// It edits the value where the core allows (task 2.5.1): Return puts in a
+/// line break, ⌘↩ commits and Esc cancels. ⌘↩ is the inspector's own, so
+/// it never reaches the grid, where it will insert a row (task 2.5a).
 @MainActor
 final class CellInspectorView: NSView {
     static let height: CGFloat = 190
@@ -108,22 +108,47 @@ final class CellInspectorView: NSView {
         NSRect(x: dirtyRect.minX, y: Self.headerHeight - 1, width: dirtyRect.width, height: 1).fill()
     }
 
+    /// What the size label says when there is no warning.
+    private var size = ""
+
     /// Shows a cell: its column's title, its row number (as the gutter
-    /// shows it), and its value, or a note if there is none to show.
-    func show(column: String, row: Int?, content: InspectorContent) {
+    /// shows it), and its value, or a note if there is none to show. With
+    /// `editable`, the value can be edited (task 2.5.1), and the label says
+    /// how to commit (mockup 05a).
+    func show(column: String, row: Int?, content: InspectorContent, editable: Bool = false) {
         columnLabel.stringValue = column
         rowLabel.stringValue = row.map(InspectorText.row) ?? ""
         switch content {
         case let .value(value):
             textView.string = value.text
             textView.textColor = .labelColor
-            sizeLabel.stringValue = InspectorText.size(value)
+            size = InspectorText.size(value)
+            if editable { size += " · " + InspectorText.editingHint }
         case let .note(note):
             textView.string = note
             textView.textColor = .secondaryLabelColor
-            sizeLabel.stringValue = ""
+            size = ""
         }
+        textView.isEditable = editable
+        showWarning(nil)
         textView.scroll(.zero)
+    }
+
+    /// The whole of a long value, read for editing in place of its start.
+    func showWhole(_ value: String) {
+        let selection = textView.selectedRanges
+        textView.string = value
+        textView.selectedRanges = selection
+        size = InspectorText.editingHint
+        showWarning(nil)
+    }
+
+    /// A warning in place of the size (a character the encoding can't
+    /// hold, a refused edit), or the size again with `nil`.
+    func showWarning(_ warning: String?) {
+        sizeLabel.stringValue = warning ?? size
+        sizeLabel.textColor = warning == nil ? .secondaryLabelColor : .systemOrange
+        sizeLabel.toolTip = warning
     }
 }
 
@@ -139,8 +164,15 @@ enum InspectorContent: Equatable {
 /// the grid's Insert Row (task 2.5a).
 @MainActor
 final class InspectorTextView: NSTextView {
-    /// ⌘↩ was pressed. SEAM(2.5): commits the edit.
+    /// ⌘↩ was pressed: commits the edit.
     var onCommit: (() -> Void)?
+    /// Esc was pressed: cancels it.
+    var onCancel: (() -> Void)?
+
+    override func cancelOperation(_ sender: Any?) {
+        guard isEditable, let onCancel else { return super.cancelOperation(sender) }
+        onCancel()
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isCommit(event), window?.firstResponder === self {
@@ -164,6 +196,9 @@ enum InspectorText {
     static let noCell = String(localized: "No cell selected.", comment: "Cell inspector with no active cell")
     static let notRead = String(localized: "This row isn’t read yet.", comment: "Cell inspector on a row past the indexed region")
     static let missing = String(localized: "This row has no field here: it is shorter than the others.", comment: "Cell inspector on a short (ragged) row's missing cell")
+
+    static let editingHint = String(localized: "⌘↩ commits · Esc cancels", comment: "Cell inspector: how to commit or cancel an edit (mockup 05a)")
+    static let loadingWhole = String(localized: "Reading the whole value to edit it…", comment: "Cell inspector: a long value is read in full before it can be edited (ADR-0008 decision 3)")
 
     static func row(_ row: Int) -> String {
         String(localized: "Row \(row.formatted())", comment: "Cell inspector: the active cell's row number, as the gutter shows it (mockup 05a)")

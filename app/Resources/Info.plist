@@ -34,7 +34,7 @@
 			<key>CFBundleTypeName</key>
 			<string>CSV Document</string>
 			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
+			<string>Editor</string>
 			<key>NSDocumentClass</key>
 			<string>$(PRODUCT_MODULE_NAME).CSVDocument</string>
 			<key>LSHandlerRank</key>
@@ -48,7 +48,7 @@
 			<key>CFBundleTypeName</key>
 			<string>TSV Document</string>
 			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
+			<string>Editor</string>
 			<key>NSDocumentClass</key>
 			<string>$(PRODUCT_MODULE_NAME).CSVDocument</string>
 			<key>LSHandlerRank</key>

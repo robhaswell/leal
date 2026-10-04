@@ -67,6 +67,12 @@ final class GridView: StripContentView, NSMenuItemValidation {
     var canCopy: () -> Bool = { false }
     /// Any key or click: the user is interacting (DESIGN §3.10 rule 3).
     var onUserInput: (() -> Void)?
+    /// Return or a double-click: edit the active cell (task 2.5.1).
+    var onEdit: (() -> Void)?
+    /// A key that types text: edit the active cell, starting from that
+    /// text (DESIGN §4.2, "start typing"). The event goes on to the editor,
+    /// so input methods compose from it.
+    var onTypeToEdit: ((NSEvent) -> Void)?
 
     let lines = TextLineCache(capacity: 2_500)
     /// Lays out the text of rows about to scroll into view (task 2.0a).
@@ -380,6 +386,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
             onExtend?(cell)
         } else {
             onClick?(cell)
+            if event.clickCount == 2 { onEdit?() }
         }
     }
 
@@ -411,7 +418,30 @@ final class GridView: StripContentView, NSMenuItemValidation {
 
     override func keyDown(with event: NSEvent) {
         onUserInput?()
+        if let onTypeToEdit, Self.typesText(event) {
+            onTypeToEdit(event)
+            return
+        }
         interpretKeyEvents([event])
+    }
+
+    /// Whether `event` types text, rather than being a command: it gives
+    /// characters, none a control character or a function key's (arrows,
+    /// Page Up and the like are in the private use area), with no ⌘ or ⌃.
+    static func typesText(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.isDisjoint(with: [.command, .control]), let characters = event.characters, !characters.isEmpty else {
+            return false
+        }
+        return characters.unicodeScalars.allSatisfy { scalar in
+            !CharacterSet.controlCharacters.contains(scalar) && !(0xF700...0xF8FF).contains(scalar.value)
+        }
+    }
+
+    /// Return (and Enter): edit the active cell.
+    override func insertNewline(_ sender: Any?) {
+        onEdit?()
     }
 
     override func doCommand(by selector: Selector) {
@@ -446,7 +476,8 @@ final class GridView: StripContentView, NSMenuItemValidation {
         }
     }
 
-    /// Typing doesn't edit yet (phase 2).
+    /// Text that reaches the grid without `onTypeToEdit` (none in the
+    /// app) is dropped: typing edits through the in-cell editor.
     override func insertText(_ insertString: Any) {}
 }
 

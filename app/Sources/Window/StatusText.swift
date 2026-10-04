@@ -78,7 +78,7 @@ enum StatusText {
         }
         items.append(StatusItem(text: encoding(status.encoding, source: status.encodingSource), role: .encoding))
         if status.readOnly {
-            items.append(StatusItem(text: String(localized: "Read-only", comment: "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)")))
+            items.append(StatusItem(text: String(localized: "Save As UTF-8 only", comment: "Status bar: a UTF-16 file can be edited but only saved as a UTF-8 copy (ADR-0013 decision 1)")))
         }
         if let note = storageNote(status) {
             items.append(StatusItem(text: note))

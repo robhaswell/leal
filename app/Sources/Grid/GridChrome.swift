@@ -7,14 +7,24 @@ import AppKit
 @MainActor
 final class GridHeaderView: NSView {
     weak var dataSource: (any GridDataSource)?
-    var geometry = GridLayout()
+    var geometry = GridLayout() {
+        didSet { placeEditor() }
+    }
     /// The scroll view's horizontal offset.
     var offsetX: CGFloat = 0 {
         didSet {
             guard offsetX != oldValue else { return }
             needsDisplay = true
+            placeEditor()
         }
     }
+    /// The menu for a right-click (or Control-click) on column `column`'s
+    /// title: "Rename Column…" (task 2.5.1).
+    var menuForColumn: ((_ column: Int) -> NSMenu?)?
+    /// The header row's editor (task 2.5.1), over its column's title, and
+    /// the column. It follows the grid's sideways scroll and the column's
+    /// width.
+    private(set) var editor: (view: NSView, column: Int)?
 
     /// The user dragged column `column` to `width`.
     var onResize: ((_ column: Int, _ width: CGFloat) -> Void)?
@@ -40,6 +50,36 @@ final class GridHeaderView: NSView {
     func invalidateContent() {
         titleLines.removeAll()
         needsDisplay = true
+    }
+
+    /// Shows `view` over column `column`'s title, as its editor.
+    func showEditor(_ view: NSView, column: Int) {
+        editor = (view, column)
+        if view.superview !== self { addSubview(view) }
+        placeEditor()
+    }
+
+    /// Where the editor's column's title is now, in this view.
+    func titleRect(column: Int) -> CGRect {
+        let rect = geometry.cellRect(row: 0, column: column).offsetBy(dx: -offsetX, dy: 0)
+        return CGRect(x: rect.minX, y: 0, width: rect.width, height: bounds.height - 1)
+    }
+
+    private func placeEditor() {
+        guard let editor, editor.column < geometry.columnCount else { return }
+        let frame = titleRect(column: editor.column)
+        if editor.view.frame != frame { editor.view.frame = frame }
+    }
+
+    override func willRemoveSubview(_ subview: NSView) {
+        super.willRemoveSubview(subview)
+        if subview === editor?.view { editor = nil }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let x = convert(event.locationInWindow, from: nil).x + offsetX
+        guard let column = geometry.column(atX: x) else { return nil }
+        return menuForColumn?(column)
     }
 
     override func viewDidChangeEffectiveAppearance() {

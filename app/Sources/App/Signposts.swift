@@ -10,6 +10,8 @@ import os
 ///   milliseconds since the process started: the DESIGN §1 launch budget.
 /// - "Open to first rows", an interval from `CSVDocument` starting to read
 ///   a file to the grid's first draw with rows in it: the open budget.
+/// - "Cell edit to screen", an interval from an edit's commit to the
+///   transaction that draws it: the edit budget (task 2.5.1).
 ///
 /// Signposts cost a check of a flag unless something is recording them.
 enum Signposts {
@@ -28,6 +30,17 @@ enum Signposts {
 
     static func firstRows(_ state: OSSignpostIntervalState) {
         signposter.endInterval("Open to first rows", state)
+    }
+
+    /// The start of an edit's commit (task 2.5.1); `editOnScreen(_:)`
+    /// ends it once the transaction with the edited cell's drawing is
+    /// committed: "Cell edit to screen", DESIGN §1's < 16 ms.
+    static func editCommitted() -> OSSignpostIntervalState {
+        signposter.beginInterval("Cell edit to screen", id: signposter.makeSignpostID())
+    }
+
+    static func editOnScreen(_ state: OSSignpostIntervalState) {
+        signposter.endInterval("Cell edit to screen", state)
     }
 
     /// Seconds since this process started, from the kernel's record of it.

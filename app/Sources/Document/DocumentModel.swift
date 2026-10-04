@@ -31,6 +31,12 @@ enum DocumentChange: Equatable, Sendable {
     /// The values of these grid rows changed (an edit, an undo or a redo:
     /// `cellsChanged(rows:)`): redraw them.
     case cells(Range<Int>)
+    /// The header row's titles changed (an edit to file row 0 while it is
+    /// the header row, task 2.5.1): redraw the column headers.
+    case header
+    /// Only the column widths changed: an edited value is wider than its
+    /// column (task 2.5.1).
+    case widths
 }
 
 /// One open file, as the window shows it: the core's `Document` (through
@@ -113,6 +119,9 @@ final class DocumentModel: GridDataSource {
 
     /// Called on the main actor when something the window shows changed.
     var onChange: ((DocumentChange) -> Void)?
+    /// A command was applied (an edit; task 2.5.1). SEAM(2.5.2): undo
+    /// and the recovery journal register it here (`commandApplied`).
+    var onCommand: ((EditCommand) -> Void)?
     /// Called when the file was moved, with its new place (task 1.9), so
     /// the `NSDocument` follows it.
     var onMoved: ((URL) -> Void)?
@@ -195,6 +204,13 @@ final class DocumentModel: GridDataSource {
     private var headerTitles: [String] = []
     /// Columns the user has resized; sizing leaves them alone.
     private var resizedColumns: Set<Int> = []
+    /// Each column's widest edited value (task 2.5.1), so that measuring
+    /// the sample rows again after an edit doesn't narrow a column an edit
+    /// outside the sample widened.
+    private var editedWidest: [Int: CGFloat] = [:]
+    /// Widths and number detection measured again after an edit inside the
+    /// sample rows, as after a reinterpret (task 2.5.1).
+    private var sizingAfterEdit: Task<Void, Never>?
     /// Each column's widest text in the rows the widths were measured from
     /// (up to `GridMetrics.fitMaximumWidth`), kept for double-click to fit
     /// instead of the rows themselves.
@@ -360,14 +376,18 @@ final class DocumentModel: GridDataSource {
         shareRecheck?.cancel()
         shareRecheck = nil
         tiles.removeAll()
+        sizingAfterEdit?.cancel()
         stopObserving()
         CoreRelease.later(&handle)
         onChange = nil
         onMoved = nil
+        onCommand = nil
     }
 
     var isFailed: Bool { failure != nil }
 
+    /// Save is off: the file is UTF-16 (ADR-0013 decision 1). It can be
+    /// edited, and Save As UTF-8 is the only way to save it.
     var isReadOnly: Bool {
         interpretation.encoding == .utf16Le || interpretation.encoding == .utf16Be
     }
@@ -443,6 +463,7 @@ final class DocumentModel: GridDataSource {
         for task in tasks { task.cancel() }
         tasks.removeAll()
         tiles.removeAll()
+        sizingAfterEdit?.cancel()
         stopObserving()
         onChange?(.failed)
     }
@@ -869,6 +890,109 @@ final class DocumentModel: GridDataSource {
         onChange?(.cells(rows))
     }
 
+    // MARK: Edits (task 2.5.1)
+
+    /// The cells `command` changed read differently now: an edit, or (task
+    /// 2.5.2) an undo or a redo. Everything that shows them catches up
+    /// (ADR-0008 decision 2; docs/tasks/2.0a.md, "For editing"):
+    /// - the grid rows' tiles, strips and gutter marks (`cellsChanged`),
+    ///   with the row flags read again (an edited cell's diagnostics are
+    ///   its new value's, and a hatched cell edited is no longer missing);
+    /// - the column headers, for file row 0 while it is the header row;
+    /// - the column widths: a column widens for a value wider than it
+    ///   (unless the user sized it), and an edit inside the sample rows
+    ///   measures the widths and number detection again, off the main
+    ///   thread, as after a reinterpret.
+    ///
+    /// Find (`FindModel.valuesChanged`) and the inspector hear of it from
+    /// the window, through `.cells` and `.header`.
+    func valuesChanged(by command: EditCommand) {
+        guard failure == nil, !command.changes.isEmpty else { return }
+        var gridRows: [Int] = []
+        var header = false
+        for change in command.changes {
+            if interpretation.header, change.row == 0 {
+                header = true
+            } else {
+                gridRows.append(Int(clamping: change.row) - headerOffset)
+            }
+        }
+        if header { reloadHeaderTitles() }
+        if let first = gridRows.min(), let last = gridRows.max() {
+            for block in (first / Self.flagBlockRows)...(last / Self.flagBlockRows) {
+                flagBlocks[block] = nil
+            }
+            cellsChanged(rows: first..<(last + 1))
+        }
+        widenColumns(for: command.changes)
+        let sampled = UInt64(headerOffset) + UInt64(Self.sizingRows)
+        if refinedSizingStarted, command.changes.contains(where: { $0.row < sampled }) {
+            measureAgainAfterEdit()
+        }
+    }
+
+    /// The header row's titles, read again after an edit to it.
+    private func reloadHeaderTitles() {
+        let columns = UInt32(max(columnCount, fileColumnCount, 1))
+        guard let row = call({
+            try $0.cells(rowStart: 0, rowCount: 1, columnStart: 0, columnCount: columns, maxChars: GridMetrics.maxCellCharacters)
+        })?.first else { return }
+        headerTitles = row.cells.map { CellText.display($0.text).text }
+        updateColumnCount()
+        onChange?(.header)
+    }
+
+    /// Widens each changed cell's column to fit its new value, as the
+    /// sizing would have (up to `GridMetrics.maximumColumnWidth`), unless
+    /// the user sized the column. A column never narrows here: that waits
+    /// for the sample to be measured again.
+    private func widenColumns(for changes: [ValueChange]) {
+        var widened = false
+        for change in changes {
+            let column = Int(change.column)
+            guard column < columnWidths.count, column < widestText.count, let value = change.newValue else { continue }
+            let limit = Int(GridMetrics.maxCellCharacters)
+            let start = value.unicodeScalars.prefix(limit + 1)
+            let truncated = start.count > limit
+            let shown = String(String.UnicodeScalarView(start.prefix(limit)))
+            let measured: CGFloat = if interpretation.header, change.row == 0 {
+                headerMeasurer.width(of: CellText.display(shown).text)
+            } else {
+                Self.cellMeasure(numeric: numeric, cell: cellMeasurer, number: numberMeasurer)(column, shown, truncated)
+            }
+            let width = min(measured, GridMetrics.fitMaximumWidth)
+            editedWidest[column] = max(editedWidest[column] ?? 0, width)
+            guard width > widestText[column] else { continue }
+            widestText[column] = width
+            guard !resizedColumns.contains(column), let fitted = ColumnSizer.widths(fromWidest: [width]).first,
+                  fitted > columnWidths[column] else { continue }
+            columnWidths[column] = fitted
+            widened = true
+        }
+        if widened { onChange?(.widths) }
+    }
+
+    /// Measures the sample rows' widths and number detection again, off
+    /// the main thread, a moment after the last edit inside them (so a run
+    /// of edits measures once).
+    private func measureAgainAfterEdit() {
+        sizingAfterEdit?.cancel()
+        let reading = readingID
+        sizingAfterEdit = Task { [weak self] in
+            try? await Task.sleep(for: Self.sizingAfterEditDelay)
+            guard !Task.isCancelled, let self, readingID == reading, failure == nil else { return }
+            sizingAfterEdit = nil
+            isSizingRefined = false
+            startRefinedSizing()
+        }
+    }
+
+    /// How long after an edit the sample is measured again. Tests shorten it.
+    static var sizingAfterEditDelay: Duration = .milliseconds(300)
+
+    /// Whether a measuring after an edit is waiting or running, for tests.
+    var isMeasuringAfterEdit: Bool { sizingAfterEdit != nil || (refinedSizingStarted && !isSizingRefined) }
+
     /// How many of the grid's reads ahead have come back, kept or dropped,
     /// for tests.
     var readsAheadBack: Int { tiles.readsAheadBack }
@@ -1039,10 +1163,13 @@ final class DocumentModel: GridDataSource {
             numeric = refined.numeric
             widestSampleRow = max(widestSampleRow, refined.fieldCount)
             updateColumnCount()
-            for (column, widest) in refined.widest.enumerated() where column < widestText.count {
+            // An edited value outside the sample rows keeps its column as
+            // wide as it made it (task 2.5.1).
+            let widest = refined.widest.enumerated().map { max($1, editedWidest[$0] ?? 0) }
+            for (column, widest) in widest.enumerated() where column < widestText.count {
                 widestText[column] = widest
             }
-            let widths = ColumnSizer.widths(fromWidest: refined.widest)
+            let widths = ColumnSizer.widths(fromWidest: widest)
             for (column, width) in widths.enumerated() where column < columnWidths.count && !resizedColumns.contains(column) {
                 columnWidths[column] = width
             }
@@ -1150,6 +1277,7 @@ final class DocumentModel: GridDataSource {
         flagBlocks.removeAll()
         tiles.removeAll()
         resizedColumns.removeAll()
+        editedWidest.removeAll()
         columnWidths = []
         widestText = []
         widestSampleRow = 0
@@ -1471,6 +1599,7 @@ final class DocumentModel: GridDataSource {
         let resized = columnWidths
         columnWidths = []
         widestText = []
+        editedWidest.removeAll()
         widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false

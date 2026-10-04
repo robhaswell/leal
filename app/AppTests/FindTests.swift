@@ -561,13 +561,13 @@ final class FindTests: XCTestCase {
         XCTAssertEqual(content.inspector.textView.string, "Deliver to the rear entrance.\nCall on arrival.\nGate code 4471")
         XCTAssertEqual(content.inspector.columnLabel.stringValue, "notes")
         XCTAssertEqual(content.inspector.rowLabel.stringValue, "Row 1")
-        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "3 lines · 61 characters")
+        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "3 lines · 61 characters · ⌘↩ commits · Esc cancels")
 
         // An invalid byte: the U+FFFD the grid shows, and a note.
         content.grid.select(CellPosition(row: 1, column: 1))
         await content.inspectorTask?.value
         XCTAssertEqual(content.inspector.textView.string, "bad \u{FFFD} byte")
-        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 10 characters · invalid bytes shown as �")
+        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 10 characters · invalid bytes shown as � · ⌘↩ commits · Esc cancels")
 
         // A very long value with no line breaks: its first 64,000
         // characters, said so. Showing it all stalled the window (a million
@@ -579,7 +579,7 @@ final class FindTests: XCTestCase {
         content.view.layoutSubtreeIfNeeded()
         content.view.displayIfNeeded()
         XCTAssertEqual(content.inspector.textView.string.count, Int(DocumentModel.inspectorMaxCharacters))
-        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 1,200,000 characters · value truncated: the first 64,000 shown")
+        XCTAssertEqual(content.inspector.sizeLabel.stringValue, "1 line · 1,200,000 characters · value truncated: the first 64,000 shown · ⌘↩ commits · Esc cancels")
 
         // A short row's missing cell.
         content.grid.select(CellPosition(row: 2, column: 2))

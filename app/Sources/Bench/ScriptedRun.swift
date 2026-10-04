@@ -46,6 +46,15 @@ import os
 ///   first paint (`JobFailure.Failed`, the "Partly read" banner); and
 ///   `-LealSimulateFault none` opens the file as if on a removable drive
 ///   that doesn't fail.
+///   For task 2.5.1's editing: `-LealEdit YES` opens the in-cell editor
+///   on the selected cell (with its callout, mockup 05b), and
+///   `-LealInspectorFocus YES`, with `-LealInspector`, puts the caret at
+///   the end of the inspector's value, as when editing it (05a).
+/// - `-LealBenchEdit <n>`: once the document is indexed, edit `n` cells
+///   through the in-cell editor (Return, new text, Return), one at a time,
+///   each once the last is on screen, then quit: each edit's "Cell edit to
+///   screen" signpost is the DESIGN §1 edit budget (`just perf`, task
+///   2.5.1).
 /// - `-LealReopen <n>`: once the document is indexed, close it and open
 ///   its file again, `n` times, then quit: each open's "Open to first rows"
 ///   signpost after the first is an open in a running app, without the
@@ -98,7 +107,7 @@ final class ScriptedRun {
 
     static func startIfAsked(defaults: UserDefaults) {
         let run = ScriptedRun(defaults: defaults)
-        guard ["LealBenchScroll", "LealSnapshot", "LealReopen"].contains(where: { run.value(of: $0) != nil }) else { return }
+        guard ["LealBenchScroll", "LealSnapshot", "LealReopen", "LealBenchEdit"].contains(where: { run.value(of: $0) != nil }) else { return }
         switch run.value(of: "LealAppearance") {
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
@@ -145,6 +154,11 @@ final class ScriptedRun {
                 NSApp.terminate(nil)
             }
             keep = bench
+        } else if let count = value(of: "LealBenchEdit").flatMap({ Int($0) }) {
+            Task { @MainActor in
+                await self.edit(document, content: content, times: count)
+                NSApp.terminate(nil)
+            }
         } else if let count = value(of: "LealReopen").flatMap({ Int($0) }) {
             Task { @MainActor in
                 await self.reopen(document, times: count)
@@ -177,6 +191,29 @@ final class ScriptedRun {
             document = next
         }
         _ = await Self.settled(document)
+    }
+
+    /// Edits `times` cells of the second column through the in-cell
+    /// editor, as typing would, each once the last is on screen.
+    private func edit(_ document: CSVDocument, content: DocumentViewController, times: Int) async {
+        guard await Self.settled(document) else { return }
+        let editor = content.cellEditor!
+        var done = 0
+        editor.onEditOnScreen = { _ in done += 1 }
+        for index in 0..<times {
+            content.grid.select(CellPosition(row: 1 + index % 20, column: 1))
+            content.editActiveCell()
+            await editor.loading?.value
+            guard let text = editor.field.currentEditor() as? NSTextView else { return }
+            text.selectAll(nil)
+            text.insertText("Edited \(index)", replacementRange: text.selectedRange())
+            text.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            let deadline = Date().addingTimeInterval(5)
+            while done <= index, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
     }
 
     /// Waits (up to 30 s) until the document's grid has drawn rows and its
@@ -237,6 +274,16 @@ final class ScriptedRun {
             // The cell inspector (mockup 05a), on the selected cell.
             content.setInspectorShown(true)
             await content.inspectorTask?.value
+            if has("LealInspectorFocus") {
+                let text = content.inspector.textView
+                content.view.window?.makeFirstResponder(text)
+                text.setSelectedRange(NSRange(location: (text.string as NSString).length, length: 0))
+            }
+        }
+        if has("LealEdit") {
+            // The in-cell editor (mockup 05b), on the selected cell.
+            content.editActiveCell()
+            await content.cellEditor.loading?.value
         }
         // Let sizing, the review and drawing settle.
         try? await Task.sleep(for: .milliseconds(has("LealSnapshotEarly") ? 30 : 600))

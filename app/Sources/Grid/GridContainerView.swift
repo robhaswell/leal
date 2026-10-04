@@ -102,6 +102,19 @@ final class GridContainerView: NSView {
         get { gridView.onCopy }
         set { gridView.onCopy = newValue }
     }
+    /// Return or a double-click in the grid: edit the active cell (task
+    /// 2.5.1).
+    var onEdit: (() -> Void)? {
+        get { gridView.onEdit }
+        set { gridView.onEdit = newValue }
+    }
+    /// A key that types text in the grid: edit the active cell from it.
+    var onTypeToEdit: ((NSEvent) -> Void)? {
+        get { gridView.onTypeToEdit }
+        set { gridView.onTypeToEdit = newValue }
+    }
+    /// The grid scrolled.
+    var onScroll: (() -> Void)?
 
     private(set) var geometry = GridLayout()
 
@@ -534,6 +547,7 @@ final class GridContainerView: NSView {
         }
         placeStrips()
         updatePill()
+        onScroll?()
     }
 
     // MARK: The active cell and keys

@@ -149,15 +149,85 @@ final class FindModel: GridHighlighter {
     }
 
     /// Reads the search's progress; if it moved on, the highlights and a
-    /// waiting Next are brought up to date.
+    /// waiting Next are brought up to date. Once it has caught up with the
+    /// edits, every highlight is read again: while it caught up they came
+    /// from the counts as they were.
     private func refresh(_ id: ObjectIdentifier) {
         guard let search, ObjectIdentifier(search) == id else { return }
         guard let latest = model.call({ _ in try search.progress() }) else { return }
         guard latest != progress else { return }
+        if progress?.catchingUp == true, !latest.catchingUp {
+            tiles.removeAll()
+            if let cell = current?.cell ?? activeCell { current = nil; noteCurrent(cell) }
+        }
         progress = latest
         retryPendingStep()
         onChange?()
     }
+
+    // MARK: Edits (task 2.5.1)
+
+    /// The values of grid rows `rows` changed (an edit): their highlights
+    /// are read again, the current match is checked again (it may no longer
+    /// be one), and the search catches up with the edit (docs/tasks/2.1.md,
+    /// "Find"). A finished search with many matches catches up in a job of
+    /// its own (`catchingUp`): meanwhile its progress is polled, and a Next
+    /// or Previous waiting (`Pending`) is tried again once it is done.
+    func valuesChanged(rows: Range<Int>) {
+        guard let search, !rows.isEmpty else { return }
+        let blocks = (rows.lowerBound / Self.tileRows)...((rows.upperBound - 1) / Self.tileRows)
+        tiles = tiles.filter { !blocks.contains($0.key.rowBlock) }
+        if let latest = model.call({ _ in try search.progress() }) { progress = latest }
+        // The selected cell may have become a match, or stopped being one.
+        if let cell = current?.cell ?? activeCell {
+            current = nil
+            noteCurrent(cell)
+        }
+        if progress?.catchingUp == true { watchCatchUp(search) }
+        retryPendingStep()
+        onChange?()
+    }
+
+    /// The current match, if `cell` is one, with its number.
+    private func noteCurrent(_ cell: CellPosition) {
+        guard let search else { return }
+        let row = UInt64(cell.row + model.headerRows)
+        let ordinal = model.call { _ in try search.ordinal(row: row, column: UInt32(clamping: cell.column)) } ?? nil
+        current = ordinal.map { (cell, $0) }
+    }
+
+    /// Waits for the search to catch up with the edits: on its catch-up
+    /// job if one runs, otherwise by asking for its progress again, which
+    /// catches up a little at a time.
+    private func watchCatchUp(_ search: Search) {
+        guard !isWatchingCatchUp else { return }
+        isWatchingCatchUp = true
+        let id = ObjectIdentifier(search)
+        let job = search.catchUpJob()
+        tasks.append(Task { [weak self] in
+            defer { self?.isWatchingCatchUp = false }
+            if let job { try? await job.finish() }
+            while !Task.isCancelled {
+                guard let self, let current = self.search, ObjectIdentifier(current) == id else { return }
+                refresh(id)
+                if progress?.catchingUp != true { return }
+                if let job = current.catchUpJob() {
+                    try? await job.finish()
+                } else {
+                    try? await Task.sleep(for: Self.catchUpInterval)
+                }
+            }
+        })
+    }
+
+    /// The selected cell, as last heard.
+    private var activeCell: CellPosition?
+
+    /// Whether a task waits for the search to catch up with edits.
+    private(set) var isWatchingCatchUp = false
+    /// How often a search catching up with edits is asked again, when no
+    /// catch-up job runs.
+    nonisolated static let catchUpInterval: Duration = .milliseconds(20)
 
     // MARK: Next and Previous
 
@@ -209,15 +279,14 @@ final class FindModel: GridHighlighter {
     /// The selection moved to `cell` (a click, a key): it is the current
     /// match if it is one, so the bar says "k of N".
     func activeCellChanged(_ cell: CellPosition?) {
-        guard let search, let cell else {
+        activeCell = cell
+        guard search != nil, let cell else {
             if current != nil { current = nil; onChange?() }
             return
         }
         if current?.cell == cell { return }
-        let row = UInt64(cell.row + model.headerRows)
-        let ordinal = model.call { _ in try search.ordinal(row: row, column: UInt32(clamping: cell.column)) } ?? nil
         let wasCurrent = current != nil
-        current = ordinal.map { (cell, $0) }
+        noteCurrent(cell)
         if wasCurrent || current != nil { onChange?() }
     }
 
