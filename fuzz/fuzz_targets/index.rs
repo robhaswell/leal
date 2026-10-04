@@ -112,11 +112,20 @@ fn check(index: &RowIndex, bytes: &[u8], layout: &Layout, what: &str) {
         unterminated,
         "{what}: unterminated quote"
     );
-    // The row at each offset, its line ending included. Not the testkit's
+    // The row at offsets on either side of every row's start, line ending
+    // and end, the line ending included in its row. (Every offset made
+    // large inputs ten times slower.) Not the testkit's
     // `Layout::row_of_offset`, which counts a line ending's characters, not
     // its UTF-16 bytes.
     let width = index.dialect().code_unit.width();
-    for offset in 0..=bytes.len() + 1 {
+    let mut offsets = vec![0, 1, layout.bom_len, bytes.len(), bytes.len() + 1];
+    for row in &layout.rows {
+        let end = row.span.end + row.line_ending.map_or(0, |l| l.byte_len() * width);
+        for at in [row.span.start, row.span.end, end] {
+            offsets.extend([at.saturating_sub(1), at, at + 1]);
+        }
+    }
+    for offset in offsets {
         let after = layout.rows.partition_point(|r| r.span.start <= offset);
         let expected = after.checked_sub(1).filter(|&r| {
             let row = &layout.rows[r];
