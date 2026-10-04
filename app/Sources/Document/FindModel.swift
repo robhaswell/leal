@@ -220,6 +220,29 @@ final class FindModel: GridHighlighter {
         onChange?()
     }
 
+    /// Rows or a column were inserted or deleted (task 2.5a; an undo or
+    /// redo of one), and the window has put the selection where they
+    /// were. A column's change searches again from the start, as it can
+    /// change every row's matches (ADR-0014 decision 2), without moving
+    /// the selection. Rows' don't restart it: the core's search catches up
+    /// with them, keyed by row id, as with a cell edit; every highlight is
+    /// read again, as every row after the change moved.
+    func structureChanged(_ change: StructureChange) {
+        guard let search else { return }
+        current = nil
+        if change.isColumn {
+            pendingStep = nil
+            searchAgain()
+            return
+        }
+        tiles.removeAll()
+        if let latest = model.call({ _ in try search.progress() }) { progress = latest }
+        if let cell = activeCell { noteCurrent(cell) }
+        if progress?.catchingUp == true { watchCatchUp(search) }
+        retryPendingStep()
+        onChange?()
+    }
+
     /// The current match, if `cell` is one, with its number.
     private func noteCurrent(_ cell: CellPosition) {
         guard let search else { return }

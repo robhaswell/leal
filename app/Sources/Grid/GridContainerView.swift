@@ -113,6 +113,12 @@ final class GridContainerView: NSView {
         get { gridView.onTypeToEdit }
         set { gridView.onTypeToEdit = newValue }
     }
+    /// ⌘↩ (`true`) or ⌘⌫ reached the grid: its menu item is off (task
+    /// 2.5a).
+    var onRowCommandKey: ((_ insert: Bool) -> Void)? {
+        get { gridView.onRowCommandKey }
+        set { gridView.onRowCommandKey = newValue }
+    }
     /// The grid scrolled.
     var onScroll: (() -> Void)?
 

@@ -37,10 +37,10 @@ enum DocumentChange: Equatable, Sendable {
     /// Only the column widths changed: an edited value is wider than its
     /// column (task 2.5.1).
     case widths
-    /// Rows or a column were inserted or deleted (an undo or a redo of
-    /// one, task 2.5.2): every row after the change moved, and the column
-    /// count and widths may be different.
-    case structure
+    /// Rows or a column were inserted or deleted (task 2.5a, or an undo or
+    /// a redo of one, task 2.5.2): every row after the change moved, and
+    /// the column count and widths may be different.
+    case structure(StructureChange)
     /// A save rebased the document onto the file it wrote (task 2.5.3b):
     /// a new reading of the same values. Every cell is drawn again (the
     /// edited-cell marks of saved edits go), and the selection, scroll
@@ -1016,20 +1016,22 @@ final class DocumentModel: GridDataSource {
         }
     }
 
-    /// Rows or a column were inserted or deleted (task 2.5.2: an undo or a
-    /// redo of one; inserting and deleting them is task 2.5a). Every row
-    /// after the change moved, so every tile and row flag is read again;
-    /// the row count comes from the core. A column moves the widths after
-    /// it, and the titles, column count and sample are read again.
+    /// Rows or a column were inserted or deleted (task 2.5a), or such a
+    /// command was undone or redone (task 2.5.2). Every row after the
+    /// change moved, so every tile and row flag is read again; the row
+    /// count comes from the core. A column moves the widths after it, and
+    /// the titles, column count and sample are read again. The window
+    /// hears where the change was (`StructureChange`).
     func structureChanged(by structural: StructuralEdit, direction: CommandDirection) {
         guard failure == nil else { return }
+        // An undo inserts what a delete took, and the reverse.
+        let inserted = structural.inserts() == (direction != .undo)
         flagBlocks.removeAll()
         tiles.removeAll()
         if let current = call({ try $0.progress() }) { progress = current }
         if let count = call({ try $0.columnCount() }) { fileColumnCount = Int(count) }
-        if structural.isColumn(), let at = structural.column().map(Int.init) {
-            // An undo inserts what a delete took, and the reverse.
-            let inserted = structural.inserts() == (direction != .undo)
+        let column = structural.column().map(Int.init)
+        if structural.isColumn(), let at = column {
             moveColumns(at: at, inserted: inserted)
             // The sample's widest row is measured again, if at all.
             widestSampleRow = 0
@@ -1039,7 +1041,11 @@ final class DocumentModel: GridDataSource {
             updateColumnCount()
             if refinedSizingStarted { measureAgainAfterEdit() }
         }
-        onChange?(.structure)
+        onChange?(.structure(StructureChange(
+            column: structural.isColumn() ? column ?? 0 : nil,
+            row: Int(clamping: structural.firstRow()) - headerOffset,
+            inserted: inserted
+        )))
     }
 
     /// A column was inserted at `at`, or deleted there: the widths and

@@ -17,7 +17,7 @@ import os
 @MainActor
 final class DocumentViewController: NSViewController, NSMenuItemValidation {
     let model: DocumentModel
-    private let scheduler: Scheduler
+    let scheduler: Scheduler
     let grid = GridContainerView()
     let statusBar = StatusBarView()
     /// The banners, top to bottom.
@@ -196,6 +196,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
         grid.onEdit = { [weak self] in self?.editActiveCell() }
         grid.onTypeToEdit = { [weak self] event in self?.editActiveCell(typing: event) }
+        grid.onRowCommandKey = { [weak self] insert in self?.rowCommandKey(insert: insert) }
         grid.onScroll = { [weak self] in self?.cellEditor.gridScrolled() }
         grid.headerView.menuForColumn = { [weak self] column in self?.headerMenu(column: column) }
         inspector.textView.delegate = self
@@ -344,20 +345,18 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             inspector.textView.isEditable = false
             find.stop()
             onFailure?()
-        case .structure:
-            // Rows or a column inserted or deleted (an undo or a redo of
-            // one): every row after it moved.
+        case let .structure(structure):
+            // Rows or a column inserted or deleted (task 2.5a, or an undo
+            // or a redo of one): every row after it moved. The selection
+            // goes where the change was; Find restarts after a column's,
+            // and catches up after rows' (ADR-0014 decision 2).
             grid.setColumnWidths(model.columnWidths)
             grid.invalidateContent()
             grid.reloadData()
             grid.headerView.invalidateContent()
-            if let cell = grid.activeCell, cell.row >= model.rowCount || cell.column >= model.columnCount {
-                grid.activeCell = model.rowCount > 0 && model.columnCount > 0
-                    ? CellPosition(row: min(cell.row, model.rowCount - 1), column: min(cell.column, model.columnCount - 1))
-                    : nil
-            }
+            selectChange(structure)
             cellEditor.relayout()
-            if isFindBarShown { find.restart(from: grid.activeCell) }
+            if isFindBarShown { find.structureChanged(structure) }
             updateInspector()
         case let .cells(rows):
             // A long value being read for an editor, of a row whose
@@ -866,7 +865,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // under way.
             return !model.isFailed && !model.isReloading && reloading == nil && savingAsUTF8 == nil && !isSaving
                 && model.original.state != .deleted && model.original.state != .unavailable
-        default:
+        case let action:
+            if let command = Self.command(for: action) { return validateStructureItem(menuItem, command) }
             return true
         }
     }
@@ -978,7 +978,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// The search whose end was last announced.
     private var announcedSearch: ObjectIdentifier?
 
-    private func announce(_ text: String) {
+    func announce(_ text: String) {
         lastAnnouncement = text
         NSAccessibility.post(
             element: view.window ?? findBar,

@@ -73,6 +73,10 @@ final class GridView: StripContentView, NSMenuItemValidation {
     /// text (DESIGN §4.2, "start typing"). The event goes on to the editor,
     /// so input methods compose from it.
     var onTypeToEdit: ((NSEvent) -> Void)?
+    /// ⌘↩ or ⌘⌫ reached the grid (task 2.5a): Edit > Insert Row Below or
+    /// Delete Row is off, or it would have taken the key first. `true` for
+    /// ⌘↩.
+    var onRowCommandKey: ((_ insert: Bool) -> Void)?
 
     let lines = TextLineCache(capacity: 2_500)
     /// Lays out the text of rows about to scroll into view (task 2.0a).
@@ -428,7 +432,25 @@ final class GridView: StripContentView, NSMenuItemValidation {
             onTypeToEdit(event)
             return
         }
+        if let insert = Self.rowCommandKey(event) {
+            // Not Return's edit, nor a beep with no reason given.
+            onRowCommandKey?(insert)
+            return
+        }
         interpretKeyEvents([event])
+    }
+
+    /// Whether `event` is ⌘↩ (`true`: Return or Enter) or ⌘⌫ (`false`),
+    /// with no other modifier: Insert Row Below and Delete Row's keys
+    /// (DESIGN §4.2). `nil` for any other key.
+    static func rowCommandKey(_ event: NSEvent) -> Bool? {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
+        guard event.type == .keyDown, modifiers == .command else { return nil }
+        switch event.keyCode {
+        case 36, 76: return true
+        case 51: return false
+        default: return nil
+        }
     }
 
     /// Whether `event` types text, rather than being a command: it gives

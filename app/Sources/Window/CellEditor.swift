@@ -93,6 +93,19 @@ class LiteralTextView: NSTextView {
         get { super.enabledTextCheckingTypes & ~Self.changingChecks }
         set { super.enabledTextCheckingTypes = newValue & ~Self.changingChecks }
     }
+
+    /// ⌘⌫ is the text's while either editor has the focus: it deletes to
+    /// the start of the line, as in any text field, and never reaches Edit
+    /// > Delete Row (task 2.5a), which would take it first. ⌘↩ goes on: in
+    /// the in-cell editor it commits the edit, then inserts a row below
+    /// (the inspector's commits only: `InspectorTextView`).
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if window?.firstResponder === self, GridView.rowCommandKey(event) == false {
+            interpretKeyEvents([event])
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 /// The in-cell editor (task 2.5.1, ADR-0001): an ordinary `NSTextField`

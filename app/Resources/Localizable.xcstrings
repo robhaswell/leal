@@ -232,6 +232,12 @@
     "A quote at %@ is never closed, so the rest of the file is one cell" : {
       "comment" : "Details popover: the unterminated quote; where its opening quote is, such as row 12"
     },
+    "A quote in the last row is never closed, so a column inserted after it would be part of its text." : {
+      "comment" : "Tooltip: Insert Column is off after an unterminated quote (ADR-0004 decision 8)"
+    },
+    "A quote in the last row is never closed, so a row inserted after it would be part of its text." : {
+      "comment" : "Tooltip: Insert Row is off after an unterminated quote (ADR-0004 decision 8)"
+    },
     "A row it changes can’t be read: its drive or share isn’t available." : {
       "comment" : "Why an undo or redo can't happen yet: a row's drive or share went away"
     },
@@ -317,13 +323,16 @@
       "comment" : "Edit menu"
     },
     "Delete Column" : {
-      "comment" : "Undo menu: Undo Delete Column"
+      "comment" : "Edit menu, and the Undo menu's Undo Delete Column"
+    },
+    "Delete Columns" : {
+      "comment" : "Edit menu with several columns selected, and the Undo menu's Undo Delete Columns"
     },
     "Delete Row" : {
-      "comment" : "Undo menu: Undo Delete Row"
+      "comment" : "Edit menu (⌘⌫), and the Undo menu's Undo Delete Row"
     },
     "Delete Rows" : {
-      "comment" : "Undo menu: Undo Delete Rows"
+      "comment" : "Edit menu with several rows selected (⌘⌫), and the Undo menu's Undo Delete Rows"
     },
     "Deleted" : {
       "comment" : "Status bar: the open file was deleted or moved to the Trash (task 1.9)"
@@ -493,8 +502,20 @@
     "Insert Column" : {
       "comment" : "Undo menu: Undo Insert Column"
     },
+    "Insert Column After" : {
+      "comment" : "Edit menu: insert an empty column after the selected cell's column (task 2.5a)"
+    },
+    "Insert Column Before" : {
+      "comment" : "Edit menu: insert an empty column before the selected cell's column (task 2.5a)"
+    },
     "Insert Row" : {
       "comment" : "Undo menu: Undo Insert Row"
+    },
+    "Insert Row Above" : {
+      "comment" : "Edit menu: insert an empty row above the selected cell's row (task 2.5a)"
+    },
+    "Insert Row Below" : {
+      "comment" : "Edit menu: insert an empty row below the selected cell's row (⌘↩, task 2.5a)"
     },
     "Insert Rows" : {
       "comment" : "Undo menu: Undo Insert Rows"
@@ -856,6 +877,9 @@
     },
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
+    },
+    "Rows and columns can be inserted and deleted once Leal has read the whole file." : {
+      "comment" : "Tooltip: Insert and Delete Row and Column are off until the file is read (ADR-0014 decision 1)"
     },
     "Save" : {
       "comment" : "File menu: save the document (⌘S)"

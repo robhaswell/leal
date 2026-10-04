@@ -249,15 +249,13 @@ final class EditHistory {
             case (true, true):
                 return String(localized: "Insert Column", comment: "Undo menu: Undo Insert Column")
             case (true, false):
-                return String(localized: "Delete Column", comment: "Undo menu: Undo Delete Column")
+                return StructureText.deleteColumn
             case (false, true):
                 return rows == 1
                     ? String(localized: "Insert Row", comment: "Undo menu: Undo Insert Row")
                     : String(localized: "Insert Rows", comment: "Undo menu: Undo Insert Rows")
             case (false, false):
-                return rows == 1
-                    ? String(localized: "Delete Row", comment: "Undo menu: Undo Delete Row")
-                    : String(localized: "Delete Rows", comment: "Undo menu: Undo Delete Rows")
+                return rows == 1 ? StructureText.deleteRow : StructureText.deleteRows
             }
         }
         if command.changes.count == 1 {

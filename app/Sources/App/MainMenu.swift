@@ -179,7 +179,29 @@ enum MainMenu {
             action: #selector(DocumentViewController.goToRow(_:)),
             keyEquivalent: "l"
         )
+        for item in structureItems() { menu.addItem(item) }
         return menu
+    }
+
+    /// Insert and delete rows and columns (task 2.5a, DESIGN §4.2: ⌘↩ and
+    /// ⌘⌫), after a separator, rows then columns. The document's view
+    /// controller validates them, with the reason one is off as its
+    /// tooltip.
+    static func structureItems() -> [NSMenuItem] {
+        func item(_ title: String, _ command: StructureCommand, _ key: String = "") -> NSMenuItem {
+            NSMenuItem(title: title, action: DocumentViewController.action(command), keyEquivalent: key)
+        }
+        return [
+            .separator(),
+            item(StructureText.insertRowAbove, .insertRowAbove),
+            // Return, and Delete (backspace), with ⌘.
+            item(StructureText.insertRowBelow, .insertRowBelow, "\r"),
+            item(StructureText.deleteRow, .deleteRows, "\u{8}"),
+            .separator(),
+            item(StructureText.insertColumnBefore, .insertColumnBefore),
+            item(StructureText.insertColumnAfter, .insertColumnAfter),
+            item(StructureText.deleteColumn, .deleteColumns),
+        ]
     }
 
     private static func viewMenu() -> NSMenu {
