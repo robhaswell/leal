@@ -766,7 +766,13 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (`stat`, then `statfs`), so a folder replaced in between is possible;
     a test that `read(from:)`'s main-thread branch is never reached
     through Revert to Saved; a test for cancelling (⌘.) a Save As
-    queued behind a Save.
+    queued behind a Save; Save As onto a hard link of the open file
+    is taken for the open file, since it is matched by `st_dev` and
+    `st_ino` (documented, `is_open_file` in
+    `crates/leal-core/src/document/saving.rs`), which may surprise;
+    an edit made during AppKit's `revert(toContentsOf:ofType:)` stops
+    the revert (`EditedDuringReload`) but is only logged as "Revert
+    failed", with nothing said to the user.
   - [ ] From 2.7's review: trim the fuzz corpus now and then (`cargo fuzz
     cmin`); `detect`'s target checks only the encoding against the oracle;
     seed `index`/`detect`/`rows` without the corpus's sidecar files; oracle
