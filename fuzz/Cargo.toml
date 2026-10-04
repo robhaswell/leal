@@ -1,0 +1,67 @@
+[package]
+name = "leal-fuzz"
+description = "cargo-fuzz targets for Leal's core (PLAN 2.7, DESIGN §5 test layer 4)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, so it stays out of the main one: `just check` and the
+# release build never compile it, and it has its own lock file.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# The fuzzing engine and its `fuzz_target!` macro.
+libfuzzer-sys = "0.4"
+# The edit scripts, built from the fuzzer's bytes.
+arbitrary = { version = "1", features = ["derive"] }
+# `test-hooks` for `Document::save_to_writer`, the save to memory. This
+# crate is never part of a release build.
+leal-core = { path = "../crates/leal-core", features = ["test-hooks"] }
+# The oracle: the save model and the encoding rules, and (through
+# `src/lib.rs`) its reference parser.
+leal-testkit = { path = "../crates/leal-testkit" }
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect"
+path = "fuzz_targets/detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rows"
+path = "fuzz_targets/rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "serialize"
+path = "fuzz_targets/serialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encodings"
+path = "fuzz_targets/encodings.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz builds in release with debug assertions on; keep line tables
+# so crash stack traces name the code.
+[profile.release]
+debug = 1

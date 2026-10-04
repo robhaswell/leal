@@ -34,12 +34,18 @@ use leal_testkit::strategies::csv::{ModelField, ModelRow};
 
 /// Parses `bytes` per the rules above.
 pub fn parse(bytes: &[u8], delimiter: Delimiter) -> Layout {
-    let d = delimiter.byte();
     let bom_len = if bytes.starts_with(UTF8_BOM) {
         UTF8_BOM.len()
     } else {
         0
     };
+    parse_after(bytes, delimiter, bom_len)
+}
+
+/// Parses `bytes` per the rules above, from offset `bom_len`, which is
+/// the length of the BOM that rule 1 skips, or 0 for none.
+fn parse_after(bytes: &[u8], delimiter: Delimiter, bom_len: usize) -> Layout {
+    let d = delimiter.byte();
     let mut rows = Vec::new();
     let mut pos = bom_len;
     if pos == bytes.len() {
@@ -228,7 +234,10 @@ pub fn analyze(bytes: &[u8], delimiter: Delimiter, encoding: Encoding) -> Analys
             let decoded = decode_utf16(bytes, bom_len, encoding == Encoding::Utf16Le);
             let map = decoded.map;
             let parsed = decoded.text.into_bytes();
-            let parsed_layout = parse(&parsed, delimiter);
+            // The transcoding has no BOM: a U+FEFF at its start was
+            // after the file's BOM, so it is text, not another BOM (found
+            // by fuzzing, task 2.7).
+            let parsed_layout = parse_after(&parsed, delimiter, 0);
             let at = |o: usize| map[o];
             let layout = Layout {
                 bom_len,

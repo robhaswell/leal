@@ -507,6 +507,20 @@ fn a_final_odd_utf16_byte_belongs_to_the_last_row() {
     }
 }
 
+/// Only the first U+FEFF is the BOM: one straight after it is text, in a
+/// row of its own (found by fuzzing against the testkit's oracle, task
+/// 2.7, which had it wrong).
+#[test]
+fn a_feff_after_a_utf16_bom_is_text() {
+    for le in [true, false] {
+        // The BOM, then U+FEFF.
+        let bytes = utf16("\u{FEFF}", le);
+        let index = RowIndex::build(&bytes, utf16_dialect(le)).unwrap();
+        assert_eq!(index.row_count(), 1, "little endian: {le}");
+        assert_eq!(index.row(0, &bytes).unwrap().span, 2..4);
+    }
+}
+
 #[test]
 fn utf16_unterminated_quote() {
     for le in [true, false] {

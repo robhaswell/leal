@@ -1,0 +1,6 @@
+# cargo-fuzz's working files: the corpus each run grows, crash and
+# mismatch artefacts, coverage reports and the build.
+/target/
+/corpus/
+/artifacts/
+/coverage/

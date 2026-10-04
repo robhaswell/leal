@@ -39,6 +39,12 @@ check:
     cargo nextest run --workspace --all-features
     cargo test --workspace --doc --exclude leal-ffi
     just doc
+    just fuzz-lint
+
+# Format check and clippy (-D warnings) for the fuzz targets (`fuzz/`, their own workspace), on stable: a few seconds, so a core change that breaks them fails here, not in the nightly fuzz run.
+fuzz-lint:
+    cargo fmt --manifest-path fuzz/Cargo.toml --check
+    cargo clippy --manifest-path fuzz/Cargo.toml --bins --locked -- -D warnings
 
 # Build the API docs, failing on any rustdoc warning (such as a broken intra-doc link).
 doc:
@@ -56,9 +62,37 @@ test:
 test-deep cases="20000" *args:
     PROPTEST_CASES={{cases}} cargo nextest run --workspace --all-features --profile deep {{ args }}
 
+# Run a fuzz target (`fuzz/fuzz_targets/`: index, detect, rows, serialize, encodings) for `seconds`, passing any other arguments to libFuzzer: `just fuzz serialize 600`. Needs `cargo install cargo-fuzz` and nightly Rust (`LEAL_FUZZ_TOOLCHAIN`, default `nightly`). Seeds come from tests/corpus and fuzz/seeds/<target>; new inputs go to fuzz/corpus/<target> and crashes to fuzz/artifacts/<target>.
+fuzz target seconds="300" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd fuzz
+    corpus="corpus/{{ target }}"
+    mkdir -p "$corpus"
+    # The seeds are tests/corpus itself (byte-exact by its .gitattributes),
+    # so they never fall out of step with it. The edit targets also get
+    # each corpus file with an edit script after it (src/harness.rs): a
+    # few bytes that hash its name, so the same seeds every run.
+    seeds=(../tests/corpus)
+    case "{{ target }}" in serialize|encodings)
+        scripted="corpus/{{ target }}.seeds"
+        rm -rf "$scripted"
+        mkdir -p "$scripted"
+        while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            { cat "$file"; printf '\0EDITS\0'; printf '%s' "$name" | shasum -a 512 | xxd -r -p; } \
+                > "$scripted/$name"
+        done < <(find ../tests/corpus -type f ! -name '*.toml' ! -name '*.md' ! -name '*.py' -print0)
+        seeds+=("$scripted")
+    esac
+    # `-timeout`: one input taking 60 s is a hang, reported as a crash.
+    cargo "+${LEAL_FUZZ_TOOLCHAIN:-nightly}" fuzz run "{{ target }}" "$corpus" "${seeds[@]}" -- \
+        -max_total_time={{ seconds }} -timeout=60 -dict=leal.dict -print_final_stats=1 {{ args }}
+
 # Format all code in place.
 fmt:
     cargo fmt --all
+    cargo fmt --manifest-path fuzz/Cargo.toml
 
 # Run clippy on all crates and targets, with warnings as errors.
 lint:

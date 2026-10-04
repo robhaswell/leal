@@ -312,3 +312,24 @@ fn byte_strategy_reaches_every_special_byte() {
     }
     assert!(inputs.iter().any(Vec::is_empty), "empty input");
 }
+
+/// A U+FEFF straight after a UTF-16 BOM is text: the file's one row holds
+/// it. The oracle used to parse its UTF-8 transcoding as a file with a
+/// UTF-8 BOM, and found no rows (found by fuzzing, task 2.7).
+#[test]
+fn the_oracle_reads_a_second_utf16_bom_as_text() {
+    for (bytes, encoding) in [
+        (&[0xFE, 0xFF, 0xFE, 0xFF][..], Encoding::Utf16Be),
+        (&[0xFF, 0xFE, 0xFF, 0xFE, b',', 0][..], Encoding::Utf16Le),
+    ] {
+        let analysis = oracle::analyze(bytes, Delimiter::Comma, encoding);
+        assert_eq!(analysis.layout.bom_len, 2, "{encoding:?}");
+        assert_eq!(analysis.layout.rows.len(), 1, "{encoding:?}");
+        assert_eq!(analysis.layout.rows[0].span, 2..bytes.len(), "{encoding:?}");
+        assert_eq!(
+            analysis.display_value(0, 0).as_deref(),
+            Some("\u{FEFF}"),
+            "{encoding:?}"
+        );
+    }
+}
