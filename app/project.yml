@@ -204,6 +204,8 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Leal.app/Contents/MacOS/Leal
         BUNDLE_LOADER: $(TEST_HOST)
+        # The net under the tests that stub questions (NoRealUI).
+        INFOPLIST_KEY_NSPrincipalClass: LealAppTestsPrincipal
 
 schemes:
   Leal:

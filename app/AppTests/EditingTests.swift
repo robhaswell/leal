@@ -820,14 +820,14 @@ final class EditingTests: XCTestCase {
 
     /// Opens a file with an edit still being typed in the in-cell editor:
     /// "Bob" over the name in the first row.
-    private func typingEdit(_ name: String) async throws -> (DocumentModel, DocumentViewController, Heard) {
-        let (_, model, content) = try await open(try file(name, "id,name\n1,Ada\n2,Bo\n"))
+    private func typingEdit(_ name: String) async throws -> (CSVDocument, DocumentModel, DocumentViewController, Heard) {
+        let (document, model, content) = try await open(try file(name, "id,name\n1,Ada\n2,Bo\n"))
         let heard = listen(to: model)
         try await returnKey(on: CellPosition(row: 0, column: 1), content)
         try type("Bob", in: content)
         XCTAssertTrue(content.cellEditor.isEditing)
         XCTAssertEqual(heard.directions, [], "nothing is committed yet")
-        return (model, content, heard)
+        return (document, model, content, heard)
     }
 
     private func assertCommitted(_ model: DocumentModel, _ content: DocumentViewController, _ heard: Heard, line: UInt = #line) {
@@ -838,27 +838,41 @@ final class EditingTests: XCTestCase {
     /// Each command that reads the file again or moves the search commits
     /// an open edit first (`commitEditing`), as it would be lost with the
     /// editor otherwise. Each assertion fails if the call is removed.
+    ///
+    /// The commit makes the edit an unsaved one, so Reload asks before it
+    /// throws it away: the test answers that question (Reload, the first
+    /// button) itself, as no sheet is ever shown to a person.
     func testReloadCommitsAnOpenEdit() async throws {
-        let (model, content, heard) = try await typingEdit("reload.csv")
+        let (document, model, content, heard) = try await typingEdit("reload.csv")
+        var asked: [NSAlert] = []
+        document.showSheet = { alert, _, done in
+            asked.append(alert)
+            done(.alertFirstButtonReturn)
+        }
         content.reloadFromDisk(nil)
         assertCommitted(model, content, heard)
+        XCTAssertEqual(asked.count, 1, "Reload asks before it discards the committed edit")
+        XCTAssertEqual(asked.first?.messageText, HistoryText.discardForReload("reload.csv"))
+        XCTAssertEqual(asked.first?.buttons.map(\.title), [HistoryText.reload, HistoryText.cancel])
+        XCTAssertNotNil(content.reloading, "answered Reload, it reads the file again")
         await content.reloading?.value
+        XCTAssertEqual(value(model, 0, 1), utf8("Ada"), "the edit was discarded by the reload")
     }
 
     func testTreatAsCommitsAnOpenEdit() async throws {
-        let (model, content, heard) = try await typingEdit("treat.csv")
+        let (_, model, content, heard) = try await typingEdit("treat.csv")
         content.treatAs(.semicolon)
         assertCommitted(model, content, heard)
     }
 
     func testReopenWithEncodingCommitsAnOpenEdit() async throws {
-        let (model, content, heard) = try await typingEdit("reopen.csv")
+        let (_, model, content, heard) = try await typingEdit("reopen.csv")
         content.reopen(encoding: .windows1252)
         assertCommitted(model, content, heard)
     }
 
     func testTheHeaderToggleCommitsAnOpenEdit() async throws {
-        let (model, content, heard) = try await typingEdit("toggle.csv")
+        let (_, model, content, heard) = try await typingEdit("toggle.csv")
         let header = model.interpretation.header
         content.toggleHeaderRow(nil)
         assertCommitted(model, content, heard)
@@ -866,7 +880,7 @@ final class EditingTests: XCTestCase {
     }
 
     func testFindNextCommitsAnOpenEdit() async throws {
-        let (model, content, heard) = try await typingEdit("next.csv")
+        let (_, model, content, heard) = try await typingEdit("next.csv")
         content.showFindBar()
         content.findBar.field.stringValue = "Bob"
         content.findNext(nil)
@@ -879,7 +893,7 @@ final class EditingTests: XCTestCase {
     /// asked doesn't go on; when the focus leaves the editor, it comes
     /// back to it, rather than sit open without it (the nit).
     func testARefusedCommitKeepsTheTypedText() async throws {
-        let (model, content, heard) = try await typingEdit("refused.csv")
+        let (_, model, content, heard) = try await typingEdit("refused.csv")
         let delimiter = model.interpretation.delimiter
         model.refusalForTesting = .valueChanged
         XCTAssertFalse(content.commitEditing())
