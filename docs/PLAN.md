@@ -791,6 +791,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     not 3. libFuzzer's limit is 2,048 MB; a 600 s nightly (about 60,000
     runs) should be under it, but check the first real nightlies'
     `peak_rss_mb`.
+  - [ ] From 2.5a's review: with the inspector focused but not editing,
+    ⌘⌫ beeps while Edit > Delete Row shows enabled; a header-only file
+    leaves Insert Column off with no reason given; with the find bar
+    focused the row and column items are off with no tooltip; VoiceOver
+    announces nothing after a successful insert or delete.
 - [x] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
