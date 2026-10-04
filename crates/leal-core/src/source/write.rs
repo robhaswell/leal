@@ -128,6 +128,16 @@ impl Existing {
     pub fn changed(&self) -> (i64, i64) {
         (self.metadata.ctime(), self.metadata.ctime_nsec())
     }
+
+    /// Sets its extended attribute `name` to `value` (`fsetxattr`): on the
+    /// file opened, whatever is at its path by now.
+    ///
+    /// # Errors
+    ///
+    /// If the system refuses: no permission, or not supported there.
+    pub fn set_attribute(&self, name: &CStr, value: &[u8]) -> io::Result<()> {
+        sys::set_xattr(&self.file, name, value)
+    }
 }
 
 /// The file at `path`, opened afresh and looked at with `fstat`

@@ -66,6 +66,7 @@
 
 mod columns;
 mod editing;
+mod remember;
 mod saving;
 mod search;
 mod structural;
@@ -446,6 +447,10 @@ struct Reading {
     /// 2.4c), so column operations needn't wait for the marks of its index
     /// pass. `None` for a file opened or read again.
     counts: Option<RowMarks>,
+    /// A save made this reading, of the file it wrote (task 2.5.3b): its
+    /// review may add the interpretation attribute
+    /// ([`Document::remember_reviewed_interpretation`]).
+    saved: bool,
 }
 
 /// First paint's result (P0), before any job starts.
@@ -2097,6 +2102,7 @@ fn start_jobs(
         cache_dropped: AtomicBool::new(false),
         edits,
         counts: None,
+        saved: false,
     }
 }
 

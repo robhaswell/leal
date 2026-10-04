@@ -25,14 +25,14 @@
 //! extended attributes to the new one, and an old fingerprint or a stale
 //! encoding must not survive (ADR-0008 decision 8).
 //!
-//! **Not yet:** ADR-0008 decision 8 also writes the interpretation
+//! **Not here:** ADR-0008 decision 8 also writes the interpretation
 //! attribute when a reopen's *whole-file review* would suggest another
 //! delimiter. In a file of up to 64 KB first paint sees the whole file, so
 //! that is covered. In a larger one it needs the review of the new file,
 //! about half a second per 100 MB, which doesn't fit DESIGN §1's 500 ms for
-//! a save. SEAM(2.5): the rebased reading's own review job runs that review
-//! anyway; when it suggests another delimiter, task 2.5 writes the
-//! attribute then (see `docs/tasks/2.2.md`).
+//! a save. The reading the save makes runs that very review anyway: when
+//! it suggests another delimiter, the app has the core write the attribute
+//! then (`Document::remember_reviewed_interpretation`, task 2.5.3b).
 
 use crate::attributes::{Fingerprint, Interpretation, text_encoding_value};
 use crate::detect::{

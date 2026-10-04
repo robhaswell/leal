@@ -946,6 +946,7 @@ impl Document {
         // Every row's field count, so column operations needn't wait for
         // the index pass's marks.
         reading.counts = counts.filter(|_| !converts);
+        reading.saved = true;
         if converts {
             // So every row reads (and the edits made during the save carry
             // over) once it is current. One pass, with no lock held; the

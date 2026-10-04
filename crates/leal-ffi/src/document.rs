@@ -1267,6 +1267,30 @@ impl Document {
         self.call(|| Ok(self.document.can_save()))
     }
 
+    /// After a save, once the review of the reading it made has finished:
+    /// records the delimiter and header choice in the saved file's
+    /// interpretation attribute if that review suggests another delimiter
+    /// (ADR-0008 decision 8; task 2.5.3b). Returns whether it wrote it:
+    /// nothing for a reading that isn't a save's, or a file changed since.
+    /// It looks at the file: call it off the main thread. See
+    /// `leal_core::document::Document::remember_reviewed_interpretation`.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::Io`] if the file can't be looked at or the system
+    /// refuses the attribute; [`LealError::DocumentFailed`].
+    pub fn remember_reviewed_interpretation(&self) -> Result<bool, LealError> {
+        self.call(|| {
+            self.document
+                .remember_reviewed_interpretation()
+                .map_err(|error| LealError::Io {
+                    path: self.path.clone(),
+                    code: error.raw_os_error(),
+                    message: format!("recording the interpretation attribute: {error}"),
+                })
+        })
+    }
+
     /// Whether the file changed on its drive while Leal was reading it, so
     /// the rows shown may mix two versions (the 1.1a "changed while
     /// loading" state).

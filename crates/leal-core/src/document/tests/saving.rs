@@ -748,6 +748,78 @@ fn a_save_records_what_a_reopen_would_guess_differently() {
     assert!(detection.notes.is_empty());
 }
 
+/// ADR-0008 decision 8's whole-file part (task 2.5.3b): a file whose
+/// first 64 KB read comma-separated but whose whole-file review suggests
+/// semicolons. The save can't tell, so it records nothing; the review of
+/// the reading the save made can, and the attribute is written then, with
+/// the saved bytes' fingerprint. A reopen reads it as the document did,
+/// with no suggestion. Nothing is written for a reading that isn't a
+/// save's, nor once the file has changed elsewhere.
+#[test]
+fn the_saved_readings_review_adds_the_interpretation_attribute() {
+    let dir = Dir::new("save-review-attribute");
+    let scheduler = scheduler();
+    let mut text = String::from("name,\n");
+    while text.len() < FIRST_PAINT_BYTES + 10 {
+        text.push_str("x\n");
+    }
+    for i in 0..100_000 {
+        text.push_str(&format!("{i};a;b\n"));
+    }
+    let path = dir.file("later.csv", text.as_bytes());
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().delimiter, Delimiter::Comma);
+    let opened_review = *document.review_job().wait().unwrap();
+    assert_eq!(
+        opened_review.delimiter_suggestion,
+        Some(Delimiter::Semicolon)
+    );
+    // Not a save's reading: nothing is written.
+    assert!(!document.remember_reviewed_interpretation().unwrap());
+    assert_eq!(attribute(&path, INTERPRETATION_ATTRIBUTE_C), None);
+
+    set(&document, 1, 0, "y");
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        saved.attributes.interpretation, None,
+        "first paint guesses the same"
+    );
+    let review = *document.review_job().wait().unwrap();
+    assert_eq!(review.delimiter_suggestion, Some(Delimiter::Semicolon));
+    assert!(document.remember_reviewed_interpretation().unwrap());
+    let out = std::fs::read(&path).unwrap();
+    let expected = Interpretation {
+        delimiter: Some(Delimiter::Comma),
+        header: Some(document.detection().header),
+        file: Some(Fingerprint::of(&out)),
+        encoding: None,
+    };
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        Some(expected.to_attribute_value().into_bytes())
+    );
+    // The attribute isn't a change elsewhere: the next save asks nothing.
+    assert!(!document.check_original().diverged);
+    let reopened = open_at(&path, &dir, &scheduler);
+    assert_eq!(reopened.detection().delimiter, Delimiter::Comma);
+    let review = *reopened.review_job().wait().unwrap();
+    assert_eq!(
+        review.delimiter_suggestion, None,
+        "no whole-file suggestion"
+    );
+    drop(reopened);
+
+    // Saved again, then changed elsewhere before the review is asked: the
+    // other app's file is left alone.
+    set(&document, 2, 0, "z");
+    save(&document, &path, SaveKind::Save).unwrap();
+    document.review_job().wait().unwrap();
+    std::fs::write(&path, b"other,app\n").unwrap();
+    let _ = document.check_original();
+    assert!(!document.remember_reviewed_interpretation().unwrap());
+    assert_eq!(attribute(&path, INTERPRETATION_ATTRIBUTE_C), None);
+}
+
 /// ADR-0013 decision 2: a file opened as Windows-1253 with a byte 1253
 /// leaves unassigned, edited in Greek and saved, reopens as 1253 showing the
 /// Greek. Its `com.apple.TextEncoding` alone would be ignored (ADR-0004
