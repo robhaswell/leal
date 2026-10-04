@@ -86,7 +86,11 @@ fuzz target seconds="300" *args:
         seeds+=("$scripted")
     esac
     # `-timeout`: one input taking 60 s is a hang, reported as a crash.
-    cargo "+${LEAL_FUZZ_TOOLCHAIN:-nightly}" fuzz run "{{ target }}" "$corpus" "${seeds[@]}" -- \
+    # Build for the machine's own architecture: cargo-fuzz otherwise uses
+    # its own build's, which on an Apple silicon CI runner can be x86_64.
+    toolchain="${LEAL_FUZZ_TOOLCHAIN:-nightly}"
+    host="$(rustc "+$toolchain" -vV | sed -n 's/^host: //p')"
+    cargo "+$toolchain" fuzz run --target "$host" "{{ target }}" "$corpus" "${seeds[@]}" -- \
         -max_total_time={{ seconds }} -timeout=60 -dict=leal.dict -print_final_stats=1 {{ args }}
 
 # Format all code in place.
