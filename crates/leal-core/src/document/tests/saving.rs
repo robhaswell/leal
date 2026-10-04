@@ -1977,6 +1977,19 @@ fn row_edits_wait_for_a_save_and_are_saved() {
                 document.can_change_rows(),
                 Err(crate::edit::EditError::Saving)
             ));
+            // Columns too.
+            assert!(matches!(
+                document.insert_column(1, "x"),
+                Err(crate::edit::EditError::Saving)
+            ));
+            assert!(matches!(
+                document.delete_column(1),
+                Err(crate::edit::EditError::Saving)
+            ));
+            assert!(matches!(
+                document.can_insert_column(1),
+                Err(crate::edit::EditError::Saving)
+            ));
             // Cell edits carry on.
             document.set_cell(3, 1, "during").unwrap();
         }
@@ -2139,13 +2152,74 @@ fn padding_goes_with_its_hatched_cell_until_a_save() {
     let document = open_at(&path, &dir, &scheduler);
     set(&document, 1, 2, "x");
     save(&document, &path, SaveKind::Save).unwrap();
-    // Column operations wait for the saved file's marks (its index pass).
-    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,,x\n");
     document.delete_column(2).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
-    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,\n");
+}
+
+/// Each row's field count in `reading`, as the save that wrote its file
+/// counted them (task 2.4c), and as its index pass's marks have them
+/// (`None` for a blank line).
+fn saved_counts_and_marks(reading: &Reading) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let rows = reading.index.row_count();
+    let mut saved = Vec::new();
+    if let Some(counts) = &reading.counts {
+        counts.for_each_code(0..rows, &mut |_, code| saved.push(code.fields));
+    }
+    let mut marks = Vec::new();
+    if let Some(diagnostics) = reading.diagnostics.get() {
+        diagnostics.for_each_code(0..rows, &mut |_, code| marks.push(code.fields));
+    }
+    (saved, marks)
+}
+
+/// Task 2.4c: right after a save of a column insert or delete, the column
+/// count is the new file's, in the outcome's first screen and the
+/// document, and column operations work at once: the save hands the new
+/// reading every row's field count, which are its index pass's.
+#[test]
+fn a_column_save_counts_its_columns_at_once() {
+    let mut bytes = Vec::new();
+    for row in 0..20_000 {
+        let fields: Vec<String> = (0..12).map(|c| format!("r{row}c{c}")).collect();
+        bytes.extend_from_slice(fields.join(",").as_bytes());
+        bytes.push(b'\n');
+    }
+    // A short row, a long one and a blank line.
+    bytes.extend_from_slice(b"short\n\na,b,c,d,e,f,g,h,i,j,k,l,m,n\n");
+    let dir = Dir::new("save-column-count");
+    let path = dir.file("a.csv", &bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.column_count(), 12);
+    document.insert_column(2, "new").unwrap().unwrap();
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        saved.reread.as_ref().map(|screen| screen.column_count),
+        Some(13)
+    );
+    assert_eq!(document.column_count(), 13);
+    assert!(document.progress().complete);
+    // Without waiting for the saved file's index pass.
+    document.can_delete_column(0).unwrap();
+    document.delete_column(0).unwrap().unwrap();
+    document.delete_column(0).unwrap().unwrap();
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        saved.reread.as_ref().map(|screen| screen.column_count),
+        Some(11)
+    );
+    assert_eq!(document.column_count(), 11);
+    let undo = document.insert_column(11, "end").unwrap().unwrap();
+    document.apply(&undo.inverse()).unwrap();
+    wait_for_index(&document);
+    let (counts, marks) = saved_counts_and_marks(&document.current());
+    assert_eq!(counts.len(), 20_003);
+    assert!(counts == marks, "the save's field counts are the marks'");
+    // The short row lost its only cell and is written `""`.
+    assert_eq!(&counts[20_000..], [Some(1), None, Some(13)]);
+    assert_eq!(document.column_count(), 11);
 }
 
 /// ADR-0014 decision 3: a column command undone after a save works by
@@ -2159,17 +2233,14 @@ fn column_commands_are_undone_by_value_after_a_save() {
     let document = open_at(&path, &dir, &scheduler);
     let deleted = document.delete_column(0).unwrap().unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
-    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"b\nd\n\"\"\n");
     document.apply(&deleted.inverse()).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
-    wait_for_index(&document);
     // The row left `""` is a field now, so it comes back one longer.
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 
     let inserted = document.insert_column(1, "x").unwrap().unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
-    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,x,b\nc,x,d\ne,x,\"\"\n");
     set(&document, 0, 1, "y");
     let refused = document.apply(&inserted.inverse());
@@ -2180,6 +2251,5 @@ fn column_commands_are_undone_by_value_after_a_save() {
     set(&document, 0, 1, "x");
     document.apply(&inserted.inverse()).unwrap();
     save(&document, &path, SaveKind::Save).unwrap();
-    wait_for_index(&document);
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 }

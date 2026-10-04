@@ -460,10 +460,8 @@ pub(super) fn open_quote_row(
         }
         None => {
             columns.is_empty() || {
-                let code = reading
-                    .diagnostics
-                    .get()
-                    .and_then(|d| d.code_of(to_usize(last)));
+                let code = super::columns::Counts::of(reading)
+                    .and_then(|counts| counts.code_of(to_usize(last)));
                 match code.and_then(|code| code.fields) {
                     Some(fields) => {
                         let quote = last_field(fields)?;

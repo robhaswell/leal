@@ -1115,4 +1115,17 @@ fn an_index_from_starts_is_the_scanned_one() {
     assert!(from(vec![0, 0], 4).is_none());
     assert!(from(vec![0, 4], 4).is_none());
     assert!(from(vec![], 0).is_some());
+    // The first row starts just past the BOM, not before it or later.
+    assert!(from(vec![1, 3], 4).is_none());
+    let bom = IndexDialect {
+        bom_len: 3,
+        ..utf8(b',')
+    };
+    let with_bom = |starts: Vec<u32>, len| RowIndex::from_starts(bom, starts, len, None, None);
+    assert!(with_bom(vec![3, 5], 7).is_some());
+    assert!(with_bom(vec![0, 5], 7).is_none());
+    assert!(with_bom(vec![4, 5], 7).is_none());
+    // No rows: only the BOM.
+    assert!(with_bom(vec![], 3).is_some());
+    assert!(with_bom(vec![], 7).is_none());
 }

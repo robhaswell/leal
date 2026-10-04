@@ -26,6 +26,8 @@
 
 use std::ops::Range;
 
+use crate::index::scan::FieldCounts;
+
 /// Bit 7 of a row's code: a field-level warning or the unterminated quote.
 const FLAG: u8 = 0x80;
 
@@ -100,6 +102,70 @@ pub(crate) struct MarksRoom {
     wide: Option<Vec<(u32, u32)>>,
 }
 
+/// The field counts of a file's rows, without flags, and the most common
+/// one, as the index pass would find them (ties to the count seen first):
+/// what a save knows of the file it writes (task 2.4c), from the old
+/// file's marks for the rows it copies and from each row it writes, so
+/// column operations on the new file needn't wait for its index pass.
+#[derive(Debug, Default)]
+pub(crate) struct CountsBuilder {
+    codes: Vec<u8>,
+    wide: Vec<(u32, u32)>,
+    tally: FieldCounts,
+}
+
+impl CountsBuilder {
+    /// Room for `rows` rows.
+    pub(crate) fn with_capacity(rows: usize) -> CountsBuilder {
+        CountsBuilder {
+            codes: Vec::with_capacity(rows),
+            ..CountsBuilder::default()
+        }
+    }
+
+    /// Adds the next row: its field count, or `None` for a blank line.
+    pub(crate) fn push(&mut self, fields: Option<usize>) {
+        let row = self.codes.len();
+        let fields = fields.filter(|&fields| fields > 0);
+        let count = fields.unwrap_or(1);
+        let code = code(count, fields.is_none(), false);
+        if code == WIDE {
+            // Neither can exceed the file's length, which fits in a `u32`.
+            let row = u32::try_from(row).unwrap_or(u32::MAX);
+            let delimiters = u32::try_from(count - 1).unwrap_or(u32::MAX);
+            self.wide.push((row, delimiters));
+        }
+        self.codes.push(code);
+        if fields.is_some() {
+            self.tally.add(count);
+        }
+    }
+
+    /// How many rows it has.
+    pub(crate) fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// The most common field count among the rows so far.
+    pub(crate) fn mode(&self) -> Option<usize> {
+        self.tally.mode()
+    }
+
+    /// The counts, as marks with no flags.
+    pub(crate) fn finish(mut self) -> RowMarks {
+        let mode = self.tally.mode();
+        let mut marks = RowMarks::default();
+        let _ = marks.extend(
+            MarksRoom::default(),
+            &mut self.codes,
+            &mut self.wide,
+            mode,
+            true,
+        );
+        marks
+    }
+}
+
 impl RowMarks {
     /// The copies the lists need to take `codes` more codes and `wide`
     /// more wide rows ([`growth::room`](crate::growth::room)), made by the
@@ -164,6 +230,17 @@ impl RowMarks {
             let wide = self.step_wide(code, &mut w, row);
             each(row, RowCode::read(code, wide));
         }
+    }
+
+    /// Adds rows `rows`' field counts to `counts`, in order. `false` if any
+    /// of them has no code yet.
+    pub(crate) fn copy_counts(&self, rows: Range<usize>, counts: &mut CountsBuilder) -> bool {
+        if rows.end > self.codes.len() {
+            return false;
+        }
+        counts.codes.reserve(rows.len());
+        self.for_each_code(rows, &mut |_, code| counts.push(code.fields));
+        true
     }
 
     /// Up to `max` rows `pick` picks by their codes: from `at` on, in

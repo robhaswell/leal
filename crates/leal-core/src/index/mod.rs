@@ -457,10 +457,12 @@ impl RowIndex {
     /// The complete index of a file a save wrote (task 2.4c), built from
     /// the save's plan rather than by scanning it: `starts` holds each row's
     /// start, in order, and the file is `len` bytes, the last row ending
-    /// there. `field_count_mode` stands in until the file's own index pass
-    /// gives the real one ([`adopt_field_count_mode`]); the unterminated
-    /// quote, if any, is at `unterminated_quote`. `None` if the starts
-    /// aren't strictly increasing and inside the file (a bug in the caller).
+    /// there. `field_count_mode` is the rows' most common field count, as
+    /// the save counted them (the file's own index pass gives it again,
+    /// [`adopt_field_count_mode`]); the unterminated quote, if any, is at
+    /// `unterminated_quote`. `None` if the first row doesn't start just
+    /// past the BOM, or the starts aren't strictly increasing and inside
+    /// the file (a bug in the caller).
     ///
     /// [`adopt_field_count_mode`]: RowIndex::adopt_field_count_mode
     #[must_use]
@@ -473,7 +475,7 @@ impl RowIndex {
     ) -> Option<RowIndex> {
         let end = u32::try_from(len).ok()?;
         let first = starts.first().copied().unwrap_or(end);
-        if to_usize(first) < dialect.bom_len
+        if to_usize(first) != dialect.bom_len
             || starts.windows(2).any(|pair| pair[0] >= pair[1])
             || starts.last().is_some_and(|&last| last >= end)
         {

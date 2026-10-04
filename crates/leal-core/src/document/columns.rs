@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 
 use super::structural::{open_quote_row, whole_file};
 use super::{Document, Reading, RowBytes, RowView};
-use crate::diagnostics::Diagnostics;
+use crate::diagnostics::{CountsBuilder, Diagnostics, RowCode, RowMarks};
 use crate::edit::{
     CellId, Changed, Column, ColumnChange, ColumnOp, ColumnSource, Columns, Command, Edit,
     EditError, Lineage, OpId, OpKind, Overlay, Own as EditOwn, RowEdits, RowId, Segment,
@@ -248,6 +248,53 @@ impl ColumnQuoting {
             start = batch.end;
         }
         Ok(census)
+    }
+}
+
+/// Where a column operation finds each unedited row's field count: the
+/// marks, once every row has them, or right after a save, the counts the
+/// save handed the file's new reading (task 2.4c), which are the same.
+#[derive(Clone, Copy)]
+pub(super) enum Counts<'a> {
+    Marks(&'a Diagnostics),
+    Saved(&'a RowMarks),
+}
+
+impl Counts<'_> {
+    /// `reading`'s, if every row of its file has one.
+    pub(super) fn of(reading: &Reading) -> Option<Counts<'_>> {
+        let rows = reading.index.row_count();
+        if let Some(saved) = reading.counts.as_ref().filter(|saved| saved.len() == rows) {
+            return Some(Counts::Saved(saved));
+        }
+        // The marks are published a moment after the index's rows.
+        let diagnostics = reading.diagnostics.get()?;
+        (diagnostics.marked_rows_and_mode().0 >= rows).then_some(Counts::Marks(diagnostics))
+    }
+
+    /// Hands each of rows `rows`' codes to `each`, in order.
+    fn for_each_code(self, rows: Range<usize>, each: &mut dyn FnMut(usize, RowCode)) {
+        match self {
+            Counts::Marks(diagnostics) => diagnostics.for_each_code(rows, each),
+            Counts::Saved(saved) => saved.for_each_code(rows, each),
+        }
+    }
+
+    /// Adds rows `rows`' field counts to `counts`, in order: a save's rows
+    /// copied as they are (task 2.4c). `false` if any isn't known.
+    pub(super) fn copy_counts(self, rows: Range<usize>, counts: &mut CountsBuilder) -> bool {
+        match self {
+            Counts::Marks(diagnostics) => diagnostics.copy_counts(rows, counts),
+            Counts::Saved(saved) => saved.copy_counts(rows, counts),
+        }
+    }
+
+    /// Row `row`'s code.
+    pub(super) fn code_of(self, row: usize) -> Option<RowCode> {
+        match self {
+            Counts::Marks(diagnostics) => diagnostics.code_of(row),
+            Counts::Saved(saved) => saved.code_of(row),
+        }
     }
 }
 
@@ -484,12 +531,8 @@ fn plan(
 ) -> Result<Plan, EditError> {
     let store = &reading.edits;
     let columns = overlay.columns();
-    let diagnostics = reading.diagnostics.get().ok_or(EditError::StillReading)?;
+    let counts = Counts::of(reading).ok_or(EditError::StillReading)?;
     let physical = reading.index.row_count();
-    if diagnostics.marked_rows_and_mode().0 < physical {
-        // The marks are published a moment after the index's rows.
-        return Err(EditError::StillReading);
-    }
     let op = ColumnOp {
         id: OpId(store.next_op()),
         at,
@@ -509,7 +552,7 @@ fn plan(
     };
     each_row(
         overlay,
-        diagnostics,
+        counts,
         physical,
         &mut |logical, id, shape| match shape {
             Shape::Unedited(own) => walk.unedited(logical, id, own),
@@ -577,11 +620,11 @@ enum Shape<'a> {
 }
 
 /// Hands each logical row of `overlay` to `each`, in order, with its id
-/// and shape: the file's rows with no edits by their field counts in the
-/// marks (`physical` rows, all marked), so no row is read.
+/// and shape: the file's rows with no edits by their field counts
+/// (`physical` rows, all counted), so no row is read.
 fn each_row<'a>(
     overlay: &'a Overlay,
-    diagnostics: &Diagnostics,
+    counts: Counts<'_>,
     physical: usize,
     each: &mut dyn FnMut(usize, RowId, Shape<'a>),
 ) {
@@ -603,7 +646,7 @@ fn each_row<'a>(
                     .collect();
                 let mut next_edited = edited.iter().peekable();
                 let first = logical;
-                diagnostics.for_each_code(rows.clone(), &mut |row, code| {
+                counts.for_each_code(rows.clone(), &mut |row, code| {
                     let here = first + (row - rows.start);
                     if let Some(&(_, edits)) = next_edited.next_if(|(r, _)| *r == row) {
                         each(here, original_id(row), Shape::Edited(edits));
@@ -633,17 +676,14 @@ fn each_row<'a>(
     }
 }
 
-/// The longest row of `overlay` now, in cells, from the marks (`None`
-/// until every row has been marked).
+/// The longest row of `overlay` now, in cells, from the field counts
+/// (`None` until every row has one).
 fn widest(reading: &Reading, overlay: &Overlay) -> Option<usize> {
-    let diagnostics = reading.diagnostics.get()?;
+    let counts = Counts::of(reading)?;
     let physical = reading.index.row_count();
-    if diagnostics.marked_rows_and_mode().0 < physical {
-        return None;
-    }
     let columns = overlay.columns();
     let mut widest = 0;
-    each_row(overlay, diagnostics, physical, &mut |_, id, shape| {
+    each_row(overlay, counts, physical, &mut |_, id, shape| {
         let len = match shape {
             Shape::Unedited(own) => columns.fold_len(own),
             Shape::Edited(edits) => edits.len_in(columns, id.inserted_index()),
@@ -821,11 +861,10 @@ fn check_quote(
         Some((_, _, after)) => after.clone(),
         None => overlay.edits(id).cloned(),
     };
-    let diagnostics = reading.diagnostics.get();
     let fields = match &edits {
         Some(edits) => edits.fields(),
-        None => diagnostics
-            .and_then(|d| d.code_of(to_usize(last)))
+        None => Counts::of(reading)
+            .and_then(|counts| counts.code_of(to_usize(last)))
             .and_then(|code| code.fields)
             .unwrap_or(1),
     };

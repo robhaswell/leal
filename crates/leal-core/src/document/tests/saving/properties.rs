@@ -627,8 +627,21 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
         reading.index.unterminated_quote(),
         built.unterminated_quote()
     );
+    // The column count is the saved file's at once, and so is every row's
+    // field count: column operations needn't wait for the index pass.
+    prop_assert_eq!(reading.index.field_count_mode(), built.field_count_mode());
+    let columns = built.field_count_mode().unwrap_or(0);
+    let screen = job.wait().ok().and_then(|done| done.reread.as_ref());
+    let screen = screen.map(|screen| screen.column_count);
+    prop_assert_eq!(screen, Some(columns));
+    prop_assert_eq!(document.column_count(), columns);
+    prop_assert!(reading.counts.is_some());
+    let can = document.can_delete_column(0);
+    prop_assert!(!matches!(can, Err(EditError::StillReading)), "{:?}", can);
     wait_for_index(&document);
     prop_assert_eq!(reading.index.field_count_mode(), built.field_count_mode());
+    let (counts, marks) = super::saved_counts_and_marks(&reading);
+    prop_assert_eq!(counts, marks);
     drop(reading);
     check_rows(&document, &oracle, &saved)?;
     check_reopen(&document, &path, &oracle, &saved, encoding)?;

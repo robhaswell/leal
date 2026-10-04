@@ -38,11 +38,12 @@
 //!    place: swapped, and the one swapped out checked, where the volume
 //!    can swap; renamed over it where it can't ([`Placed`]);
 //! 7. rebases: makes the new reading with no lock held, its index built
-//!    from the plan (each row's start in the new file, noted as it was
-//!    written, task 2.4c), so every row reads at once and rows can be
-//!    inserted and deleted again at once; the index pass runs again in the
-//!    background only for the diagnostics, the field count mode and the
-//!    review. A file converted to UTF-8
+//!    from the plan (each row's start and field count in the new file,
+//!    noted as it was written, task 2.4c), so every row reads at once, the
+//!    column count is right at once, and rows and columns can be inserted
+//!    and deleted again at once; the index pass runs again in the
+//!    background only for the diagnostics and the review. A file converted
+//!    to UTF-8
 //!    moved every byte, so its new reading waits for that pass instead
 //!    (about 60 ms per 100 MB), before it is current. Then, under the
 //!    writer lock, carries the edits made during the save (after step 2)
@@ -74,6 +75,7 @@ use super::{
     Context, Document, FirstScreen, Reading, Restarted, inserted_row, read_first_paint, start_jobs,
 };
 use crate::detect::{CensusStream, Choices, FIRST_PAINT_BYTES};
+use crate::diagnostics::RowMarks;
 use crate::dialect::{Bom, Encoding};
 use crate::edit::{EditStore, Overlay, RowEdits, RowId};
 use crate::index::{RowIndex, Status};
@@ -310,6 +312,12 @@ struct Streamed {
     /// Each row's start in the new file, for its index (`None` when
     /// converting, or if the file would be too large).
     starts: Option<Vec<u32>>,
+    /// Each row's field count in the new file, for its column operations
+    /// (`None` when converting, or if the old file's weren't all known).
+    counts: Option<RowMarks>,
+    /// The new file's most common field count: from `counts`, or else the
+    /// old one's as the column operations made it.
+    mode: Option<usize>,
     len: u64,
     /// The old file's unterminated quote: where it is in the new one, or
     /// gone if its cell was edited (the quote closed).
@@ -726,7 +734,9 @@ impl Document {
                 .map_err(|error| error.to_string())
                 .and_then(|source| {
                     let starts = streamed.starts.take();
-                    self.rebuilt(&reading, &Arc::new(source), &extent, &streamed, starts)
+                    let counts = streamed.counts.take();
+                    let plan = (starts, counts);
+                    self.rebuilt(&reading, &Arc::new(source), &extent, &streamed, plan)
                 })
                 .and_then(|new| {
                     reached(BEFORE_ADOPT);
@@ -810,17 +820,19 @@ impl Document {
     /// The new reading of the file a save wrote, whose snapshot is
     /// `source`, split into cells the way `old` was, in `old`'s lineage,
     /// with no edits yet. Its rows come from an index built from the save's
-    /// plan (`starts`, task 2.4c), complete at once, so they read at once
-    /// and rows can be inserted and deleted again; its index pass runs
-    /// again for the diagnostics, the field count mode and the review. Or
-    /// why it couldn't be made (the document then keeps reading `old`).
+    /// plan (`starts`, task 2.4c), complete at once, with the field count
+    /// mode of the rows written, so they read at once and rows can be
+    /// inserted and deleted again; with each row's field count (`counts`),
+    /// so can columns. Its index pass runs again for the diagnostics and
+    /// the review. Or why it couldn't be made (the document then keeps
+    /// reading `old`).
     fn rebuilt(
         &self,
         old: &Reading,
         source: &Arc<Source>,
         extent: &Extent<'_>,
         streamed: &Streamed,
-        starts: Option<Vec<u32>>,
+        (starts, counts): (Option<Vec<u32>>, Option<RowMarks>),
     ) -> Result<Rebuilt, String> {
         let head: Arc<[u8]> = Arc::from(
             &*source
@@ -880,7 +892,7 @@ impl Document {
                         extent.index.dialect(),
                         starts,
                         len,
-                        extent.index.field_count_mode(),
+                        streamed.mode,
                         streamed.unterminated,
                     )
                 })
@@ -899,7 +911,10 @@ impl Document {
             scheduler: &self.scheduler,
             progress: self.progress.as_ref(),
         };
-        let reading = start_jobs(&context, generation, paint, choices, edits);
+        let mut reading = start_jobs(&context, generation, paint, choices, edits);
+        // Every row's field count, so column operations needn't wait for
+        // the index pass's marks.
+        reading.counts = counts.filter(|_| !converts);
         if converts {
             // So every row reads (and the edits made during the save carry
             // over) once it is current. One pass, with no lock held; the

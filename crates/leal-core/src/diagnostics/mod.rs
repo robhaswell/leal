@@ -105,8 +105,7 @@ pub(crate) use collect::Collector;
 pub(crate) use find::{
     Hit, decided_by_bytes, field_has, field_with, has_invalid, next_hit, row_may_have, value_has,
 };
-use marks::RowMarks;
-pub(crate) use marks::{Mark, RowCode};
+pub(crate) use marks::{CountsBuilder, Mark, RowCode, RowMarks};
 
 #[cfg(test)]
 thread_local! {
@@ -476,6 +475,13 @@ impl Diagnostics {
     /// Hands each of rows `rows`' codes to `each`, in order, under one lock.
     pub(crate) fn for_each_code(&self, rows: Range<usize>, each: &mut dyn FnMut(usize, RowCode)) {
         self.read().marks.for_each_code(rows, each);
+    }
+
+    /// Adds rows `rows`' field counts to `counts`, under one lock: a save's
+    /// rows copied as they are (task 2.4c). `false` if any of them has no
+    /// marks yet.
+    pub(crate) fn copy_counts(&self, rows: Range<usize>, counts: &mut CountsBuilder) -> bool {
+        self.read().marks.copy_counts(rows, counts)
     }
 
     /// Up to `max` rows `pick` picks by their codes, under one lock: from

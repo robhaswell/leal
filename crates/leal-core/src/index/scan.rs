@@ -359,7 +359,7 @@ pub(crate) struct FieldCounts {
 }
 
 impl FieldCounts {
-    fn add(&mut self, fields: usize) {
+    pub(crate) fn add(&mut self, fields: usize) {
         let i = match self.last {
             Some(i) if self.seen[i].0 == fields => i,
             _ => *self.position.entry(fields).or_insert_with(|| {
@@ -379,7 +379,7 @@ impl FieldCounts {
         };
     }
 
-    fn mode(&self) -> Option<usize> {
+    pub(crate) fn mode(&self) -> Option<usize> {
         self.best.map(|b| self.seen[b].0)
     }
 

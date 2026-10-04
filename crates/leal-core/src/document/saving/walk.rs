@@ -6,7 +6,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{Extent, QUOTE_SCAN_ROWS, ROWS_PER_CHECKPOINT, Sink, Streamed, to_i64};
+use crate::diagnostics::CountsBuilder;
 use crate::dialect::{Bom, LineEnding};
+use crate::document::columns::Counts;
 use crate::document::view::{RowView, ViewCell};
 use crate::document::{Document, Reading, RowBytes, inserted_row, to_usize};
 use crate::edit::{CellId, Overlay, Segment};
@@ -89,6 +91,9 @@ struct Walk<'w, 's> {
     pending_starts: Vec<usize>,
     /// Each output row's start, for the new index (not when converting).
     starts: Option<Vec<u32>>,
+    /// Each output row's field count, for the new reading (with `starts`),
+    /// while the old file's are known.
+    counts: Option<CountsBuilder>,
     /// The old file's unterminated quote.
     quote: Option<usize>,
     /// Whether the file quotes every field, once it is needed.
@@ -133,6 +138,7 @@ impl<'w, 's> Walk<'w, 's> {
             pending: Vec::new(),
             pending_starts: Vec::new(),
             starts: (!extent.converts()).then(|| Vec::with_capacity(rows)),
+            counts: (!extent.converts()).then(|| CountsBuilder::with_capacity(rows)),
             quote,
             quote_all: None,
             quoting: None,
@@ -273,6 +279,23 @@ impl<'w, 's> Walk<'w, 's> {
         }
     }
 
+    /// Notes the field count of the output row being written: `None` for a
+    /// blank line.
+    fn push_count(&mut self, fields: Option<usize>) {
+        if let Some(counts) = &mut self.counts {
+            counts.push(fields);
+        }
+    }
+
+    /// Notes the field count of a row written whole as `out` with line
+    /// ending `ending`, from `cells`: one field each (a field's bytes
+    /// copied hold no delimiter outside quotes), or one (`""`) for none,
+    /// or a blank line if it has no bytes.
+    fn push_whole_count(&mut self, out: &[u8], ending: Option<LineEnding>, cells: usize) {
+        let content = out.len() - ending.map_or(0, |ending| ending.bytes().len());
+        self.push_count((content > 0).then_some(cells.max(1)));
+    }
+
     /// Writes the snapshot up to `splice`, then `splice`. `drops_quote`:
     /// if it covers the old file's unterminated quote, the quote is gone
     /// (its row deleted, or its field edited, which closes it). Otherwise
@@ -356,6 +379,7 @@ impl<'w, 's> Walk<'w, 's> {
                         self.out_row
                     ))
                 })?;
+            self.push_whole_count(&bytes, ending, cells.len());
             self.pending_starts.push(self.pending.len());
             self.pending.extend_from_slice(&bytes);
             self.out_row += 1;
@@ -475,6 +499,12 @@ impl<'w, 's> Walk<'w, 's> {
         {
             self.starts = None;
         }
+        // Copied as they are: the old file's counts.
+        if let Some(counts) = &mut self.counts
+            && !Counts::of(self.reading).is_some_and(|old| old.copy_counts(rows.clone(), counts))
+        {
+            self.counts = None;
+        }
         self.out_row += rows.len();
         self.prev = Prev::Row(rows.end - 1);
     }
@@ -579,6 +609,11 @@ impl<'w, 's> Walk<'w, 's> {
             );
             self.put(splice, open_field_edited)?;
         }
+        // Its own fields and hatched cells, in place; with no bytes, a
+        // blank line stays one while it has a line ending (`row_splices`
+        // writes any other row with no bytes `""`).
+        let blank_out = blank && cells.is_empty() && ending.is_some();
+        self.push_count((!blank_out).then_some(len));
         self.out_row += 1;
         self.prev = Prev::Ending(written);
         Ok(written == Some(LineEnding::Cr) && line_ending != Some(LineEnding::Cr))
@@ -689,6 +724,7 @@ impl<'w, 's> Walk<'w, 's> {
                 // `check_encodable` passed every value.
                 SaveError::Failed(format!("row {row}'s columns {columns:?} can't be encoded"))
             })?;
+        self.push_whole_count(&out, written, cells.len());
         self.push_start(range.start);
         if out != bytes.bytes[range.start - base..range.end - base] {
             let start = to_i64(range.start).saturating_add(self.delta);
@@ -719,6 +755,17 @@ impl<'w, 's> Walk<'w, 's> {
             checked_len(self.extent.end, self.delta).map_err(|len| SaveError::TooLarge { len })?;
         self.streamed.rows = self.rows;
         self.streamed.starts = self.starts;
+        let counts = self.counts.filter(|counts| counts.len() == self.rows);
+        self.streamed.mode = match &counts {
+            Some(counts) => counts.mode(),
+            None if self.rows == 0 => None,
+            None => {
+                let columns = self.overlay.columns();
+                let mode = self.extent.index.field_count_mode();
+                mode.map(|mode| columns.fold_fields(mode))
+            }
+        };
+        self.streamed.counts = counts.map(CountsBuilder::finish);
         Ok(self.streamed)
     }
 }

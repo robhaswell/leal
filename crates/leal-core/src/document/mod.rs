@@ -101,11 +101,11 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock};
 use crate::detect::{
     self, ChoiceError, Choices, Detection, FIRST_PAINT_BYTES, Hints, Review, detect, review_with,
 };
-use crate::diagnostics::RowCode;
 use crate::diagnostics::{
     DiagnosticKind, Diagnostics, Hit, Mark, Report, RowFlags, decided_by_bytes, field_with,
     next_hit, row_may_have,
 };
+use crate::diagnostics::{RowCode, RowMarks};
 use crate::dialect::{Encoding, QUOTE};
 use crate::edit::{
     CellId, Columns, EditStore, InsertedRow, Kinds, Overlay, OverlayRow, Own as EditOwn, RowEdits,
@@ -434,6 +434,10 @@ struct Reading {
     /// after this one while they split the file the same way, so the header
     /// toggle and a drive reconnecting keep them (ADR-0008 decision 4).
     edits: Arc<EditStore>,
+    /// Every row's field count, from the save that wrote the file (task
+    /// 2.4c), so column operations needn't wait for the marks of its index
+    /// pass. `None` for a file opened or read again.
+    counts: Option<RowMarks>,
 }
 
 /// First paint's result (P0), before any job starts.
@@ -2047,6 +2051,7 @@ fn start_jobs(
         cache: Mutex::new(RowCache::new(parser, DEFAULT_CACHE_ROWS)),
         cache_dropped: AtomicBool::new(false),
         edits,
+        counts: None,
     }
 }
 
