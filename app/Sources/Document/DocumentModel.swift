@@ -1688,6 +1688,16 @@ final class DocumentModel: GridDataSource {
         try await save(to: url, kind: .saveAsUtf8)?.outcome
     }
 
+    /// What a Save As writing now would hold, if not every row (ADR-0008
+    /// decision 6): the rows read so far, of the rows the file is thought
+    /// to have, as the status bar counts them (no header row). `nil` if it
+    /// would be complete: the core then waits for the whole file to be
+    /// read. The save's outcome has the exact count.
+    var incompleteCopy: (rows: Int, of: Int)? {
+        guard storage == .disconnected || storage == .deleted || changedOnDisk else { return nil }
+        return (loadedRowCount, max(loadedRowCount, rowCount))
+    }
+
     // MARK: Saving (task 2.5.3a)
 
     /// A finished save: its outcome, and the edit version its snapshot of
@@ -1695,6 +1705,9 @@ final class DocumentModel: GridDataSource {
     struct Saved: Sendable {
         let outcome: SaveOutcome
         let snapshotVersion: UInt64?
+        /// The generation the core read the file again at as the save
+        /// ended (`SaveJob.restarted()`: a drive back during the save).
+        let restarted: UInt64?
     }
 
     /// Where a save writes its new file and snapshot: the folders
@@ -1766,7 +1779,9 @@ final class DocumentModel: GridDataSource {
             return nil
         }
         let result = await Self.outcome(of: job)
-        saveEnded(job, place: place, outcomeFollows: false)
+        let saved = try? result.get()
+        saveEnded(job, place: place, outcomeFollows: saved != nil)
+        if let saved { self.saved(saved, kind: kind) }
         return try result.get()
     }
 
@@ -1827,7 +1842,7 @@ final class DocumentModel: GridDataSource {
     nonisolated static func outcome(of job: SaveJob) async -> Result<Saved, SaveFailure> {
         do {
             let outcome = try await job.outcome()
-            return .success(Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion))
+            return .success(Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion, restarted: job.restarted()))
         } catch let failure as SaveFailure {
             return .failure(failure)
         } catch {
@@ -1848,8 +1863,11 @@ final class DocumentModel: GridDataSource {
         saveProgress = nil
         if !outcomeFollows {
             saveOutcomePending = false
-            // While the flag was set `checkOriginal` left a new generation
-            // alone (a reconnect's restart, say): take it up now.
+            // The save didn't write the file, but the core read it again:
+            // a drive back during the save was reconnected as it ended
+            // (`SaveJob.restarted()`, task 2.2), or `checkOriginal` left a
+            // new generation alone while the flag was set. Either way it is
+            // taken as `checkOriginal`'s restart.
             if failure == nil, let current = call({ try $0.progress() }), current.generation != generation {
                 restarted(current)
             }
@@ -1876,15 +1894,28 @@ final class DocumentModel: GridDataSource {
     /// drive back), which is taken as any re-read (`restarted`). Until
     /// here `checkOriginal` leaves a new generation alone
     /// (`saveOutcomePending`).
-    func saved(_ outcome: SaveOutcome) {
+    ///
+    /// **Save As** (task 2.5.3c, `kind` not `.save`): the document is the
+    /// new file now, as the core's is (its watcher, path and snapshot), and
+    /// the model follows it (`followSaveAs`).
+    ///
+    /// If the core read the file again as the save ended
+    /// (`SaveJob.restarted()`, a drive back during the save), that reading
+    /// is taken as `checkOriginal`'s restart is (`restarted`).
+    func saved(_ saved: Saved, kind: SaveKind = .save) {
+        let outcome = saved.outcome
         saveOutcomePending = false
         guard failure == nil else { return }
-        // Not `apply(original:)`: the path the core reports is the one it
-        // wrote, a symbolic link followed, which isn't a move.
-        original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
+        if kind == .save {
+            // Not `apply(original:)`: the path the core reports is the one
+            // it wrote, a symbolic link followed, which isn't a move.
+            original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
+        } else {
+            followSaveAs(outcome, kind: kind)
+        }
         refreshUnsavedEdits()
         if let current = call({ try $0.progress() }), current.generation != generation {
-            if outcome.firstScreen != nil {
+            if outcome.firstScreen != nil, current.generation != saved.restarted {
                 adoptSaved(current)
             } else {
                 restarted(current)
@@ -1892,6 +1923,24 @@ final class DocumentModel: GridDataSource {
         } else {
             refreshDriveState()
             onChange?(.progress)
+        }
+    }
+
+    /// After a Save As the model is the new file's (ADR-0008 decision 1),
+    /// at the name on disk the core reports: its URL, the watcher's status,
+    /// and whether it is on a share. A disconnected share's checks stop:
+    /// the document no longer reads it. After Save As UTF-8 the copy is
+    /// read in UTF-8 (its first screen says how), so the window is no
+    /// longer read-only.
+    private func followSaveAs(_ outcome: SaveOutcome, kind: SaveKind) {
+        url = URL(filePath: outcome.path)
+        original = outcome.original
+        isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
+        shareRecheck?.cancel()
+        shareRecheck = nil
+        lastDisconnection = nil
+        if kind == .saveAsUtf8, let screen = outcome.firstScreen {
+            interpretation = screen.interpretation
         }
     }
 

@@ -63,18 +63,17 @@ enum HistoryText {
 
     static let editedDuringReloadDetail = String(localized: "It was edited while the file was being read again, so your edits were kept. Reload again to discard them.", comment: "Alert text: a Reload wasn't adopted because of edits made meanwhile")
 
-    static func editedDuringSaveAsUTF8(_ name: String) -> String {
-        String(localized: "The UTF-8 copy was saved, but this window still shows “\(name)”.", comment: "Alert title: Save As UTF-8 saved the copy but the window didn't switch to it, because of edits made meanwhile; the original file's name")
-    }
-
-    static let editedDuringSaveAsUTF8Detail = String(localized: "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save. Save As UTF-8 again to include them.", comment: "Alert text: Save As UTF-8 kept the window on the original because of edits made during the save")
-
     // MARK: Reload with edits (ADR-0008 decision 4)
 
     static func discardForReload(_ name: String) -> String {
         String(localized: "Reload “\(name)” and discard your changes?", comment: "Alert title: Reload would throw unsaved edits away; the file's name")
     }
 
+    static func discardForRevert(_ name: String) -> String {
+        String(localized: "Revert “\(name)” to the saved version and discard your changes?", comment: "Alert title: Revert to Saved would throw unsaved edits away; the file's name")
+    }
+
+    static let revert = String(localized: "Revert", comment: "Button: revert to the saved file and discard the edits")
     static let discardForReloadDetail = String(localized: "Your unsaved edits will be lost. This can’t be undone.", comment: "Alert text: Reload would throw unsaved edits away")
     static let reload = String(localized: "Reload", comment: "Button: reload and discard the edits")
     static let cancel = String(localized: "Cancel", comment: "Button: cancel")

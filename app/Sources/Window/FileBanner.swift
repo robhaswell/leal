@@ -83,12 +83,21 @@ enum FileBanner: Equatable, Sendable {
         }
     }
 
-    /// The plain button after it, if any.
+    /// The plain button after it, if any: Keep Editing, or, after a change
+    /// while reading, Save As… (task 2.5.3c): Reload would discard the
+    /// edits, and Save As keeps them in a copy of the rows Leal checked
+    /// (ADR-0008 decision 6).
     var secondaryTitle: String? {
         switch self {
         case .changed, .deleted: Self.keepEditing
-        case .changedWhileReading, .deletedWhileReading, .disconnected, .readStopped: nil
+        case .changedWhileReading: DiagnosticsText.saveAs
+        case .deletedWhileReading, .disconnected, .readStopped: nil
         }
+    }
+
+    /// Whether the plain button is Save As….
+    var secondarySavesAs: Bool {
+        self == .changedWhileReading
     }
 
     /// Whether the prominent button is Reload.

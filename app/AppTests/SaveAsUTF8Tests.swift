@@ -26,9 +26,12 @@ final class SaveAsUTF8Tests: XCTestCase {
         )
         savedEnvironment = CSVDocument.environment
         CSVDocument.environment = { environment }
+        // Leal's own Open Recent stays as it was.
+        CSVDocument.noteRecentDocument = { _ in }
     }
 
     override func tearDown() async throws {
+        debugReleaseHeldSave()
         if let savedEnvironment { CSVDocument.environment = savedEnvironment }
         for document in NSDocumentController.shared.documents {
             document.close()
@@ -132,7 +135,7 @@ final class SaveAsUTF8Tests: XCTestCase {
         XCTAssertEqual(items.map(content.validateMenuItem), [true, true, true])
 
         content.chooseUTF8Destination = { _, _, _, done in done(self.directory.appending(path: "slow (UTF-8).csv")) }
-        content.onSaveAsUTF8 = { _, _ in
+        content.onSaveAsUTF8 = { _ in
             // A save that runs until it is cancelled, as the core's does.
             while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
             throw SaveFailure.Cancelled
@@ -152,11 +155,13 @@ final class SaveAsUTF8Tests: XCTestCase {
         XCTAssertNil(shown, "a cancelled save says nothing")
     }
 
-    /// While Save As UTF-8 runs, editing and undo are off; an edit made all
-    /// the same keeps the window on the UTF-16 file, with its edits and
-    /// their history, and says so (task 2.5.2 review). The copy is saved.
-    func testAnEditDuringSaveAsUTF8KeepsTheWindowOnTheFile() async throws {
-        let (url, _) = try utf16File("edited.csv", "id\tname\r\n1\tZoë\r\n2\tAda\r\n")
+    /// Save As UTF-8 adopts the reading the core made of the copy (task
+    /// 2.5.3c), rather than reading it again: editing carries on while it
+    /// runs, as during any save, and an edit made after its snapshot (held
+    /// there) carries over to the copy's reading, unsaved, with its undo.
+    /// No alert; Save then writes the edit to the copy, in UTF-8.
+    func testAnEditDuringSaveAsUTF8CarriesOverToTheCopy() async throws {
+        let (url, data) = try utf16File("edited.csv", "id\tname\r\n1\tZoë\r\n2\tAda\r\n")
         let (document, model, controller) = try open(url)
         let content = controller.content
         let copy = directory.appending(path: "edited (UTF-8).csv")
@@ -166,37 +171,52 @@ final class SaveAsUTF8Tests: XCTestCase {
         let cell = CellPosition(row: 0, column: 1)
         guard case .edited = model.setCell(.cell(cell), to: "Zoe") else { return XCTFail("not edited") }
         let undo = document.history.undoManager
-        XCTAssertTrue(undo.canUndo)
 
-        content.grid.activeCell = cell
+        debugHoldNextSave()
         content.saveAsUTF8(nil)
         let saving = try XCTUnwrap(content.savingAsUTF8)
-        XCTAssertTrue(content.isReplacingDocument)
-        content.editActiveCell()
-        XCTAssertFalse(content.cellEditor.isEditing)
-        XCTAssertFalse(undo.canUndo)
-        // An edit made all the same, behind the window's back.
+        XCTAssertFalse(content.isReplacingDocument, "editing carries on")
+        try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
+        let generation = model.generation
+        let asked = Date()
         guard case .edited = model.setCell(.cell(CellPosition(row: 1, column: 1)), to: "Ada L") else { return XCTFail("not edited") }
+        XCTAssertLessThan(Date().timeIntervalSince(asked), 0.5, "the edit doesn't wait for the save")
+        debugReleaseHeldSave()
         await saving.value
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)), "the copy was saved")
-        XCTAssertEqual(document.fileURL?.standardizedFileURL, url.standardizedFileURL, "still the UTF-16 file")
-        XCTAssertEqual(model.url.standardizedFileURL, url.standardizedFileURL)
-        XCTAssertTrue(model.isReadOnly)
-        // The core reads the copy now: Save stays off, asking for Save As
-        // UTF-8 (task 2.5.3a), until a Reload.
-        XCTAssertEqual(document.readsUTF8Copy?.standardizedFileURL, copy.standardizedFileURL)
-        XCTAssertFalse(document.canSave)
-        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertEqual(try Data(contentsOf: copy), Data("\u{FEFF}id\tname\r\n1\tZoe\r\n2\tAda\r\n".utf8))
+        XCTAssertEqual(try Data(contentsOf: url), data, "the UTF-16 file is untouched")
+        XCTAssertNotEqual(model.generation, generation, "the copy's reading, adopted")
+        XCTAssertTrue(model.readingFromSave)
+        XCTAssertEqual(document.fileURL?.standardizedFileURL, copy.standardizedFileURL)
+        XCTAssertEqual(model.url.standardizedFileURL, copy.standardizedFileURL)
+        XCTAssertEqual(model.interpretation.encoding, .utf8)
+        XCTAssertFalse(model.isReadOnly)
+        XCTAssertTrue(document.canSave)
+        XCTAssertTrue(document.isDocumentEdited, "the edit made during the save is unsaved")
         XCTAssertEqual(model.fullValue(.cell(cell)), "Zoe")
         XCTAssertEqual(model.fullValue(.cell(CellPosition(row: 1, column: 1))), "Ada L")
-        XCTAssertEqual(document.history.journal.count, 2)
-        XCTAssertEqual(undo.undoActionName, "Typing")
-        XCTAssertEqual(shown.map(\.messageText), ["The UTF-8 copy was saved, but this window still shows “edited.csv”."])
-        content.editActiveCell()
-        XCTAssertTrue(content.cellEditor.isEditing)
-        content.discardEditing()
+        XCTAssertEqual(document.history.journal.count, 1, "only the edit after the snapshot")
+        XCTAssertEqual(document.history.choices?.encoding, .utf8, "Recover changes reads the copy in UTF-8")
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertTrue(shown.isEmpty, shown.map(\.messageText).joined())
+
+        document.save(nil)
+        _ = await document.saving?.value
+        XCTAssertEqual(try Data(contentsOf: copy), Data("\u{FEFF}id\tname\r\n1\tZoe\r\n2\tAda L\r\n".utf8))
+        XCTAssertFalse(document.isDocumentEdited)
         document.close()
+    }
+
+    private func waitUntil(_ what: String, timeout: TimeInterval = 30, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline {
+                XCTFail("timed out waiting until \(what)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     /// During a Reload, Save As UTF-8 is off.

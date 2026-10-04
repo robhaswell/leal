@@ -244,10 +244,12 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(document.fileModificationDate).timeIntervalSince1970, later.timeIntervalSince1970, accuracy: 0.001)
 
         try save(text(rows: 5, prefix: "newer"), to: url)
+        // Read again off the main thread (task 2.5.3c), not by AppKit's
+        // `read(from:)`.
         try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        try await waitUntil("read again") { model.cell(row: 0, column: 1) == .text("newer 0", truncated: false) }
         XCTAssertTrue(document.model === model, "the same model")
         XCTAssertTrue(content.model === model, "the window still shows it")
-        XCTAssertEqual(model.cell(row: 0, column: 1), .text("newer 0", truncated: false))
         try await waitUntil("indexed again") { model.isIndexComplete }
         XCTAssertEqual(model.rowCount, 5)
         XCTAssertEqual(content.grid.gridView.frame.height, max(CGFloat(5) * GridMetrics.rowHeight, content.grid.scrollView.contentSize.height))
@@ -327,7 +329,8 @@ final class ExternalChangesTests: XCTestCase {
         let banner = try XCTUnwrap(content.driveBanner)
         XCTAssertEqual(banner.message, DiagnosticsText.changedWhileReading)
         XCTAssertEqual(banner.button?.title, "Reload")
-        XCTAssertNil(banner.secondaryButton)
+        // Save As… keeps the edits, which Reload would discard (task 2.5.3c).
+        XCTAssertEqual(banner.secondaryButton?.title, "Save As…")
         XCTAssertFalse(document.canSave)
         // Only rows from the checked copy, not first paint's 64 KB.
         XCTAssertLessThanOrEqual(model.loadedRowCount, newlines(16_384))
@@ -537,6 +540,9 @@ final class ExternalChangesTests: XCTestCase {
         XCTAssertEqual(FileBanner.deletedWhileReading.buttonTitle, DiagnosticsText.saveAs)
         XCTAssertTrue(FileBanner.changed.reloads)
         XCTAssertTrue(FileBanner.changedWhileReading.reloads)
+        XCTAssertEqual(FileBanner.changedWhileReading.secondaryTitle, DiagnosticsText.saveAs)
+        XCTAssertTrue(FileBanner.changedWhileReading.secondarySavesAs)
+        XCTAssertFalse(FileBanner.changed.secondarySavesAs)
         XCTAssertFalse(FileBanner.deleted.reloads)
         XCTAssertFalse(FileBanner.disconnected.reloads)
         XCTAssertEqual(Set([FileBanner.changedWhileReading, .changed, .deleted, .disconnected, .readStopped].map(\.key)).count, 5)

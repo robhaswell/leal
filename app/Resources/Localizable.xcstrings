@@ -85,6 +85,9 @@
     "%@ columns" : {
       "comment" : "Status bar: the number of columns"
     },
+    "%@ copy" : {
+      "comment" : "Duplicate: the suggested name, as in \"people copy\"; the file's name without its extension"
+    },
     "%@ empty rows, the first at %@" : {
       "comment" : "Details popover: blank lines; their count, and where the first is",
       "localizations" : {
@@ -225,9 +228,6 @@
     },
     "1 row has a different number of fields to the other %@" : {
       "comment" : "Details popover: one ragged row; the number of rows with the usual field count"
-    },
-    "A later version of Leal saves a copy of what it shows, wherever you choose." : {
-      "comment" : "Alert: the drive banner's Save As button before task 2.5"
     },
     "A quote at %@ is never closed, so the rest of the file is one cell" : {
       "comment" : "Details popover: the unterminated quote; where its opening quote is, such as row 12"
@@ -541,11 +541,22 @@
     "Irregularities in %@" : {
       "comment" : "Title of the diagnostics details popover (mockup 03b); the file's name"
     },
+    "It has about %@ of %@ rows: only the rows Leal had read in full." : {
+      "comment" : "Alert text after Save As saved an incomplete copy; rows written, rows in the file",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "It has about %1$@ of %2$@ rows: only the rows Leal had read in full."
+          }
+        }
+      }
+    },
+    "It has only the %@ rows Leal had read in full, not the whole file." : {
+      "comment" : "Alert text after Save As saved an incomplete copy, when Leal can't tell how many rows the file has; rows written"
+    },
     "It isn’t a regular file." : {
       "comment" : "Open error: the path is a named pipe, socket or device"
-    },
-    "It was edited during the save, so your edits were kept here. The copy doesn’t have the edits made during the save. Save As UTF-8 again to include them." : {
-      "comment" : "Alert text: Save As UTF-8 kept the window on the original because of edits made during the save"
     },
     "It was edited while the file was being read again, so your edits were kept. Reload again to discard them." : {
       "comment" : "Alert text: a Reload wasn't adopted because of edits made meanwhile"
@@ -579,6 +590,9 @@
     },
     "Leal couldn’t open “%@”." : {
       "comment" : "Alert title when a file can't be opened"
+    },
+    "Leal couldn’t read all of the file, so this copy will be incomplete: it gets only the %@ rows Leal has read in full." : {
+      "comment" : "Save panel message: as the other, when Leal can't tell how many rows the file has; rows read"
     },
     "Leal couldn’t read all of the file. Try again, or reopen it first." : {
       "comment" : "Alert text: Save As UTF-8 failed for another reason"
@@ -618,6 +632,17 @@
     },
     "Leal guessed the encoding from the start of the file." : {
       "comment" : "Status bar tooltip: encoding source"
+    },
+    "Leal has read only about %@ of %@ rows, so this copy will be incomplete: it gets only the rows Leal has read in full." : {
+      "comment" : "Save panel message: Save As from a document Leal couldn't read all of (its drive or share went, or the file changed or was deleted while read); rows read, rows in the file",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Leal has read only about %1$@ of %2$@ rows, so this copy will be incomplete: it gets only the rows Leal has read in full."
+          }
+        }
+      }
     },
     "Leal is still reading the file." : {
       "comment" : "Why an undo or redo can't happen yet: the file is still being read"
@@ -814,8 +839,14 @@
     "Reopen with Encoding" : {
       "comment" : "Menu: read the file in another encoding (ADR-0005 decision 8)"
     },
+    "Revert" : {
+      "comment" : "Button: revert to the saved file and discard the edits"
+    },
     "Revert to Saved" : {
       "comment" : "File menu: discard the edits and read the file again"
+    },
+    "Revert “%@” to the saved version and discard your changes?" : {
+      "comment" : "Alert title: Revert to Saved would throw unsaved edits away; the file's name"
     },
     "Row %@" : {
       "comment" : "Cell inspector: the active cell's row number, as the gutter shows it (mockup 05a)"
@@ -837,9 +868,6 @@
     },
     "Save As UTF-8…" : {
       "comment" : "Banner button on a UTF-16 file\nButton: save a UTF-8 copy (ADR-0008 decision 7)"
-    },
-    "Save As isn’t available yet." : {
-      "comment" : "Alert: the drive banner's Save As button before task 2.5"
     },
     "Save As…" : {
       "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)\nButton: save a copy of the recovered document\nButton: save the document elsewhere\nFile menu: save a copy under another name (⇧⌘S)"
@@ -880,9 +908,6 @@
     "Show the irregularities (%@ kinds)" : {
       "comment" : "Tooltip of the status bar's diagnostics badge"
     },
-    "Since its UTF-8 copy was saved, Leal can save your changes only as a UTF-8 copy. Reload the file to save it in place again, which discards them." : {
-      "comment" : "Alert text: Save after Save As UTF-8 whose copy the window didn't switch to; the buttons are Save As UTF-8… and Cancel"
-    },
     "Some cells can’t be saved in %@." : {
       "comment" : "Alert title: Save refused values the file's encoding can't represent; the encoding"
     },
@@ -913,9 +938,6 @@
     "That encoding doesn’t match the file’s byte order mark." : {
       "comment" : "Open error: Reopen with Encoding chose an encoding the file's BOM rules out"
     },
-    "The UTF-8 copy was saved, but this window still shows “%@”." : {
-      "comment" : "Alert title: Save As UTF-8 saved the copy but the window didn't switch to it, because of edits made meanwhile; the original file's name"
-    },
     "The UTF-8 copy wasn’t saved." : {
       "comment" : "Alert title: Save As UTF-8 failed (task 2.3)"
     },
@@ -941,6 +963,9 @@
     },
     "The copy would be too large for Leal to open again." : {
       "comment" : "Alert text: Save As UTF-8's file would be over 4 GiB (ADR-0012 decision 2)"
+    },
+    "The copy “%@” is incomplete." : {
+      "comment" : "Alert title: Save As saved an incomplete copy (ADR-0008 decision 6); the copy's name"
     },
     "The drive it’s on was disconnected." : {
       "comment" : "Open error: the removable drive holding the file vanished"
@@ -1024,6 +1049,9 @@
     },
     "The undo history was cleared. Your edits are still there." : {
       "comment" : "After a refused undo or redo, the undo history is cleared"
+    },
+    "These edits weren’t saved, because their rows aren’t in the copy:" : {
+      "comment" : "Alert text after an incomplete Save As, before the list of edited cells it didn't save"
     },
     "They hold characters %@ can’t represent, and Leal never replaces them. Change them, or save a UTF-8 copy of “%@”." : {
       "comment" : "Alert text after the cells Save refused; the encoding and the file's name; the buttons are Save As UTF-8… and Cancel",

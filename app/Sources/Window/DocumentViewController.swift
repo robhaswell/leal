@@ -29,9 +29,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// main thread (task 2.0). Without one, the model reloads.
     var onReload: (() async throws -> Void)?
     /// Asks whether to throw the unsaved edits away (task 2.5.2), before a
-    /// Reload, through the `NSDocument`: `answer` hears whether to go on.
-    /// Without one, the edits go without asking.
-    var confirmDiscardingEdits: ((_ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
+    /// Reload or Revert to Saved, through the `NSDocument`: `answer` hears
+    /// whether to go on. Without one, the edits go without asking.
+    var confirmDiscardingEdits: ((_ reason: RereadReason, _ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
+    /// **Save As…** (task 2.5.3c), through the `NSDocument`
+    /// (`CSVDocument.chooseSaveAs`): the file banners' Save As….
+    var onSaveAs: (() -> Void)?
     /// A Reload, while it is under way.
     private(set) var reloading: Task<Void, Never>? {
         didSet { updateSaveAsUTF8Button() }
@@ -492,7 +495,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                     action: file?.reloads == true ? #selector(reloadFromDisk(_:)) : #selector(saveACopy(_:)),
                     key: key,
                     secondaryTitle: file?.secondaryTitle,
-                    secondaryAction: #selector(keepEditing(_:))
+                    secondaryAction: file?.secondarySavesAs == true ? #selector(saveACopy(_:)) : #selector(keepEditing(_:))
                 )
             }
         )
@@ -636,6 +639,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// stay where they were, as far as the new file reaches. If the file
     /// can't be opened, the window says why and keeps what it shows.
     @objc func reloadFromDisk(_ sender: Any?) {
+        reload(.reload)
+    }
+
+    /// Reload, or **Revert to Saved** (task 2.5.3c, ADR-0008 decision 4),
+    /// which is the same but for its question.
+    func reload(_ reason: RereadReason) {
         scheduler.noteUserInput()
         // Opening the file reads it, which on a network share can block:
         // always off the main thread (task 2.0, ADR-0009). The window shows
@@ -648,7 +657,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard commitEditing() else { return NSSound.beep() }
         // Reload throws unsaved edits away: ask first (ADR-0008 decision 4).
         if model.hasUnsavedEdits, let confirm = confirmDiscardingEdits {
-            confirm { [weak self] proceed in
+            confirm(reason) { [weak self] proceed in
                 guard proceed, let self, reloading == nil, savingAsUTF8 == nil, !model.isSaving else { return }
                 startReload()
             }
@@ -670,7 +679,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                     try await model.reloadInBackground()
                 }
             } catch is EditedDuringReload {
-                self?.showEditedDuringReplace(saveAsUTF8: false)
+                self?.showEditedDuringReload()
             } catch {
                 self?.showReloadError(error)
             }
@@ -703,13 +712,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         updateBanners()
     }
 
-    /// A Reload or Save As UTF-8 kept the window on the file it showed,
-    /// because it was edited meanwhile (`EditedDuringReload`): say so.
-    private func showEditedDuringReplace(saveAsUTF8: Bool) {
-        let name = model.url.lastPathComponent
+    /// A Reload kept the window on the file it showed, because it was
+    /// edited meanwhile (`EditedDuringReload`): say so.
+    private func showEditedDuringReload() {
         let alert = NSAlert()
-        alert.messageText = saveAsUTF8 ? HistoryText.editedDuringSaveAsUTF8(name) : HistoryText.editedDuringReload(name)
-        alert.informativeText = saveAsUTF8 ? HistoryText.editedDuringSaveAsUTF8Detail : HistoryText.editedDuringReloadDetail
+        alert.messageText = HistoryText.editedDuringReload(model.url.lastPathComponent)
+        alert.informativeText = HistoryText.editedDuringReloadDetail
         present(alert)
     }
 
@@ -1192,13 +1200,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         cellEditor.begin(.cell(cell), typing: typing)
     }
 
-    /// A Reload or Save As UTF-8 is replacing the document shown: editing
-    /// (the in-cell editor, the inspector, Rename Column) and undo are off
-    /// meanwhile, as an edit made now would be thrown away with the old
-    /// document. (`DocumentModel.reloadInBackground` also won't adopt the
-    /// new one over an edit made all the same.)
+    /// A Reload is replacing the document shown: editing (the in-cell
+    /// editor, the inspector, Rename Column) and undo are off meanwhile, as
+    /// an edit made now would be thrown away with the old document.
+    /// (`DocumentModel.reloadInBackground` also won't adopt the new one
+    /// over an edit made all the same.) Save As UTF-8 isn't one (task
+    /// 2.5.3c): as during any save, an edit made meanwhile carries over to
+    /// the copy's reading, unsaved.
     var isReplacingDocument: Bool {
-        savingAsUTF8 != nil || reloading != nil || model.isReloading
+        reloading != nil || model.isReloading
     }
 
     /// A column header's context menu: "Rename Column…", which edits the
@@ -1456,10 +1466,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// **Save As UTF-8**, through the `NSDocument`
     /// (`CSVDocument.saveAsUTF8(to:)`), so it follows the copy. Returns
-    /// whether it saved. Without one, the model saves and reloads.
-    /// The edit version as the save starts goes with it: an edit made
-    /// after it keeps the window on this file (`EditedDuringReload`).
-    var onSaveAsUTF8: ((URL, UInt64) async throws -> Bool)?
+    /// whether it saved. Without one, the model saves and adopts the
+    /// copy's reading.
+    var onSaveAsUTF8: ((URL) async throws -> Bool)?
     /// Stops the document's Saves under way (`CSVDocument.cancelSave`),
     /// and says whether there was one.
     var onCancelSave: (() -> Bool)?
@@ -1513,25 +1522,20 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard commitEditing() else { return NSSound.beep() }
         let save = onSaveAsUTF8
         let model = model
-        let version = model.editVersion
         savingAsUTF8 = Task { [weak self] in
             do {
                 if let save {
-                    _ = try await save(url, version)
-                } else if try await model.saveAsUTF8(to: url) != nil {
-                    try await model.reloadInBackground(from: url, editVersion: version)
+                    _ = try await save(url)
+                } else {
+                    _ = try await model.saveAsUTF8(to: url)
                 }
-            } catch is EditedDuringReload {
-                self?.showEditedDuringReplace(saveAsUTF8: true)
             } catch let failure as SaveFailure {
                 // Including the core refusing to start it
                 // (`DocumentModel.saveAsUTF8`).
                 self?.showSaveAsUTF8Failure(failure)
-            } catch is CancellationError {
-                // The window is closing (`savingAsUTF8?.cancel()`): no alert.
             } catch {
-                // Saved, but the copy couldn't be read back.
-                self?.showReloadError(error)
+                // The window is closing (`savingAsUTF8?.cancel()`): no alert.
+                Logger.document.error("Save As UTF-8 stopped: \(String(describing: error), privacy: .public)")
             }
             self?.savingAsUTF8 = nil
         }
@@ -1571,26 +1575,22 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         alert.beginSheetModal(for: window)
     }
 
-    /// The drive banners' Save As…: Save is refused (`DocumentModel.canSave`)
-    /// but a copy may be saved elsewhere. SEAM(2.5): Leal writes files from
-    /// task 2.5; until then this says so.
+    /// The file banners' **Save As…** (task 2.5.3c): Save is refused
+    /// (`DocumentModel.canSave`), or there is no file to save over, but the
+    /// document may be saved elsewhere, through the `NSDocument`. If Leal
+    /// couldn't read all of the file, the copy has the complete rows it
+    /// has, and the save panel says so (ADR-0008 decision 6, ADR-0010).
     @objc func saveACopy(_ sender: Any?) {
-        showNotYet(
-            String(localized: "Save As isn’t available yet.", comment: "Alert: the drive banner's Save As button before task 2.5"),
-            String(
-                localized: "A later version of Leal saves a copy of what it shows, wherever you choose.",
-                comment: "Alert: the drive banner's Save As button before task 2.5"
-            )
-        )
+        guard let onSaveAs else { return NSSound.beep() }
+        onSaveAs()
     }
+}
 
-    private func showNotYet(_ message: String, _ information: String) {
-        guard let window = view.window else { return }
-        let alert = NSAlert()
-        alert.messageText = message
-        alert.informativeText = information
-        alert.beginSheetModal(for: window)
-    }
+/// Why the file is read again with unsaved edits, which are asked about
+/// first (ADR-0008 decision 4): a Reload, or Revert to Saved.
+enum RereadReason: Sendable {
+    case reload
+    case revert
 }
 
 /// A document's window. `NSDocument` keeps its title, proxy icon, tabs and

@@ -333,20 +333,6 @@ extension SaveText {
         }
     }
 
-    /// Save after a UTF-8 copy was saved but the window stayed on this
-    /// file (an edit made meanwhile): Leal now holds the copy's reading,
-    /// so only Save As UTF-8 can save the edits (`readsUTF8Copy`).
-    static func utf8CopyOnly(name: String) -> Refusal {
-        Refusal(
-            title: String(localized: "“\(name)” wasn’t saved.", comment: "Alert title: Save failed; the file's name"),
-            detail: String(
-                localized: "Since its UTF-8 copy was saved, Leal can save your changes only as a UTF-8 copy. Reload the file to save it in place again, which discards them.",
-                comment: "Alert text: Save after Save As UTF-8 whose copy the window didn't switch to; the buttons are Save As UTF-8… and Cancel"
-            ),
-            choices: [.saveAsUTF8, .cancel]
-        )
-    }
-
     /// Unlocking the file failed.
     /// Save refused a file locked by the system (`schg` or `sappnd`), which
     /// only an administrator can unlock: no Unlock.
@@ -421,5 +407,92 @@ extension SaveText {
     /// The button that shows the kept file in Finder.
     static var showInFinder: String {
         String(localized: "Show in Finder", comment: "Button: show the file a save kept in Finder")
+    }
+}
+
+// MARK: Save As (task 2.5.3c)
+
+extension SaveText {
+    /// Why Save As didn't save, and what the user can do; `nil` if it says
+    /// nothing (cancelled, or the document failed, which its own alert
+    /// says). Nothing was written either way. Text the file's encoding
+    /// can't hold, and a UTF-16 file, offer Save As UTF-8; the rest say why
+    /// (in Save As UTF-8's words) with OK.
+    static func saveAsFailure(_ failure: SaveFailure, name: String, headerRows: Int) -> Refusal? {
+        switch failure {
+        case .Cancelled, .DocumentFailed:
+            return nil
+        case .Unencodable, .ReadOnly:
+            return saveFailure(failure, name: name, headerRows: headerRows)
+        default:
+            guard let message = saveAsUTF8Failure(failure, headerRows: headerRows) else { return nil }
+            return Refusal(
+                title: String(localized: "“\(name)” wasn’t saved.", comment: "Alert title: Save failed; the file's name"),
+                detail: message.detail,
+                choices: [.ok]
+            )
+        }
+    }
+
+    /// The save panel's message when the copy will be incomplete (ADR-0008
+    /// decision 6): Leal has read about `rows` of `total` rows (a total no
+    /// larger is unknown: the file went before Leal could tell).
+    static func incompleteCopyMessage(rows: Int, of total: Int) -> String {
+        if total > rows {
+            String(
+                localized: "Leal has read only about \(rows.formatted()) of \(total.formatted()) rows, so this copy will be incomplete: it gets only the rows Leal has read in full.",
+                comment: "Save panel message: Save As from a document Leal couldn't read all of (its drive or share went, or the file changed or was deleted while read); rows read, rows in the file"
+            )
+        } else {
+            String(
+                localized: "Leal couldn’t read all of the file, so this copy will be incomplete: it gets only the \(rows.formatted()) rows Leal has read in full.",
+                comment: "Save panel message: as the other, when Leal can't tell how many rows the file has; rows read"
+            )
+        }
+    }
+
+    /// After an incomplete Save As (ADR-0008 decision 6): it has `rows` of
+    /// about `total` rows, and the edits to rows it doesn't have
+    /// (`skipped`) weren't saved, named as Save's unencodable cells are.
+    static func incompleteCopy(name: String, rows: Int, of total: Int, skipped: [CellPlace], headerRows: Int) -> Refusal {
+        var detail = if total > rows {
+            String(
+                localized: "It has about \(rows.formatted()) of \(total.formatted()) rows: only the rows Leal had read in full.",
+                comment: "Alert text after Save As saved an incomplete copy; rows written, rows in the file"
+            )
+        } else {
+            String(
+                localized: "It has only the \(rows.formatted()) rows Leal had read in full, not the whole file.",
+                comment: "Alert text after Save As saved an incomplete copy, when Leal can't tell how many rows the file has; rows written"
+            )
+        }
+        if !skipped.isEmpty {
+            var lines = skipped.prefix(namedCells).map { "• " + capitalized(cell($0, headerRows: headerRows)) }
+            let rest = skipped.count - min(skipped.count, namedCells)
+            if rest > 0 {
+                lines.append(String(localized: "and \(rest) more", comment: "After a list of cells Save refused: how many more"))
+            }
+            let why = String(
+                localized: "These edits weren’t saved, because their rows aren’t in the copy:",
+                comment: "Alert text after an incomplete Save As, before the list of edited cells it didn't save"
+            )
+            detail += "\n\n" + ([why] + lines).joined(separator: "\n")
+        }
+        return Refusal(
+            title: String(
+                localized: "The copy “\(name)” is incomplete.",
+                comment: "Alert title: Save As saved an incomplete copy (ADR-0008 decision 6); the copy's name"
+            ),
+            detail: detail,
+            choices: [.ok]
+        )
+    }
+
+    /// The name Duplicate suggests: the file's own with "copy", as the
+    /// Finder names a duplicate.
+    static func copyName(of url: URL) -> String {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let name = String(localized: "\(stem) copy", comment: "Duplicate: the suggested name, as in \"people copy\"; the file's name without its extension")
+        return url.pathExtension.isEmpty ? name : "\(name).\(url.pathExtension)"
     }
 }

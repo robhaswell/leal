@@ -356,7 +356,7 @@ final class AfterSaveTests: XCTestCase {
         XCTAssertEqual(model.generation, generation, "left to saved(_:)")
         XCTAssertFalse(model.readingFromSave)
 
-        model.saved(saved.outcome)
+        model.saved(saved)
         XCTAssertNotEqual(model.generation, generation)
         XCTAssertTrue(model.readingFromSave, "adopted as the save's reading")
         XCTAssertFalse(model.saveOutcomePending)
