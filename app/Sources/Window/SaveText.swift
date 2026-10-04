@@ -135,6 +135,20 @@ extension SaveText {
         let title: String
         let detail: String
         let choices: [SaveChoice]
+        /// The failure's particulars, shown in small type under the text:
+        /// for a write that failed, which step and the OS error, so a
+        /// report from the user names the cause.
+        var details: String?
+    }
+
+    /// The particulars of a failed write: the core's step (English, as in
+    /// the log) and the OS error's number and description.
+    static func ioDetails(step: String, code: Int32?, message: String) -> String {
+        let error = code.map { "errno \($0), \(String(cString: strerror($0)))" } ?? message
+        return String(
+            localized: "Details: \(step) failed (\(error)).",
+            comment: "Alert text, small type: which step of a save failed, in English as the log has it, and the OS error's number and description"
+        )
     }
 
     /// The most cells an alert names one by one; the rest are counted.
@@ -255,14 +269,15 @@ extension SaveText {
                 ),
                 choices: [.ok]
             )
-        case .Io:
+        case let .Io(step, code, message):
             return Refusal(
                 title: title,
                 detail: String(
                     localized: "Leal couldn’t write the file. Check that the drive has room and that you may write to that folder.",
                     comment: "Alert text: Save failed writing the file (a full disk, no permission); the details are in the log"
                 ),
-                choices: [.ok]
+                choices: [.ok],
+                details: ioDetails(step: step, code: code, message: message)
             )
         case .Unconvertible, .Internal:
             return Refusal(

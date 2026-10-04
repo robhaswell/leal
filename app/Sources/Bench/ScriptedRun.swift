@@ -53,6 +53,12 @@ import os
 ///   For task 2.5.2: `-LealSetCells row,column=value+row,column=value`
 ///   commits those edits (grid rows; "_" for a space) first, so the
 ///   edited-cell marks and "— Edited" show (05a).
+/// - `-LealSaveCheck <file.json>`: once the document is indexed, make
+///   `-LealSetCells`' edits, choose File > Save inside the app (nothing
+///   is sent to the system), wait for the Save, write
+///   what happened to the file, and quit (`just sandbox-save-check`: a
+///   Save under the real sandbox, of a file outside the container that
+///   `open` handed the app).
 /// - `-LealBenchEdit <n>`: once the document is indexed, edit `n` cells
 ///   through the in-cell editor (Return, new text, Return), one at a time,
 ///   each once the last is on screen, then quit: each edit's "Cell edit to
@@ -110,7 +116,7 @@ final class ScriptedRun {
 
     static func startIfAsked(defaults: UserDefaults) {
         let run = ScriptedRun(defaults: defaults)
-        guard ["LealBenchScroll", "LealSnapshot", "LealReopen", "LealBenchEdit"].contains(where: { run.value(of: $0) != nil }) else { return }
+        guard ["LealBenchScroll", "LealSnapshot", "LealReopen", "LealBenchEdit", "LealSaveCheck"].contains(where: { run.value(of: $0) != nil }) else { return }
         switch run.value(of: "LealAppearance") {
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
@@ -172,7 +178,147 @@ final class ScriptedRun {
                 await self.snapshot(content: content, to: Self.outputURL(out))
                 Self.quit()
             }
+        } else if let out = value(of: "LealSaveCheck") {
+            Task { @MainActor in
+                var result = await self.saveCheck()
+                if let path = self.value(of: "LealSaveAsTo") {
+                    result["saveAs"] = await self.saveAsCheck(to: URL(filePath: path))
+                }
+                Self.write(result, to: Self.outputURL(out))
+                Self.quit()
+            }
         }
+    }
+
+    /// `-LealSetCells`' edits, committed as the editor does (task 2.5.2).
+    private func setCells(_ model: DocumentModel) {
+        guard let edits = value(of: "LealSetCells") else { return }
+        for edit in edits.split(separator: "+") {
+            let parts = edit.split(separator: "=", maxSplits: 1)
+            let place = parts.first?.split(separator: ",").compactMap { Int($0) } ?? []
+            guard parts.count == 2, place.count == 2 else { continue }
+            let text = parts[1].replacingOccurrences(of: "_", with: " ")
+            _ = model.setCell(.cell(CellPosition(row: place[0], column: place[1])), to: text)
+        }
+    }
+
+    /// `-LealSaveCheck`: makes `-LealSetCells`' edits, chooses File > Save
+    /// inside the app (nothing is sent to the system), and waits for the
+    /// Save to end or for its alert, which it dismisses. Returns what
+    /// happened: Save's key and whether it was on, whether it saved, and
+    /// the failure and the alert's text if not.
+    ///
+    /// With `-LealSaveAsTo`, `open` was handed that file too, and it opened
+    /// as a second document: the check saves the other one.
+    private func saveCheck() async -> [String: Any] {
+        var result: [String: Any] = [:]
+        let saveAsTo = value(of: "LealSaveAsTo").map { URL(filePath: $0).standardizedFileURL }
+        let documents: [CSVDocument] = await {
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                let all = NSDocumentController.shared.documents.compactMap { $0 as? CSVDocument }
+                if all.count == (saveAsTo == nil ? 1 : 2) { return all }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            return []
+        }()
+        guard let document = documents.first(where: { $0.fileURL?.standardizedFileURL != saveAsTo }),
+              let content = (document.windowControllers.first as? DocumentWindowController)?.content
+        else {
+            result["error"] = "the documents didn't open"
+            return result
+        }
+        result["file"] = document.fileURL?.path(percentEncoded: false) ?? ""
+        guard await Self.settled(document) else {
+            result["error"] = "the document didn't finish opening"
+            return result
+        }
+        setCells(content.model)
+        result["editedBeforeSave"] = document.isDocumentEdited
+        let window = content.view.window
+        let file = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.items.contains { $0.action == #selector(NSDocument.save(_:)) } }
+        guard let save = file?.items.first(where: { $0.action == #selector(NSDocument.save(_:)) }) else {
+            result["error"] = "the File menu has no Save"
+            return result
+        }
+        result["saveKey"] = save.keyEquivalentModifierMask == .command ? "⌘" + save.keyEquivalent.uppercased() : save.keyEquivalent
+        result["saveEnabled"] = document.validateUserInterfaceItem(save)
+        // As the menu sends it. The app runs in the background (it leaves
+        // the frontmost app alone), so it has no key window for the
+        // responder chain: the document is the target.
+        NSApp.sendAction(#selector(NSDocument.save(_:)), to: document, from: save)
+        // The Save starts on a later turn of the run loop.
+        try? await Task.sleep(for: .milliseconds(100))
+        let deadline = Date().addingTimeInterval(30)
+        while document.saving != nil, window?.attachedSheet == nil, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        if let window, let sheet = window.attachedSheet {
+            result["alert"] = Self.texts(in: sheet)
+            window.endSheet(sheet, returnCode: .cancel)
+            _ = await document.saving?.value
+        }
+        result["saved"] = !document.isDocumentEdited && document.lastSaveFailure == nil
+        if let failure = document.lastSaveFailure {
+            result["failure"] = String(describing: failure)
+        }
+        if let outcome = document.lastSaveOutcome {
+            // Swapped: `renamex_np(RENAME_SWAP)`, and the old file checked
+            // against the one checked before writing (ADR-0012).
+            result["swapped"] = outcome.swapped
+            result["keptOldFile"] = outcome.keptOldFile ?? ""
+            result["skippedMetadata"] = outcome.skippedMetadata
+        }
+        return result
+    }
+
+    /// `-LealSaveAsTo <path>`: a Save As through the core to a new file at
+    /// `url`, outside the container, after the Save. A save panel would
+    /// grant the app that file's path; here `open` granted it, as the
+    /// second file it was handed. Its document is closed and the file
+    /// deleted first, so the Save As makes a new file there, with no
+    /// access to the folder, as after a save panel. The core's save to a
+    /// new place (`SaveKind.saveAs`) is what Save As uses (task 2.5.3c).
+    private func saveAsCheck(to url: URL) async -> [String: Any] {
+        var result: [String: Any] = ["file": url.path(percentEncoded: false)]
+        let documents = NSDocumentController.shared.documents.compactMap { $0 as? CSVDocument }
+        guard let source = documents.first(where: { $0.fileURL?.standardizedFileURL != url.standardizedFileURL }),
+              let model = source.model
+        else {
+            result["error"] = "no document to save"
+            return result
+        }
+        for document in documents where document !== source {
+            document.updateChangeCount(.changeCleared)
+            document.close()
+        }
+        if unlink(url.path(percentEncoded: false)) != 0 {
+            result["error"] = "couldn’t delete the file first: errno \(errno)"
+            return result
+        }
+        do {
+            let saved = try await model.save(to: url, kind: .saveAs)
+            result["saved"] = saved != nil
+            result["swapped"] = saved?.outcome.swapped ?? false
+        } catch {
+            result["saved"] = false
+            result["failure"] = String(describing: error)
+            if let failure = error as? SaveFailure {
+                Logger.document.error("Save As check failed: \(String(describing: failure), privacy: .public)")
+            }
+        }
+        return result
+    }
+
+    /// The texts a sheet shows, top to bottom.
+    private static func texts(in sheet: NSWindow) -> [String] {
+        var texts: [String] = []
+        func collect(_ view: NSView) {
+            if let field = view as? NSTextField, !field.stringValue.isEmpty { texts.append(field.stringValue) }
+            view.subviews.forEach(collect)
+        }
+        if let view = sheet.contentView { collect(view) }
+        return texts
     }
 
     /// Quits. A scripted run's edits are never saved, and since task 2.5.2
@@ -282,17 +428,7 @@ final class ScriptedRun {
                 try? await Task.sleep(for: .milliseconds(20))
             }
         }
-        if let edits = value(of: "LealSetCells") {
-            let model = content.model
-            // Edits, committed as the editor does (task 2.5.2).
-            for edit in edits.split(separator: "+") {
-                let parts = edit.split(separator: "=", maxSplits: 1)
-                let place = parts.first?.split(separator: ",").compactMap { Int($0) } ?? []
-                guard parts.count == 2, place.count == 2 else { continue }
-                let text = parts[1].replacingOccurrences(of: "_", with: " ")
-                _ = model.setCell(.cell(CellPosition(row: place[0], column: place[1])), to: text)
-            }
-        }
+        setCells(content.model)
         if has("LealInspector") {
             // The cell inspector (mockup 05a), on the selected cell.
             content.setInspectorShown(true)

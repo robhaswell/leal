@@ -370,6 +370,17 @@
     "Details" : {
       "comment" : "Diagnostics banner button: shows the details popover (mockup 03a)"
     },
+    "Details: %@ failed (%@)." : {
+      "comment" : "Alert text, small type: which step of a save failed, in English as the log has it, and the OS error's number and description",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Details: %1$@ failed (%2$@)."
+          }
+        }
+      }
+    },
     "Dismiss" : {
       "comment" : "Banner's close button, for VoiceOver"
     },
@@ -383,7 +394,7 @@
       "comment" : "Status bar: the open file's drive was ejected after Leal had copied the file (task 1.9)"
     },
     "Duplicate" : {
-      "comment" : "Button: keep the changes in a copy of a file Leal can't save"
+      "comment" : "Button: keep the changes in a copy of a file Leal can't save\nFile menu: open a copy of the document (⇧⌘D)"
     },
     "Edit" : {
       "comment" : "Menu title"
@@ -655,6 +666,9 @@
     "More than %@" : {
       "comment" : "Alert text: how many cells Save As UTF-8 refused, when it stopped counting"
     },
+    "Move To…" : {
+      "comment" : "File menu: move the document's file to another folder"
+    },
     "NUL bytes" : {
       "comment" : "Diagnostic kind (DESIGN §3.5)"
     },
@@ -785,6 +799,9 @@
     "Rename Column…" : {
       "comment" : "Column header context menu: edit the header row's cell (task 2.5.1)"
     },
+    "Rename…" : {
+      "comment" : "File menu: rename the document's file"
+    },
     "Reopen" : {
       "comment" : "Button: open the file again after a failure"
     },
@@ -797,6 +814,9 @@
     "Reopen with Encoding" : {
       "comment" : "Menu: read the file in another encoding (ADR-0005 decision 8)"
     },
+    "Revert to Saved" : {
+      "comment" : "File menu: discard the edits and read the file again"
+    },
     "Row %@" : {
       "comment" : "Cell inspector: the active cell's row number, as the gutter shows it (mockup 05a)"
     },
@@ -805,6 +825,9 @@
     },
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
+    },
+    "Save" : {
+      "comment" : "File menu: save the document (⌘S)"
     },
     "Save Anyway" : {
       "comment" : "Button: write over a file another app changed"
@@ -819,7 +842,7 @@
       "comment" : "Alert: the drive banner's Save As button before task 2.5"
     },
     "Save As…" : {
-      "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)\nButton: save a copy of the recovered document\nButton: save the document elsewhere"
+      "comment" : "Banner button: save a copy of the file elsewhere (ADR-0006)\nButton: save a copy of the recovered document\nButton: save the document elsewhere\nFile menu: save a copy under another name (⇧⌘S)"
     },
     "Save a copy of what was recovered to keep it." : {
       "comment" : "Alert text after Recover changes, offering Save As"

@@ -178,6 +178,58 @@ final class SaveTests: XCTestCase {
 
     // MARK: Saving
 
+    /// The File menu has the document's items, with `NSDocument`'s
+    /// standard actions and keys and no target (so they reach the front
+    /// document), and the document turns Save on once it is edited (task
+    /// 2.5.3a's save fix: the menu had no Save, so ⌘S did nothing).
+    func testTheFileMenuHasSaveAndTheDocumentsItems() async throws {
+        let bar = MainMenu.make()
+        let fileMenu = try XCTUnwrap(bar.items.compactMap(\.submenu).first { $0.title == "File" })
+        let expected: [(String, Selector, String, NSEvent.ModifierFlags)] = [
+            ("Save", #selector(NSDocument.save(_:)), "s", .command),
+            ("Save As…", #selector(NSDocument.saveAs(_:)), "s", [.command, .shift]),
+            ("Duplicate", #selector(NSDocument.duplicate(_:)), "d", [.command, .shift]),
+            ("Rename…", #selector(NSDocument.rename(_:)), "", .command),
+            ("Move To…", #selector(NSDocument.move(_:)), "", .command),
+            ("Revert to Saved", #selector(NSDocument.revertToSaved(_:)), "", .command),
+        ]
+        for (title, action, key, modifiers) in expected {
+            let item = try XCTUnwrap(fileMenu.items.first { $0.action == action }, title)
+            XCTAssertEqual(item.title, title)
+            XCTAssertEqual(item.keyEquivalent, key, title)
+            if !key.isEmpty { XCTAssertEqual(item.keyEquivalentModifierMask, modifiers, title) }
+            XCTAssertNil(item.target, title)
+        }
+        // No other item takes their keys.
+        let keys = bar.items.compactMap(\.submenu).flatMap(\.items).filter { !$0.keyEquivalent.isEmpty }
+        for (title, _, key, modifiers) in expected where !key.isEmpty {
+            let taking = keys.filter { $0.keyEquivalent == key && $0.keyEquivalentModifierMask == modifiers }
+            XCTAssertEqual(taking.map(\.title), [title])
+        }
+
+        let opened = try await open(file("menu.csv", csv))
+        let save = try XCTUnwrap(fileMenu.items.first { $0.action == #selector(NSDocument.save(_:)) })
+        set(opened.model, 1, 1, "Edited")
+        XCTAssertTrue(opened.document.isDocumentEdited)
+        XCTAssertTrue(opened.document.validateMenuItem(save), "Save is on once the document is edited")
+    }
+
+    /// A write that failed names its step and the OS error in small type
+    /// under the alert's text, so a report names the cause; the text
+    /// itself stays the String Catalog's.
+    func testAFailedWriteShowsItsStepAndError() throws {
+        let failure = SaveFailure.Io(step: "looking at the folder", code: 1, message: "Operation not permitted (os error 1)")
+        let refusal = try XCTUnwrap(SaveText.saveFailure(failure, name: "a.csv", headerRows: 1))
+        XCTAssertEqual(refusal.details, "Details: looking at the folder failed (errno 1, Operation not permitted).")
+        XCTAssertFalse(refusal.detail.contains("os error"), refusal.detail)
+        let unknown = SaveFailure.Io(step: "coordinating the save", code: nil, message: "The operation couldn’t be completed.")
+        XCTAssertEqual(
+            SaveText.saveFailure(unknown, name: "a.csv", headerRows: 1)?.details,
+            "Details: coordinating the save failed (The operation couldn’t be completed.)."
+        )
+        XCTAssertNil(SaveText.saveFailure(.Locked, name: "a.csv", headerRows: 1)?.details)
+    }
+
     /// ⌘S writes what the core's own save writes, and the document is
     /// clean: the change count, "— Edited", the journal (nothing left to
     /// replay) and `fileModificationDate`; the undo history stays.

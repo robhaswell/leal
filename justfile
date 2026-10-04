@@ -575,6 +575,50 @@ snapshot file out *options: (_app-scripted "debug")
     mv "$container/$name" "{{ out }}"
     echo "snapshot: {{ out }}"
 
+# Save in the real sandbox, outside its container (task 2.5.3a's save fix): `open` hands the sandboxed app a file, as Finder does, and a second one; the app edits a cell, chooses File > Save, then Saves As to the second file's path, which it deletes first (a save panel grants a new file's path the same way), and quits. Checks the bytes, that Save swapped the files and checked the old one, that a Finder tag was kept, and that nothing was left in the folder, which must be outside the container.
+sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": (_app-scripted profile)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail() { echo "error: sandbox-save-check: $*" >&2; exit 1; }
+    container="$HOME/Library/Containers/io.github.robhaswell.leal/Data"
+    folder="{{ folder }}"
+    folder="${folder/#\~/$HOME}/$$"
+    case "$folder" in "$container"/*) fail "$folder is inside the container, so the sandbox extension isn't tested" ;; esac
+    out="sandbox-save-check-$$.json"
+    result="$container/tmp/$out"
+    rm -rf "$folder" "$folder.expected"
+    mkdir -p "$folder"
+    trap 'rm -rf "$folder" "$folder.expected" "$result"' EXIT
+    file="$folder/sandbox save.csv"
+    # No spaces: the launch options are split at them.
+    copy="$folder/sandbox-save-as.csv"
+    # CRLF, a quoted field with an escaped quote, no final newline: bytes a
+    # save must keep exactly. Grid row 1, column 1 is "Ostrava".
+    printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Ostrava,5\r\n3,Halden,8' > "$file"
+    printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Halden,8' > "$folder.expected"
+    printf 'placeholder\n' > "$copy"
+    tags='62706c6973743030a10155477265656e0a080a'
+    /usr/bin/xattr -wx com.apple.metadata:_kMDItemUserTags "$tags" "$file"
+    inode="$(stat -f %i "$file")"
+    app="$PWD/{{ bench_derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
+    just _run-scripted "$app" "$file|$copy" 90 back -LealSaveCheck "$out" -LealSetCells "1,1=Edited" -LealSaveAsTo "$copy"
+    [ -f "$result" ] || fail "the app wrote no result"
+    cat "$result"
+    echo
+    value() { plutil -extract "$1" raw -o - "$result" 2>/dev/null || echo "(none)"; }
+    [ "$(value saveKey)" = "⌘S" ] || fail "File > Save isn't ⌘S"
+    [ "$(value saved)" = true ] || fail "Save failed: $(value failure)"
+    [ "$(value swapped)" = true ] || fail "Save didn't swap the files (and check the old one)"
+    [ -z "$(value keptOldFile)" ] || fail "Save kept the old file"
+    cmp "$file" "$folder.expected" || fail "Save's bytes differ from the expected ones"
+    [ "$(stat -f %i "$file")" != "$inode" ] || fail "Save didn't replace the file"
+    [ "$(/usr/bin/xattr -px com.apple.metadata:_kMDItemUserTags "$file" | tr -d ' \n' | tr 'A-F' 'a-f')" = "$tags" ] || fail "Save didn't keep the Finder tag"
+    [ "$(value saveAs.saved)" = true ] || fail "Save As to a new file failed: $(value saveAs.failure) $(value saveAs.error)"
+    cmp "$copy" "$folder.expected" || fail "Save As's bytes differ from the expected ones"
+    left="$(ls -A "$folder" | grep -vx -e 'sandbox save.csv' -e 'sandbox-save-as.csv' || true)"
+    [ -z "$left" ] || fail "left in the folder: $left"
+    echo "sandbox-save-check: in the sandbox, Save (swapped and checked) and Save As to a new file wrote the expected bytes; tag kept, nothing left over"
+
 # Build Leal.app with the scripted runs (the `LEAL_BENCH` compilation condition) into its own DerivedData.
 [private]
 _app-scripted profile: (ffi profile) xcodeproj
@@ -628,13 +672,13 @@ check-no-bench app="build/DerivedData/Build/Products/Release/Leal.app":
     #!/usr/bin/env bash
     set -euo pipefail
     binary="{{ app }}/Contents/MacOS/Leal"
-    if nm "$binary" | grep -E 'ScriptedRun|ScrollBench' || strings "$binary" | grep -E 'LealBenchScroll|LealSnapshot'; then
+    if nm "$binary" | grep -E 'ScriptedRun|ScrollBench' || strings "$binary" | grep -E 'LealBenchScroll|LealSnapshot|LealSaveCheck'; then
         echo "error: $binary has the scripted runs (LEAL_BENCH)" >&2
         exit 1
     fi
     echo "check-no-bench: $binary has no scripted runs"
 
-# Open a file in a new Leal with scripted-run options (`place`: front, or back to leave the frontmost app alone), wait for it to quit by itself, and quit it after `limit` seconds.
+# Open a file (or several, separated by `|`) in a new Leal with scripted-run options (`place`: front, or back to leave the frontmost app alone), wait for it to quit by itself, and quit it after `limit` seconds.
 [private]
 _run-scripted app file limit place *options:
     #!/usr/bin/env bash
@@ -646,7 +690,8 @@ _run-scripted app file limit place *options:
     # is the one process of this app bundle that wasn't running before.
     executable="{{ app }}/Contents/MacOS/Leal"
     before=" $(pgrep -f "$executable" | tr '\n' ' ') "
-    open -n $background -W -a "{{ app }}" "{{ file }}" --args -ApplePersistenceIgnoreState YES {{ options }} &
+    IFS='|' read -ra files <<<"{{ file }}"
+    open -n $background -W -a "{{ app }}" "${files[@]}" --args -ApplePersistenceIgnoreState YES {{ options }} &
     waiting=$!
     pid=""
     for _ in $(seq {{ limit }}); do

@@ -61,6 +61,7 @@ enum MainMenu {
         menu.addItem(openRecent)
         menu.addItem(.separator())
         menu.addItem(withTitle: String(localized: "Close", comment: "File menu"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        for item in documentItems() { menu.addItem(item) }
         menu.addItem(.separator())
         // Task 1.9: open the file again as it is on disk now, also after
         // Keep Editing hid the banner. Validated by the view controller.
@@ -85,6 +86,30 @@ enum MainMenu {
         reopen.submenu = encodings
         menu.addItem(reopen)
         return menu
+    }
+
+    /// The document's own File menu items, with `NSDocument`'s standard
+    /// actions and no target, so they reach the front document through the
+    /// responder chain and it validates them (`validateUserInterfaceItem`):
+    /// Save ⌘S, Save As… ⇧⌘S, Duplicate ⇧⌘D, Rename…, Move To… and Revert
+    /// to Saved (task 2.5.3a's save fix: the menu had none, so ⌘S did
+    /// nothing). No Lock or Unlock: AppKit's standard File menu has none
+    /// (they are in the title bar's document menu, which documents that
+    /// autosave in place get).
+    static func documentItems() -> [NSMenuItem] {
+        func item(_ title: String, _ action: Selector, _ key: String = "", _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = modifiers
+            return item
+        }
+        return [
+            item(String(localized: "Save", comment: "File menu: save the document (⌘S)"), #selector(NSDocument.save(_:)), "s"),
+            item(String(localized: "Save As…", comment: "File menu: save a copy under another name (⇧⌘S)"), #selector(NSDocument.saveAs(_:)), "s", [.command, .shift]),
+            item(String(localized: "Duplicate", comment: "File menu: open a copy of the document (⇧⌘D)"), #selector(NSDocument.duplicate(_:)), "d", [.command, .shift]),
+            item(String(localized: "Rename…", comment: "File menu: rename the document's file"), #selector(NSDocument.rename(_:))),
+            item(String(localized: "Move To…", comment: "File menu: move the document's file to another folder"), #selector(NSDocument.move(_:))),
+            item(String(localized: "Revert to Saved", comment: "File menu: discard the edits and read the file again"), #selector(NSDocument.revertToSaved(_:))),
+        ]
     }
 
     /// Every encoding Leal reads (ADR-0005 decision 5), in the core's order.

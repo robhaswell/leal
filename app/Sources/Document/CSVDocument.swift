@@ -415,6 +415,13 @@ final class CSVDocument: NSDocument {
     private var saveNumber = 0
     /// Who waits for `saving` to end (`waitForSaves`).
     private var saveWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Why the last Save to end didn't write the file, or `nil` if it did
+    /// (or none has run): for the scripted save check and tests.
+    private(set) var lastSaveFailure: SaveFailure?
+    /// What the last Save to write the file did (whether it swapped the
+    /// files and checked the old one, any old file kept): for the
+    /// scripted save check.
+    private(set) var lastSaveOutcome: SaveOutcome?
     /// What a Save alert's Duplicate, Save As… and Save As UTF-8… do, in
     /// place of doing it. Only tests set it.
     var saveFollowUpForTesting: ((SaveChoice) -> Void)?
@@ -523,6 +530,7 @@ final class CSVDocument: NSDocument {
             } else {
                 .Incomplete
             }
+            lastSaveFailure = failure
             await refuse(failure, model: model)
             return false
         }
@@ -543,6 +551,8 @@ final class CSVDocument: NSDocument {
             overwrite = false
             switch result {
             case let .success(saved?):
+                lastSaveFailure = nil
+                lastSaveOutcome = saved.outcome
                 // The user hears of a kept old file before the save ends,
                 // so Save and Close, and Quit, wait for it.
                 if let reporting = saveFinished(saved, model: model) {
@@ -553,7 +563,8 @@ final class CSVDocument: NSDocument {
                 // The document failed or closed meanwhile.
                 return false
             case var .failure(failure):
-                Logger.document.error("Save failed: \(String(describing: failure), privacy: .public)")
+                lastSaveFailure = failure
+                Self.log(failure, url: url)
                 if case .ChangedElsewhere = failure, await FileWork.run({ !Self.exists(url) }) {
                     // The watcher saw it deleted: say it's missing, rather
                     // than ask to write over it and then say so.
@@ -596,6 +607,21 @@ final class CSVDocument: NSDocument {
     /// The file's name, as the window's title has it.
     private var fileName: String {
         displayName ?? fileURL?.lastPathComponent ?? ""
+    }
+
+    /// Logs why a Save failed, at error level: for a write that failed, the
+    /// step, the OS error (`errno`) and the file, so the cause can be found
+    /// in Console from the user's report.
+    private static func log(_ failure: SaveFailure, url: URL) {
+        let path = url.path(percentEncoded: false)
+        if case let .Io(step, code, message) = failure {
+            let errno = code.map { String($0) } ?? "none"
+            Logger.document.error(
+                "Save failed \(step, privacy: .public) (errno \(errno, privacy: .public): \(message, privacy: .public)) for \(path, privacy: .private)"
+            )
+        } else {
+            Logger.document.error("Save failed: \(String(describing: failure), privacy: .public) for \(path, privacy: .private)")
+        }
     }
 
     /// The save itself, as one of the document's file accesses
@@ -967,6 +993,17 @@ final class CSVDocument: NSDocument {
         let alert = NSAlert()
         alert.messageText = refusal.title
         alert.informativeText = refusal.detail
+        if let details = refusal.details {
+            // Small, selectable type under the text, so it can be copied
+            // into a report.
+            let field = NSTextField(wrappingLabelWithString: details)
+            field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            field.textColor = .secondaryLabelColor
+            field.isSelectable = true
+            field.preferredMaxLayoutWidth = 260
+            field.frame.size = field.fittingSize
+            alert.accessoryView = field
+        }
         let destructive = refusal.choices.contains(.saveAnyway)
         for choice in refusal.choices {
             let button = alert.addButton(withTitle: SaveText.button(choice))
