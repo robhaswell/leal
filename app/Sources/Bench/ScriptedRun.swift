@@ -356,7 +356,7 @@ final class ScriptedRun {
         }
         defer { document.chooseSaveAsDestination = choose }
         if duplicate {
-            NSApp.sendAction(#selector(NSDocument.duplicate(_:)), to: document, from: nil)
+            NSApp.sendAction(#selector(CSVDocument.saveDuplicate(_:)), to: document, from: nil)
         } else {
             NSApp.sendAction(#selector(NSDocument.saveAs(_:)), to: document, from: nil)
         }

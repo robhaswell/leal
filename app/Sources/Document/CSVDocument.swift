@@ -348,7 +348,7 @@ final class CSVDocument: NSDocument {
         case #selector(saveTo(_:)):
             // No Export: it would write through `NSDocument`.
             return false
-        case #selector(saveAs(_:)), #selector(duplicate(_:)):
+        case #selector(saveAs(_:)), #selector(duplicate(_:)), #selector(saveDuplicate(_:)):
             if model == nil || model?.isFailed == true { return false }
         case #selector(revertToSaved(_:)):
             // Not while the file is read again already.
@@ -367,7 +367,7 @@ final class CSVDocument: NSDocument {
     /// save replaces it, and so mustn't run before `NSDocument` and the
     /// model have heard what the save did.
     private static let waitForSave: [Selector] = [
-        #selector(revertToSaved(_:)), #selector(saveAs(_:)), #selector(saveTo(_:)), #selector(duplicate(_:)),
+        #selector(revertToSaved(_:)), #selector(saveAs(_:)), #selector(saveTo(_:)), #selector(duplicate(_:)), #selector(saveDuplicate(_:)),
         #selector(move(_:)), #selector(rename(_:)), #selector(lock(_:)), #selector(NSDocument.unlock(_:)),
     ]
 
@@ -1183,6 +1183,15 @@ final class CSVDocument: NSDocument {
     /// file (its core reads one), so there is no untitled duplicate.
     override func duplicate(_ sender: Any?) {
         chooseSaveAs(.duplicate)
+    }
+
+    /// File ▸ **Duplicate** (⇧⌘D): `duplicate(_:)`, under an action of
+    /// Leal's own. `NSDocument` hides any item whose action is
+    /// `duplicateDocument:` when the app doesn't autosave in place, as
+    /// Leal doesn't (`validateUserInterfaceItem`, seen on macOS 26), so
+    /// the menu item can't use it.
+    @objc func saveDuplicate(_ sender: Any?) {
+        duplicate(sender)
     }
 
     /// AppKit's own Save As panel, should anything ask for it: Leal's Save

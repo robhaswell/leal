@@ -188,7 +188,7 @@ final class SaveTests: XCTestCase {
         let expected: [(String, Selector, String, NSEvent.ModifierFlags)] = [
             ("Save", #selector(NSDocument.save(_:)), "s", .command),
             ("Save As…", #selector(NSDocument.saveAs(_:)), "s", [.command, .shift]),
-            ("Duplicate", #selector(NSDocument.duplicate(_:)), "d", [.command, .shift]),
+            ("Duplicate", #selector(CSVDocument.saveDuplicate(_:)), "d", [.command, .shift]),
             ("Rename…", #selector(NSDocument.rename(_:)), "", .command),
             ("Move To…", #selector(NSDocument.move(_:)), "", .command),
             ("Revert to Saved", #selector(NSDocument.revertToSaved(_:)), "", .command),
@@ -212,6 +212,36 @@ final class SaveTests: XCTestCase {
         set(opened.model, 1, 1, "Edited")
         XCTAssertTrue(opened.document.isDocumentEdited)
         XCTAssertTrue(opened.document.validateMenuItem(save), "Save is on once the document is edited")
+    }
+
+    /// The running app's File menu (as AppKit has fixed it up since
+    /// launch) shows every document item, on and not hidden, once an open
+    /// document has validated them: `NSDocument` hides a
+    /// `duplicateDocument:` item in an app that doesn't autosave in place
+    /// (Rob's test of 2.5.3c: Duplicate was missing), so Leal's Duplicate
+    /// has its own action, which Duplicates.
+    func testTheRunningAppsFileMenuShowsTheDocumentsItems() async throws {
+        let fileMenu = try XCTUnwrap(NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.title == "File" })
+        let opened = try await open(file("shown.csv", csv))
+        set(opened.model, 1, 1, "Edited")
+        for expected in MainMenu.documentItems() {
+            let item = try XCTUnwrap(fileMenu.items.first { $0.action == expected.action }, expected.title)
+            XCTAssertTrue(opened.document.validateMenuItem(item), item.title)
+            XCTAssertFalse(item.isHidden, "\(item.title) is hidden")
+        }
+        // AppKit's own action would be hidden: why Leal doesn't use it.
+        let appKits = NSMenuItem(title: "Duplicate", action: #selector(NSDocument.duplicate(_:)), keyEquivalent: "")
+        _ = opened.document.validateMenuItem(appKits)
+        XCTAssertTrue(appKits.isHidden, "if AppKit shows it now, Leal could use duplicateDocument: again")
+
+        var chosen: [CSVDocument.SaveAsRequest] = []
+        opened.document.chooseSaveAsDestination = { request, _, done in
+            chosen.append(request)
+            done(nil)
+        }
+        let duplicate = try XCTUnwrap(fileMenu.items.first { $0.action == #selector(CSVDocument.saveDuplicate(_:)) })
+        NSApp.sendAction(try XCTUnwrap(duplicate.action), to: opened.document, from: duplicate)
+        XCTAssertEqual(chosen.map(\.name), ["shown copy.csv"])
     }
 
     /// A write that failed names its step and the OS error in small type

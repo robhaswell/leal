@@ -93,7 +93,9 @@ enum MainMenu {
     /// responder chain and it validates them (`validateUserInterfaceItem`):
     /// Save ⌘S, Save As… ⇧⌘S, Duplicate ⇧⌘D, Rename…, Move To… and Revert
     /// to Saved (task 2.5.3a's save fix: the menu had none, so ⌘S did
-    /// nothing). No Lock or Unlock: AppKit's standard File menu has none
+    /// nothing). Duplicate's action is Leal's own
+    /// (`CSVDocument.saveDuplicate`): `NSDocument` hides a
+    /// `duplicateDocument:` item in an app that doesn't autosave in place. No Lock or Unlock: AppKit's standard File menu has none
     /// (they are in the title bar's document menu, which documents that
     /// autosave in place get).
     static func documentItems() -> [NSMenuItem] {
@@ -105,7 +107,12 @@ enum MainMenu {
         return [
             item(String(localized: "Save", comment: "File menu: save the document (⌘S)"), #selector(NSDocument.save(_:)), "s"),
             item(String(localized: "Save As…", comment: "File menu: save a copy under another name (⇧⌘S)"), #selector(NSDocument.saveAs(_:)), "s", [.command, .shift]),
-            item(String(localized: "Duplicate", comment: "File menu: open a copy of the document (⇧⌘D)"), #selector(NSDocument.duplicate(_:)), "d", [.command, .shift]),
+            item(
+                String(localized: "Duplicate", comment: "File menu: save a copy of the document under a new name, then edit the copy (⇧⌘D)"),
+                #selector(CSVDocument.saveDuplicate(_:)),
+                "d",
+                [.command, .shift]
+            ),
             item(String(localized: "Rename…", comment: "File menu: rename the document's file"), #selector(NSDocument.rename(_:))),
             item(String(localized: "Move To…", comment: "File menu: move the document's file to another folder"), #selector(NSDocument.move(_:))),
             item(String(localized: "Revert to Saved", comment: "File menu: discard the edits and read the file again"), #selector(NSDocument.revertToSaved(_:))),
