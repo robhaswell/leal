@@ -720,7 +720,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
         file's security scope, `renamex_np` in the item-replacement folder).
       - Test on a real SMB share while Leal holds descriptors on the file:
         the swap, its fallback, and close-time updates.
-- [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
+- [x] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
     delete columns, all undoable, on top of 2.4.
   - Inserting a row or column after an unterminated quote is disabled,
