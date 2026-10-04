@@ -40,8 +40,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     var documentIsSaving: () -> Bool = { false }
     /// The document's undo manager (`CSVDocument.history`, the window's
     /// too: `windowWillReturnUndoManager`), for a step of several commands
-    /// (Delete Columns, task 2.5a).
-    var undoHistory: () -> UndoManager? = { nil }
+    /// (Delete Columns, task 2.5a), or a step with its own name
+    /// (Duplicate Row).
+    var undoHistory: () -> DocumentUndoManager? = { nil }
     /// The key window, which may be a sheet over this one (Go to Row's):
     /// its text field keeps ⌘↩ and ⌘⌫ (`availability`). Tests stand one in.
     var keyWindow: () -> NSWindow? = { NSApp.keyWindow }
@@ -203,7 +204,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
         grid.onEdit = { [weak self] in self?.editActiveCell() }
         grid.onTypeToEdit = { [weak self] event in self?.editActiveCell(typing: event) }
-        grid.onRowCommandKey = { [weak self] insert in self?.rowCommandKey(insert: insert) }
+        grid.onRowCommandKey = { [weak self] key in self?.rowCommandKey(StructureCommand(key)) }
         grid.onScroll = { [weak self] in self?.cellEditor.gridScrolled() }
         grid.headerView.menuForColumn = { [weak self] column in self?.headerMenu(column: column) }
         inspector.textView.delegate = self

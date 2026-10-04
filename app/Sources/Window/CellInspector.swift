@@ -165,8 +165,8 @@ enum InspectorContent: Equatable {
 /// The inspector's text view, which keeps text as typed
 /// (`LiteralTextView`). ⌘↩ is the inspector's (it commits an edit from
 /// task 2.5, ADR-0002 question 11): consumed here, so it never reaches the
-/// grid's Insert Row (task 2.5a). Return (and ⌥↩) put in the file's own
-/// line break.
+/// grid's Insert Row (task 2.5a). Return (and ⇧↩ and ⌥↩) put in the
+/// file's own line break.
 @MainActor
 final class InspectorTextView: LiteralTextView {
     /// ⌘↩ was pressed: commits the edit.

@@ -183,19 +183,22 @@ enum MainMenu {
         return menu
     }
 
-    /// Insert and delete rows and columns (task 2.5a, DESIGN §4.2: ⌘↩ and
-    /// ⌘⌫), after a separator, rows then columns. The document's view
-    /// controller validates them, with the reason one is off as its
-    /// tooltip.
+    /// Insert, duplicate and delete rows, and insert and delete columns
+    /// (task 2.5a, DESIGN §4.2: ⌘↩, ⇧⌘↩ and ⌘⌫), after a separator, rows
+    /// then columns. The document's view controller validates them, with
+    /// the reason one is off as its tooltip.
     static func structureItems() -> [NSMenuItem] {
-        func item(_ title: String, _ command: StructureCommand, _ key: String = "") -> NSMenuItem {
-            NSMenuItem(title: title, action: DocumentViewController.action(command), keyEquivalent: key)
+        func item(_ title: String, _ command: StructureCommand, _ key: String = "", shift: Bool = false) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: DocumentViewController.action(command), keyEquivalent: key)
+            if shift { item.keyEquivalentModifierMask = [.command, .shift] }
+            return item
         }
         return [
             .separator(),
             item(StructureText.insertRowAbove, .insertRowAbove),
-            // Return, and Delete (backspace), with ⌘.
+            // Return, Return with Shift, and Delete (backspace), with ⌘.
             item(StructureText.insertRowBelow, .insertRowBelow, "\r"),
+            item(StructureText.duplicateRow, .duplicateRows, "\r", shift: true),
             item(StructureText.deleteRow, .deleteRows, "\u{8}"),
             .separator(),
             item(StructureText.insertColumnBefore, .insertColumnBefore),

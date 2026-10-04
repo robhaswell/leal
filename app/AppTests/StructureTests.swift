@@ -127,39 +127,48 @@ final class StructureTests: XCTestCase {
         return try Data(contentsOf: try XCTUnwrap(opened.document.fileURL))
     }
 
-    private func key(_ characters: String, code: UInt16, window: NSWindow, repeating: Bool = false) throws -> NSEvent {
+    private func key(_ characters: String, code: UInt16, window: NSWindow, shift: Bool = false, repeating: Bool = false) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0, windowNumber: window.windowNumber,
+            with: .keyDown, location: .zero, modifierFlags: shift ? [.command, .shift] : .command, timestamp: 0, windowNumber: window.windowNumber,
             context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: repeating, keyCode: code
         ))
     }
 
     // MARK: The menu
 
-    /// The Edit menu has the six commands, ⌘↩ and ⌘⌫ on Insert Row Below
-    /// and Delete Row (DESIGN §4.2), with no target (they reach the front
-    /// window's view controller), and no other item takes those keys.
+    /// The Edit menu has the seven commands, in order, ⌘↩, ⇧⌘↩ and ⌘⌫ on
+    /// Insert Row Below, Duplicate Row and Delete Row (DESIGN §4.2), with
+    /// no target (they reach the front window's view controller), and no
+    /// other item takes those keys.
     func testTheEditMenuHasTheRowAndColumnCommands() throws {
         let bar = MainMenu.make()
         let edit = try XCTUnwrap(bar.items.compactMap(\.submenu).first { $0.title == "Edit" })
-        let expected: [(String, StructureCommand, String)] = [
-            ("Insert Row Above", .insertRowAbove, ""),
-            ("Insert Row Below", .insertRowBelow, "\r"),
-            ("Delete Row", .deleteRows, "\u{8}"),
-            ("Insert Column Before", .insertColumnBefore, ""),
-            ("Insert Column After", .insertColumnAfter, ""),
-            ("Delete Column", .deleteColumns, ""),
+        let shift: NSEvent.ModifierFlags = [.command, .shift]
+        let expected: [(String, StructureCommand, String, NSEvent.ModifierFlags)] = [
+            ("Insert Row Above", .insertRowAbove, "", .command),
+            ("Insert Row Below", .insertRowBelow, "\r", .command),
+            ("Duplicate Row", .duplicateRows, "\r", shift),
+            ("Delete Row", .deleteRows, "\u{8}", .command),
+            ("Insert Column Before", .insertColumnBefore, "", .command),
+            ("Insert Column After", .insertColumnAfter, "", .command),
+            ("Delete Column", .deleteColumns, "", .command),
         ]
-        for (title, command, key) in expected {
-            let item = try XCTUnwrap(edit.items.first { $0.action == DocumentViewController.action(command) }, title)
+        var indexes: [Int] = []
+        for (title, command, key, modifiers) in expected {
+            let index = try XCTUnwrap(edit.items.firstIndex { $0.action == DocumentViewController.action(command) }, title)
+            let item = edit.items[index]
+            indexes.append(index)
             XCTAssertEqual(item.title, title)
             XCTAssertEqual(item.keyEquivalent, key, title)
-            XCTAssertEqual(item.keyEquivalentModifierMask, .command, title)
+            XCTAssertEqual(item.keyEquivalentModifierMask, modifiers, title)
             XCTAssertNil(item.target, title)
         }
+        XCTAssertEqual(indexes, indexes.sorted(), "in order")
+        XCTAssertEqual(indexes[3] - indexes[0], 3, "the row items together")
         let keys = bar.items.compactMap(\.submenu).flatMap(\.items)
-        for key in ["\r", "\u{8}"] {
-            XCTAssertEqual(keys.filter { $0.keyEquivalent == key }.count, 1, "one item takes ⌘\(key.debugDescription)")
+        for (key, modifiers) in [("\r", NSEvent.ModifierFlags.command), ("\r", shift), ("\u{8}", .command)] {
+            let taking = keys.filter { $0.keyEquivalent == key && $0.keyEquivalentModifierMask == modifiers }
+            XCTAssertEqual(taking.count, 1, "one item takes \(modifiers) \(key.debugDescription)")
         }
     }
 
@@ -175,7 +184,7 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(model.rowCount, 4)
         XCTAssertEqual(column(model, 1), ["Marlow", "", "Ostrava", "Halden"])
         XCTAssertEqual(value(model, 1, 2), "", "as many cells as the other rows")
-        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 1), "the new row, to type into")
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 0), "the new row's first cell, to type into")
         XCTAssertTrue(model.hasUnsavedEdits)
         XCTAssertEqual(undo.undoActionName, "Insert Row")
         XCTAssertEqual(opened.document.history.journal.map(\.direction), [.edit])
@@ -194,7 +203,7 @@ final class StructureTests: XCTestCase {
         content.insertRowAbove(nil)
         XCTAssertEqual(model.headerTitle(column: 1).text, "name")
         XCTAssertEqual(column(model, 1), ["", "Marlow", "Ostrava", "Halden"])
-        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 0, column: 2))
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 0, column: 0))
 
         // Below the last row: at the end.
         opened.grid.select(CellPosition(row: 3, column: 0))
@@ -240,6 +249,96 @@ final class StructureTests: XCTestCase {
         content.insertRowBelow(nil)
         XCTAssertEqual(model.rowCount, 1)
         XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 0, column: 0))
+    }
+
+    // MARK: Duplicate Row
+
+    /// Duplicate Row (⇧⌘↩) puts a copy of the row below it and selects it,
+    /// in the same column; undo and redo keep the step's name. Several
+    /// rows: copies of each after the last, as one step, selected in the
+    /// same columns.
+    func testDuplicateRowCopiesTheRowsAndKeepsTheColumn() async throws {
+        let opened = try await open(file("duplicate.csv", csv))
+        let (model, content, undo) = (opened.model, opened.content, opened.undo)
+        _ = model.setCell(.cell(CellPosition(row: 1, column: 2)), to: "6")
+        opened.grid.select(CellPosition(row: 1, column: 2))
+        let item = item(.duplicateRows)
+        XCTAssertTrue(content.validateMenuItem(item))
+        XCTAssertEqual(item.title, "Duplicate Row")
+
+        content.duplicateRows(nil)
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Ostrava", "Halden"])
+        XCTAssertEqual(column(model, 2), ["3", "6", "6", "8"], "the row as it reads, edits and all")
+        XCTAssertEqual(opened.grid.selection, GridSelection(CellPosition(row: 2, column: 2)), "the copy, same column")
+        XCTAssertEqual(undo.undoActionName, "Duplicate Row")
+        XCTAssertEqual(opened.document.history.journal.map(\.direction), [.edit, .edit])
+        undo.undo()
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Halden"])
+        XCTAssertEqual(undo.redoActionName, "Duplicate Row")
+        undo.redo()
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Ostrava", "Halden"])
+        XCTAssertEqual(undo.undoActionName, "Duplicate Row")
+        undo.undo()
+
+        // Two rows, two columns: copies after the second, selected alike.
+        opened.grid.select(CellPosition(row: 1, column: 2))
+        opened.grid.extend(to: CellPosition(row: 0, column: 1))
+        _ = content.validateMenuItem(item)
+        XCTAssertEqual(item.title, "Duplicate Rows")
+        content.duplicateRows(nil)
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Marlow", "Ostrava", "Halden"])
+        XCTAssertEqual(
+            opened.grid.selection,
+            GridSelection(active: CellPosition(row: 3, column: 2), anchor: CellPosition(row: 3, column: 2), extent: CellPosition(row: 2, column: 1))
+        )
+        XCTAssertEqual(opened.grid.selection?.rows, 2...3)
+        XCTAssertEqual(undo.undoActionName, "Duplicate Rows")
+        undo.undo()
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Halden"])
+        XCTAssertEqual(undo.redoActionName, "Duplicate Rows")
+
+        // ⇧⌘↩ in the grid (its item off, or the keypad's Enter), held too.
+        opened.window.makeFirstResponder(opened.grid.gridView)
+        opened.grid.select(CellPosition(row: 2, column: 1))
+        opened.grid.gridView.keyDown(with: try key("\r", code: 36, window: opened.window, shift: true))
+        opened.grid.gridView.keyDown(with: try key("\u{3}", code: 76, window: opened.window, shift: true, repeating: true))
+        XCTAssertEqual(column(model, 1), ["Marlow", "Ostrava", "Halden", "Halden", "Halden"])
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 4, column: 1))
+        XCTAssertFalse(content.cellEditor.isEditing, "not Return's edit")
+        XCTAssertEqual(undo.undoActionName, "Duplicate Row")
+    }
+
+    /// The copy's line is its row's, byte for byte: quotes, an escaped
+    /// quote, spaces, an edited cell quoted as its field was, the file's
+    /// CRLF; undone and redone after a save (by value, ADR-0014 decisions
+    /// 3 and 8), the file goes back to its bytes, then to the copy's.
+    func testADuplicateSavesItsRowsBytes() async throws {
+        let text = "id,name,note\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
+        let opened = try await open(file("dup-bytes.csv", text))
+        _ = opened.model.setCell(.cell(CellPosition(row: 0, column: 1)), to: "Brno")
+        let edited = "id,name,note\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
+        let doubled = "id,name,note\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        opened.content.duplicateRows(nil)
+        var saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), doubled)
+        opened.undo.undo()
+        saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), edited, "undone")
+        opened.undo.redo()
+        XCTAssertEqual(opened.undo.undoActionName, "Duplicate Row")
+        saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), doubled, "redone")
+
+        // Two rows, one a spaced one: both copied after the second.
+        opened.grid.select(CellPosition(row: 1, column: 0))
+        opened.grid.extend(to: CellPosition(row: 2, column: 0))
+        opened.content.duplicateRows(nil)
+        saved = try await save(opened)
+        XCTAssertEqual(
+            String(decoding: saved, as: UTF8.self),
+            "id,name,note\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n"
+        )
     }
 
     // MARK: Columns
@@ -331,6 +430,8 @@ final class StructureTests: XCTestCase {
         model.refusalForTesting = nil
         XCTAssertEqual(model.columnCount, 3)
         XCTAssertEqual(undo.undoActionName, undoName, "no nameless step")
+        XCTAssertTrue(undo.canRedo, "Redo kept")
+        XCTAssertEqual(undo.redoActionName, redoName)
 
         // No window: still both, as one step of the document's history.
         opened.window.contentView = NSView()
@@ -502,8 +603,8 @@ final class StructureTests: XCTestCase {
             XCTAssertEqual(item.toolTip, reason, "\(command)")
         }
         let rows = model.rowCount
-        content.rowCommandKey(insert: true)
-        content.rowCommandKey(insert: false)
+        content.rowCommandKey(.insertRowBelow)
+        content.rowCommandKey(.deleteRows)
         content.insertColumnAfter(nil)
         XCTAssertEqual(content.lastAnnouncement, reason)
         XCTAssertEqual(model.rowCount, rows)
@@ -551,17 +652,38 @@ final class StructureTests: XCTestCase {
         opened.grid.select(CellPosition(row: 1, column: 1))
         let (below, belowReason) = validate(opened, .insertRowBelow)
         XCTAssertFalse(below)
-        XCTAssertEqual(belowReason, "A quote in the last row is never closed, so a row inserted after it would be part of its text.")
+        XCTAssertEqual(
+            belowReason,
+            "A quote in the last row is never closed, so a row inserted after it would land inside the quote. Insert Row Above still works, and the cell can still be edited."
+        )
         let (after, afterReason) = validate(opened, .insertColumnAfter)
         XCTAssertFalse(after)
-        XCTAssertEqual(afterReason, "A quote in the last row is never closed, so a column inserted after it would be part of its text.")
+        XCTAssertEqual(
+            afterReason,
+            "A quote in the last row is never closed, so a column inserted after it would land inside the quote. Insert Column Before still works, and the cell can still be edited."
+        )
+        let (duplicate, duplicateReason) = validate(opened, .duplicateRows)
+        XCTAssertFalse(duplicate, "a copy would follow the quote's row")
+        XCTAssertEqual(
+            duplicateReason,
+            "A quote in the last row is never closed, so a copy of the row would land inside the quote. Insert Row Above still works, and the cell can still be edited."
+        )
         XCTAssertTrue(validate(opened, .insertRowAbove).0)
         XCTAssertTrue(validate(opened, .insertColumnBefore).0)
         XCTAssertTrue(validate(opened, .deleteRows).0)
 
-        opened.content.rowCommandKey(insert: true)
+        opened.content.rowCommandKey(.insertRowBelow)
         XCTAssertEqual(model.rowCount, 2, "⌘↩ beeps")
         XCTAssertEqual(opened.content.lastAnnouncement, belowReason)
+        opened.content.rowCommandKey(.duplicateRows)
+        XCTAssertEqual(model.rowCount, 2, "⇧⌘↩ beeps")
+        XCTAssertEqual(opened.content.lastAnnouncement, duplicateReason)
+        // Rows before the quote's row can be duplicated; with it, not.
+        opened.grid.select(CellPosition(row: 0, column: 0))
+        XCTAssertTrue(validate(opened, .duplicateRows).0)
+        opened.grid.extend(to: CellPosition(row: 1, column: 0))
+        XCTAssertFalse(validate(opened, .duplicateRows).0)
+        opened.grid.select(CellPosition(row: 1, column: 1))
         opened.content.insertRowAbove(nil)
         XCTAssertEqual(model.rowCount, 3)
         XCTAssertEqual(value(model, 2, 1), "never closed\n4,5\n")
@@ -570,10 +692,10 @@ final class StructureTests: XCTestCase {
     // MARK: Keys
 
     /// ⌘⌫ in the in-cell editor deletes to the start of the line, as in any
-    /// text field, never a row; ⌘↩ there commits the edit and inserts a row
-    /// below. In the find bar both are the field's: the commands are off.
-    /// In the grid, ⌘ with the keypad's Enter (which isn't the menu item's
-    /// key) inserts a row too.
+    /// text field, never a row; ⌘↩ (⇧⌘↩) there commits the edit and
+    /// inserts a row below (duplicates the row). In the find bar all are
+    /// the field's: the commands are off. In the grid, ⌘ with the keypad's
+    /// Enter (which isn't the menu item's key) inserts a row too.
     func testRowKeysInTheEditorsAndTheFindBar() async throws {
         let opened = try await open(file("keys.csv", csv))
         let (model, content, window) = (opened.model, opened.content, opened.window)
@@ -597,10 +719,11 @@ final class StructureTests: XCTestCase {
         content.insertRowBelow(nil)
         XCTAssertFalse(content.cellEditor.isEditing)
         XCTAssertEqual(column(model, 1), ["Marlowe", "", "Ostrava", "Halden"])
-        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 1))
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 0))
 
         // ⌘ and the keypad's Enter in the in-cell editor: as ⌘↩, the edit
         // committed, then a row inserted below.
+        opened.grid.select(CellPosition(row: 1, column: 1))
         content.editActiveCell()
         await content.cellEditor.loading?.value
         let again = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
@@ -608,7 +731,7 @@ final class StructureTests: XCTestCase {
         XCTAssertTrue(again.performKeyEquivalent(with: try key("\u{3}", code: 76, window: window)))
         XCTAssertFalse(content.cellEditor.isEditing)
         XCTAssertEqual(column(model, 1), ["Marlowe", "Bree", "", "Ostrava", "Halden"])
-        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 2, column: 1))
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 2, column: 0))
 
         // ⌘ and the keypad's Enter in the grid.
         window.makeFirstResponder(opened.grid.gridView)
@@ -620,6 +743,21 @@ final class StructureTests: XCTestCase {
         // A held ⌘⌫'s repeats delete nothing more.
         opened.grid.gridView.keyDown(with: try key("\u{7f}", code: 51, window: window, repeating: true))
         XCTAssertEqual(model.rowCount, 5)
+
+        // ⇧⌘↩ in the in-cell editor goes on to the menu (which commits the
+        // edit, then duplicates the row); ⇧⌘ and the keypad's Enter does
+        // both there.
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.editActiveCell()
+        await content.cellEditor.loading?.value
+        let third = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
+        third.insertText("Marlow", replacementRange: NSRange(location: 0, length: (third.string as NSString).length))
+        XCTAssertFalse(third.performKeyEquivalent(with: try key("\r", code: 36, window: window, shift: true)), "⇧⌘↩ goes on to the menu")
+        XCTAssertTrue(third.performKeyEquivalent(with: try key("\u{3}", code: 76, window: window, shift: true)))
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(column(model, 1), ["Marlow", "Marlow", "Bree", "", "Ostrava", "Halden"])
+        XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 1, column: 1), "the copy, same column")
+        XCTAssertEqual(opened.undo.undoActionName, "Duplicate Row")
 
         // A sheet over the window (Go to Row's) with its field focused:
         // the field keeps the keys.

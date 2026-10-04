@@ -658,6 +658,43 @@ final class EditingTests: XCTestCase {
         XCTAssertEqual(EditorLines.ranges(in: "a\n\nb", upTo: 2).count, 2)
     }
 
+    /// ⇧↩ puts in the file's own line break, as ⌥↩ does: in the in-cell
+    /// editor (Return or the keypad's Enter, with Shift), where Return
+    /// commits, and in the inspector, where Return does too. The in-cell
+    /// editor's tooltip and VoiceOver help say so.
+    func testShiftReturnPutsInALineBreak() async throws {
+        let (_, model, content) = try await open(try file("shift.csv", "id,v\r\n1,abc\r\n2,def\r\n"))
+        let window = content.view.window
+        let field = content.cellEditor.field
+        XCTAssertEqual(field.toolTip, "Return commits · ⇧↩ or ⌥↩ for a new line · Esc cancels")
+        XCTAssertEqual(field.accessibilityHelp(), field.toolTip)
+
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        let editor = try fieldEditor(content)
+        editor.setSelectedRange(NSRange(location: (editor.string as NSString).length, length: 0))
+        editor.keyDown(with: try key("\r", code: 36, flags: .shift, window: window))
+        XCTAssertTrue(content.cellEditor.isEditing, "not committed")
+        XCTAssertEqual(utf8(field.stringValue), utf8("abc\r\n"))
+        editor.keyDown(with: try key("\u{3}", code: 76, flags: [.shift, .numericPad], window: window))
+        editor.insertText("x", replacementRange: editor.selectedRange())
+        try press(#selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), in: content)
+        XCTAssertEqual(utf8(field.stringValue), utf8("abc\r\n\r\nx\r\n"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 0, 1), utf8("abc\r\n\r\nx\r\n"))
+
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        window?.makeFirstResponder(text)
+        text.setSelectedRange(NSRange(location: (text.string as NSString).length, length: 0))
+        text.keyDown(with: try key("\r", code: 36, flags: .shift, window: window))
+        XCTAssertEqual(text.string, "def\r\n")
+        text.onCommit?()
+        XCTAssertEqual(value(model, 1, 1), utf8("def\r\n"))
+    }
+
     /// A value with invalid bytes, opened and left untouched (Return, or
     /// leaving the editor), is no edit: its bytes stay. Whether a long
     /// value has invalid bytes is read from its full value off the main

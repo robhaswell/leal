@@ -113,9 +113,8 @@ final class GridContainerView: NSView {
         get { gridView.onTypeToEdit }
         set { gridView.onTypeToEdit = newValue }
     }
-    /// ⌘↩ (`true`) or ⌘⌫ reached the grid: its menu item is off (task
-    /// 2.5a).
-    var onRowCommandKey: ((_ insert: Bool) -> Void)? {
+    /// ⌘↩, ⇧⌘↩ or ⌘⌫ reached the grid: its menu item is off (task 2.5a).
+    var onRowCommandKey: ((RowCommandKey) -> Void)? {
         get { gridView.onRowCommandKey }
         set { gridView.onRowCommandKey = newValue }
     }
@@ -567,6 +566,16 @@ final class GridContainerView: NSView {
         guard let clamped = clamp(cell) else { return }
         selection = GridSelection(clamped)
         scrollToVisible(clamped)
+    }
+
+    /// Selects `newSelection` (rows a command made, say), and scrolls its
+    /// active cell into view.
+    func select(_ newSelection: GridSelection) {
+        pendingJump = nil
+        jumpedTo = nil
+        guard let active = clamp(newSelection.active) else { return }
+        selection = newSelection
+        scrollToVisible(active)
     }
 
     /// Selects the cells from the active cell to `cell` (Shift-click, a

@@ -56,7 +56,15 @@ final class DocumentUndoManager: UndoManager {
     /// The name of the step being undone or redone: the steps it registers
     /// meanwhile, for the other way, take it, so a group of commands keeps
     /// its own name ("Redo Delete Columns", not the last command's).
-    private var stepName: String?
+    private(set) var stepName: String?
+    /// `registerAsOneStep` runs: its group is waiting for its first
+    /// command, or open.
+    private var oneStep: OneStep?
+
+    private enum OneStep {
+        case waiting
+        case open
+    }
 
     override init() {
         super.init()
@@ -116,14 +124,41 @@ final class DocumentUndoManager: UndoManager {
     }
 
     /// Registers `action` as one undo step named `name`. Inside an undo or
-    /// a redo the manager has its group open already; otherwise the step is
-    /// a group of its own.
+    /// a redo the manager has its group open already; inside
+    /// `registerAsOneStep`, its group; otherwise the step is a group of its
+    /// own.
     func registerStep(named name: String, _ action: @escaping @MainActor () -> Void) {
-        let ownGroup = !isUndoing && !isRedoing
+        if oneStep == .waiting {
+            beginUndoGrouping()
+            oneStep = .open
+        }
+        let ownGroup = !isUndoing && !isRedoing && oneStep == nil
         if ownGroup { beginUndoGrouping() }
         registerUndo(withTarget: self) { _ in action() }
         setActionName(stepName(or: name))
         if ownGroup { endUndoGrouping() }
+    }
+
+    /// Runs `body`, whose commands (task 2.5a: Delete Columns' several, or
+    /// Duplicate Row's one) become one undo step, named what `body` returns
+    /// (`nil`: the last command's name). The step's group opens with its
+    /// first command, so a `body` whose commands the core refused leaves
+    /// nothing: an empty group would be a nameless Undo, and opening one
+    /// clears Redo, which `undoNestedGroup` doesn't bring back.
+    func registerAsOneStep(_ body: () -> String?) {
+        guard oneStep == nil, !isUndoing, !isRedoing else {
+            _ = body()
+            return
+        }
+        oneStep = .waiting
+        let name = body()
+        if oneStep == .open {
+            // Named while the group is open: with none open, the undo
+            // manager raises.
+            if let name { setActionName(name) }
+            endUndoGrouping()
+        }
+        oneStep = nil
     }
 
     /// The step being undone or redone's name, if any, else `name`.

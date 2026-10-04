@@ -229,13 +229,16 @@
     "1 row has a different number of fields to the other %@" : {
       "comment" : "Details popover: one ragged row; the number of rows with the usual field count"
     },
-    "A quote at %@ is never closed, so the rest of the file is one cell" : {
-      "comment" : "Details popover: the unterminated quote; where its opening quote is, such as row 12"
+    "A quote at %@ is never closed, so the rest of the file is one cell. That cell can still be edited, but rows and columns can’t be added or duplicated after it: they would land inside the quote. Insert Row Above still works." : {
+      "comment" : "Details popover: the unterminated quote, and what it stops (ADR-0004 decision 8); where its opening quote is, such as row 12"
     },
-    "A quote in the last row is never closed, so a column inserted after it would be part of its text." : {
+    "A quote in the last row is never closed, so a column inserted after it would land inside the quote. Insert Column Before still works, and the cell can still be edited." : {
       "comment" : "Tooltip: Insert Column is off after an unterminated quote (ADR-0004 decision 8)"
     },
-    "A quote in the last row is never closed, so a row inserted after it would be part of its text." : {
+    "A quote in the last row is never closed, so a copy of the row would land inside the quote. Insert Row Above still works, and the cell can still be edited." : {
+      "comment" : "Tooltip: Duplicate Row is off for an unterminated quote's row (ADR-0004 decision 8)"
+    },
+    "A quote in the last row is never closed, so a row inserted after it would land inside the quote. Insert Row Above still works, and the cell can still be edited." : {
       "comment" : "Tooltip: Insert Row is off after an unterminated quote (ADR-0004 decision 8)"
     },
     "A row it changes can’t be read: its drive or share isn’t available." : {
@@ -404,6 +407,12 @@
     },
     "Duplicate" : {
       "comment" : "Button: keep the changes in a copy of a file Leal can't save\nFile menu: open a copy of the document (⇧⌘D)"
+    },
+    "Duplicate Row" : {
+      "comment" : "Edit menu (⇧⌘↩): a copy of the selected row below it (task 2.5a), and the Undo menu's Undo Duplicate Row"
+    },
+    "Duplicate Rows" : {
+      "comment" : "Edit menu with several rows selected (⇧⌘↩): a copy of each after the last, and the Undo menu's Undo Duplicate Rows"
     },
     "Edit" : {
       "comment" : "Menu title"
@@ -859,6 +868,9 @@
     },
     "Reopen with Encoding" : {
       "comment" : "Menu: read the file in another encoding (ADR-0005 decision 8)"
+    },
+    "Return commits · ⇧↩ or ⌥↩ for a new line · Esc cancels" : {
+      "comment" : "In-cell editor's tooltip and VoiceOver help: its keys (task 2.5a)"
     },
     "Revert" : {
       "comment" : "Button: revert to the saved file and discard the edits"

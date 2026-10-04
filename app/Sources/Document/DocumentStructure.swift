@@ -1,7 +1,8 @@
 import Foundation
 import LealFFI
 
-/// Inserting and deleting rows and columns (task 2.5a, DESIGN §4.2): the
+/// Inserting, duplicating and deleting rows, and inserting and deleting
+/// columns (task 2.5a, DESIGN §4.2): the
 /// core's structural edits (task 2.4), with grid rows turned into the
 /// core's logical rows. Each command goes to `commandApplied`, as a cell
 /// edit does, so undo, the journal, the grid, Find and the inspector hear
@@ -27,6 +28,16 @@ extension DocumentModel {
     func rowInsertRefusal(beforeGridRow gridRow: Int) -> EditRefusal? {
         let at = logicalRow(gridRow: gridRow)
         let refusal: EditRefusal?? = call { try $0.canInsertRows(at: at) }
+        return refusal ?? .unreadable
+    }
+
+    /// Why grid rows `rows` can't be duplicated now, or `nil` if they can:
+    /// as for rows inserted after them (the last an unterminated quote's
+    /// row, say).
+    func rowDuplicateRefusal(_ rows: ClosedRange<Int>) -> EditRefusal? {
+        let at = logicalRow(gridRow: rows.lowerBound)
+        let count = UInt64(rows.count)
+        let refusal: EditRefusal?? = call { try $0.canDuplicateRows(at: at, count: count) }
         return refusal ?? .unreadable
     }
 
@@ -61,6 +72,14 @@ extension DocumentModel {
         let at = logicalRow(gridRow: gridRow)
         let row = Array(repeating: "", count: max(1, fileColumnCount))
         return make { try $0.insertRows(at: at, rows: [row]) }
+    }
+
+    /// Duplicates grid rows `rows`, as one command: a copy of each, in
+    /// order, after the last, written as its row is (task 2.5a).
+    func duplicateRows(_ rows: ClosedRange<Int>) -> EditOutcome {
+        let at = logicalRow(gridRow: rows.lowerBound)
+        let count = UInt64(rows.count)
+        return make { try $0.duplicateRows(at: at, count: count) }
     }
 
     /// Deletes grid rows `rows`, as one command.

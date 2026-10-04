@@ -44,9 +44,9 @@ final class CSVDocument: NSDocument {
     let history = EditHistory()
     /// What the last Recover changes did, for tests.
     private(set) var lastRecovery: ReplayReport?
-    /// A step's undo or redo the core refused, dealt with once the undo
-    /// manager is done (`stepEnded`).
-    private var refusedStep: (command: EditCommand, direction: CommandDirection, refusal: EditRefusal)?
+    /// A step's undo or redo the core refused, with the step's name,
+    /// dealt with once the undo manager is done (`stepEnded`).
+    private var refusedStep: (direction: CommandDirection, refusal: EditRefusal, name: String)?
     /// Asks whether to save the changes before closing, in place of
     /// `NSDocument`'s alert. Only tests set it: `answer` says whether to
     /// close.
@@ -1494,7 +1494,10 @@ final class CSVDocument: NSDocument {
         guard let model else { return }
         let outcome = direction == .undo ? model.undo(command) : model.redo(command)
         if case let .refused(refusal) = outcome {
-            refusedStep = (command, direction, refusal)
+            // The step's own name ("Duplicate Row", "Delete Columns"), not
+            // its command's.
+            let name = history.undoManager.stepName ?? EditHistory.actionName(for: command)
+            refusedStep = (direction, refusal, name)
             if HistoryText.isTemporary(refusal) {
                 // Back where it came from, to try again: done while the
                 // undo manager is still in this undo or redo.
@@ -1515,7 +1518,7 @@ final class CSVDocument: NSDocument {
     /// apply either: the history is cleared, with the edits left as they
     /// are. Either way the user is told.
     private func stepEnded() {
-        guard let (command, direction, refusal) = refusedStep else { return }
+        guard let (direction, refusal, name) = refusedStep else { return }
         refusedStep = nil
         let temporary = HistoryText.isTemporary(refusal)
         if !temporary {
@@ -1524,7 +1527,7 @@ final class CSVDocument: NSDocument {
         NSSound.beep()
         guard let window = windowControllers.first?.window else { return }
         let alert = NSAlert()
-        alert.messageText = HistoryText.undoRefused(EditHistory.actionName(for: command), undo: direction == .undo)
+        alert.messageText = HistoryText.undoRefused(name, undo: direction == .undo)
         alert.informativeText = temporary ? HistoryText.undoNotYetDetail(refusal) : HistoryText.undoRefusedDetail(refusal)
         showSheet(alert, window) { _ in }
     }

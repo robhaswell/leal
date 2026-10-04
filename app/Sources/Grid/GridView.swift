@@ -73,10 +73,10 @@ final class GridView: StripContentView, NSMenuItemValidation {
     /// text (DESIGN §4.2, "start typing"). The event goes on to the editor,
     /// so input methods compose from it.
     var onTypeToEdit: ((NSEvent) -> Void)?
-    /// ⌘↩ or ⌘⌫ reached the grid (task 2.5a): Edit > Insert Row Below or
-    /// Delete Row is off, or it would have taken the key first. `true` for
-    /// ⌘↩.
-    var onRowCommandKey: ((_ insert: Bool) -> Void)?
+    /// ⌘↩, ⇧⌘↩ or ⌘⌫ reached the grid (task 2.5a): Edit > Insert Row
+    /// Below, Duplicate Row or Delete Row is off, or it would have taken
+    /// the key first.
+    var onRowCommandKey: ((RowCommandKey) -> Void)?
 
     let lines = TextLineCache(capacity: 2_500)
     /// Lays out the text of rows about to scroll into view (task 2.0a).
@@ -432,25 +432,25 @@ final class GridView: StripContentView, NSMenuItemValidation {
             onTypeToEdit(event)
             return
         }
-        if let insert = Self.rowCommandKey(event) {
+        if let key = Self.rowCommandKey(event) {
             // Not Return's edit, nor a beep with no reason given. A held
             // ⌘⌫ deletes once, not a row each repeat.
-            if !insert, event.isARepeat { return }
-            onRowCommandKey?(insert)
+            if key == .delete, event.isARepeat { return }
+            onRowCommandKey?(key)
             return
         }
         interpretKeyEvents([event])
     }
 
-    /// Whether `event` is ⌘↩ (`true`: Return or Enter) or ⌘⌫ (`false`),
-    /// with no other modifier: Insert Row Below and Delete Row's keys
-    /// (DESIGN §4.2). `nil` for any other key.
-    static func rowCommandKey(_ event: NSEvent) -> Bool? {
+    /// Which row command's key `event` is (DESIGN §4.2): ⌘↩ (Return or
+    /// Enter), ⇧⌘↩, or ⌘⌫, with no other modifier. `nil` for any other key.
+    static func rowCommandKey(_ event: NSEvent) -> RowCommandKey? {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
-        guard event.type == .keyDown, modifiers == .command else { return nil }
-        switch event.keyCode {
-        case 36, 76: return true
-        case 51: return false
+        guard event.type == .keyDown else { return nil }
+        switch (event.keyCode, modifiers) {
+        case (36, .command), (76, .command): return .insertBelow
+        case (36, [.command, .shift]), (76, [.command, .shift]): return .duplicate
+        case (51, .command): return .delete
         default: return nil
         }
     }
@@ -614,4 +614,14 @@ enum GridMove: Equatable, Sendable {
         }
         return CellPosition(row: min(max(0, row), rows - 1), column: min(max(0, column), columns - 1))
     }
+}
+
+/// A row command's key (`GridView.rowCommandKey`, task 2.5a).
+enum RowCommandKey: Equatable {
+    /// ⌘↩: Insert Row Below.
+    case insertBelow
+    /// ⇧⌘↩: Duplicate Row.
+    case duplicate
+    /// ⌘⌫: Delete Row.
+    case delete
 }

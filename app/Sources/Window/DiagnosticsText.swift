@@ -81,8 +81,8 @@ enum DiagnosticsText {
         switch diagnostic.kind {
         case .unterminatedQuote:
             return String(
-                localized: "A quote at \(first) is never closed, so the rest of the file is one cell",
-                comment: "Details popover: the unterminated quote; where its opening quote is, such as row 12"
+                localized: "A quote at \(first) is never closed, so the rest of the file is one cell. That cell can still be edited, but rows and columns can’t be added or duplicated after it: they would land inside the quote. Insert Row Above still works.",
+                comment: "Details popover: the unterminated quote, and what it stops (ADR-0004 decision 8); where its opening quote is, such as row 12"
             )
         case .raggedRows:
             return count == 1

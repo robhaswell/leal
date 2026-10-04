@@ -68,6 +68,16 @@ struct GridSelection: Equatable, Sendable {
         GridSelection(active: active, anchor: anchor, extent: cell, throughLastRow: throughLastRow)
     }
 
+    /// The same cells of the copies of `rows` (Duplicate Row, task 2.5a),
+    /// which follow them: each corner's row (within `rows`) moved down by
+    /// their count, its column kept.
+    func copied(_ rows: ClosedRange<Int>) -> GridSelection {
+        func copy(_ cell: CellPosition) -> CellPosition {
+            CellPosition(row: min(max(cell.row, rows.lowerBound), rows.upperBound) + rows.count, column: cell.column)
+        }
+        return GridSelection(active: copy(active), anchor: copy(anchor), extent: copy(extent))
+    }
+
     /// The selection kept inside a grid of `rows` × `columns` (the row
     /// count fell when indexing finished, or the file was read again):
     /// `nil` if the grid is empty.

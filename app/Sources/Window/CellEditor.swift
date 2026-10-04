@@ -96,22 +96,40 @@ class LiteralTextView: NSTextView {
 
     /// ⌘⌫ is the text's while either editor has the focus: it deletes to
     /// the start of the line, as in any text field, and never reaches Edit
-    /// > Delete Row (task 2.5a), which would take it first. ⌘↩ goes on: in
-    /// the in-cell editor it commits the edit, then inserts a row below
-    /// (the inspector's commits only: `InspectorTextView`). ⌘ and the
-    /// keypad's Enter, which isn't the menu item's key, does the same as
-    /// ⌘↩ there, as it does in the grid.
+    /// > Delete Row (task 2.5a), which would take it first. ⌘↩ and ⇧⌘↩ go
+    /// on: in the in-cell editor they commit the edit, then insert a row
+    /// below or duplicate the row (in the inspector ⌘↩ commits only:
+    /// `InspectorTextView`). ⌘ (or ⇧⌘) and the keypad's Enter, which isn't
+    /// the menu items' key, do the same there, as they do in the grid.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if window?.firstResponder === self, let insert = GridView.rowCommandKey(event) {
-            if !insert {
+        if window?.firstResponder === self, let key = GridView.rowCommandKey(event) {
+            if key == .delete {
                 interpretKeyEvents([event])
                 return true
             }
             if isFieldEditor, event.keyCode == Self.keypadEnter {
-                return tryToPerform(#selector(DocumentViewController.insertRowBelow(_:)), with: self)
+                let command = StructureCommand(key)
+                return tryToPerform(DocumentViewController.action(command), with: self)
             }
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// ⇧↩ puts in a line break, as ⌥↩ does (`insertNewlineIgnoringFieldEditor`):
+    /// in the in-cell editor, where Return commits, the file's own; in the
+    /// inspector, as Return does. Not while an input method composes.
+    override func keyDown(with event: NSEvent) {
+        if Self.isShiftReturn(event), !hasMarkedText() {
+            doCommand(by: #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)))
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// ⇧↩ (Return or Enter, with Shift and nothing else).
+    static func isShiftReturn(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function])
+        return event.type == .keyDown && modifiers == .shift && (event.keyCode == 36 || event.keyCode == 76)
     }
 
     /// The keypad's Enter key.
@@ -148,6 +166,8 @@ final class CellEditorField: NSTextField {
         layer?.borderWidth = 2
         updateBorder()
         setAccessibilityLabel(EditText.editorLabel)
+        setAccessibilityHelp(EditText.editorKeys)
+        toolTip = EditText.editorKeys
         // The accent colour can change while the editor is open.
         NotificationCenter.default.addObserver(
             self, selector: #selector(systemColorsChanged(_:)), name: NSColor.systemColorsDidChangeNotification, object: nil
@@ -332,8 +352,8 @@ final class EditCallout: NSView {
 /// double-click or typing opens it on the active cell (or "Rename
 /// Column…" on a header-row title); Return commits, Tab and Shift-Tab
 /// commit and move along the row, Esc cancels, and leaving the editor (a
-/// click elsewhere) commits. ⌥↩ puts a line break in the value (the
-/// file's own, `DocumentModel.lineBreak`).
+/// click elsewhere) commits. ⇧↩ or ⌥↩ puts a line break in the value
+/// (the file's own, `DocumentModel.lineBreak`).
 ///
 /// - It opens only where the core's `canEdit` allows; elsewhere the
 ///   callout says why.
@@ -578,7 +598,8 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         case #selector(NSResponder.cancelOperation(_:)):
             cancel()
         case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            // ⌥↩: a line break, the file's own.
+            // ⌥↩ (and ⇧↩, `LiteralTextView.keyDown`): a line break, the
+            // file's own.
             textView.insertText(model.lineBreak, replacementRange: textView.selectedRange())
         default:
             return false
@@ -835,6 +856,7 @@ enum EditorLines {
 /// The editing words (DESIGN §4.4: from the String Catalog).
 enum EditText {
     static let editorLabel = String(localized: "Cell editor", comment: "VoiceOver name of the in-cell editor (task 2.5.1)")
+    static let editorKeys = String(localized: "Return commits · ⇧↩ or ⌥↩ for a new line · Esc cancels", comment: "In-cell editor's tooltip and VoiceOver help: its keys (task 2.5a)")
     static let renameColumn = String(localized: "Rename Column…", comment: "Column header context menu: edit the header row's cell (task 2.5.1)")
 
     /// Mockup 05b's callout. The mockup names the bytes (0xE9); the core
