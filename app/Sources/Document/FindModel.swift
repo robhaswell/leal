@@ -78,28 +78,10 @@ final class FindModel: GridHighlighter {
     /// typing in the find bar shows the next match as it goes, as macOS
     /// find bars do.
     func find(_ text: String, caseSensitive: Bool, from: CellPosition?) {
-        stop()
-        query = text
-        self.caseSensitive = caseSensitive
-        current = nil
-        guard !text.isEmpty else {
-            onChange?()
-            return
-        }
-        // `nil` for a query the core won't search for (too long).
-        let found: Search?? = model.call { handle -> Search? in
-            try handle.find(text: text, caseSensitive: caseSensitive)
-        }
-        guard let started = found ?? nil else {
-            onChange?()
-            return
-        }
-        search = started
-        progress = model.call { _ in try started.progress() }
+        guard begin(text, caseSensitive: caseSensitive) else { return }
         // The first match at or after the active cell: Next from the cell
         // before it.
         pendingStep = (from.flatMap { cellBefore($0) }, true)
-        watch(started)
         retryPendingStep()
         onChange?()
     }
@@ -109,6 +91,51 @@ final class FindModel: GridHighlighter {
         guard !query.isEmpty else { return }
         find(query, caseSensitive: caseSensitive, from: from)
     }
+
+    /// The query again on a new reading of the same values (after a save,
+    /// task 2.5.3b review), without a step: nothing selects a match, so
+    /// the selection, a range or an open editor stay as they are. The
+    /// current match stays current if it still is one, once the search
+    /// has found it again.
+    func searchAgain() {
+        guard !query.isEmpty else { return }
+        let cell = current?.cell ?? activeCell
+        guard begin(query, caseSensitive: caseSensitive) else { return }
+        if let cell {
+            noteCurrent(cell)
+            if current == nil { awaitingCurrent = cell }
+        }
+        onChange?()
+    }
+
+    /// Starts searching for `text`, with nothing selected yet. `false`
+    /// (the bar told) if there is nothing to search for.
+    private func begin(_ text: String, caseSensitive: Bool) -> Bool {
+        stop()
+        query = text
+        self.caseSensitive = caseSensitive
+        current = nil
+        guard !text.isEmpty else {
+            onChange?()
+            return false
+        }
+        // `nil` for a query the core won't search for (too long).
+        let found: Search?? = model.call { handle -> Search? in
+            try handle.find(text: text, caseSensitive: caseSensitive)
+        }
+        guard let started = found ?? nil else {
+            onChange?()
+            return false
+        }
+        search = started
+        progress = model.call { _ in try started.progress() }
+        watch(started)
+        return true
+    }
+
+    /// The selected cell, to be the current match once the search has got
+    /// as far (`searchAgain`).
+    private var awaitingCurrent: CellPosition?
 
     /// Stops the search and forgets its matches (the find bar closed).
     func stop() {
@@ -121,6 +148,7 @@ final class FindModel: GridHighlighter {
         progress = nil
         pendingStep = nil
         current = nil
+        awaitingCurrent = nil
         tiles.removeAll()
     }
 
@@ -161,6 +189,10 @@ final class FindModel: GridHighlighter {
             if let cell = current?.cell ?? activeCell { current = nil; noteCurrent(cell) }
         }
         progress = latest
+        if let cell = awaitingCurrent {
+            noteCurrent(cell)
+            if current != nil || latest.complete { awaitingCurrent = nil }
+        }
         retryPendingStep()
         onChange?()
     }
@@ -290,6 +322,7 @@ final class FindModel: GridHighlighter {
     /// match if it is one, so the bar says "k of N".
     func activeCellChanged(_ cell: CellPosition?) {
         activeCell = cell
+        awaitingCurrent = nil
         guard search != nil, let cell else {
             if current != nil { current = nil; onChange?() }
             return

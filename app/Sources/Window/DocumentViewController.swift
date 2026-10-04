@@ -321,8 +321,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             grid.headerView.invalidateContent()
             detailsPopover?.close()
             navigation.reset()
+            // Searched again without a step: nothing moves the selection,
+            // which may be a range, or an editor still open.
             if isFindBarShown {
-                find.restart(from: grid.activeCell)
+                find.searchAgain()
             } else {
                 find.stop()
             }
@@ -453,7 +455,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // banner start afresh. The file's banners are about the file,
             // not the reading. Not after Leal's own save (task 2.5.3b): the
             // file is the one the user had, with their edits, so a banner
-            // they closed stays closed.
+            // they closed stays closed. Rob's decision (task 2.5.3b
+            // review): it comes back only after a Reload, Treat As or a
+            // re-read, never after a save.
             if !model.readingFromSave {
                 dismissed = dismissed.filter { $0.hasPrefix("drive") || $0.hasPrefix("file") }
             }

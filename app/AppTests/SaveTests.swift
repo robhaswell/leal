@@ -839,7 +839,7 @@ private final class SaveReviewProbe: NSObject {
 
 /// Stops the test host if `stop()` isn't called within `seconds`: a main
 /// thread deadlocked for good would otherwise hang the test run.
-private final class Watchdog: Sendable {
+final class Watchdog: Sendable {
     private let stopped = OSAllocatedUnfairLock(initialState: false)
 
     init(seconds: Double, what: String) {

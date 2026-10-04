@@ -543,7 +543,11 @@ final class CSVDocument: NSDocument {
             overwrite = false
             switch result {
             case let .success(saved?):
-                saveFinished(saved, model: model)
+                // The user hears of a kept old file before the save ends,
+                // so Save and Close, and Quit, wait for it.
+                if let reporting = saveFinished(saved, model: model) {
+                    _ = await reporting.value
+                }
                 return true
             case .success(nil):
                 // The document failed or closed meanwhile.
@@ -657,7 +661,9 @@ final class CSVDocument: NSDocument {
         }
         let result = await DocumentModel.outcome(of: job)
         await document.onMain {
-            model.saveEnded(job, place: place)
+            // A save that wrote the file goes on to `saveFinished`, and so
+            // to `DocumentModel.saved`.
+            model.saveEnded(job, place: place, outcomeFollows: (try? result.get()) != nil)
             if case let .success(saved) = result {
                 document.noteWritten(saved, model: model)
             }
@@ -770,23 +776,27 @@ final class CSVDocument: NSDocument {
     /// replay into the saved file still applies, and the model hears the
     /// file's new status. Edits made during the save stay unsaved: the
     /// dirty state is the core's again once every Save has ended
-    /// (`savesEnded`). Nothing, if the document now shows another model.
-    private func saveFinished(_ saved: DocumentModel.Saved, model: DocumentModel) {
-        guard self.model === model, !model.isFailed else { return }
+    /// (`savesEnded`). Nothing, if the document now shows another model,
+    /// except that a kept old file is always reported. Returns the report
+    /// of a kept old file (`keepOldFile`), for the save to wait for.
+    private func saveFinished(_ saved: DocumentModel.Saved, model: DocumentModel) -> Task<URL?, Never>? {
         let outcome = saved.outcome
+        if let kept = outcome.keptOldFile {
+            keptOldFile = Task { await keepOldFile(kept) }
+        }
+        let reporting = outcome.keptOldFile == nil ? nil : keptOldFile
+        guard self.model === model, !model.isFailed else { return reporting }
         if !outcome.skippedMetadata.isEmpty {
             Logger.document.info("Saved without some of the file’s metadata: \(outcome.skippedMetadata.joined(separator: ", "), privacy: .public)")
         }
         if let error = outcome.rereadError {
             Logger.document.error("Saved, but couldn’t read the file back: \(error, privacy: .public)")
         }
-        if let kept = outcome.keptOldFile {
-            keptOldFile = Task { await keepOldFile(kept) }
-        }
         if let version = saved.snapshotVersion {
             history.savedThrough(version: version)
         }
         model.saved(outcome)
+        return reporting
     }
 
     // MARK: After a save (task 2.5.3b)
@@ -800,76 +810,128 @@ final class CSVDocument: NSDocument {
     private(set) var remembering: Task<Bool, Never>?
 
     /// A save kept the old file at `path` (`SaveOutcome.keptOldFile`): it
-    /// may hold another app's version. It is in the save's temporary
-    /// folder, which the system may empty, so it is moved at once to
-    /// Leal's Recovered folder (`RecoveredFiles`), off the main thread,
-    /// and the user is told where it is, with Show in Finder. If it can't
-    /// be moved, the user is told where it is instead. Returns where it
-    /// is now, or `nil` if it couldn't be moved.
+    /// may hold another app's version. The core's first choice is next to
+    /// the file saved (`a (replaced, kept by Leal).csv`), where it stays.
+    /// Otherwise it is in the save's temporary folder, which the system may
+    /// empty, so it is moved at once to Leal's Recovered folder
+    /// (`RecoveredFiles`), off the main thread. Either way the user is told
+    /// where it is, with Show in Finder; if it can't be moved, where it is
+    /// instead. The save waits for the user's answer (`saveInPlace`), so
+    /// Save and Close and Quit tell the user before the window goes. With
+    /// no window, the alert is app-modal (`showAlert`). Returns where it is
+    /// now, or `nil` if it couldn't be moved.
     @discardableResult
     func keepOldFile(_ path: String) async -> URL? {
         let name = fileName
-        let folder = Result { try RecoveredFiles.folder() }
-        let moved = await FileWork.run(qos: .utility) { () -> Result<URL, any Error> in
-            Result { try RecoveredFiles.keep(path, in: folder.get()) }
-        }
+        let file = fileURL
+        let kept = await FileWork.run(qos: .utility) { RecoveredFiles.place(path, savedTo: file) }
         let message: SaveText.Message
         let shown: URL
-        switch moved {
-        case let .success(url):
+        switch kept {
+        case let .besideFile(url):
+            Logger.document.error("Saved; the old file was kept next to it, as \(url.path(percentEncoded: false), privacy: .private)")
+            message = SaveText.keptOldFileBeside(name: name, keptAs: url.lastPathComponent)
+            shown = url
+        case let .moved(url):
             Logger.document.error("Saved; the old file was kept and moved to \(url.path(percentEncoded: false), privacy: .private)")
             message = SaveText.keptOldFile(name: name, keptAs: url.lastPathComponent)
             shown = url
-        case let .failure(error):
+        case let .notMoved(error):
             Logger.document.error("Saved; the old file was kept at \(path, privacy: .private) and couldn’t be moved: \(String(describing: error), privacy: .public)")
             message = SaveText.keptOldFileNotMoved(name: name, path: path)
             shown = URL(filePath: path)
         }
-        if let window = windowControllers.first?.window {
-            let alert = NSAlert()
-            alert.messageText = message.title
-            alert.informativeText = message.detail
-            alert.addButton(withTitle: SaveText.button(.ok))
-            alert.addButton(withTitle: SaveText.showInFinder)
-            showSheet(alert, window) { response in
-                if response == .alertSecondButtonReturn {
-                    NSWorkspace.shared.activateFileViewerSelecting([shown])
-                }
+        let alert = NSAlert()
+        alert.messageText = message.title
+        alert.informativeText = message.detail
+        alert.addButton(withTitle: SaveText.button(.ok))
+        alert.addButton(withTitle: SaveText.showInFinder)
+        let window = windowControllers.first?.window
+        let response = await withCheckedContinuation { continuation in
+            if let window {
+                showSheet(alert, window) { continuation.resume(returning: $0) }
+            } else {
+                showAlert(alert) { continuation.resume(returning: $0) }
             }
         }
-        return try? moved.get()
+        if response == .alertSecondButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([shown])
+        }
+        switch kept {
+        case let .besideFile(url), let .moved(url): return url
+        case .notMoved: return nil
+        }
+    }
+
+    /// Shows `alert` app-modally, for a document with no window (closed by
+    /// Save and Close, or by Quit), then calls `done` with the button
+    /// chosen. Tests replace it, so that no alert is shown.
+    var showAlert: (_ alert: NSAlert, _ done: @escaping @MainActor (NSApplication.ModalResponse) -> Void) -> Void = { alert, done in
+        done(alert.runModal())
     }
 
     /// The review of a save's reading suggests another delimiter (ADR-0008
     /// decision 8's whole-file part): the core records the delimiter and
     /// header in the saved file's interpretation attribute, if the file is
     /// still the one saved (`rememberReviewedInterpretation`), so a reopen
-    /// reads it as the document does. Off the main thread, inside a
-    /// coordinated write of the file's metadata, with the document as
-    /// presenter so it doesn't hear of its own write. Not while another
-    /// save runs: its own reading is reviewed in turn.
+    /// reads it as the document does. Inside a coordinated write of the
+    /// file's metadata, with the document as presenter so it doesn't hear
+    /// of its own write. Not while another save runs: its own reading is
+    /// reviewed in turn.
     private func rememberReviewedInterpretation(model: DocumentModel) {
         guard self.model === model, !model.isSaving, let url = fileURL else { return }
-        var handle = model.backgroundHandle()
-        guard handle != nil else { return }
-        remembering = Task { [weak self] in
-            let write = try? await CoordinatedWrite.begin(url, options: .contentIndependentMetadataOnly, presenter: self)
-            let core = handle
-            let result = await FileWork.run(qos: .utility) { () -> Result<Bool, any Error> in
-                Result { try core?.rememberReviewedInterpretation() ?? false }
-            }
-            write?.end()
-            // Off the main thread: it may hold the last reference to the
-            // core's document (`CoreRelease`).
-            CoreRelease.later(&handle)
-            switch result {
-            case let .success(wrote):
-                if wrote { Logger.document.info("Recorded the delimiter after the saved file’s review") }
-                return wrote
-            case let .failure(error):
-                Logger.document.error("Couldn’t record the delimiter after a save: \(String(describing: error), privacy: .public)")
-                return false
-            }
+        guard let handle = model.backgroundHandle() else { return }
+        remembering = Task { await Self.remember(url, handle: handle, document: self) }
+    }
+
+    /// Called off the main thread while `remember` holds its coordinated
+    /// write, before the core's call. Tests set it, to hold the write.
+    nonisolated(unsafe) static var whileRememberingForTesting: (@Sendable () -> Void)?
+    /// Called off the main thread once `remember` has ended its coordinated
+    /// write. Tests set it.
+    nonisolated(unsafe) static var afterRememberingForTesting: (@Sendable () -> Void)?
+
+    /// `rememberReviewedInterpretation`, off the main thread from the
+    /// moment it has its coordinated write until it ends it (task 2.5.3b
+    /// review). Other apps' coordinated access to the file waits for the
+    /// write, and the main thread may be blocked meanwhile: `NSDocument`
+    /// blocks it wherever it reads its own `isDocumentEdited` while a save
+    /// holds the document's file access (the 2.5.3a rule). So nothing here
+    /// waits for the main actor while the write is held. It takes no file
+    /// access of its own: asking for one while a save holds one blocks the
+    /// main thread. (Coordinated writes with the same presenter don't wait
+    /// for each other, so Leal's own save doesn't wait for this one; the
+    /// core keeps the two apart.) Without a coordinated write (the
+    /// coordinator refused, or the wait was cancelled), the core isn't
+    /// called. Returns whether the attribute was written.
+    nonisolated private static func remember(_ url: URL, handle: LealFFI.Document, document: CSVDocument) async -> Bool {
+        var handle: LealFFI.Document? = handle
+        // Off the main thread: it may hold the last reference to the
+        // core's document (`CoreRelease`).
+        defer { CoreRelease.later(&handle) }
+        let write: CoordinatedWrite
+        do {
+            write = try await CoordinatedWrite.begin(url, options: .contentIndependentMetadataOnly, presenter: document)
+        } catch {
+            Logger.document.error("Couldn’t coordinate recording the delimiter after a save: \(String(describing: error), privacy: .public)")
+            return false
+        }
+        defer {
+            write.end()
+            afterRememberingForTesting?()
+        }
+        let core = handle
+        let result = await FileWork.run(qos: .utility) { () -> Result<Bool, any Error> in
+            whileRememberingForTesting?()
+            return Result { try core?.rememberReviewedInterpretation() ?? false }
+        }
+        switch result {
+        case let .success(wrote):
+            if wrote { Logger.document.info("Recorded the delimiter after the saved file’s review") }
+            return wrote
+        case let .failure(error):
+            Logger.document.error("Couldn’t record the delimiter after a save: \(String(describing: error), privacy: .public)")
+            return false
         }
     }
 

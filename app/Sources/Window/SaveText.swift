@@ -372,6 +372,18 @@ extension SaveText {
         )
     }
 
+    /// As `keptOldFile`, but the core kept it next to the file saved, as
+    /// `keptAs` (its first choice), where it stays.
+    static func keptOldFileBeside(name: String, keptAs: String) -> Message {
+        Message(
+            title: keptTitle(name: name),
+            detail: String(
+                localized: "Another app may have changed the file as Leal saved it. Its version is next to it, as “\(keptAs)”.",
+                comment: "Alert text: the kept old file is in the same folder as the file saved; the name it was kept as"
+            )
+        )
+    }
+
     /// As `keptOldFile`, but it couldn't be moved to the Recovered folder:
     /// it is still in the save's temporary folder, at `path`.
     static func keptOldFileNotMoved(name: String, path: String) -> Message {

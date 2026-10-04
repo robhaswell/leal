@@ -256,6 +256,9 @@
     "Another app may have changed the file as Leal saved it. Its version is in Leal’s Recovered folder, as “%@”." : {
       "comment" : "Alert text: where the kept old file now is; the name it was kept as"
     },
+    "Another app may have changed the file as Leal saved it. Its version is next to it, as “%@”." : {
+      "comment" : "Alert text: the kept old file is in the same folder as the file saved; the name it was kept as"
+    },
     "Another computer deleted it while Leal was reading it." : {
       "comment" : "Open error: the file on a network share was deleted elsewhere while it was being read (ADR-0009)"
     },

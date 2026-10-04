@@ -44,6 +44,8 @@ final class AfterSaveTests: XCTestCase {
 
     override func tearDown() async throws {
         debugReleaseHeldSave()
+        CSVDocument.whileRememberingForTesting = nil
+        CSVDocument.afterRememberingForTesting = nil
         if let savedEnvironment { CSVDocument.environment = savedEnvironment }
         if let savedRecovered { RecoveredFiles.folder = savedRecovered }
         DocumentModel.sizingAfterEditDelay = savedDelay
@@ -240,7 +242,8 @@ final class AfterSaveTests: XCTestCase {
 
     /// After a save the index says it is complete at once (task 2.4c), but
     /// the diagnostics are taken only once their own report is: never a
-    /// partial one.
+    /// partial one. Until then the old reading's report stays shown, so
+    /// the banner and the badge don't flicker.
     func testTheDiagnosticsWaitForTheSavedReadingsCompleteReport() async throws {
         var text = "id,name\n"
         for row in 0..<200_000 { text += "\(row),n\(row)\n" }
@@ -252,14 +255,22 @@ final class AfterSaveTests: XCTestCase {
         set(model, 0, 1, "x")
         let generation = model.generation
         let saving = Task { try await self.save(opened) }
+        // Whether each report of the new reading seen was complete, and
+        // how often there was none at all.
         var seen: [Bool] = []
+        var none = 0
         try await waitUntil("the saved reading") { model.generation != generation }
         XCTAssertTrue(model.progress.complete, "rows and columns can be edited at once")
-        while model.diagnostics?.complete != true {
-            if let report = model.diagnostics { seen.append(report.complete) }
+        while model.diagnostics?.generation != model.generation || model.diagnostics?.complete != true {
+            if let report = model.diagnostics {
+                if report.generation == model.generation { seen.append(report.complete) }
+            } else {
+                none += 1
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTAssertFalse(seen.contains(false), "no partial report taken")
+        XCTAssertEqual(none, 0, "the old report stays until the new one is complete")
         XCTAssertEqual(model.diagnostics?.generation, model.generation)
         XCTAssertEqual(model.diagnostics?.bannerKinds, 1)
         _ = try await saving.value
@@ -286,11 +297,69 @@ final class AfterSaveTests: XCTestCase {
 
         try await waitUntil("searched again") { content.find.search !== old && content.find.progress?.complete == true }
         XCTAssertEqual(content.find.matchCount, 1)
+        XCTAssertEqual(content.find.current?.cell, CellPosition(row: 3, column: 1), "still the current match")
         set(opened.model, 10, 1, "needle too")
         content.search(for: "needle")
         try await waitUntil("found again") { content.find.progress?.complete == true }
         XCTAssertEqual(content.find.matchCount, 2)
         XCTAssertNil(old, "the old reading's search is let go")
+    }
+
+    /// Find searches the saved reading again without stepping: a range
+    /// selected whose active cell isn't a match stays as it is, and
+    /// nothing is the current match.
+    func testFindAfterASaveLeavesTheSelectionAlone() async throws {
+        var text = "id,name\n"
+        for row in 0..<50 { text += "\(row),n\(row)\n" }
+        let url = try file("find-range.csv", text)
+        let opened = try await open(url)
+        let content = opened.content
+        set(opened.model, 3, 1, "needle")
+        content.showFindBar()
+        content.findBar.field.stringValue = "needle"
+        content.search(for: "needle")
+        try await waitUntil("found") { content.find.progress?.complete == true }
+        content.grid.select(CellPosition(row: 10, column: 0))
+        content.grid.gridView.onExtend?(CellPosition(row: 14, column: 1))
+        let selection = content.grid.selection
+        XCTAssertEqual(selection?.rows, 10...14)
+        XCTAssertNil(content.find.current)
+        weak let old = content.find.search
+
+        try await save(opened)
+
+        try await waitUntil("searched again") { content.find.search !== old && content.find.progress?.complete == true }
+        XCTAssertEqual(content.find.matchCount, 1)
+        XCTAssertEqual(content.grid.selection, selection, "the range stays")
+        XCTAssertEqual(content.grid.activeCell, CellPosition(row: 10, column: 0))
+        XCTAssertNil(content.find.current)
+    }
+
+    /// A look at the file that ends after the save has ended but before its
+    /// outcome reaches the model leaves the new reading to `saved(_:)`,
+    /// which adopts it as a save's (not as a re-read).
+    func testALookAtTheFileBeforeTheOutcomeArrivesLeavesTheSavedReadingToIt() async throws {
+        let url = try file("gap.csv", "a,b\n1,2\n3,4\n")
+        let opened = try await open(url)
+        let model = opened.model
+        set(model, 1, 1, "x")
+        let generation = model.generation
+        let place = await DocumentModel.placeForSaving(url)
+        let job = try XCTUnwrap(model.startSave(to: url, kind: .save, place: place, overwriteChanged: false).get())
+        let result = await DocumentModel.outcome(of: job)
+        model.saveEnded(job, place: place, outcomeFollows: true)
+        let saved = try result.get()
+        // In the gap.
+        await model.checkOriginal()?.value
+        XCTAssertEqual(model.generation, generation, "left to saved(_:)")
+        XCTAssertFalse(model.readingFromSave)
+
+        model.saved(saved.outcome)
+        XCTAssertNotEqual(model.generation, generation)
+        XCTAssertTrue(model.readingFromSave, "adopted as the save's reading")
+        XCTAssertFalse(model.saveOutcomePending)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "a,b\n1,2\n3,x\n")
+        XCTAssertTrue(alerts.isEmpty)
     }
 
     /// Leal's own save is never a change elsewhere (ADR-0008 decision 1):
@@ -370,6 +439,49 @@ final class AfterSaveTests: XCTestCase {
         XCTAssertTrue(alerts.last?.informativeText.contains(gone) == true, alerts.last?.informativeText ?? "")
     }
 
+    /// The core's first choice is to keep the old file next to the user's
+    /// (`… (replaced, kept by Leal).csv`): it stays there, and the user is
+    /// told so.
+    func testAKeptOldFileNextToTheUsersFileStaysThere() async throws {
+        let url = try file("orders.csv", "a,b\n1,2\n")
+        let opened = try await open(url)
+        let beside = try file("orders (replaced, kept by Leal).csv", "another app's\n")
+        let kept = await opened.document.keepOldFile(beside.path(percentEncoded: false))
+        XCTAssertEqual(kept?.standardizedFileURL, beside.standardizedFileURL)
+        XCTAssertEqual(try String(contentsOf: beside, encoding: .utf8), "another app's\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "Recovered").path(percentEncoded: false)), "nothing moved")
+        let alert = try XCTUnwrap(alerts.last)
+        XCTAssertEqual(alert.messageText, "Leal saved “orders.csv” and kept the version it replaced.")
+        XCTAssertEqual(alert.informativeText, "Another app may have changed the file as Leal saved it. Its version is next to it, as “orders (replaced, kept by Leal).csv”.")
+        XCTAssertEqual(alert.buttons.map(\.title), ["OK", "Show in Finder"])
+    }
+
+    /// With no window (Save and Close, or ⌘S then ⌘Q, closed it), the
+    /// user is told all the same, in an app-modal alert.
+    func testAKeptOldFileIsReportedWithNoWindow() async throws {
+        let url = try file("closed.csv", "a,b\n1,2\n")
+        let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
+        XCTAssertTrue(document.windowControllers.isEmpty)
+        document.showSheet = { _, _, done in
+            XCTFail("no window for a sheet")
+            done(.alertFirstButtonReturn)
+        }
+        document.showAlert = { [weak self] alert, done in
+            self?.alerts.append(alert)
+            done(.alertFirstButtonReturn)
+        }
+        let folder = directory.appending(path: "save-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let path = folder.appending(path: "closed (old).csv")
+        try Data("old\n".utf8).write(to: path)
+        let moved = await document.keepOldFile(path.path(percentEncoded: false))
+        XCTAssertEqual(moved?.lastPathComponent, "closed (old).csv")
+        XCTAssertEqual(alerts.count, 1)
+        XCTAssertEqual(alerts.first?.messageText, "Leal saved “closed.csv” and kept the version it replaced.")
+        XCTAssertEqual(alerts.first?.informativeText, "Another app may have changed the file as Leal saved it. Its version is in Leal’s Recovered folder, as “closed (old).csv”.")
+        document.close()
+    }
+
     // MARK: Attributes (ADR-0008 decision 8)
 
     /// After Save the attributes on disk are the saved file's own, not
@@ -404,12 +516,11 @@ final class AfterSaveTests: XCTestCase {
     /// comma-separated, the whole file looks semicolon-separated. The save
     /// can't tell; the review of its reading can, and the delimiter is
     /// recorded then, with the saved bytes' fingerprint. The attribute
-    /// isn't a change elsewhere: the next save asks nothing.
+    /// isn't a change elsewhere: the next save asks nothing, and records
+    /// the delimiter itself ("on every save", ADR-0008 decision 8), so it
+    /// is there even if the window closes at once.
     func testTheSavedFilesReviewRecordsTheDelimiter() async throws {
-        var text = "name,\n"
-        while text.utf8.count < 64 * 1024 + 10 { text += "x\n" }
-        for i in 0..<100_000 { text += "\(i);a;b\n" }
-        let url = try file("later.csv", text)
+        let url = try file("later.csv", Self.laterDelimiter)
         let opened = try await open(url)
         let model = opened.model
         try await waitUntil("reviewed") { model.review != nil }
@@ -427,18 +538,109 @@ final class AfterSaveTests: XCTestCase {
         let header = model.interpretation.header ? "yes" : "no"
         XCTAssertEqual(attribute(url, Self.interpretation), "v=1;delimiter=comma;header=\(header);file=\(fingerprint(bytes))")
 
-        let first = opened.document.remembering
-        set(model, 2, 0, "z")
-        let saved = try await save(opened)
-        XCTAssertTrue(saved)
-        try await waitUntil("remembering again") { opened.document.remembering != first }
-        let again = await opened.document.remembering?.value
-        XCTAssertEqual(again, true)
-        let resaved = try Data(contentsOf: url)
-        XCTAssertEqual(attribute(url, Self.interpretation), "v=1;delimiter=comma;header=\(header);file=\(fingerprint(resaved))")
         await model.checkOriginal()?.value
         opened.content.updateBanners()
         XCTAssertNil(opened.content.driveBanner)
+        set(model, 2, 0, "z")
+        let saved = try await save(opened)
+        XCTAssertTrue(saved)
+        // Closed at once: no review of this save's reading is waited for.
+        opened.document.close()
+        let resaved = try Data(contentsOf: url)
+        XCTAssertEqual(attribute(url, Self.interpretation), "v=1;delimiter=comma;header=\(header);file=\(fingerprint(resaved))")
         XCTAssertTrue(alerts.isEmpty, "no prompt: \(alerts.map(\.messageText))")
+    }
+
+    /// Comma-separated in its first 64 KB, semicolon-separated after: the
+    /// whole-file review suggests semicolons.
+    private static let laterDelimiter: String = {
+        var text = "name,\n"
+        while text.utf8.count < 64 * 1024 + 10 { text += "x\n" }
+        for i in 0..<100_000 { text += "\(i);a;b\n" }
+        return text
+    }()
+
+    /// Recording the delimiter holds a coordinated write of the file, which
+    /// other apps' coordinated access waits for. Meanwhile the main thread
+    /// may be blocked: `NSDocument` blocks it wherever it reads
+    /// `isDocumentEdited` while a save holds the document's file access. So
+    /// the recording must end its write without the main thread. Here the
+    /// recording is held, a save starts, the main thread reads
+    /// `isDocumentEdited` and then waits for the write to end, and a
+    /// background thread lets the recording go. A deadlock would hang the
+    /// main thread for good: the watchdog then stops the test host, so it
+    /// fails rather than hangs.
+    func testRecordingTheDelimiterNeverDeadlocksWithASave() async throws {
+        let url = try file("held.csv", Self.laterDelimiter)
+        let opened = try await open(url)
+        let model = opened.model
+        let hold = Hold()
+        let ended = DispatchSemaphore(value: 0)
+        CSVDocument.whileRememberingForTesting = { hold.hold() }
+        CSVDocument.afterRememberingForTesting = { ended.signal() }
+        set(model, 1, 0, "y")
+        try await save(opened)
+        try await waitUntil("the recording held") { hold.isHolding }
+
+        set(model, 2, 0, "z")
+        let watchdog = Watchdog(seconds: 30, what: "the main thread, waiting while the delimiter is recorded")
+        // Let go from another thread, whatever the main thread waits for.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { hold.release() }
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        // Synchronously, on the main thread: as NSDocument does while the
+        // save holds its file access, then until the recording's write ends.
+        _ = opened.document.isDocumentEdited
+        _ = opened.document.fileModificationDate
+        blockMainThread(until: ended)
+        watchdog.stop()
+        XCTAssertTrue(hold.isReleased)
+
+        let saved = await saving.value
+        XCTAssertTrue(saved)
+        _ = await opened.document.remembering?.value
+        XCTAssertFalse(opened.document.isDocumentEdited)
+        let header = model.interpretation.header ? "yes" : "no"
+        // Recorded by the review or by the save, whichever came last.
+        try await waitUntil("the delimiter recorded") {
+            guard let bytes = try? Data(contentsOf: url) else { return false }
+            return attribute(url, Self.interpretation) == "v=1;delimiter=comma;header=\(header);file=\(fingerprint(bytes))"
+        }
+        let text = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(text.contains("\ny\n") && text.contains("\nz\n"), "both edits saved")
+        XCTAssertTrue(alerts.isEmpty, "no prompt: \(alerts.map(\.messageText))")
+    }
+}
+
+/// Blocks the calling thread (the main thread) until `semaphore` is
+/// signalled, as `NSDocument` blocks it waiting for a file access.
+private func blockMainThread(until semaphore: DispatchSemaphore) {
+    semaphore.wait()
+}
+
+/// Holds the first caller of `hold()` until `release()`; later callers go
+/// on at once.
+private final class Hold: @unchecked Sendable {
+    // @unchecked: `holding` and `released` are only touched under `lock`.
+    private let lock = NSLock()
+    private var holding = false
+    private var released = false
+    private let go = DispatchSemaphore(value: 0)
+
+    var isHolding: Bool { lock.withLock { holding } }
+    var isReleased: Bool { lock.withLock { released } }
+
+    func hold() {
+        let wait = lock.withLock { () -> Bool in
+            guard !released, !holding else { return false }
+            holding = true
+            return true
+        }
+        if wait { go.wait() }
+    }
+
+    func release() {
+        lock.withLock { released = true }
+        go.signal()
     }
 }

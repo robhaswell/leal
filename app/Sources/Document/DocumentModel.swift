@@ -238,6 +238,12 @@ final class DocumentModel: GridDataSource {
     /// field counts come from the save's plan), but its pass still builds
     /// the diagnostics (task 2.4c): only a complete report is taken.
     private var awaitingCompleteDiagnostics = false
+    /// A save has started and its outcome hasn't reached `saved(_:)` yet
+    /// (task 2.5.3b review). Meanwhile the core may already read the saved
+    /// file, a new generation, which only `saved(_:)` adopts: a
+    /// `checkOriginal` ending in that gap mustn't take it as a re-read
+    /// (`restarted`).
+    private(set) var saveOutcomePending = false
     /// The review of a save's reading has finished (task 2.5.3b): it may
     /// add the interpretation attribute to the saved file
     /// (`CSVDocument.rememberReviewedInterpretation`).
@@ -1555,7 +1561,8 @@ final class DocumentModel: GridDataSource {
             guard failure == nil else { return }
             switch result {
             case let .success(status):
-                if let current = call({ try $0.progress() }), current.generation != generation {
+                // A save's new reading is `saved(_:)`'s to adopt.
+                if !saveOutcomePending, let current = call({ try $0.progress() }), current.generation != generation {
                     restarted(current)
                 }
                 apply(original: status)
@@ -1759,7 +1766,7 @@ final class DocumentModel: GridDataSource {
             return nil
         }
         let result = await Self.outcome(of: job)
-        saveEnded(job, place: place)
+        saveEnded(job, place: place, outcomeFollows: false)
         return try result.get()
     }
 
@@ -1800,6 +1807,7 @@ final class DocumentModel: GridDataSource {
             return .failure(.Internal(message: String(describing: error)))
         }
         saveJob = job
+        saveOutcomePending = true
         saveProgress = nil
         saveWatching?.cancel()
         saveWatching = Task { [weak self] in
@@ -1828,10 +1836,13 @@ final class DocumentModel: GridDataSource {
     }
 
     /// The save `job` ended: its progress goes from the status bar, and
-    /// the folders it didn't take over are removed.
-    func saveEnded(_ job: SaveJob, place: SavePlace) {
+    /// the folders it didn't take over are removed. `outcomeFollows`: it
+    /// wrote the file and its outcome is about to be given to `saved(_:)`,
+    /// which ends `saveOutcomePending`; otherwise it ends here.
+    func saveEnded(_ job: SaveJob, place: SavePlace, outcomeFollows: Bool) {
         place.removeLeftovers()
         guard saveJob === job else { return }
+        if !outcomeFollows { saveOutcomePending = false }
         saveWatching?.cancel()
         saveWatching = nil
         saveJob = nil
@@ -1854,15 +1865,23 @@ final class DocumentModel: GridDataSource {
     /// The core now reads the file it wrote (ADR-0008 decision 1), as a new
     /// reading: the model adopts it (`adoptSaved`). Not if it couldn't read
     /// the file back (`firstScreen` is `nil`): it still reads the old
-    /// snapshot, with the edits.
+    /// snapshot, with the edits, unless it read that again meanwhile (a
+    /// drive back), which is taken as any re-read (`restarted`). Until
+    /// here `checkOriginal` leaves a new generation alone
+    /// (`saveOutcomePending`).
     func saved(_ outcome: SaveOutcome) {
+        saveOutcomePending = false
         guard failure == nil else { return }
         // Not `apply(original:)`: the path the core reports is the one it
         // wrote, a symbolic link followed, which isn't a move.
         original = OriginalStatus(state: outcome.original.state, path: original.path, diverged: outcome.original.diverged)
         refreshUnsavedEdits()
-        if outcome.firstScreen != nil, let current = call({ try $0.progress() }), current.generation != generation {
-            adoptSaved(current)
+        if let current = call({ try $0.progress() }), current.generation != generation {
+            if outcome.firstScreen != nil {
+                adoptSaved(current)
+            } else {
+                restarted(current)
+            }
         } else {
             refreshDriveState()
             onChange?(.progress)
@@ -1878,12 +1897,17 @@ final class DocumentModel: GridDataSource {
     /// widths and the undo stack stay: the values are the same. If the
     /// core read the file again as the save ended (a drive back), this is
     /// that reading.
+    ///
+    /// Until the new reading's complete report arrives, the old one stays
+    /// shown, so the banner and the badge don't flicker.
     private func adoptSaved(_ report: IndexProgress) {
+        // The old reading's jobs: their results are dropped anyway.
+        for task in tasks { task.cancel() }
+        tasks.removeAll()
         generation = report.generation
         readingFromSave = true
         awaitingCompleteDiagnostics = true
         progress = report
-        diagnostics = nil
         review = nil
         readStopped = false
         indexStopped = false
