@@ -538,7 +538,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   parts of about a day (CLAUDE.md, token budget). The parts are named
   2.5.1 to 2.5.3 so as not to clash with 2.5a below; the bullets in each
   part are its acceptance criteria.
-  - [ ] **2.5.1 App: in-cell editing and the inspector** — the edit overlay
+  - [x] **2.5.1 App: in-cell editing and the inspector** — the edit overlay
     in the grid, the full values, `canEdit`, what an edit invalidates.
     - In-cell editing uses an `NSTextField` overlaid on the cell; Return
       commits and Esc cancels through the field editor (ADR-0001).
@@ -582,7 +582,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
       to `just perf` and recorded in docs/perf.md.
     - Screenshots next to mockups 05a and 05b.
-  - [ ] **2.5.2 App: undo, the journal and dirty state** — `NSUndoManager`
+  - [x] **2.5.2 App: undo, the journal and dirty state** — `NSUndoManager`
     over the core's commands, the recovery journal, the change count.
     - Keep an append-only journal of every command applied (edits, undos
       and redos, in order) with the reading's choices, for Recover changes;
