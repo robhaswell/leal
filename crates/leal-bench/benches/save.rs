@@ -20,13 +20,19 @@
 //!   `one_edit`.
 //! - `save/column_insert` (PLAN 2.4c): a column inserted near the start of
 //!   every row, then Save over it, timed as `one_edit`: every row is
-//!   written whole, after the per-column quoting census (a pass over the
-//!   file, as the new field is written), and the rebase builds the new
-//!   index from the plan. Recorded only: no budget, and not compared
-//!   between commits (the disk's noise, as `one_edit`). The column is
-//!   deleted and saved again, untimed, after each.
-//! - `save/rows_deleted_no_disk`: the same save's work without the disk,
-//!   compared between commits.
+//!   written whole, after the per-column quoting census (which stops
+//!   early: the new column has no original field), and the rebase builds
+//!   the new index, with each row's field count, from the plan. Under
+//!   DESIGN §1's 500 ms for a save after one edit; budget-only, as
+//!   `one_edit`. The column is deleted and saved again, untimed, after
+//!   each.
+//! - `save/column_insert_no_disk`: the same save's work without the disk,
+//!   on the reference file with the column inserted (then taken out
+//!   again), compared between commits.
+//! - `save/rows_deleted_no_disk`: `rows_deleted`'s work without the disk,
+//!   on the reference file with the rows deleted (then put back), compared
+//!   between commits. It runs before `rows_deleted`, whose saves shrink
+//!   the file.
 //! - `save/utf8_from_utf16` (PLAN 2.3): Save As UTF-8 of the reference
 //!   file written as UTF-16 LE (about 200 MB, read-only in v1), to a new
 //!   place, timed from the request to the job's end: every byte converted
@@ -53,6 +59,7 @@ use leal_bench::report::Side;
 use leal_core::detect::Choices;
 use leal_core::dialect::Encoding;
 use leal_core::document::{Document, OpenOptions};
+use leal_core::edit::Command;
 use leal_core::save::{SaveKind, SaveRequest};
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
@@ -69,16 +76,19 @@ const COLUMN: usize = 2;
 const DELETED: usize = 1_000;
 
 /// Deletes [`DELETED`] rows of `document`, one at a time, spread over it
-/// (not the header row).
-fn delete_spread(document: &Document) {
+/// (not the header row). Returns the commands, in the order made.
+fn delete_spread(document: &Document) -> Vec<Command> {
     document.index_job().wait().expect("indexing");
     let step = document.row_count() / DELETED;
-    for k in (0..DELETED).rev() {
-        document
-            .delete_rows(1 + k * step, 1)
-            .expect("the delete")
-            .expect("a change");
-    }
+    (0..DELETED)
+        .rev()
+        .map(|k| {
+            document
+                .delete_rows(1 + k * step, 1)
+                .expect("the delete")
+                .expect("a change")
+        })
+        .collect()
 }
 
 fn save(c: &mut Criterion) {
@@ -136,6 +146,34 @@ fn save(c: &mut Criterion) {
         });
     });
 
+    // The writer's work after a column insert, and after 1,000 rows
+    // deleted (task 2.4c), each on the reference file as it is now, then
+    // undone, so every run times the same work.
+    document.index_job().wait().expect("indexing");
+    let inserted = document
+        .insert_column(COLUMN, "new")
+        .expect("the insert")
+        .expect("a change");
+    group.bench_function("column_insert_no_disk", |b| {
+        b.iter(|| {
+            document
+                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
+    document.apply(&inserted.inverse()).expect("the undo");
+    let deleted = delete_spread(&document);
+    group.bench_function("rows_deleted_no_disk", |b| {
+        b.iter(|| {
+            document
+                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
+    for command in deleted.iter().rev() {
+        document.apply(&command.inverse()).expect("the undo");
+    }
+
     // A save after a column insert (task 2.4c): every row rewritten.
     group
         .sampling_mode(SamplingMode::Flat)
@@ -169,7 +207,7 @@ fn save(c: &mut Criterion) {
     });
 
     // A save after 1,000 rows deleted (task 2.4c): the file loses them
-    // each time.
+    // each time (so it runs after `rows_deleted_no_disk`).
     group
         .sampling_mode(SamplingMode::Flat)
         .sample_size(10)
@@ -179,23 +217,13 @@ fn save(c: &mut Criterion) {
         b.iter_custom(|iterations| {
             let mut total = Duration::ZERO;
             for _ in 0..iterations {
-                delete_spread(&document);
+                let _ = delete_spread(&document);
                 let started = Instant::now();
                 let job = document.save(SaveRequest::new(&path, SaveKind::Save));
                 job.wait().expect("the save");
                 total += started.elapsed();
             }
             total
-        });
-    });
-
-    delete_spread(&document);
-    common::whole_file(&mut group, document.source().len());
-    group.bench_function("rows_deleted_no_disk", |b| {
-        b.iter(|| {
-            document
-                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
-                .expect("the write")
         });
     });
 

@@ -122,6 +122,13 @@ pub const BUDGETS: &[Budget] = &[
         max_ms: 500.0,
         source: "DESIGN §1",
     },
+    // Save after a column inserted (PLAN 2.4c): every row written whole,
+    // under a save's budget.
+    Budget {
+        id: "save/column_insert",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    },
     // Save As UTF-8 of the reference file written as UTF-16 (PLAN 2.3):
     // Save's 500 ms, doubled for a file twice the size, every byte of it
     // converted (ADR-0013 decision 3).
