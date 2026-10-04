@@ -809,15 +809,109 @@ fn the_saved_readings_review_adds_the_interpretation_attribute() {
     );
     drop(reopened);
 
-    // Saved again, then changed elsewhere before the review is asked: the
-    // other app's file is left alone.
+    // Saved again (ADR-0008 decision 8: "on every save"): the remembered
+    // delimiter is the document's own choice now, so the save records it
+    // itself, with no review needed, even if the app quits at once.
     set(&document, 2, 0, "z");
-    save(&document, &path, SaveKind::Save).unwrap();
+    let again = save(&document, &path, SaveKind::Save).unwrap();
+    let out = std::fs::read(&path).unwrap();
+    let expected = Interpretation {
+        file: Some(Fingerprint::of(&out)),
+        ..expected
+    };
+    assert_eq!(again.attributes.interpretation, Some(expected));
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        Some(expected.to_attribute_value().into_bytes())
+    );
     document.review_job().wait().unwrap();
-    std::fs::write(&path, b"other,app\n").unwrap();
-    let _ = document.check_original();
+    assert!(
+        !document.remember_reviewed_interpretation().unwrap(),
+        "the save recorded it"
+    );
+}
+
+/// The review's attribute goes only onto the file its own reading read
+/// (task 2.5.3b review). A later save whose file couldn't be read back
+/// leaves the document on the earlier save's reading: that reading's
+/// review must not overwrite the newer file's attribute, here one that
+/// records an encoding (ADR-0013 decision 2). Nor is anything written
+/// while a save runs.
+#[test]
+fn an_earlier_saves_reading_never_overwrites_a_later_saves_attribute() {
+    let dir = Dir::new("save-review-stale");
+    let scheduler = scheduler();
+    // ASCII read as Windows-1253 (chosen), longer than first paint: the
+    // save marks the tag as Leal's own (`encoding=`). Comma-separated in
+    // the first 64 KB, semicolons after.
+    let mut text = String::from("name,\n");
+    while text.len() < FIRST_PAINT_BYTES + 10 {
+        text.push_str("x\n");
+    }
+    for i in 0..100_000 {
+        text.push_str(&format!("{i};a;b\n"));
+    }
+    let path = dir.file("stale.csv", text.as_bytes());
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1253);
+    let recorded = |bytes: &[u8]| {
+        let own = Interpretation {
+            file: Some(Fingerprint::of(bytes)),
+            encoding: Some(Encoding::Windows1253),
+            ..Interpretation::default()
+        };
+        Some(own.to_attribute_value().into_bytes())
+    };
+    set(&document, 1, 0, "y");
+    save(&document, &path, SaveKind::Save).unwrap();
+    let first = std::fs::read(&path).unwrap();
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        recorded(&first),
+        "an encoding, and no delimiter"
+    );
+    let review = *document.review_job().wait().unwrap();
+    assert_eq!(review.delimiter_suggestion, Some(Delimiter::Semicolon));
+
+    // While a save runs, nothing is written.
+    set(&document, 2, 0, "z");
+    let scratch = dir.0.join("scratch");
+    let before = leftovers(&scratch, &[]);
+    let (job, go_on) = held_at(&document, SaveRequest::new(&path, SaveKind::Save), AT_SWAP);
+    let during = Arc::clone(&document);
+    assert!(!promptly(move || during
+        .remember_reviewed_interpretation()
+        .unwrap()));
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        recorded(&first)
+    );
+    // Its file can't be read back: its snapshot is deleted.
+    for folder in leftovers(&scratch, &[]) {
+        if !before.contains(&folder) {
+            for file in std::fs::read_dir(scratch.join(&folder)).unwrap() {
+                std::fs::remove_file(file.unwrap().path()).unwrap();
+            }
+        }
+    }
+    go_on();
+    let saved = job.wait().unwrap().clone();
+    assert!(saved.reread_error.is_some());
+    let second = std::fs::read(&path).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        recorded(&second)
+    );
+    assert!(!document.check_original().diverged);
+
+    // The first save's reading is still the document's, reviewed, but the
+    // file there now isn't the one it read.
     assert!(!document.remember_reviewed_interpretation().unwrap());
-    assert_eq!(attribute(&path, INTERPRETATION_ATTRIBUTE_C), None);
+    assert_eq!(
+        attribute(&path, INTERPRETATION_ATTRIBUTE_C),
+        recorded(&second),
+        "the newer file's attribute stays"
+    );
 }
 
 /// ADR-0013 decision 2: a file opened as Windows-1253 with a byte 1253

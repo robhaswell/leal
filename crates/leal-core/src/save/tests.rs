@@ -368,6 +368,7 @@ fn plan(file: &[u8], detection: &crate::detect::Detection, had: bool) -> Attribu
         len,
         census,
         utf8: false,
+        remembered: false,
     })
 }
 
@@ -481,6 +482,7 @@ fn the_encoding_is_marked_as_leals_own_when_a_reopen_would_ignore_it() {
             len: u64::try_from(long.len()).unwrap(),
             census: None,
             utf8: false,
+            remembered: false,
         })
         .interpretation
         .and_then(|i| i.encoding)

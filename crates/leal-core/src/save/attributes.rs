@@ -82,6 +82,10 @@ pub(crate) struct AttributeFacts<'a> {
     /// As UTF-8, ADR-0008 decision 7): `com.apple.TextEncoding` is set to
     /// UTF-8, and the BOM is a UTF-8 one if the document had a BOM.
     pub(crate) utf8: bool,
+    /// The review of the reading a save made had the delimiter and header
+    /// recorded in the attribute (`Document::remember_reviewed_interpretation`):
+    /// they are recorded again, as a choice of the attribute's.
+    pub(crate) remembered: bool,
 }
 
 /// Whether the plan needs the census of the whole new file: only for an
@@ -139,7 +143,8 @@ impl AttributePlan {
 
         // The reopen, with the encoding as it will read.
         let reopened = reopen(tag, own_value.as_deref().map(str::as_bytes)).ok();
-        let chosen = document.delimiter_source != DialectSource::Guess
+        let chosen = facts.remembered
+            || document.delimiter_source != DialectSource::Guess
             || document.header_source != DialectSource::Guess;
         let differs = reopened
             .is_none_or(|d| d.delimiter != document.delimiter || d.header != document.header);

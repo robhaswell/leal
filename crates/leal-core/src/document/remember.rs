@@ -8,6 +8,7 @@
 //! the attribute is written then, onto the saved file.
 
 use std::io;
+use std::sync::atomic::Ordering;
 
 use crate::attributes::{Fingerprint, Interpretation};
 use crate::source::{INTERPRETATION_ATTRIBUTE_C, OriginalState, look_afresh, same_file};
@@ -21,14 +22,20 @@ impl Document {
     /// suggests another delimiter: a reopen's review would, too.
     ///
     /// It writes only when:
+    /// - no save is under way;
     /// - the current reading is the one a save made (not read again since);
     /// - its review has finished and suggests another delimiter;
-    /// - the save didn't record the delimiter already;
-    /// - the file is still the one saved, where it is now (it may have
-    ///   been moved): the same inode, length and modification time, and the
-    ///   watcher has seen no change.
+    /// - the save didn't record the delimiter already, nor this did;
+    /// - the file is still the one that reading read, where it is now (it
+    ///   may have been moved): the same volume, inode, length and
+    ///   modification time as the reading's own source, and the watcher
+    ///   has seen no change. Not the watcher's identity: a later save whose
+    ///   file couldn't be read back moves the watcher on to its file but
+    ///   leaves this reading current, and its attribute must stay.
     ///
-    /// A recorded encoding (ADR-0013 decision 2) is kept. Returns whether
+    /// A recorded encoding (ADR-0013 decision 2) is kept. Once written, the
+    /// delimiter and header count as the attribute's choice, so every later
+    /// save records them itself (`Reading::remembered`). Returns whether
     /// it wrote the attribute. It looks at the file, which a network share
     /// can slow down: call it off the main thread.
     ///
@@ -36,8 +43,13 @@ impl Document {
     ///
     /// If the file can't be looked at, or the system refuses the attribute.
     pub fn remember_reviewed_interpretation(&self) -> io::Result<bool> {
+        // A save under way replaces the file, and makes a reading of its
+        // own, which is reviewed in turn.
+        if self.saving.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         let reading = self.current();
-        if !reading.saved {
+        if !reading.saved || reading.remembered.load(Ordering::Acquire) {
             return Ok(false);
         }
         let Some(Ok(review)) = reading.review_job.result() else {
@@ -69,10 +81,15 @@ impl Document {
         let Some(existing) = look_afresh(&status.path)? else {
             return Ok(false);
         };
-        if !same_file(&self.original.opened(), existing.identity()) {
+        let read = reading.source.identity();
+        let now = existing.identity();
+        // `same_file` leaves out the volume, for a removable drive mounted
+        // again; here the file was saved on this mount.
+        if read.device != now.device || !same_file(read, now) {
             return Ok(false);
         }
         existing.set_attribute(INTERPRETATION_ATTRIBUTE_C, value.as_bytes())?;
+        reading.remembered.store(true, Ordering::Release);
         Ok(true)
     }
 }

@@ -651,6 +651,7 @@ impl Document {
             len: streamed.len,
             census: census.map(CensusStream::finish),
             utf8,
+            remembered: reading.remembered.load(Ordering::Acquire),
         });
         let text_encoding = attributes.text_encoding_value();
         let interpretation = attributes.interpretation_value();

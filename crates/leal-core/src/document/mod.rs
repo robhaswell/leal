@@ -451,6 +451,11 @@ struct Reading {
     /// review may add the interpretation attribute
     /// ([`Document::remember_reviewed_interpretation`]).
     saved: bool,
+    /// Its review's delimiter and header were written to the file's
+    /// interpretation attribute (task 2.5.3b review): from then on they are
+    /// the attribute's choice, which every later save records itself
+    /// (ADR-0008 decision 8).
+    remembered: AtomicBool,
 }
 
 /// First paint's result (P0), before any job starts.
@@ -2103,6 +2108,7 @@ fn start_jobs(
         edits,
         counts: None,
         saved: false,
+        remembered: AtomicBool::new(false),
     }
 }
 
