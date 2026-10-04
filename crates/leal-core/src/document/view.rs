@@ -171,7 +171,7 @@ impl<'a> RowView<'a> {
     }
 
     /// Which cell each logical column is.
-    fn layout(&self) -> Layout<'a> {
+    pub(crate) fn layout(&self) -> Layout<'a> {
         Layout::of(self.columns, self.own_shape(), self.edits)
     }
 
@@ -194,12 +194,14 @@ impl<'a> RowView<'a> {
         self.layout().get(column)
     }
 
-    /// Whether the row's cells are all its own fields in their places,
-    /// then hatched cells: no column operation moved or took anything in
-    /// it, so it can be written field by field (task 2.4c).
-    pub(crate) fn same_shape(&self) -> bool {
+    /// Whether the row's cells, laid out as `layout` (its
+    /// [`layout`](Self::layout), worked out once by the caller), are all its
+    /// own fields in their places, then hatched cells: no column operation
+    /// moved or took anything in it, so it can be written field by field
+    /// (task 2.4c).
+    pub(crate) fn same_shape_in(&self, layout: &Layout<'_>) -> bool {
         let fields = self.own.len();
-        match self.layout() {
+        match layout {
             Layout::Default { fold, .. } => match fold {
                 Fold::Identity { .. } => true,
                 fold => {
@@ -301,6 +303,18 @@ impl<'a> RowView<'a> {
     }
 
     /// Cell `column`, or `None` past the row's end.
+    /// Cell `column`'s id and cell, with the row's
+    /// [`layout`](Self::layout) worked out already: for a walk over every
+    /// cell of a row (a row written whole, task 2.4c).
+    pub(crate) fn cell_in(
+        &self,
+        layout: &Layout<'_>,
+        column: usize,
+    ) -> Option<(CellId, ViewCell<'a>)> {
+        let id = layout.get(column)?;
+        Some((id, self.cell_of(id)))
+    }
+
     pub(crate) fn cell(&self, column: usize) -> Option<ViewCell<'a>> {
         if self.edits.is_none() && self.columns.is_empty() {
             return self.own_cell(column);

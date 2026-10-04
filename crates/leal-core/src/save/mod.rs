@@ -901,7 +901,19 @@ pub(crate) fn whole_row_bytes(
     quoting: &ColumnQuoting,
     fixes: &mut Vec<Fix>,
 ) -> Result<(Vec<u8>, Option<LineEnding>), Vec<usize>> {
-    let mut content = Vec::new();
+    // Room for every cell, quoted, with its delimiter, and the line ending.
+    let room: usize = row
+        .cells
+        .iter()
+        .map(|cell| match cell {
+            NewCell::New(value) | NewCell::Hatched(value) | NewCell::Edited { value, .. } => {
+                value.len() + 3
+            }
+            NewCell::Bytes(bytes) => bytes.len() + 1,
+            NewCell::Padding => 1,
+        })
+        .sum();
+    let mut content = Vec::with_capacity(room + 2);
     let mut first = 0;
     let mut unencodable = Vec::new();
     for (column, cell) in row.cells.iter().enumerate() {

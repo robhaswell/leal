@@ -11,7 +11,7 @@ use crate::dialect::{Bom, LineEnding};
 use crate::document::columns::Counts;
 use crate::document::view::{RowView, ViewCell};
 use crate::document::{Document, Reading, RowBytes, inserted_row, to_usize};
-use crate::edit::{CellId, Overlay, Segment};
+use crate::edit::{CellId, Layout, Overlay, Segment};
 use crate::rows::{FieldSpan, ParsedRow};
 use crate::save::{
     ColumnQuoting, EditedRow, NewCell, RowRules, SaveError, Splice, Transcoder, WholeRow,
@@ -254,8 +254,12 @@ impl<'w, 's> Walk<'w, 's> {
         Ok((bytes, parsed, line_ending))
     }
 
+    /// Original row `row`'s line ending, from the index alone.
     fn line_ending_of(&self, row: usize) -> Result<Option<LineEnding>, SaveError> {
-        Ok(self.read(row)?.2)
+        let unreadable = || SaveError::Failed(format!("row {row} can't be read"));
+        let bytes = Document::row_bytes(self.reading, row)?.ok_or_else(unreadable)?;
+        let span = bytes.index.row_in(row, &bytes.bytes, bytes.base);
+        Ok(span.ok_or_else(unreadable)?.line_ending)
     }
 
     /// The line ending of the output row before this one.
@@ -544,9 +548,12 @@ impl<'w, 's> Walk<'w, 's> {
         });
         let fields = parsed.fields().len();
         let len = fields.max(cells.last().map_or(0, |&(column, _)| column + 1));
-        if !view.same_shape() || view.len() != len {
+        // Worked out once for the row.
+        let layout = view.layout();
+        if !view.same_shape_in(&layout) || layout.len() != len {
             // Cells moved, taken or added by a column operation.
-            return self.whole(row, &view, &bytes, &parsed, line_ending, ending);
+            let read = (&bytes, &parsed);
+            return self.whole(row, (&view, &layout), read, (line_ending, ending));
         }
         let blank = parsed.span().is_empty();
         let after_cr = blank
@@ -637,11 +644,9 @@ impl<'w, 's> Walk<'w, 's> {
     fn whole(
         &mut self,
         row: usize,
-        view: &RowView<'_>,
-        bytes: &RowBytes<'_, '_>,
-        parsed: &ParsedRow,
-        line_ending: Option<LineEnding>,
-        ending: Option<LineEnding>,
+        (view, layout): (&RowView<'_>, &Layout<'_>),
+        (bytes, parsed): (&RowBytes<'_, '_>, &ParsedRow),
+        (line_ending, ending): (Option<LineEnding>, Option<LineEnding>),
     ) -> Result<bool, SaveError> {
         let base = bytes.base;
         let range = self
@@ -655,14 +660,16 @@ impl<'w, 's> Walk<'w, 's> {
         };
         let converts = self.extent.converts();
         let source = self.extent.source;
-        let mut cells: Vec<NewCell<'_>> = Vec::with_capacity(view.len());
+        let len = layout.len();
+        let mut cells: Vec<NewCell<'_>> = Vec::with_capacity(len);
         let mut unconvertible = Vec::new();
         // The old file's open quote's field, if it is still there unedited:
         // its length as written. Nothing can follow it (2.4b's
         // `AfterUnterminatedQuote`), so it ends the row's content.
         let mut quote_len = None;
-        for column in 0..view.len() {
-            let cell = match (view.cell_id(column), view.cell(column)) {
+        for column in 0..len {
+            let cell = view.cell_in(layout, column);
+            let cell = match (cell.map(|(id, _)| id), cell.map(|(_, cell)| cell)) {
                 (_, Some(ViewCell::Field(field))) => {
                     let bytes = if converts {
                         Transcoder::convert(raw(field), source)
@@ -670,7 +677,7 @@ impl<'w, 's> Walk<'w, 's> {
                         Some(Cow::Borrowed(raw(field)))
                     };
                     if self.quote == Some(field.start()) {
-                        debug_assert_eq!(column + 1, view.len(), "a cell after the open quote");
+                        debug_assert_eq!(column + 1, len, "a cell after the open quote");
                         quote_len = bytes.as_ref().map(|bytes| bytes.len());
                     }
                     bytes.map_or_else(

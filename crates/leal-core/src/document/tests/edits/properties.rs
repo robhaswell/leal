@@ -418,7 +418,7 @@ fn check_sources(
         let edited = (0..view.len())
             .filter(|&c| matches!(view.cell(c), Some(ViewCell::Edited(_))))
             .count();
-        (cells, view.same_shape(), edited)
+        (cells, view.same_shape_in(&view.layout()), edited)
     })
     .unwrap();
     let mut edited = 0;

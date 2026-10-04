@@ -73,10 +73,12 @@ fn ids(document: &Document, row: usize) -> Vec<CellId> {
 
 fn same_shape(document: &Document, row: usize) -> bool {
     let reading = document.current();
-    Document::read_rows_of(&reading, row..row + 1, |view| view.same_shape())
-        .unwrap()
-        .pop()
-        .unwrap()
+    Document::read_rows_of(&reading, row..row + 1, |view| {
+        view.same_shape_in(&view.layout())
+    })
+    .unwrap()
+    .pop()
+    .unwrap()
 }
 
 #[test]
