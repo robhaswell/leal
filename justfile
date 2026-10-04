@@ -575,49 +575,84 @@ snapshot file out *options: (_app-scripted "debug")
     mv "$container/$name" "{{ out }}"
     echo "snapshot: {{ out }}"
 
-# Save in the real sandbox, outside its container (task 2.5.3a's save fix): `open` hands the sandboxed app a file, as Finder does, and a second one; the app edits a cell, chooses File > Save, then Saves As to the second file's path, which it deletes first (a save panel grants a new file's path the same way), and quits. Checks the bytes, that Save swapped the files and checked the old one, that a Finder tag was kept, and that nothing was left in the folder, which must be outside the container.
+# Save in the real sandbox, outside its container, on the internal disk and on throwaway FAT32 and exFAT disk images (USB sticks): `open` hands the sandboxed app a file, as Finder does, and a second one; the app edits a cell, chooses File > Save, then Saves As to the second file's path, which it deletes first (a save panel grants a new file's path the same way), and quits. Checks the bytes, that Save swapped the files and checked the old one where the volume can swap (APFS), that a Finder tag was kept, and that nothing was left over. `folder` must be outside the container.
 sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": (_app-scripted profile)
     #!/usr/bin/env bash
     set -euo pipefail
     fail() { echo "error: sandbox-save-check: $*" >&2; exit 1; }
     container="$HOME/Library/Containers/io.github.robhaswell.leal/Data"
-    folder="{{ folder }}"
-    folder="${folder/#\~/$HOME}/$$"
-    case "$folder" in "$container"/*) fail "$folder is inside the container, so the sandbox extension isn't tested" ;; esac
-    out="sandbox-save-check-$$.json"
-    result="$container/tmp/$out"
-    rm -rf "$folder" "$folder.expected"
-    mkdir -p "$folder"
-    trap 'rm -rf "$folder" "$folder.expected" "$result"' EXIT
-    file="$folder/sandbox save.csv"
-    # No spaces: the launch options are split at them.
-    copy="$folder/sandbox-save-as.csv"
-    # CRLF, a quoted field with an escaped quote, no final newline: bytes a
-    # save must keep exactly. Grid row 1, column 1 is "Ostrava".
-    printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Ostrava,5\r\n3,Halden,8' > "$file"
-    printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Halden,8' > "$folder.expected"
-    printf 'placeholder\n' > "$copy"
-    tags='62706c6973743030a10155477265656e0a080a'
-    /usr/bin/xattr -wx com.apple.metadata:_kMDItemUserTags "$tags" "$file"
-    inode="$(stat -f %i "$file")"
+    base="{{ folder }}"
+    base="${base/#\~/$HOME}/$$"
+    case "$base" in "$container"/*) fail "$base is inside the container, so the sandbox extension isn't tested" ;; esac
     app="$PWD/{{ bench_derived_data }}/Build/Products/$(just _configuration {{ profile }})/Leal.app"
-    just _run-scripted "$app" "$file|$copy" 90 back -LealSaveCheck "$out" -LealSetCells "1,1=Edited" -LealSaveAsTo "$copy"
-    [ -f "$result" ] || fail "the app wrote no result"
-    cat "$result"
-    echo
-    value() { plutil -extract "$1" raw -o - "$result" 2>/dev/null || echo "(none)"; }
-    [ "$(value saveKey)" = "⌘S" ] || fail "File > Save isn't ⌘S"
-    [ "$(value saved)" = true ] || fail "Save failed: $(value failure)"
-    [ "$(value swapped)" = true ] || fail "Save didn't swap the files (and check the old one)"
-    [ -z "$(value keptOldFile)" ] || fail "Save kept the old file"
-    cmp "$file" "$folder.expected" || fail "Save's bytes differ from the expected ones"
-    [ "$(stat -f %i "$file")" != "$inode" ] || fail "Save didn't replace the file"
-    [ "$(/usr/bin/xattr -px com.apple.metadata:_kMDItemUserTags "$file" | tr -d ' \n' | tr 'A-F' 'a-f')" = "$tags" ] || fail "Save didn't keep the Finder tag"
-    [ "$(value saveAs.saved)" = true ] || fail "Save As to a new file failed: $(value saveAs.failure) $(value saveAs.error)"
-    cmp "$copy" "$folder.expected" || fail "Save As's bytes differ from the expected ones"
-    left="$(ls -A "$folder" | grep -vx -e 'sandbox save.csv' -e 'sandbox-save-as.csv' || true)"
-    [ -z "$left" ] || fail "left in the folder: $left"
-    echo "sandbox-save-check: in the sandbox, Save (swapped and checked) and Save As to a new file wrote the expected bytes; tag kept, nothing left over"
+    images="$base.images"
+    devices=()
+    cleanup() {
+        for device in "${devices[@]}"; do
+            /usr/bin/hdiutil detach "$device" -quiet || /usr/bin/hdiutil detach "$device" -force -quiet || \
+                echo "warning: couldn't detach $device; run \`hdiutil detach -force $device\`" >&2
+        done
+        rm -rf "$base" "$images" "$container/tmp/sandbox-save-check-$$-"*.json
+    }
+    trap cleanup EXIT
+    rm -rf "$base" "$images"
+    mkdir -p "$base" "$images"
+    places=("$base")
+    kinds=(internal)
+    # Removable drives: FAT32 and exFAT can't swap, so the core renames
+    # over the file (ADR-0012). Mounted in /Volumes as a stick would be,
+    # hidden from Finder. Volume names: at most 11 characters for FAT.
+    for fs in "MS-DOS FAT32" ExFAT; do
+        name="LEAL${fs:0:1}$$"
+        /usr/bin/hdiutil create -quiet -size 40m -fs "$fs" -volname "$name" "$images/$name.dmg"
+        attached="$(/usr/bin/hdiutil attach -nobrowse -noverify -noautoopen "$images/$name.dmg")"
+        devices+=("$(head -n 1 <<<"$attached" | awk '{print $1}')")
+        mount="$(grep -o '/Volumes/.*$' <<<"$attached" | head -n 1)"
+        [ -d "$mount" ] || fail "couldn't mount the $fs image: $attached"
+        places+=("$mount")
+        kinds+=("$fs")
+    done
+    tags='62706c6973743030a10155477265656e0a080a'
+    for index in "${!places[@]}"; do
+        kind="${kinds[$index]}"
+        folder="${places[$index]}/run"
+        mkdir -p "$folder"
+        file="$folder/sandbox save.csv"
+        # No spaces: the launch options are split at them.
+        copy="$folder/sandbox-save-as.csv"
+        expected="$images/expected.csv"
+        # CRLF, a quoted field with an escaped quote, no final newline:
+        # bytes a save must keep exactly. Grid row 1, column 1 is "Ostrava".
+        printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Ostrava,5\r\n3,Halden,8' > "$file"
+        printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Halden,8' > "$expected"
+        printf 'placeholder\n' > "$copy"
+        /usr/bin/xattr -wx com.apple.metadata:_kMDItemUserTags "$tags" "$file"
+        inode="$(stat -f %i "$file")"
+        out="sandbox-save-check-$$-$index.json"
+        result="$container/tmp/$out"
+        echo "sandbox-save-check: $kind, $folder"
+        just _run-scripted "$app" "$file|$copy" 90 back -LealSaveCheck "$out" -LealSetCells "1,1=Edited" -LealSaveAsTo "$copy"
+        [ -f "$result" ] || fail "$kind: the app wrote no result"
+        cat "$result"
+        echo
+        value() { plutil -extract "$1" raw -o - "$result" 2>/dev/null || echo "(none)"; }
+        [ "$(value saveKey)" = "⌘S" ] || fail "File > Save isn't ⌘S"
+        [ "$(value saved)" = true ] || fail "$kind: Save failed: $(value failure)"
+        swaps=false
+        if [ "$kind" = internal ]; then swaps=true; fi
+        [ "$(value swapped)" = "$swaps" ] || fail "$kind: Save swapped: $(value swapped), expected $swaps"
+        [ -z "$(value keptOldFile)" ] || fail "$kind: Save kept the old file"
+        cmp "$file" "$expected" || fail "$kind: Save's bytes differ from the expected ones"
+        [ "$(stat -f %i "$file")" != "$inode" ] || fail "$kind: Save didn't replace the file"
+        [ "$(/usr/bin/xattr -px com.apple.metadata:_kMDItemUserTags "$file" | tr -d ' \n' | tr 'A-F' 'a-f')" = "$tags" ] || fail "$kind: Save didn't keep the Finder tag"
+        [ "$(value saveAs.saved)" = true ] || fail "$kind: Save As to a new file failed: $(value saveAs.failure) $(value saveAs.error)"
+        cmp "$copy" "$expected" || fail "$kind: Save As's bytes differ from the expected ones"
+        # On FAT and exFAT, extended attributes live in `._` files.
+        left="$(ls -A "$folder" | grep -vx -e 'sandbox save.csv' -e 'sandbox-save-as.csv' -e '._sandbox save.csv' -e '._sandbox-save-as.csv' || true)"
+        [ -z "$left" ] || fail "$kind: left in the folder: $left"
+        echo "sandbox-save-check: $kind: Save ($( [ "$swaps" = true ] && echo "swapped and checked" || echo "renamed over" )) and Save As to a new file wrote the expected bytes; replacement folder: $( [ -n "$(value replacementFolder)" ] && echo given || echo none ); a folder next to the file: $(value folderNextToFile)"
+    done
+    echo "sandbox-save-check: passed on the internal disk, FAT32 and exFAT"
 
 # Build Leal.app with the scripted runs (the `LEAL_BENCH` compilation condition) into its own DerivedData.
 [private]

@@ -229,6 +229,9 @@ final class ScriptedRun {
             return result
         }
         result["file"] = document.fileURL?.path(percentEncoded: false) ?? ""
+        if let url = document.fileURL {
+            result.merge(Self.folders(for: url)) { $1 }
+        }
         guard await Self.settled(document) else {
             result["error"] = "the document didn't finish opening"
             return result
@@ -272,6 +275,29 @@ final class ScriptedRun {
         return result
     }
 
+    /// Where a save to `url` can make its new file, under the sandbox:
+    /// whether `FileManager` gives an item-replacement folder for it (the
+    /// one the app passes the core; made and removed again here), and
+    /// whether a folder can be made next to the file (the core's fallback,
+    /// `.leal-save-<id>`, when it is given none), or the errno if not.
+    private static func folders(for url: URL) -> [String: Any] {
+        var result: [String: Any] = [:]
+        if let folder = TemporaryFolders.volumeFolder(for: url) {
+            result["replacementFolder"] = folder
+            try? FileManager.default.removeItem(atPath: folder)
+        } else {
+            result["replacementFolder"] = ""
+        }
+        let probe = url.deletingLastPathComponent().appending(path: ".leal-save-probe").path(percentEncoded: false)
+        if mkdir(probe, 0o700) == 0 {
+            rmdir(probe)
+            result["folderNextToFile"] = "allowed"
+        } else {
+            result["folderNextToFile"] = "errno \(errno)"
+        }
+        return result
+    }
+
     /// `-LealSaveAsTo <path>`: a Save As through the core to a new file at
     /// `url`, outside the container, after the Save. A save panel would
     /// grant the app that file's path; here `open` granted it, as the
@@ -296,6 +322,7 @@ final class ScriptedRun {
             result["error"] = "couldn’t delete the file first: errno \(errno)"
             return result
         }
+        result.merge(Self.folders(for: url)) { $1 }
         do {
             let saved = try await model.save(to: url, kind: .saveAs)
             result["saved"] = saved != nil
