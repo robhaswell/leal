@@ -59,9 +59,12 @@ import os
 ///   what happened to the file, and quit (`just sandbox-save-check`: a
 ///   Save under the real sandbox, of a file outside the container that
 ///   `open` handed the app). Then, if asked: `-LealRevert YES` (an edit,
-///   then Revert to Saved), `-LealSaveAsTo <path>` (Save As), and
-///   `-LealDuplicateTo <path>` (`-LealDuplicateCells`' edits, then
-///   Duplicate), to files `open` was also handed, which are deleted first.
+///   then Revert to Saved), `-LealSaveAsTo <path>` (Save As, then
+///   `-LealSaveAsCells`' edits, Save and Revert to Saved on the new
+///   file), `-LealDuplicateTo <path>` (`-LealDuplicateCells`' edits, then
+///   Duplicate), and `-LealCrossVolumeTo <path>` (Save As to another
+///   volume, then `-LealCrossVolumeCells`' edits and Save there), to files
+///   `open` was also handed, which are deleted first.
 /// - `-LealBenchEdit <n>`: once the document is indexed, edit `n` cells
 ///   through the in-cell editor (Return, new text, Return), one at a time,
 ///   each once the last is on screen, then quit: each edit's "Cell edit to
@@ -204,10 +207,12 @@ final class ScriptedRun {
     }
 
     /// `-LealSaveCheck` (`just sandbox-save-check`): Save, then, if asked,
-    /// Revert to Saved (`-LealRevert YES`), Save As (`-LealSaveAsTo`) and
-    /// Duplicate (`-LealDuplicateTo`), each as the File menu does it,
-    /// inside the app (nothing is sent to the system). `open` was handed
-    /// the Save As and Duplicate files too, which grants the sandboxed app
+    /// Revert to Saved (`-LealRevert YES`), Save As (`-LealSaveAsTo`, then
+    /// Save and Revert on the new file), Duplicate (`-LealDuplicateTo`)
+    /// and Save As to another volume, then Save there
+    /// (`-LealCrossVolumeTo`), each as the File menu does it, inside the
+    /// app (nothing is sent to the system). `open` was handed the Save As,
+    /// Duplicate and other volume's files too, which grants the sandboxed app
     /// their paths as a save panel would; their documents are closed and
     /// the files deleted first, so each makes a new file there, with no
     /// access to the folder. Returns what happened at each step.
@@ -215,7 +220,8 @@ final class ScriptedRun {
         var result: [String: Any] = [:]
         let saveAsTo = value(of: "LealSaveAsTo").map { URL(filePath: $0).standardizedFileURL }
         let duplicateTo = value(of: "LealDuplicateTo").map { URL(filePath: $0).standardizedFileURL }
-        let targets = [saveAsTo, duplicateTo].compactMap { $0 }
+        let crossVolumeTo = value(of: "LealCrossVolumeTo").map { URL(filePath: $0).standardizedFileURL }
+        let targets = [saveAsTo, duplicateTo, crossVolumeTo].compactMap { $0 }
         let documents: [CSVDocument] = await {
             let deadline = Date().addingTimeInterval(30)
             while Date() < deadline {
@@ -246,19 +252,28 @@ final class ScriptedRun {
         }
         if let saveAsTo {
             result["saveAs"] = await saveAsCheck(document, to: saveAsTo, duplicate: false)
+            // The new file is the document's now: Save and Revert there.
+            if has("LealSaveAsCells") {
+                result["saveAsSave"] = await saveCheck(document, content: content, option: "LealSaveAsCells")
+                result["saveAsRevert"] = await revertCheck(document, content: content)
+            }
         }
         if let duplicateTo {
             setCells(content.model, option: "LealDuplicateCells")
             result["duplicate"] = await saveAsCheck(document, to: duplicateTo, duplicate: true)
         }
+        if let crossVolumeTo {
+            result["crossVolume"] = await saveAsCheck(document, to: crossVolumeTo, duplicate: false)
+            result["crossVolumeSave"] = await saveCheck(document, content: content, option: "LealCrossVolumeCells")
+        }
         return result
     }
 
-    /// Makes `-LealSetCells`' edits, chooses File > Save, and waits for the
-    /// Save to end or for its alert, which it dismisses. Returns what
-    /// happened: Save's key and whether it was on, whether it saved, and
-    /// the failure and the alert's text if not.
-    private func saveCheck(_ document: CSVDocument, content: DocumentViewController) async -> [String: Any] {
+    /// Makes `-LealSetCells`' edits (or `option`'s), chooses File > Save,
+    /// and waits for the Save to end or for its alert, which it dismisses.
+    /// Returns what happened: Save's key and whether it was on, whether it
+    /// saved, and the failure and the alert's text if not.
+    private func saveCheck(_ document: CSVDocument, content: DocumentViewController, option: String = "LealSetCells") async -> [String: Any] {
         var result: [String: Any] = ["file": document.fileURL?.path(percentEncoded: false) ?? ""]
         if let url = document.fileURL {
             result.merge(Self.folders(for: url)) { $1 }
@@ -267,7 +282,7 @@ final class ScriptedRun {
             result["error"] = "the document didn't finish opening"
             return result
         }
-        setCells(content.model)
+        setCells(content.model, option: option)
         result["editedBeforeSave"] = document.isDocumentEdited
         let file = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.items.contains { $0.action == #selector(NSDocument.save(_:)) } }
         guard let save = file?.items.first(where: { $0.action == #selector(NSDocument.save(_:)) }) else {

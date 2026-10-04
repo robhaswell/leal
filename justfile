@@ -575,7 +575,7 @@ snapshot file out *options: (_app-scripted "debug")
     mv "$container/$name" "{{ out }}"
     echo "snapshot: {{ out }}"
 
-# Save in the real sandbox, outside its container, on the internal disk and on throwaway FAT32 and exFAT disk images (USB sticks): `open` hands the sandboxed app a file, as Finder does, and two more; the app edits a cell and chooses File > Save, edits and chooses Revert to Saved, then Save As and (after an edit) Duplicate to the other two files' paths, which it deletes first (a save panel grants a new file's path the same way), and quits. Checks the bytes, that Save swapped the files and checked the old one where the volume can swap (APFS), that a Finder tag was kept, and that nothing was left over. `folder` must be outside the container.
+# Save in the real sandbox, outside its container, on the internal disk and on throwaway FAT32 and exFAT disk images (USB sticks): `open` hands the sandboxed app a file, as Finder does, and more; the app edits a cell and chooses File > Save, edits and chooses Revert to Saved, then Save As (then an edit, Save and Revert on the new file) and (after an edit) Duplicate to the other files' paths, which it deletes first (a save panel grants a new file's path the same way); from the internal disk, also Save As to the FAT32 image, then an edit and Save there; and quits. Checks the bytes, that Save swapped the files and checked the old one where the volume can swap (APFS), that a Finder tag was kept, that every save was given an item-replacement folder, and that nothing was left over. `folder` must be outside the container.
 sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": (_app-scripted profile)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -622,26 +622,55 @@ sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": 
         copy="$folder/sandbox-save-as.csv"
         duplicate="$folder/sandbox-duplicate.csv"
         expected="$images/expected.csv"
+        expected_copy="$images/expected-copy.csv"
         expected_duplicate="$images/expected-duplicate.csv"
+        expected_cross="$images/expected-cross.csv"
         # CRLF, a quoted field with an escaped quote, no final newline:
         # bytes a save must keep exactly. Grid row 1, column 1 is "Ostrava";
-        # Revert's edit (then discarded) is row 0's quoted field.
+        # Revert's edits (then discarded) are row 0's quoted field.
         printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Ostrava,5\r\n3,Halden,8' > "$file"
         printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Halden,8' > "$expected"
-        printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Duplicated,8' > "$expected_duplicate"
+        printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Halden,9' > "$expected_copy"
+        printf 'id,name,qty\r\n1,"Mar""low",3\r\n2,Edited,5\r\n3,Duplicated,9' > "$expected_duplicate"
+        printf 'id,name,qty\r\n1,"Mar""low",4\r\n2,Edited,5\r\n3,Duplicated,9' > "$expected_cross"
         printf 'placeholder\n' > "$copy"
         printf 'placeholder\n' > "$duplicate"
+        files="$file|$copy|$duplicate"
+        # From the internal disk only: Save As to the FAT32 image (another
+        # volume), then Save there.
+        cross=""
+        cross_options=()
+        if [ "$kind" = internal ]; then
+            mkdir -p "${places[1]}/cross"
+            cross="${places[1]}/cross/sandbox-cross.csv"
+            printf 'placeholder\n' > "$cross"
+            files="$files|$cross"
+            cross_options=(-LealCrossVolumeTo "$cross" -LealCrossVolumeCells "0,2=4")
+        fi
         /usr/bin/xattr -wx com.apple.metadata:_kMDItemUserTags "$tags" "$file"
         inode="$(stat -f %i "$file")"
         out="sandbox-save-check-$$-$index.json"
         result="$container/tmp/$out"
         echo "sandbox-save-check: $kind, $folder"
-        just _run-scripted "$app" "$file|$copy|$duplicate" 120 back -LealSaveCheck "$out" -LealSetCells "1,1=Edited" \
-            -LealRevert YES -LealSaveAsTo "$copy" -LealDuplicateTo "$duplicate" -LealDuplicateCells "2,1=Duplicated"
+        just _run-scripted "$app" "$files" 180 back -LealSaveCheck "$out" -LealSetCells "1,1=Edited" \
+            -LealRevert YES -LealSaveAsTo "$copy" -LealSaveAsCells "2,2=9" \
+            -LealDuplicateTo "$duplicate" -LealDuplicateCells "2,1=Duplicated" ${cross_options[@]+"${cross_options[@]}"}
         [ -f "$result" ] || fail "$kind: the app wrote no result"
         cat "$result"
         echo
         value() { plutil -extract "$1" raw -o - "$result" 2>/dev/null || echo "(none)"; }
+        # Every save was given an item-replacement folder for its
+        # destination: the core's fallback, a folder next to the file, is
+        # refused under the sandbox.
+        given() {
+            local folder
+            folder="$(value "$1")"
+            [ -n "$folder" ] && [ "$folder" != "(none)" ] || fail "$kind: no item-replacement folder for $2"
+        }
+        given replacementFolder "Save"
+        given saveAs.replacementFolder "Save As"
+        given saveAsSave.replacementFolder "Save on Save As's file"
+        given duplicate.replacementFolder "Duplicate"
         [ "$(value saveKey)" = "⌘S" ] || fail "File > Save isn't ⌘S"
         [ "$(value saved)" = true ] || fail "$kind: Save failed: $(value failure)"
         swaps=false
@@ -652,18 +681,30 @@ sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": 
         [ "$(/usr/bin/xattr -px com.apple.metadata:_kMDItemUserTags "$file" | tr -d ' \n' | tr 'A-F' 'a-f')" = "$tags" ] || fail "$kind: Save didn't keep the Finder tag"
         [ "$(value revert.reverted)" = true ] || fail "$kind: Revert to Saved didn't discard the edit"
         [ "$(value saveAs.saved)" = true ] || fail "$kind: Save As to a new file failed: $(value saveAs.failure) $(value saveAs.alert)"
+        [ "$(value saveAsSave.saved)" = true ] || fail "$kind: Save on Save As's new file failed: $(value saveAsSave.failure) $(value saveAsSave.alert)"
+        [ "$(value saveAsRevert.reverted)" = true ] || fail "$kind: Revert to Saved on Save As's new file didn't discard the edit"
         [ "$(value duplicate.saved)" = true ] || fail "$kind: Duplicate to a new file failed: $(value duplicate.failure) $(value duplicate.alert)"
         [ "$(value duplicate.suggestedName)" = "sandbox-save-as copy.csv" ] || fail "$kind: Duplicate suggested $(value duplicate.suggestedName)"
         # The file Saved, untouched by Revert, Save As and Duplicate; Save
-        # As's copy (without Revert's discarded edit), untouched by
-        # Duplicate; Duplicate's, with its edit.
+        # As's copy, Saved again with its edit (without Revert's discarded
+        # edits), untouched by Duplicate; Duplicate's, with its edit.
         cmp "$file" "$expected" || fail "$kind: Save's bytes differ from the expected ones"
-        cmp "$copy" "$expected" || fail "$kind: Save As's bytes differ from the expected ones"
+        cmp "$copy" "$expected_copy" || fail "$kind: Save As's file, saved again, differs from the expected bytes"
         cmp "$duplicate" "$expected_duplicate" || fail "$kind: Duplicate's bytes differ from the expected ones"
+        if [ -n "$cross" ]; then
+            given crossVolume.replacementFolder "Save As to another volume"
+            given crossVolumeSave.replacementFolder "Save on the other volume"
+            [ "$(value crossVolume.saved)" = true ] || fail "$kind: Save As to ${kinds[1]} failed: $(value crossVolume.failure) $(value crossVolume.alert)"
+            [ "$(value crossVolumeSave.saved)" = true ] || fail "$kind: Save on ${kinds[1]} after Save As failed: $(value crossVolumeSave.failure) $(value crossVolumeSave.alert)"
+            [ "$(value crossVolumeSave.swapped)" = false ] || fail "$kind: Save on ${kinds[1]} swapped"
+            cmp "$cross" "$expected_cross" || fail "$kind: the other volume's file differs from the expected bytes"
+            left="$(ls -A "$(dirname "$cross")" | sed 's/^\._//' | grep -vx 'sandbox-cross.csv' || true)"
+            [ -z "$left" ] || fail "$kind: left on ${kinds[1]}: $left"
+        fi
         # On FAT and exFAT, extended attributes live in `._` files.
         left="$(ls -A "$folder" | sed 's/^\._//' | grep -vx -e 'sandbox save.csv' -e 'sandbox-save-as.csv' -e 'sandbox-duplicate.csv' || true)"
         [ -z "$left" ] || fail "$kind: left in the folder: $left"
-        echo "sandbox-save-check: $kind: Save ($( [ "$swaps" = true ] && echo "swapped and checked" || echo "renamed over" )), Revert to Saved, and Save As and Duplicate to new files wrote the expected bytes; replacement folder: $( [ -n "$(value replacementFolder)" ] && echo given || echo none ); a folder next to the file: $(value folderNextToFile)"
+        echo "sandbox-save-check: $kind: Save ($( [ "$swaps" = true ] && echo "swapped and checked" || echo "renamed over" )), Revert to Saved, Save As to a new file then Save and Revert there, and Duplicate$( [ -n "$cross" ] && echo ", and Save As to ${kinds[1]} then Save there," ) wrote the expected bytes, each in an item-replacement folder; a folder next to the file: $(value folderNextToFile)"
     done
     echo "sandbox-save-check: passed on the internal disk, FAT32 and exFAT"
 
