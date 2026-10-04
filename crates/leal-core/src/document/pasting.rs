@@ -93,6 +93,12 @@ impl Document {
                 }
                 fill(&rows, &columns, value)
             } else {
+                // The values as they will be written: a line break may
+                // have grown into the file's two bytes (`\r\n`).
+                let bytes: usize = pasted.rows().iter().flatten().map(|cell| cell.len()).sum();
+                if bytes > PASTE_BYTE_LIMIT {
+                    return Err(EditError::TooMuchText { bytes });
+                }
                 let (top, left) = (rows.start, columns.start);
                 if top.saturating_add(pasted.height()) > row_count {
                     return Err(EditError::PastLastRow {

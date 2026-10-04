@@ -595,6 +595,74 @@ final class PasteTests: XCTestCase {
         XCTAssertFalse(GridSelection.all(rows: 3, columns: 3, active: CellPosition(row: 0, column: 0)).wholeRows, "⌘A is cells")
     }
 
+    /// Whole rows are copied whole, however wide the grid was when they were
+    /// picked: a column added since is on the clipboard too, as the rows
+    /// that go hold it.
+    func testCutOfWholeRowsCopiesColumnsAddedSincePicking() async throws {
+        let opened = try await open(file("cut-wide.csv", csv))
+        let model = opened.model
+        guard case .edited = model.insertColumn(before: 3) else { return XCTFail("inserted") }
+        XCTAssertEqual(model.columnCount, 4)
+        // Rows picked while the grid had three columns (the column count
+        // grows as the file is read, and the selection isn't widened).
+        let stale = GridSelection.row(0, columns: 3, column: 0).extended(to: CellPosition(row: 1, column: 2))
+        opened.grid.select(stale)
+        XCTAssertEqual(opened.grid.selection, stale)
+        XCTAssertEqual(opened.grid.selection?.columns, 0...2)
+        XCTAssertEqual(opened.grid.selection?.wholeRows, true)
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(pasteboard.string(forType: .string), "1\tMarlow\t3\t\n2\tOstrava\t5\t")
+        XCTAssertEqual(model.rowCount, 1)
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+    }
+
+    /// Whole rows that run to the last row (⇧⌘↓) are cut to the last row,
+    /// as the cells they are would be: all of them, copied and deleted.
+    func testCutOfWholeRowsThroughTheLastRowTakesThemAll() async throws {
+        let opened = try await open(file("cut-last.csv", csv))
+        let model = opened.model
+        let start = CellPosition(row: 0, column: 0)
+        opened.grid.select(GridSelection(
+            active: start, anchor: start, extent: CellPosition(row: 0, column: 2), throughLastRow: true, wholeRows: true
+        ))
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(pasteboard.string(forType: .string), "1\tMarlow\t3\n2\tOstrava\t5\n3\tHalden\t8")
+        XCTAssertEqual(model.rowCount, 0)
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+    }
+
+    /// A Cut that asked first (a very large copy) goes on only if what it
+    /// asked about still stands: a selection that moved while the sheet was
+    /// up cuts nothing and copies nothing.
+    func testCutAfterTheLargeCopySheetChecksTheSelectionAgain() async throws {
+        let opened = try await open(file("cut-sheet.csv", csv))
+        let (model, content) = (opened.model, opened.content)
+        content.askBeforeCopyBytes = 0
+        var answers: [@MainActor (Bool) -> Void] = []
+        content.confirmLargeCopy = { _, answer in answers.append(answer) }
+        copy("kept")
+
+        select(opened, (0, 1), (1, 2))
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(answers.count, 1, "asked first")
+        XCTAssertEqual(pasteboard.string(forType: .string), "kept")
+        select(opened, (2, 1), (2, 1))
+        answers[0](true)
+        XCTAssertEqual(pasteboard.string(forType: .string), "kept")
+        XCTAssertFalse(model.hasUnsavedEdits)
+        XCTAssertEqual(row(model, 0), ["1", "Marlow", "3"])
+        XCTAssertEqual(row(model, 2), ["3", "Halden", "8"])
+
+        // Unchanged, it goes on.
+        select(opened, (0, 1), (1, 2))
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(answers.count, 2)
+        answers[1](true)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Marlow\t3\nOstrava\t5")
+        XCTAssertEqual(row(model, 0), ["1", "", ""])
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+    }
+
     /// A Cut that can't delete or clear copies nothing: too many cells (an
     /// alert, and the tooltip), or a save running (off, saying why).
     func testARefusedCutCopiesNothing() async throws {

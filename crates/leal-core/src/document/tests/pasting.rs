@@ -234,6 +234,25 @@ fn pastes_that_dont_fit_or_are_too_large_are_refused() {
     assert!(document.can_clear_cells(1..rows, 0..3).is_ok());
 }
 
+/// The limit is on what is written: a block under it as it was copied,
+/// whose line breaks grow into the file's `\r\n`, is over it and refused,
+/// as one value is. The document is unchanged.
+#[test]
+fn a_block_that_grows_past_the_limit_with_line_breaks_is_refused() {
+    let dir = Dir::new("paste-block-grows");
+    let document = open_with(&dir, "a.csv", FILE);
+    let before = saved(&document);
+    let text = format!("\"{}\"\tb", "\r".repeat(PASTE_BYTE_LIMIT - 16));
+    assert!(text.len() < PASTE_BYTE_LIMIT);
+    assert!(matches!(
+        document.paste(1..2, 0..1, 3, &text, LineEnding::Crlf),
+        Err(EditError::TooMuchText { bytes }) if bytes > PASTE_BYTE_LIMIT
+    ));
+    // As it came, it fits.
+    assert!(document.paste(1..2, 0..1, 3, &text, LineEnding::Cr).is_ok());
+    assert_ne!(saved(&document), before);
+}
+
 /// Nothing goes after an unterminated quote (ADR-0004 decision 8): a paste
 /// reaching past the quote's cell in its row is refused, whole.
 #[test]

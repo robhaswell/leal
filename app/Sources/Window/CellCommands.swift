@@ -52,7 +52,7 @@ extension DocumentViewController {
         let refusal: EditRefusal?
         switch command {
         case .cut:
-            refusal = cutRefusal(selection, area)
+            refusal = cutPlan().map(cutRefusal) ?? .unreadable
         case .paste:
             guard pasteboard.availableType(from: Self.pasteTypes) != nil else { return .off }
             refusal = model.pasteRefusal()
@@ -87,16 +87,45 @@ extension DocumentViewController {
     }
 
     /// The rows Cut deletes: those of whole rows picked by their numbers,
-    /// within the file; `nil` for cells.
+    /// within the file (to the last row if the selection runs there, as
+    /// `cellArea` does); `nil` for cells.
     private func rowsToCut(_ selection: GridSelection) -> ClosedRange<Int>? {
         guard selection.wholeRows, model.rowCount > 0, selection.rows.lowerBound < model.rowCount else { return nil }
-        return selection.rows.lowerBound...min(selection.rows.upperBound, model.rowCount - 1)
+        let last = selection.throughLastRow ? model.rowCount - 1 : min(selection.rows.upperBound, model.rowCount - 1)
+        return selection.rows.lowerBound...last
     }
 
-    /// Why Cut can't delete or clear `selection` now: as Delete Row or
-    /// Clear would refuse.
-    private func cutRefusal(_ selection: GridSelection, _ area: CellArea) -> EditRefusal? {
-        rowsToCut(selection) != nil ? model.rowDeleteRefusal() : model.clearRefusal(area)
+    /// What Cut would do now: the selection, its cells, the rows it deletes
+    /// (`nil` for cells) and what it copies. Whole rows are deleted whole,
+    /// so they are copied whole: every column the file or the grid has,
+    /// whatever the selection's columns were when the rows were picked
+    /// (the grid may have widened since), and the rows deleted, no more.
+    struct CutPlan: Equatable {
+        let selection: GridSelection
+        let area: CellArea
+        let rows: ClosedRange<Int>?
+        let range: CopyRange
+    }
+
+    private func cutPlan() -> CutPlan? {
+        guard let selection = grid.selection, let area = model.cellArea(selection) else { return nil }
+        let rows = rowsToCut(selection)
+        var range = model.copyRange(selection)
+        if let rows {
+            range = CopyRange(
+                rowStart: UInt64(rows.lowerBound + model.headerRows),
+                rowCount: UInt64(rows.count),
+                columnStart: 0,
+                columnCount: UInt32(clamping: max(model.columnCount, model.fileColumnCount, 1))
+            )
+        }
+        return CutPlan(selection: selection, area: area, rows: rows, range: range)
+    }
+
+    /// Why Cut can't delete or clear `plan` now: as Delete Row or Clear
+    /// would refuse.
+    private func cutRefusal(_ plan: CutPlan) -> EditRefusal? {
+        plan.rows != nil ? model.rowDeleteRefusal() : model.clearRefusal(plan.area)
     }
 
     /// Runs `command`, after committing an open edit.
@@ -163,23 +192,28 @@ extension DocumentViewController {
     /// as Copy does.
     func cutSelection() {
         scheduler.noteUserInput()
-        guard !model.isFailed, !isReplacingDocument, commitEditing(),
-              let selection = grid.selection, let area = model.cellArea(selection) else { return NSSound.beep() }
-        if let refusal = cutRefusal(selection, area) { return refused(.cut, refusal) }
-        let range = model.copyRange(selection)
-        let bytes = model.estimatedCopyBytes(range)
-        guard bytes > askBeforeCopyBytes else { return cut(selection, area, range, bytes: bytes) }
+        guard !model.isFailed, !isReplacingDocument, commitEditing(), let plan = cutPlan() else { return NSSound.beep() }
+        if let refusal = cutRefusal(plan) { return refused(.cut, refusal) }
+        let bytes = model.estimatedCopyBytes(plan.range)
+        guard bytes > askBeforeCopyBytes else { return cut(plan, bytes: bytes) }
         confirmLargeCopy(bytes) { [weak self] go in
-            if go { self?.cut(selection, area, range, bytes: bytes) }
+            guard go, let self else { return }
+            // The sheet was up a while: the selection, the rows or the
+            // columns may have changed (the file read again, say), and
+            // what was asked about is no longer what would be cut.
+            guard !model.isFailed, !isReplacingDocument, cutPlan() == plan, cutRefusal(plan) == nil else {
+                return NSSound.beep()
+            }
+            cut(plan, bytes: bytes)
         }
     }
 
-    private func cut(_ selection: GridSelection, _ area: CellArea, _ range: CopyRange, bytes: UInt64) {
+    private func cut(_ plan: CutPlan, bytes: UInt64) {
         find.cancelPendingStep()
         // Made before the cells change (a job copies the edits as they are
         // when it starts), placed only once they have.
-        guard let copy = prepareCopy(range, bytes: bytes) else { return NSSound.beep() }
-        let rows = rowsToCut(selection)
+        guard let copy = prepareCopy(plan.range, bytes: bytes) else { return NSSound.beep() }
+        let (rows, area) = (plan.rows, plan.area)
         var outcome = EditOutcome.unchanged
         asOneStep {
             outcome = if let rows { model.deleteRows(rows) } else { model.clear(area) }
