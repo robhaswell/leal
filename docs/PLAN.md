@@ -534,102 +534,79 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       the index pass, or builds the index from the plan;
     - the save's carry-over maps rows through the piece list.
 - [ ] **2.5 App: editing** — in-place editing, `NSUndoManager`, dirty state,
-  Save / Save As / Revert, safe-save with metadata preserved.
-  - In-cell editing uses an `NSTextField` overlaid on the cell; Return
-    commits and Esc cancels through the field editor (ADR-0001).
-  - The invalid-bytes callout is a small view anchored to the edited cell
-    (ADR-0001, mockup 05b).
-  - Hatched cells can be edited. (ADR-0005 decision 2)
-  - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
-    guess a different encoding, and updates it if the file already has one
-    (ADR-0004 decision 11).
-  - Writes the interpretation attribute when a reopen would guess a
-    different delimiter or header choice, or the user chose them.
-    (ADR-0005 decision 1)
-  - `Info.plist`'s document role becomes `Editor`.
-  - Save asks before writing over a file that changed elsewhere
-    (`OriginalStatus.diverged`, which stays set after Keep Editing; DESIGN
-    §3.1), and **re-checks the original's identity immediately before
-    writing**, whatever the watcher last said: a network share's watcher
-    sees only this Mac's changes, and a change can land between the last
-    event and the save. (1.9 review)
-  - Leal's own save is not an outside change. After a successful save the
-    document is rebased onto the file just written: a new snapshot (clone,
-    or copy on removable drives), re-indexed; the watcher gets the new
-    identity and treats the event from Leal's own replace as expected;
-    `diverged` is cleared; edits and undo carry on. A hosted test saves
-    twice in a row and sees no banner and no prompt. (ADR-0008 decision 1)
-  - The inspector, find highlights, copy and the diagnostics marks show
-    edited values (2.1's overlay); a hosted test edits a cell, then finds,
-    copies and steps to it. (ADR-0008 decision 2)
-  - The in-cell editor and the inspector start from the core's full
-    display value, never the grid's shortened text or its ↵ ⇥ ␀ symbols.
-    A value longer than the inspector's 64,000 characters is loaded in
-    full before it can be edited. A test commits an untouched long value
-    and an untouched multiline value and gets no edit. (ADR-0008
-    decision 3)
-  - Reload and Revert to Saved ask before discarding unsaved edits, and
-    Revert goes through the model's Reload, never NSDocument's default
-    `read(from:)`. Treat As and Reopen with Encoding are disabled while
-    there are unsaved edits ("Save or revert your changes first"); the
-    Header row toggle stays available; a drive coming back keeps the
-    edits. Each has a test. (ADR-0008 decision 4)
-  - Revert runs off the main thread, like Reload (`reloadInBackground`):
-    AppKit's `read(from:)` reads on the main thread, where a share must
-    never be read. (2.0, `SEAM(2.5)` in `CSVDocument.read(from:)`)
-  - When the open couldn't read the file's modification date
-    (`PendingOpens.Facts.modified` is nil), Save's check before writing
-    looks at the file afresh rather than take it as unchanged. (2.0,
-    `SEAM(2.5)`)
-  - If a document fails (DESIGN §3.9) with unsaved edits, the alert offers
-    **Recover changes**: Leal opens the file afresh and replays the undo
-    history's commands. If the file is unchanged the window carries on;
-    otherwise Leal offers Save As of what it recovered and names the edits
-    it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5)
-  - Save As from an incomplete document says plainly that the copy is
-    incomplete ("about N of M rows"); this wires the drive and
-    deleted-elsewhere banners' Save As… (`SEAM(2.5)`). (ADR-0008
-    decision 6, ADR-0010)
-  - On every save, the interpretation attribute is written with
-    `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
-    paint or whole-file review would guess differently, when the user
-    chose the delimiter or header, or when the choice came from the
-    attribute; otherwise any old attribute is removed. The same rule for
-    `com.apple.TextEncoding`, against both the first-64 KB and the
-    whole-file guess. A hosted test checks that after Save the attributes
-    are the new values, not ones NSDocument copied from the old file.
-    (ADR-0008 decision 8)
-  - The check before writing opens the file afresh and reads its identity
-    with `fstat`, so network file systems revalidate; tested on a share if
-    one is available. (ADR-0008 decision 9)
-  - Revert to Saved only, with no Versions browser: autosave-in-place
-    stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
-  - The user sees one prompt about a file changed elsewhere, never both
-    Leal's and NSDocument's own. Decide what Save does for a deleted file
-    (`can_save()` is true today; the core's save refuses it as `missing`,
-    and Save As works). (phase 1 review, 2.2)
-  - Swift wraps the save's await in `withTaskCancellationHandler`, which
-    calls the job's `cancel()` (2.2; ADR-0005 decision 6).
-  - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
-    to `just perf` and recorded in docs/perf.md.
-  - From 2.1 (docs/tasks/2.1.md):
+  Save / Save As / Revert, safe-save with metadata preserved. Split into
+  parts of about a day (CLAUDE.md, token budget). The parts are named
+  2.5.1 to 2.5.3 so as not to clash with 2.5a below; the bullets in each
+  part are its acceptance criteria.
+  - [ ] **2.5.1 App: in-cell editing and the inspector** — the edit overlay
+    in the grid, the full values, `canEdit`, what an edit invalidates.
+    - In-cell editing uses an `NSTextField` overlaid on the cell; Return
+      commits and Esc cancels through the field editor (ADR-0001).
+    - The invalid-bytes callout is a small view anchored to the edited cell
+      (ADR-0001, mockup 05b).
+    - Hatched cells can be edited. (ADR-0005 decision 2)
+    - Header-row cells (file row 0, not a grid row) are edited in place
+      (docs/tasks/2.1.md; 2.1's "Decide whether header-row cells can be
+      edited" bullet leaves it to 2.5):
+      - the header cell's editor starts from `fullValue(row: 0, …)`, not
+        the header's title text;
+      - the column header view refreshes after an edit;
+      - Find still doesn't search row 0;
+      - editing a header cell past the end of a short header row (a
+        hatched header cell) is allowed too, for consistency;
+      - if the in-place header editor is awkward (it is a different view,
+        not a grid cell), a fallback is "Rename Column…" in the header's
+        context menu, using the same `setCell(row: 0, …)`.
+    - `Info.plist`'s document role becomes `Editor`.
+    - The inspector, find highlights, copy and the diagnostics marks show
+      edited values (2.1's overlay); a hosted test edits a cell, then finds,
+      copies and steps to it. (ADR-0008 decision 2)
+    - The in-cell editor and the inspector start from the core's full
+      display value, never the grid's shortened text or its ↵ ⇥ ␀ symbols.
+      A value longer than the inspector's 64,000 characters is loaded in
+      full before it can be edited. A test commits an untouched long value
+      and an untouched multiline value and gets no edit. (ADR-0008
+      decision 3)
+    - The in-cell editor opens only where `canEdit` allows it. (2.1 notes)
+    - After an edit, an undo or a redo, call `cellsChanged(rows:)` for the
+      rows touched (2.0a notes, "For editing"), and re-measure column
+      widths and number detection, as after a reinterpret. (2.1 notes)
+    - While `Search.progress().catchingUp` is true, keep polling (or await
+      `catchUpJob()`), and retry a `Pending` Next or Previous once it
+      clears. (2.1 notes)
+    - UTF-16 documents are editable with Save off; Save As UTF-8 is the
+      only save. (ADR-0013 decision 1)
+    - Edits run the core's `unencodable(value:)` check before commit.
+      Windows-1258 refuses precomposed Vietnamese, so the warning should
+      point to Save As UTF-8. (docs/tasks/2.3.md)
+    - Cell edit to screen is measured against DESIGN §1's "< 16 ms", added
+      to `just perf` and recorded in docs/perf.md.
+    - Screenshots next to mockups 05a and 05b.
+  - [ ] **2.5.2 App: undo, the journal and dirty state** — `NSUndoManager`
+    over the core's commands, the recovery journal, the change count.
     - Keep an append-only journal of every command applied (edits, undos
       and redos, in order) with the reading's choices, for Recover changes;
       `NSUndoManager` can't be listed. Replay once the fresh document's
-      index has finished (`NotReadYet` before then).
-    - The in-cell editor opens only where `canEdit` allows it.
-    - After an edit, an undo or a redo, call `cellsChanged(rows:)` for the
-      rows touched (2.0a notes, "For editing"), and re-measure column
-      widths and number detection, as after a reinterpret.
-    - While `Search.progress().catchingUp` is true, keep polling (or await
-      `catchUpJob()`), and retry a `Pending` Next or Previous once it
-      clears.
+      index has finished (`NotReadYet` before then). (2.1 notes)
+    - If a document fails (DESIGN §3.9) with unsaved edits, the alert offers
+      **Recover changes**: Leal opens the file afresh and replays the undo
+      history's commands. If the file is unchanged the window carries on;
+      otherwise Leal offers Save As of what it recovered and names the edits
+      it couldn't apply. Tested with `debug_panic`. (ADR-0008 decision 5)
+    - Change-count tokens, not counts: note `changeCountToken` with
+      `editVersion()` after each edit; when a save ends, apply the token
+      noted at `progress().snapshotVersion`, and reset the recovery
+      journal to the commands after that version. (2.2)
     - Clear the undo history when the split changes (a new lineage).
-  - From 2.2 (docs/tasks/2.2.md, "What 2.3, 2.4 and 2.5 need"; ADR-0012's
-    consequences):
+      (2.1 notes)
+  - [ ] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save
+    over the core's save job, the rebase after it, Revert, the failures.
     - Override NSDocument's save to start the core's job, inside an
       `NSFileCoordinator` write with `.forReplacing` (the document as file
       presenter), serialised with `performAsynchronousFileAccess`.
+      (2.2; ADR-0012's consequences)
+    - Swift wraps the save's await in `withTaskCancellationHandler`, which
+      calls the job's `cancel()` (2.2; ADR-0005 decision 6).
     - Set `fileModificationDate` from `SaveOutcome.modified`.
     - Always pass an item-replacement folder on the file's volume, and a
       second one for the snapshot, with a defined fallback where AppKit
@@ -638,40 +615,83 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       file's security scope, `renamex_np` in the item-replacement folder).
     - Test on a real SMB share while Leal holds descriptors on the file:
       the swap, its fallback, and close-time updates.
+    - Save asks before writing over a file that changed elsewhere
+      (`OriginalStatus.diverged`, which stays set after Keep Editing; DESIGN
+      §3.1), and **re-checks the original's identity immediately before
+      writing**, whatever the watcher last said: a network share's watcher
+      sees only this Mac's changes, and a change can land between the last
+      event and the save. (1.9 review)
+    - The check before writing opens the file afresh and reads its identity
+      with `fstat`, so network file systems revalidate; tested on a share if
+      one is available. (ADR-0008 decision 9)
+    - When the open couldn't read the file's modification date
+      (`PendingOpens.Facts.modified` is nil), Save's check before writing
+      looks at the file afresh rather than take it as unchanged. (2.0,
+      `SEAM(2.5)`)
+    - The user sees one prompt about a file changed elsewhere, never both
+      Leal's and NSDocument's own. Decide what Save does for a deleted file
+      (`can_save()` is true today; the core's save refuses it as `missing`,
+      and Save As works). (phase 1 review, 2.2)
     - Ask on `diverged` before Save and on `changedElsewhere`, then save
       again with `overwriteChanged`; offer Duplicate on `notWritable` and
-      Unlock on `locked`; try again after `moving`.
+      Unlock on `locked`; try again after `moving`. (2.2)
     - Word each `SaveFailure` (`notAFile` included); name `skippedEdits`
       and `encodingNotSupported`'s cells; log `skippedMetadata` and
-      `rereadError`.
-    - Change-count tokens, not counts: note `changeCountToken` with
-      `editVersion()` after each edit; when a save ends, apply the token
-      noted at `progress().snapshotVersion`, and reset the recovery
-      journal to the commands after that version.
+      `rereadError`. (2.2)
+    - Leal's own save is not an outside change. After a successful save the
+      document is rebased onto the file just written: a new snapshot (clone,
+      or copy on removable drives), re-indexed; the watcher gets the new
+      identity and treats the event from Leal's own replace as expected;
+      `diverged` is cleared; edits and undo carry on. A hosted test saves
+      twice in a row and sees no banner and no prompt. (ADR-0008 decision 1)
     - After a save (`SaveOutcome.firstScreen` set), as after a re-read:
       adopt the new generation; drop the tiles and flag blocks; reset the
       diagnostics and the review and wait for the new reading's; restart
       Find on it; keep the column widths and the undo stack; drop the old
-      search and copy objects; count `editsDuringSave` as unsaved.
+      search and copy objects; count `editsDuringSave` as unsaved. (2.2)
     - When `keptOldFile` is set, move it at once somewhere lasting (a
       Recovered folder in Application Support, say), then tell the user
-      where it is.
+      where it is. (2.2)
     - When a save ends with `SaveJob.restarted()` set (a drive back during
-      the save), do what `restarted(_:)` does after `checkOriginal`.
+      the save), do what `restarted(_:)` does after `checkOriginal`. (2.2)
     - Disable Treat As, Reopen with Encoding and the header toggle while a
-      save runs (`LealError.saving` otherwise).
+      save runs (`LealError.saving` otherwise). (2.2)
+    - Reload and Revert to Saved ask before discarding unsaved edits, and
+      Revert goes through the model's Reload, never NSDocument's default
+      `read(from:)`. Treat As and Reopen with Encoding are disabled while
+      there are unsaved edits ("Save or revert your changes first"); the
+      Header row toggle stays available; a drive coming back keeps the
+      edits. Each has a test. (ADR-0008 decision 4)
+    - Revert runs off the main thread, like Reload (`reloadInBackground`):
+      AppKit's `read(from:)` reads on the main thread, where a share must
+      never be read. (2.0, `SEAM(2.5)` in `CSVDocument.read(from:)`)
+    - Revert to Saved only, with no Versions browser: autosave-in-place
+      stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
+    - Save As from an incomplete document says plainly that the copy is
+      incomplete ("about N of M rows"); this wires the drive and
+      deleted-elsewhere banners' Save As… (`SEAM(2.5)`). (ADR-0008
+      decision 6, ADR-0010)
+    - Save As UTF-8 needs a progress display (the `SEAM(2.5)` in
+      `DocumentViewController`), and adopting the core's rebased reading
+      should replace the app's reload after Save As UTF-8.
+    - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
+      guess a different encoding, and updates it if the file already has one
+      (ADR-0004 decision 11).
+    - Writes the interpretation attribute when a reopen would guess a
+      different delimiter or header choice, or the user chose them.
+      (ADR-0005 decision 1)
+    - On every save, the interpretation attribute is written with
+      `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
+      paint or whole-file review would guess differently, when the user
+      chose the delimiter or header, or when the choice came from the
+      attribute; otherwise any old attribute is removed. The same rule for
+      `com.apple.TextEncoding`, against both the first-64 KB and the
+      whole-file guess. A hosted test checks that after Save the attributes
+      are the new values, not ones NSDocument copied from the old file.
+      (ADR-0008 decision 8)
     - The whole-file delimiter review's part of ADR-0008 decision 8
       (`SEAM(2.5)`): write the interpretation attribute when the rebased
-      reading's review suggests another delimiter.
-  - UTF-16 documents are editable with Save off; Save As UTF-8 is the
-    only save. (ADR-0013 decision 1)
-  - Edits run the core's `unencodable(value:)` check before commit.
-    Windows-1258 refuses precomposed Vietnamese, so the warning should
-    point to Save As UTF-8. (docs/tasks/2.3.md)
-  - Save As UTF-8 needs a progress display (the `SEAM(2.5)` in
-    `DocumentViewController`), and adopting the core's rebased reading
-    should replace the app's reload after Save As UTF-8.
-  - Screenshots next to mockups 05a and 05b.
+      reading's review suggests another delimiter. (2.2)
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
     delete columns, all undoable, on top of 2.4.
@@ -679,6 +699,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     with an explanation (ADR-0004 decision 8, which names 2.5).
   - Menu commands and shortcuts only; anything more needs a mockup Rob
     approves (ADR-0002).
+  - Row and column inserts and deletes are refused until the index pass is
+    complete and trusted (`StillReading`) and while a save runs (`Saving`);
+    the app disables them, giving the reason. (ADR-0014 decision 1)
+  - Find restarts after a column insert or delete; it still catches up,
+    without restarting, after cell edits and row inserts and deletes.
+    (ADR-0014 decision 2)
 - [ ] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
   - Pasting over short rows follows the hatched-cell rule from 2.1.
     (ADR-0005 decision 2)
