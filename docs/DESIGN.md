@@ -249,7 +249,7 @@ Shares have more rules (ADR-0009):
   - the same file there: only the handle went stale, so the share is
     disconnected, and it reconnects;
   - another file there: the file was replaced, so it changed while being
-    read, and the banner offers Reload;
+    read, and the banner offers Reload or Save As… (an incomplete copy);
   - nothing there, with its folder present on the same device: another
     computer deleted it (**Deleted**, below);
   - anything else (no folder, a folder on another device such as an empty
@@ -290,9 +290,8 @@ Shares have more rules (ADR-0009):
   away to bytes Leal had already copied, goes unnoticed (2.1a). Catching
   it would mean reading the copied part again on every reconnect. Bytes
   not yet copied, and the first 64 KB, are checked.
-- **Revert to Saved** is AppKit's second read of the file, on the main
-  thread. The app doesn't save until task 2.5, so it can't be reached yet;
-  2.5 sends it through Reload.
+- **Revert to Saved** goes through Reload, off the main thread (§4.3), so
+  AppKit's second read of the file on the main thread never happens.
 
 ### 3.2 Dialect and encoding detection
 
@@ -671,7 +670,10 @@ written until these pass.
 **Writing.** The new file is written in a folder on the destination's
 volume: the app's item-replacement folder, which a sandboxed app may write
 to, or, without one (the CLI, tests), a recorded hidden folder next to the
-file. The writer walks the snapshot's piece list in logical order, splicing in
+file. Under the sandbox a folder next to the file is refused (`EPERM`):
+the app holds a grant for the file, not for its folder. So the core only
+`stat`s the folder, and `statfs`es it by path, to learn its volume's kind
+(`kind_of_folder`; opening it is refused). The writer walks the snapshot's piece list in logical order, splicing in
 each edited row as it reaches it, and checks for a cancel before each
 chunk (§3.10 rule 3). On a
 removable drive or a share each byte is also teed to a copy on the internal
@@ -765,6 +767,14 @@ emoji in a Windows-1252 file), saving stops with a message naming the cells,
 and offers **Save As UTF-8** instead. Leal never drops or substitutes
 characters.
 
+**Save As onto the document's own file** is a Save, with all of Save's
+checks. The core decides by `st_dev` and `st_ino`, of the file it has
+open or the one at the path now, so a link or another spelling of the
+name (a case-only difference on a case-insensitive volume) counts. Save As
+UTF-8 onto it converts the file in place, after the same checks (Rob
+accepted, 2026-10-04); as a plain Save it would write the old encoding, or
+be refused for UTF-16.
+
 **Save As UTF-8** (ADR-0008 decision 7) keeps line endings, quoting style
 and delimiters, in meaning. It writes a UTF-8 BOM only if the original file
 had a BOM. It sets `com.apple.TextEncoding` to UTF-8 and rewrites the
@@ -772,7 +782,8 @@ interpretation attribute for the new bytes. Text that can't be converted
 (an unpaired surrogate or odd final byte in UTF-16, or an unmapped byte in
 a single-byte encoding) makes it refuse and name the cells, as F5 requires.
 The user can edit those cells and try again. Nothing is substituted
-silently.
+silently. Like any save, it ends with the document reading the copy (the
+rebase above) and editing carries on during it.
 
 **Save As from an incomplete document** (ADR-0008 decision 6): a drive or
 share disconnected, the file changed while it was being read, or it was
@@ -783,7 +794,7 @@ a row, half a character or an open quote. It reports how many rows it
 wrote, and the dialog says plainly that the copy is incomplete ("about N
 of M rows"). Nothing is added to the file to mark it. Edits to rows it
 didn't write, including any made during the save, aren't saved, and the
-app names them.
+app names them. The document then is the copy, which is complete in itself.
 
 **Known v1 limits.**
 - **No swap on HFS+, exFAT or FAT.** These volumes can't swap, so the new
@@ -799,6 +810,14 @@ app names them.
   rename, so a crash there leaves the old file or the new one.
 - **A power cut in about the second after a save** can bring back the old
   file, never a mix (the flush, above).
+- **A share that gives no item-replacement folder.** The app asks macOS
+  for one on the file's volume for every save, which on a share is
+  `.TemporaryItems` on the share. If macOS gives none, the core falls back
+  to its folder next to the file, which the sandbox refuses, so Save fails
+  with an `Io` error naming the step. Unverified on a real SMB share.
+- **Quarantine.** macOS adds `com.apple.quarantine` to files the sandboxed
+  app saves, and even to ones it only opens (the system's doing, not the
+  save's; issue #3).
 - **What a safe save can't keep:** a hard link to the file keeps the old
   contents; a symbolic link survives and its target is replaced; the owner
   is kept only where Leal may set it.
@@ -969,23 +988,80 @@ to run concurrently and asserts first paint is still under 150 ms.
 
 ### 4.3 Documents
 
-- `NSDocument`-based: Open Recent, window tabs, Save, Save As, Revert to
-  Saved, dirty indicator.
-- **Save starts the core's save job** (§3.7, ADR-0012), in place of
-  NSDocument's own writing, inside an `NSFileCoordinator` write so other
-  apps and iCloud Drive get notice. The app passes it an item-replacement
-  folder on the file's volume.
-- **Autosave-in-place is off.** Leal only writes the file when the user saves.
+- `NSDocument`-based: Open Recent, window tabs, dirty indicator. **AppKit
+  never writes** (ADR-0008 decision 10, ADR-0012): Save, Save As and
+  Duplicate are overridden, `save(to:ofType:for:completionHandler:)` refuses
+  anything but Leal's own Save As, and Export is off. Autosave in place is
+  off and `preservesVersions` is false.
+- **Save** is `saveDocumentWithDelegate:didSaveSelector:contextInfo:`, which
+  ⌘S and the close and quit alerts all call. It skips `NSDocument`'s own
+  checks, so the user sees only Leal's prompts. Saves queue, one at a time
+  (Save As joins the same queue).
+  - The core's save job (§3.7) runs inside an `NSFileCoordinator`
+    `.forReplacing` write of the file, within `performAsynchronousFileAccess`,
+    so other apps and iCloud Drive get notice and `NSDocument` never reacts
+    to Leal's own save. While it is held, nothing awaits the main actor: the
+    main thread's own file access would wait on ours. The main thread never
+    waits for the save.
+  - The app passes **item-replacement folders** from `FileManager` for the
+    file's volume: one for the new file, one for the snapshot (none on a
+    share, where the snapshot is the teed copy). A folder next to the file
+    is `EPERM` under the sandbox (§3.7).
+  - **Change counts.** At the snapshot the app notes its change-count
+    token (`updateChangeCount(withToken:for:)`), so edits made during the
+    save stay unsaved. A save keeps the document edited while it runs.
+    `fileModificationDate` is set from the outcome.
+  - **After a save** the model adopts the core's rebased reading (§3.7,
+    ADR-0008 decision 1): the grid redraws from it, Find searches again,
+    selection, editor, scroll and undo stay. A banner the user closed stays
+    closed.
+  - **Progress and cancel.** The status bar shows the save's step and a
+    progress bar after 100 ms. ⌘. or Escape cancels every queued Save, the
+    running one too, with no alert; the edits stay unsaved.
+  - **While a save runs**, Treat As, Reopen with Encoding, the header
+    toggle, Reload, Revert, Save As, Duplicate, Rename…, Move To… and
+    Lock are off. Close and quit wait for it, then ask. **While a Reload
+    or Revert reads the file**, Save, Save As and Duplicate are off.
+  - Each refusal from the core has its own alert and buttons (Save Anyway,
+    Unlock, Duplicate, Save As UTF-8…, Try Again); the core's English goes
+    only to the log. An `Io` failure shows its step and errno.
+    A deleted file is "can't be found" with Save As…; Save never recreates
+    it.
+  - A version the core kept (§3.7) is moved at once to Leal's Recovered
+    folder in Application Support, unless it is next to the user's file,
+    and the user is told where.
+- **Save As** asks for a destination in a save panel (which asks before
+  replacing), then runs the core's job on the destination in the same
+  coordinated write; the document then **is the new file** (URL, title,
+  type, watcher, Open Recent), the old file untouched. From an incomplete
+  document (§3.1, ADR-0008 decision 6) the panel and an alert say "about N
+  of M rows" and name the edits not saved; the changed-while-reading
+  banner has Save As… as its second button. Onto the document's own file
+  it is a Save (§3.7).
+- **Duplicate** is Save As with "name copy.csv" suggested, and the window
+  then edits the copy (Rob accepted, 2026-10-04). A Leal document is
+  always a file, so there is no untitled copy, and Save's alerts for a
+  locked or read-only file offer Duplicate so the edits have somewhere to
+  go. It is a Leal action (`saveDuplicate(_:)`) because AppKit hides its
+  `duplicateDocument:` item for apps that don't autosave in place.
+  **Rename…** and **Move To…** are `NSDocument`'s.
 - **No Versions browser in v1** (ADR-0008 decision 10). AppKit's Versions
   browser needs autosave-in-place, so v1 offers **Revert to Saved** only.
-- **Revert to Saved** asks to discard unsaved edits first, and goes through
-  the same path as File ▸ Reload from Disk, never AppKit's default
-  `read(from:)` (§3.6, ADR-0008 decision 4).
+- **Revert to Saved** never calls `super`: it goes through the same path as
+  File ▸ Reload from Disk, off the main thread, and asks to discard unsaved
+  edits first (§3.6, ADR-0008 decision 4). AppKit's `read(from:)` second-read
+  branch is unreachable.
 - UTF-16 files can be edited, but Save is off for them: the notice offers
   **Save As UTF-8**, which names any cells that can't be converted so the
-  user can fix them and try again (ADR-0013, ADR-0008 decision 7).
-- Sandbox-compatible from the start (security-scoped access, temp files in the
-  container), so a Mac App Store build stays possible.
+  user can fix them and try again (ADR-0013, ADR-0008 decision 7). It
+  adopts the core's reading of the copy, so the window is no longer
+  read-only.
+- **Sandboxed** (security-scoped access, temp files in the container), so a
+  Mac App Store build stays possible. The hosted tests' files sit in the
+  container, where every folder may be opened, so only **`just
+  sandbox-save-check`** catches sandbox problems: it saves, Saves As,
+  Duplicates and Reverts files outside the container, on the internal
+  disk and on FAT32 and exFAT disk images.
 
 ### 4.4 Accessibility and localization
 
