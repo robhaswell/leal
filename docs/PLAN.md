@@ -761,6 +761,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     when strips never settle; `GridDataSource.readAhead`'s `wanted.set`
     should come before its early returns; queued alerts could skip a failed
     document; `updateWindowMinimum` with no window.
+  - [ ] From 2.5.3c's review: `kind_of_folder`'s doc comment
+    (`crates/leal-core/src/source/mod.rs`) should say it looks twice
+    (`stat`, then `statfs`), so a folder replaced in between is possible;
+    a test that `read(from:)`'s main-thread branch is never reached
+    through Revert to Saved; a test for cancelling (⌘.) a Save As
+    queued behind a Save.
   - [ ] From 2.7's review: trim the fuzz corpus now and then (`cargo fuzz
     cmin`); `detect`'s target checks only the encoding against the oracle;
     seed `index`/`detect`/`rows` without the corpus's sidecar files; oracle
