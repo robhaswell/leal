@@ -670,6 +670,9 @@
     "OK" : {
       "comment" : "Button: dismiss an alert"
     },
+    "Only an administrator can unlock it. Keep your changes in a duplicate instead." : {
+      "comment" : "Alert text: Save refused a file the system locked (schg); the buttons are Duplicate and Cancel"
+    },
     "Open Recent" : {
       "comment" : "File menu"
     },

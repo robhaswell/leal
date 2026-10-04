@@ -333,6 +333,19 @@ extension SaveText {
     }
 
     /// Unlocking the file failed.
+    /// Save refused a file locked by the system (`schg` or `sappnd`), which
+    /// only an administrator can unlock: no Unlock.
+    static func lockedBySystem(name: String) -> Refusal {
+        Refusal(
+            title: String(localized: "“\(name)” is locked.", comment: "Alert title: Save refused a locked file; the file's name"),
+            detail: String(
+                localized: "Only an administrator can unlock it. Keep your changes in a duplicate instead.",
+                comment: "Alert text: Save refused a file the system locked (schg); the buttons are Duplicate and Cancel"
+            ),
+            choices: [.duplicate, .cancel]
+        )
+    }
+
     static func unlockFailed(name: String) -> Refusal {
         Refusal(
             title: String(localized: "Leal couldn’t unlock “\(name)”.", comment: "Alert title: Unlock failed; the file's name"),

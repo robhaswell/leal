@@ -29,28 +29,48 @@ final class CoordinatedWrite: @unchecked Sendable {
         self.url = url
     }
 
-    /// Waits, without blocking the caller's thread, for a coordinated
-    /// write that replaces `url`; `end()` ends it.
-    ///
-    /// - Throws: the coordinator's error, if it couldn't give access.
-    static func begin(replacing url: URL, presenter: (any NSFilePresenter)?) async throws -> CoordinatedWrite {
-        let coordinator = NSFileCoordinator(filePresenter: presenter)
-        let intent = NSFileAccessIntent.writingIntent(with: url, options: .forReplacing)
-        return try await withCheckedThrowingContinuation { continuation in
-            coordinator.coordinate(with: [intent], queue: queue) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                let write = CoordinatedWrite(url: intent.url)
-                continuation.resume(returning: write)
-                // The access lasts while this accessor runs.
-                write.ended.wait()
-            }
+    /// The coordinator, for cancelling a wait from another thread
+    /// (`NSFileCoordinator.cancel()` is safe to call from any thread).
+    private final class Coordinator: @unchecked Sendable {
+        let coordinator: NSFileCoordinator
+
+        init(presenter: (any NSFilePresenter)?) {
+            coordinator = NSFileCoordinator(filePresenter: presenter)
         }
     }
 
-    /// Ends the coordinated write. Call it exactly once.
+    /// Waits, without blocking the caller's thread, for a coordinated
+    /// write that replaces `url`; `end()` ends it. Cancelling the waiting
+    /// task stops the wait (`NSFileCoordinator.cancel()`): it then throws
+    /// `CancellationError`. Once access is given, the write is the
+    /// caller's to end, cancelled or not.
+    ///
+    /// - Throws: `CancellationError`, or the coordinator's error if it
+    ///   couldn't give access.
+    static func begin(replacing url: URL, presenter: (any NSFilePresenter)?) async throws -> CoordinatedWrite {
+        let held = Coordinator(presenter: presenter)
+        let intent = NSFileAccessIntent.writingIntent(with: url, options: .forReplacing)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                held.coordinator.coordinate(with: [intent], queue: queue) { error in
+                    if let error {
+                        let cancelled = (error as NSError).domain == NSCocoaErrorDomain
+                            && (error as NSError).code == NSUserCancelledError
+                        continuation.resume(throwing: cancelled ? CancellationError() : error)
+                        return
+                    }
+                    let write = CoordinatedWrite(url: intent.url)
+                    continuation.resume(returning: write)
+                    // The access lasts while this accessor runs.
+                    write.ended.wait()
+                }
+            }
+        } onCancel: {
+            held.coordinator.cancel()
+        }
+    }
+
+    /// Ends the coordinated write. Call it exactly once, from any thread.
     func end() {
         ended.signal()
     }

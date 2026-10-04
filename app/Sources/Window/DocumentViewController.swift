@@ -1432,14 +1432,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// The edit version as the save starts goes with it: an edit made
     /// after it keeps the window on this file (`EditedDuringReload`).
     var onSaveAsUTF8: ((URL, UInt64) async throws -> Bool)?
-    /// Stops the document's Save under way (`CSVDocument.cancelSave`).
-    var onCancelSave: (() -> Void)?
+    /// Stops the document's Saves under way (`CSVDocument.cancelSave`),
+    /// and says whether there was one.
+    var onCancelSave: (() -> Bool)?
 
-    /// ⌘. or Escape while a Save runs stops it (task 2.5.3a): nothing is
-    /// written, and the edits stay unsaved. Otherwise as usual.
+    /// ⌘. or Escape while a Save runs, or waits to start (for its turn,
+    /// for coordination with other apps, or for another app's save to
+    /// settle), stops it (task 2.5.3a): nothing is written, and the edits
+    /// stay unsaved. Otherwise as usual.
     override func cancelOperation(_ sender: Any?) {
-        guard model.isSaving, let onCancelSave else { return super.cancelOperation(sender) }
-        onCancelSave()
+        guard let onCancelSave, onCancelSave() else { return super.cancelOperation(sender) }
     }
     /// A Save As UTF-8, while it is under way. Reload, Treat As and Reopen
     /// with Encoding are off meanwhile: each would read the file again

@@ -1656,9 +1656,29 @@ final class DocumentModel: GridDataSource {
 
     /// A finished save: its outcome, and the edit version its snapshot of
     /// the edits was taken at (the edits up to it are in the file).
-    struct Saved {
+    struct Saved: Sendable {
         let outcome: SaveOutcome
         let snapshotVersion: UInt64?
+    }
+
+    /// Where a save writes its new file and snapshot: the folders
+    /// `FileManager` made on the destination's volume, and what is known
+    /// about that volume (`placeForSaving(_:)`).
+    struct SavePlace: Sendable {
+        let folder: String?
+        let volume: VolumeInfo
+
+        /// Removes the empty folders the save was given and didn't take
+        /// over (it refused before writing), off the main thread. A folder
+        /// the core took over is gone already, or holds a file it kept:
+        /// `rmdir` leaves anything that isn't empty.
+        func removeLeftovers() {
+            let folders = [folder, volume.folder].compactMap { $0 }
+            guard !folders.isEmpty else { return }
+            FileWork.queue.async(qos: .utility) {
+                for folder in folders { _ = rmdir(folder) }
+            }
+        }
     }
 
     /// The save under way (Save, or Save As UTF-8): while it runs the file
@@ -1669,9 +1689,15 @@ final class DocumentModel: GridDataSource {
     /// The save's progress as last looked at (every `savePollInterval`),
     /// for the status bar; `nil` before the first look.
     private(set) var saveProgress: SaveProgress?
+    /// A Save waits to start: for its turn at the file, for other apps to
+    /// let go of it (coordination), or for another app's save to settle
+    /// (`Moving`). The status bar says so ("Waiting to save…").
+    private(set) var isWaitingToSave = false
+    /// Looks at the save's progress, while it runs.
+    private var saveWatching: Task<Void, Never>?
     /// How often the status bar's save progress is looked at.
     nonisolated static let savePollInterval: Duration = .milliseconds(100)
-    var isSaving: Bool { saveJob != nil }
+    var isSaving: Bool { saveJob != nil || isWaitingToSave }
 
     /// Saves through the core (ADR-0012): `kind` to `url`. The core writes
     /// on a thread of its own and the main thread never waits for it
@@ -1687,25 +1713,48 @@ final class DocumentModel: GridDataSource {
     /// one: `TemporaryFolders.volume(for:)`). Folders the core didn't take
     /// over (a refusal before writing) are removed afterwards.
     ///
+    /// Save itself (`CSVDocument`) uses the parts below, so that its file
+    /// access ends off the main thread: `placeForSaving`, `startSave`,
+    /// `outcome(of:)` and `saveEnded`.
+    ///
     /// Returns `nil` if the document has failed or closed.
     ///
     /// - Throws: the `SaveFailure` the save ended with, or why the core
     ///   wouldn't start it, as one: `DocumentFailed` (the document fails, as
     ///   for any core call) or `Internal`.
     func save(to url: URL, kind: SaveKind, overwriteChanged: Bool = false) async throws -> Saved? {
-        guard failure == nil, let handle else { return nil }
-        // Asking FileManager about a volume can block (a share): not here.
-        let (folder, volume) = await FileWork.run {
-            (TemporaryFolders.volumeFolder(for: url), TemporaryFolders.volume(for: url.deletingLastPathComponent()))
+        guard failure == nil, handle != nil else { return nil }
+        let place = await Self.placeForSaving(url)
+        guard let job = try startSave(to: url, kind: kind, place: place, overwriteChanged: overwriteChanged).get() else {
+            place.removeLeftovers()
+            return nil
         }
-        let made = [folder, volume.folder].compactMap { $0 }
-        defer { Self.removeLeftovers(made) }
-        guard failure == nil, self.handle === handle else { return nil }
+        let result = await Self.outcome(of: job)
+        saveEnded(job, place: place)
+        return try result.get()
+    }
+
+    /// The folders a save to `url` writes in (`save(to:kind:)`), made off
+    /// the main thread: asking `FileManager` about a volume can block (a
+    /// share).
+    nonisolated static func placeForSaving(_ url: URL) async -> SavePlace {
+        await FileWork.run {
+            SavePlace(
+                folder: TemporaryFolders.volumeFolder(for: url),
+                volume: TemporaryFolders.volume(for: url.deletingLastPathComponent())
+            )
+        }
+    }
+
+    /// Starts the core's save, and shows its progress until `saveEnded`.
+    /// `nil` if the document has failed or closed.
+    func startSave(to url: URL, kind: SaveKind, place: SavePlace, overwriteChanged: Bool) -> Result<SaveJob?, SaveFailure> {
+        guard failure == nil, let handle else { return .success(nil) }
         let options = SaveOptions(
             destination: url.path(percentEncoded: false),
             kind: kind,
-            folder: folder,
-            volume: volume,
+            folder: place.folder,
+            volume: place.volume,
             overwriteChanged: overwriteChanged,
             firstScreenRows: 1,
             maxChars: GridMetrics.maxCellCharacters
@@ -1717,14 +1766,14 @@ final class DocumentModel: GridDataSource {
         } catch {
             report(error)
             if case let .DocumentFailed(_, message)? = error as? LealError {
-                throw SaveFailure.DocumentFailed(message: message)
+                return .failure(.DocumentFailed(message: message))
             }
-            throw SaveFailure.Internal(message: String(describing: error))
+            return .failure(.Internal(message: String(describing: error)))
         }
         saveJob = job
         saveProgress = nil
-        onChange?(.progress)
-        let watching = Task { [weak self] in
+        saveWatching?.cancel()
+        saveWatching = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.savePollInterval)
                 guard let self, saveJob === job, !Task.isCancelled else { return }
@@ -1732,16 +1781,40 @@ final class DocumentModel: GridDataSource {
                 onChange?(.progress)
             }
         }
-        defer {
-            watching.cancel()
-            if saveJob === job {
-                saveJob = nil
-                saveProgress = nil
-                onChange?(.progress)
-            }
+        onChange?(.progress)
+        return .success(job)
+    }
+
+    /// Waits for `job`, off the main thread, and cancels it if the waiting
+    /// task is cancelled (`SaveJob.outcome()`): what it saved, or why not.
+    nonisolated static func outcome(of job: SaveJob) async -> Result<Saved, SaveFailure> {
+        do {
+            let outcome = try await job.outcome()
+            return .success(Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion))
+        } catch let failure as SaveFailure {
+            return .failure(failure)
+        } catch {
+            return .failure(.Internal(message: String(describing: error)))
         }
-        let outcome = try await job.outcome()
-        return Saved(outcome: outcome, snapshotVersion: job.progress().snapshotVersion)
+    }
+
+    /// The save `job` ended: its progress goes from the status bar, and
+    /// the folders it didn't take over are removed.
+    func saveEnded(_ job: SaveJob, place: SavePlace) {
+        place.removeLeftovers()
+        guard saveJob === job else { return }
+        saveWatching?.cancel()
+        saveWatching = nil
+        saveJob = nil
+        saveProgress = nil
+        onChange?(.progress)
+    }
+
+    /// Save is waiting to start (`isWaitingToSave`), or no longer is.
+    func waitingToSave(_ waiting: Bool) {
+        guard isWaitingToSave != waiting else { return }
+        isWaitingToSave = waiting
+        onChange?(.progress)
     }
 
     /// After a save that wrote the file: the dirty state is the core's
@@ -1759,17 +1832,6 @@ final class DocumentModel: GridDataSource {
         refreshDriveState()
         refreshUnsavedEdits()
         onChange?(.progress)
-    }
-
-    /// Removes the empty folders a save was given and didn't take over (it
-    /// refused before writing), off the main thread. A folder the core
-    /// took over is gone already, or holds a file it kept: `rmdir` leaves
-    /// anything that isn't empty.
-    nonisolated private static func removeLeftovers(_ folders: [String]) {
-        guard !folders.isEmpty else { return }
-        FileWork.queue.async(qos: .utility) {
-            for folder in folders { _ = rmdir(folder) }
-        }
     }
 
     /// A Reload was asked for: the re-readings are off from now, before its
@@ -1984,7 +2046,7 @@ final class DocumentModel: GridDataSource {
             notes: interpretation.notes,
             encodingChoices: interpretation.encodingChoices,
             unsavedEdits: failure == nil && hasUnsavedEdits,
-            saving: failure == nil ? saveProgress.map(SavingStatus.init) : nil
+            saving: failure == nil ? saveProgress.map(SavingStatus.init) ?? (isWaitingToSave ? SavingStatus(step: .waiting, fraction: nil) : nil) : nil
         )
     }
 

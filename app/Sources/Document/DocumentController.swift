@@ -91,8 +91,21 @@ final class DocumentController: NSDocumentController {
     /// so the answer is delivered on the main queue's next turn. A quit
     /// already waiting for its answer keeps it: a second terminate neither
     /// replaces its `reply` nor starts a second review, and waits for it.
+    ///
+    /// During a Save (task 2.5.3a review) the quit waits for it, without
+    /// blocking the main thread, and then reviews whatever is still
+    /// edited: quitting at once would stop the save part-way and leave its
+    /// temporary files behind, and an edit made meanwhile would go unasked.
     func shouldTerminate(reply: @escaping (Bool) -> Void) -> NSApplication.TerminateReply {
         guard quitReply == nil else { return .terminateLater }
+        if isSaving {
+            quitReply = reply
+            Task { [weak self] in
+                await self?.waitForSaves()
+                self?.quitAfterSaving()
+            }
+            return .terminateLater
+        }
         let csv = documents.compactMap { $0 as? CSVDocument }
         let editedBefore = csv.filter(\.isDocumentEdited)
         guard commitOpenEdits() else {
@@ -112,6 +125,49 @@ final class DocumentController: NSDocumentController {
             contextInfo: nil
         )
         return .terminateLater
+    }
+
+    /// The saves a quit waited for have ended: every open edit is
+    /// committed, and the documents still edited are reviewed (Save, Don't
+    /// Save, Cancel); with none, the quit goes on.
+    private func quitAfterSaving() {
+        guard quitReply != nil else { return }
+        guard commitOpenEdits() else {
+            NSSound.beep()
+            return quitReviewEnded(self, didReviewAll: false, contextInfo: nil)
+        }
+        guard documents.contains(where: \.isDocumentEdited) else {
+            return quitReviewEnded(self, didReviewAll: true, contextInfo: nil)
+        }
+        reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: self,
+            didReviewAllSelector: #selector(quitReviewEnded(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
+    }
+
+    /// Whether any document is saving (`CSVDocument.saving`).
+    var isSaving: Bool {
+        documents.contains { ($0 as? CSVDocument)?.saving != nil }
+    }
+
+    /// Returns once no document is saving, without blocking the main
+    /// thread.
+    func waitForSaves() async {
+        while let document = documents.compactMap({ $0 as? CSVDocument }).first(where: { $0.saving != nil }) {
+            await document.waitForSaves()
+        }
+    }
+
+    /// A document that is saving counts as edited, so that Quit (and Log
+    /// Out and Restart) reviews the documents, which waits for the save
+    /// (`reviewUnsavedDocuments`), and never quits in the middle of it.
+    /// Asked first, so `NSDocument`'s own answer isn't asked for while a
+    /// save holds the file.
+    override var hasEditedDocuments: Bool {
+        isSaving || super.hasEditedDocuments
     }
 
     @objc private func quitReviewEnded(_ controller: NSDocumentController, didReviewAll: Bool, contextInfo: UnsafeMutableRawPointer?) {
@@ -140,6 +196,24 @@ final class DocumentController: NSDocumentController {
         didReviewAllSelector: Selector?,
         contextInfo: UnsafeMutableRawPointer?
     ) {
+        if isSaving {
+            // Waits for the saves, then reviews: what they wrote, and an
+            // edit made meanwhile, are known only then.
+            let review: @MainActor () -> Void = { [weak self] in
+                self?.reviewUnsavedDocuments(
+                    withAlertTitle: title,
+                    cancellable: cancellable,
+                    delegate: delegate,
+                    didReviewAllSelector: didReviewAllSelector,
+                    contextInfo: contextInfo
+                )
+            }
+            Task { [weak self] in
+                await self?.waitForSaves()
+                review()
+            }
+            return
+        }
         let committed = commitOpenEdits()
         let answer: @MainActor (Bool) -> Void = { [weak self] reviewed in
             guard let self else { return }

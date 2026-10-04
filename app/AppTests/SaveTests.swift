@@ -1,6 +1,7 @@
 import AppKit
 import LealFFI
 import XCTest
+import os
 
 @testable import Leal
 
@@ -261,11 +262,19 @@ final class SaveTests: XCTestCase {
         try await waitUntil("the save took its snapshot") {
             opened.model.saveJob?.progress().snapshotVersion != nil
         }
+        // A second Save waits for the first; ⌘. stops both, the one
+        // running too.
+        let delegate = SaveDelegate()
+        opened.document.save(withDelegate: delegate, didSave: #selector(SaveDelegate.document(_:didSave:contextInfo:)), contextInfo: nil)
+        XCTAssertNotEqual(opened.document.saving, saving)
         opened.content.cancelOperation(nil)
         debugReleaseHeldSave()
         let saved = await saving.value
+        try await waitUntil("the second save ended") { delegate.answers.count == 1 }
 
         XCTAssertFalse(saved)
+        XCTAssertEqual(delegate.answers, [false])
+        XCTAssertNil(opened.document.saving)
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), csv)
         XCTAssertTrue(opened.document.isDocumentEdited)
         XCTAssertEqual(opened.document.history.journal.count, 1)
@@ -307,6 +316,7 @@ final class SaveTests: XCTestCase {
         XCTAssertEqual(alerts.map(\.messageText), ["“changed.csv” changed on disk since Leal opened or last saved it."])
         XCTAssertEqual(alerts.first?.buttons.map(\.title), ["Save Anyway", "Cancel"])
         XCTAssertEqual(alerts.first?.buttons.first?.hasDestructiveAction, true)
+        XCTAssertEqual(alerts.first?.buttons.map(\.keyEquivalent), ["", "\r"], "Return is Cancel's, not Save Anyway's")
         XCTAssertNil(opened.window.attachedSheet, "no sheet of NSDocument's own")
         XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,ours,3"))
         XCTAssertFalse(opened.document.isDocumentEdited)
@@ -471,6 +481,258 @@ final class SaveTests: XCTestCase {
         XCTAssertEqual(SaveText.saveFailure(.ReadOnly, name: "a.csv", headerRows: 1)?.choices, [.saveAsUTF8, .cancel])
     }
 
+    // MARK: While a save runs (task 2.5.3a review)
+
+    /// `NSDocument` reads its own `fileURL`, `isDocumentEdited` and
+    /// `fileModificationDate` inside a synchronous file access on the main
+    /// thread, which waits for the save's asynchronous one. So the save
+    /// must end its file access without needing the main thread: here the
+    /// main thread asks everything that might wait, with the save held,
+    /// while a background thread lets the save go on. A deadlock would
+    /// hang the main thread for good: the watchdog then stops the test
+    /// host, so it fails rather than hangs.
+    func testTheMainThreadAskingDuringASaveNeverDeadlocks() async throws {
+        let url = try file("deadlock.csv", csv)
+        let opened = try await open(url)
+        let document = opened.document
+        let controller = try XCTUnwrap(NSDocumentController.shared as? DocumentController)
+        controller.addDocument(document)
+        document.unsavedChangesPromptForTesting = { answer in answer(false) }
+        set(opened.model, 0, 1, "held")
+        debugHoldNextSave()
+        document.save(nil)
+        let saving = try XCTUnwrap(document.saving)
+        try await waitUntil("the save took its snapshot") {
+            opened.model.saveJob?.progress().snapshotVersion != nil
+        }
+
+        let watchdog = Watchdog(seconds: 30, what: "the main thread, asking NSDocument during a save")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { debugReleaseHeldSave() }
+        // Synchronously, on the main thread, for a second: before the
+        // save goes on, and after it has written the file but before it
+        // has ended its file access, which it mustn't need the main
+        // thread for.
+        let started = Date()
+        let items = [
+            #selector(NSDocument.revertToSaved(_:)), #selector(NSDocument.saveAs(_:)), #selector(NSDocument.duplicate(_:)),
+            #selector(NSDocument.move(_:)), #selector(NSDocument.rename(_:)), #selector(NSDocument.lock(_:)),
+        ]
+        let probe = SaveCloseProbe()
+        document.canClose(withDelegate: probe, shouldClose: #selector(SaveCloseProbe.document(_:shouldClose:contextInfo:)), contextInfo: nil)
+        document.revertToSaved(nil)
+        var enabled: [Bool] = []
+        while Date().timeIntervalSince(started) < 1 {
+            enabled = items.map { document.validateUserInterfaceItem(NSMenuItem(title: "", action: $0, keyEquivalent: "")) }
+            _ = controller.hasEditedDocuments
+        }
+        let asked = Date().timeIntervalSince(started)
+        let saved = await saving.value
+        watchdog.stop()
+
+        XCTAssertTrue(saved)
+        XCTAssertEqual(enabled, [false, false, false, false, false, false], "Revert, Save As, Duplicate, Move, Rename and Lock wait for the save")
+        XCTAssertNil(document.saving)
+        XCTAssertLessThan(asked, 5, "nothing waited for the save")
+        try await waitUntil("closing heard") { !probe.answers.isEmpty }
+        XCTAssertEqual(probe.answers, [true], "saved: nothing left to ask about")
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,held,3"))
+        XCTAssertEqual(value(opened.model, 0, 1), "held", "Revert did nothing during the save")
+        XCTAssertFalse(document.isDocumentEdited)
+    }
+
+    /// Closing during a save, with the cell typed back as it was in the
+    /// file (so the core has nothing unsaved): the document stays edited
+    /// while the save runs, and closing waits for the save before it
+    /// decides. The saved file then holds the edit and the cell doesn't,
+    /// so it asks.
+    func testClosingDuringASaveWaitsForItThenAsks() async throws {
+        let url = try file("close-held.csv", csv)
+        let opened = try await open(url)
+        let document = opened.document
+        var asked: [Bool] = []
+        document.unsavedChangesPromptForTesting = { answer in
+            asked.append(document.saving == nil)
+            answer(false)
+        }
+        set(opened.model, 0, 1, "held")
+        debugHoldNextSave()
+        document.save(nil)
+        let saving = try XCTUnwrap(document.saving)
+        try await waitUntil("the save took its snapshot") {
+            opened.model.saveJob?.progress().snapshotVersion != nil
+        }
+        set(opened.model, 0, 1, "Marlow")
+        XCTAssertFalse(opened.model.hasUnsavedEdits)
+        XCTAssertTrue(document.isDocumentEdited, "edited while the save runs")
+
+        let probe = SaveCloseProbe()
+        document.canClose(withDelegate: probe, shouldClose: #selector(SaveCloseProbe.document(_:shouldClose:contextInfo:)), contextInfo: nil)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(probe.answers.isEmpty, "closing waits for the save")
+        XCTAssertTrue(asked.isEmpty)
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        try await waitUntil("closing heard") { !probe.answers.isEmpty }
+
+        XCTAssertTrue(saved)
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,held,3"))
+        XCTAssertEqual(asked, [true], "asked once, after the save")
+        XCTAssertEqual(probe.answers, [false])
+        XCTAssertTrue(document.isDocumentEdited, "the cell reads differently from the saved file")
+    }
+
+    /// Quitting during a save, with the cell typed back as it was in the
+    /// file: a saving document counts as edited, so AppKit reviews the
+    /// documents, and the review waits for the save before it asks; the app
+    /// delegate's answer waits for it too, rather than quitting part-way.
+    func testQuittingDuringASaveWaitsForItThenReviews() async throws {
+        let url = try file("quit-held.csv", csv)
+        let opened = try await open(url)
+        let document = opened.document
+        let controller = try XCTUnwrap(NSDocumentController.shared as? DocumentController)
+        controller.addDocument(document)
+        var asked: [Bool] = []
+        document.unsavedChangesPromptForTesting = { answer in
+            asked.append(document.saving == nil)
+            answer(false)
+        }
+        set(opened.model, 0, 1, "held")
+        debugHoldNextSave()
+        document.save(nil)
+        let saving = try XCTUnwrap(document.saving)
+        try await waitUntil("the save took its snapshot") {
+            opened.model.saveJob?.progress().snapshotVersion != nil
+        }
+        set(opened.model, 0, 1, "Marlow")
+        XCTAssertTrue(controller.hasEditedDocuments, "a saving document counts as edited")
+
+        // AppKit's review, as `NSApplication.terminate` starts it, and the
+        // app delegate's answer.
+        let review = SaveReviewProbe()
+        controller.reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: review,
+            didReviewAllSelector: #selector(SaveReviewProbe.documentController(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
+        let app = AppDelegate()
+        var quit: [Bool] = []
+        app.replyToTerminate = { quit.append($0) }
+        XCTAssertEqual(app.applicationShouldTerminate(NSApp), .terminateLater, "never quits in the middle of a save")
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(review.answers.isEmpty && quit.isEmpty && asked.isEmpty, "both wait for the save")
+
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        XCTAssertTrue(saved)
+        try await waitUntil("reviewed and answered") { !review.answers.isEmpty && !quit.isEmpty }
+
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,held,3"))
+        XCTAssertEqual(asked, [true, true], "each asked once, after the save")
+        XCTAssertEqual(review.answers, [false])
+        XCTAssertEqual(quit, [false])
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path(percentEncoded: false)))
+    }
+
+    /// Another app reading the file through a coordinated read asks its
+    /// presenters to save first: Leal says there is nothing to save, so
+    /// `NSDocument` never writes (in place or as an autosave), and the
+    /// read goes on at once with the file as it is on disk.
+    func testAnotherAppsCoordinatedReadWritesNothing() async throws {
+        let url = try file("read-elsewhere.csv", csv)
+        let opened = try await open(url)
+        let document = opened.document
+        set(opened.model, 0, 1, "unsaved")
+        XCTAssertNil(document.autosavingFileType)
+        // The document presents its file (as it does once on screen).
+        let registered = NSFileCoordinator.filePresenters.contains { $0 === document }
+        if !registered { NSFileCoordinator.addFilePresenter(document) }
+        defer { if !registered { NSFileCoordinator.removeFilePresenter(document) } }
+        let expected = Data(csv.utf8)
+
+        let error = await FileWork.run { () -> String? in
+            var error: NSError?
+            var read: Data?
+            NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: url, options: [], error: &error) { url in
+                read = try? Data(contentsOf: url)
+            }
+            if let error { return String(describing: error) }
+            return read == expected ? nil : "read something else"
+        }
+
+        XCTAssertNil(error)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), csv)
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertNil(document.autosavedContentsFileURL, "no autosave elsewhere")
+        XCTAssertTrue(alerts.isEmpty)
+    }
+
+    /// Save Anyway is for the file the user was asked about: after an
+    /// Unlock, Save goes round again and asks again if it still differs,
+    /// rather than writing over whatever is there by then.
+    func testSaveAnywayIsAskedAgainAfterUnlock() async throws {
+        let url = try file("changed-locked.csv", csv)
+        let opened = try await open(url)
+        set(opened.model, 0, 1, "ours")
+        try Data("id,name,qty\r\n1,theirs,3\r\n".utf8).write(to: url)
+        XCTAssertEqual(chflags(url.path(percentEncoded: false), UInt32(UF_IMMUTABLE)), 0)
+        answers = [0, 0, 0]
+
+        let saved = try await save(opened)
+
+        XCTAssertTrue(saved)
+        XCTAssertEqual(alerts.map(\.messageText), [
+            "“changed-locked.csv” changed on disk since Leal opened or last saved it.",
+            "“changed-locked.csv” is locked.",
+            "“changed-locked.csv” changed on disk since Leal opened or last saved it.",
+        ])
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,ours,3"))
+    }
+
+    /// ⌘. while Save waits for another app to let go of the file stops it
+    /// at once: the status bar said "Waiting to save…", nothing is written,
+    /// and nothing is asked.
+    func testCancellingASaveWaitingForAnotherAppWritesNothing() async throws {
+        let url = try file("coordinated.csv", csv)
+        let opened = try await open(url)
+        set(opened.model, 0, 1, "waited")
+        // Another writer holds the file until `release` is signalled.
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let other = Task.detached {
+            var error: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: url, options: .forReplacing, error: &error) { _ in
+                entered.signal()
+                release.wait()
+            }
+        }
+        defer { release.signal() }
+        await FileWork.run { entered.wait() }
+
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        try await waitUntil("waiting to save") { opened.model.isWaitingToSave }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(opened.model.saveJob, "the core's save hasn't started")
+        opened.content.view.layoutSubtreeIfNeeded()
+        XCTAssertTrue(opened.content.statusBar.text.contains("Waiting to save…"), opened.content.statusBar.text)
+
+        let started = Date()
+        opened.content.cancelOperation(nil)
+        let saved = await saving.value
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "stops without waiting for the other app")
+        release.signal()
+        await other.value
+
+        XCTAssertFalse(saved)
+        XCTAssertFalse(opened.model.isWaitingToSave)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), csv)
+        XCTAssertTrue(opened.document.isDocumentEdited)
+        XCTAssertTrue(alerts.isEmpty)
+    }
+
     // MARK: Progress
 
     /// The save's steps in the status bar, `Checking` (the census before
@@ -497,6 +759,44 @@ final class SaveTests: XCTestCase {
         status.saving = nil
         bar.show(status)
         XCTAssertFalse(bar.isShowingProgress)
+    }
+}
+
+/// `canClose`'s delegate, which hears the answer.
+@MainActor
+private final class SaveCloseProbe: NSObject {
+    private(set) var answers: [Bool] = []
+
+    @objc func document(_ document: NSDocument, shouldClose: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        answers.append(shouldClose)
+    }
+}
+
+/// `reviewUnsavedDocuments`'s delegate, which hears the answer.
+@MainActor
+private final class SaveReviewProbe: NSObject {
+    private(set) var answers: [Bool] = []
+
+    @objc func documentController(_ controller: NSDocumentController, didReviewAll: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        answers.append(didReviewAll)
+    }
+}
+
+/// Stops the test host if `stop()` isn't called within `seconds`: a main
+/// thread deadlocked for good would otherwise hang the test run.
+private final class Watchdog: Sendable {
+    private let stopped = OSAllocatedUnfairLock(initialState: false)
+
+    init(seconds: Double, what: String) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { [stopped] in
+            if !stopped.withLock({ $0 }) {
+                fatalError("deadlocked: \(what)")
+            }
+        }
+    }
+
+    func stop() {
+        stopped.withLock { $0 = true }
     }
 }
 

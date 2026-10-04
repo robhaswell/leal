@@ -294,7 +294,7 @@ final class CSVDocument: NSDocument {
         controller.content.onSaveAsUTF8 = { [weak self] url, version in
             try await self?.saveAsUTF8(to: url, editVersion: version) ?? false
         }
-        controller.content.onCancelSave = { [weak self] in self?.cancelSave() }
+        controller.content.onCancelSave = { [weak self] in self?.cancelSave() ?? false }
         controller.content.confirmDiscardingEdits = { [weak self] answer in
             guard let self else { return answer(true) }
             confirmDiscardingEdits(answer)
@@ -332,6 +332,20 @@ final class CSVDocument: NSDocument {
         throw NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError)
     }
 
+    /// Another app's coordinated read asks the file's presenters to save
+    /// first (`NSFilePresenter`), which `NSDocument` does by autosaving,
+    /// through its own writing. Leal writes the file only when the user
+    /// saves (DESIGN §4.3): there is nothing to save, so the reader goes
+    /// on at once and reads the file as it is on disk.
+    nonisolated override func savePresentedItemChanges(completionHandler: @escaping ((any Error)?) -> Void) {
+        completionHandler(nil)
+    }
+
+    /// No autosave of any kind (`autosavesInPlace` is false): with no
+    /// autosaving type, `NSDocument` never writes the edits elsewhere
+    /// either.
+    override var autosavingFileType: String? { nil }
+
     /// Whether Save may write over the file: not once its removable drive
     /// was disconnected before Leal had read it all, once it changed while
     /// Leal read it, or while its drive isn't connected (ADR-0006, 1.1a,
@@ -347,15 +361,27 @@ final class CSVDocument: NSDocument {
         if item.action == #selector(save(_:)), !canSave || saving != nil {
             return false
         }
+        if saving != nil, let action = item.action, Self.waitForSave.contains(action) {
+            return false
+        }
         return super.validateUserInterfaceItem(item)
     }
 
+    /// What waits for a Save under way (task 2.5.3a review): each would
+    /// read the file again, write it, or move, rename or lock it while the
+    /// save replaces it, and so mustn't run before `NSDocument` and the
+    /// model have heard what the save did.
+    private static let waitForSave: [Selector] = [
+        #selector(revertToSaved(_:)), #selector(saveAs(_:)), #selector(saveTo(_:)), #selector(duplicate(_:)),
+        #selector(move(_:)), #selector(rename(_:)), #selector(lock(_:)), #selector(NSDocument.unlock(_:)),
+    ]
+
     /// **Revert to Saved** commits an open edit first, so that it counts
     /// (the document asks before throwing it away), or, if the core
-    /// refuses it, stops with the editor open, saying why. SEAM(2.5.3):
-    /// Revert proper.
+    /// refuses it, stops with the editor open, saying why. It waits for a
+    /// Save under way (`waitForSave`). SEAM(2.5.3): Revert proper.
     override func revertToSaved(_ sender: Any?) {
-        guard commitEditing() else { return NSSound.beep() }
+        guard saving == nil, commitEditing() else { return NSSound.beep() }
         super.revertToSaved(sender)
     }
 
@@ -373,8 +399,18 @@ final class CSVDocument: NSDocument {
     // MARK: Save (task 2.5.3a, ADR-0012)
 
     /// The Save under way, and whether it saved: for tests, and so that
-    /// a second one waits for it.
+    /// a second one waits for it. While it is set, the document stays
+    /// edited (`updateDirtyState`), closing and quitting wait for it
+    /// (`waitForSaves`), and Revert, Save As, Duplicate, Move, Rename and
+    /// Lock are off (`waitForSave`).
     private(set) var saving: Task<Bool, Never>?
+    /// Every Save not yet ended, the one running and those waiting for
+    /// it, by number, for `cancelSave`.
+    private var saves: [Int: Task<Bool, Never>] = [:]
+    /// The last Save's number.
+    private var saveNumber = 0
+    /// Who waits for `saving` to end (`waitForSaves`).
+    private var saveWaiters: [CheckedContinuation<Void, Never>] = []
     /// What a Save alert's Duplicate, Save As… and Save As UTF-8… do, in
     /// place of doing it. Only tests set it.
     var saveFollowUpForTesting: ((SaveChoice) -> Void)?
@@ -385,8 +421,10 @@ final class CSVDocument: NSDocument {
     /// again, until a Reload. The copy's URL.
     private(set) var readsUTF8Copy: URL?
     /// How many times Save tries again on its own when the file is in the
-    /// middle of a rename (`Moving`), and how long it waits each time.
-    static let movingRetries = 3
+    /// middle of a rename (`Moving`), and how long it waits each time:
+    /// together longer than the core's `MOVE_WINDOW` (2 s), after which a
+    /// rename is a move, not part of another app's save.
+    static let movingRetries = 10
     static let movingDelay: Duration = .milliseconds(250)
 
     /// **Save** (ADR-0012, DESIGN §4.3): every Save comes here, ⌘S and
@@ -410,22 +448,58 @@ final class CSVDocument: NSDocument {
             return reply(false)
         }
         let previous = saving
+        saveNumber += 1
+        let number = saveNumber
         let task = Task { [weak self] () -> Bool in
             _ = await previous?.value
-            return await self?.saveInPlace() ?? false
+            let saved = await self?.saveInPlace() ?? false
+            // Before the task's value is known: whoever awaits it finds
+            // `saving` and the dirty state up to date.
+            self?.saveEnded(number)
+            return saved
         }
         saving = task
-        Task { [weak self] in
-            let saved = await task.value
-            if let self, saving == task { saving = nil }
-            reply(saved)
+        saves[number] = task
+        Task {
+            reply(await task.value)
         }
     }
 
-    /// Stops the Save under way (⌘. or Escape while it runs): before the
-    /// new file is in place nothing is written, and the edits stay unsaved.
-    func cancelSave() {
-        saving?.cancel()
+    /// Save `number` has ended.
+    private func saveEnded(_ number: Int) {
+        saves[number] = nil
+        if saves.isEmpty { savesEnded() }
+    }
+
+    /// Every Save has ended: the dirty state is the core's again (an edit
+    /// set back by hand during the save is clean now), and whoever waits
+    /// for the saves (closing, quitting) goes on.
+    private func savesEnded() {
+        saving = nil
+        updateDirtyState()
+        let waiters = saveWaiters
+        saveWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    /// Returns once no Save is under way (at once if none is), without
+    /// blocking the main thread. Closing and quitting wait here before they
+    /// decide whether to ask about unsaved changes.
+    func waitForSaves() async {
+        while saving != nil {
+            await withCheckedContinuation { saveWaiters.append($0) }
+        }
+    }
+
+    /// Stops the Saves under way (⌘. or Escape while one runs or waits to
+    /// start): the one running and any waiting for it. Before the new file
+    /// is in place nothing is written, and the edits stay unsaved. Returns
+    /// whether there was one to stop.
+    @discardableResult
+    func cancelSave() -> Bool {
+        guard saving != nil else { return false }
+        for save in saves.values { save.cancel() }
+        return true
     }
 
     /// Save, then: asks first if the file changed elsewhere, saves through
@@ -460,6 +534,9 @@ final class CSVDocument: NSDocument {
         while !Task.isCancelled {
             guard let url = fileURL else { return false }
             let result = await saveCoordinated(url, overwriteChanged: overwrite, model: model)
+            // Save Anyway's consent is for the file the user was asked
+            // about: any other way round the loop asks again.
+            overwrite = false
             switch result {
             case let .success(saved?):
                 saveFinished(saved, model: model)
@@ -478,8 +555,15 @@ final class CSVDocument: NSDocument {
                     // Another app's save renaming the file a moment ago:
                     // try again shortly (DESIGN §3.7).
                     moves += 1
+                    model.waitingToSave(true)
                     try? await Task.sleep(for: Self.movingDelay)
+                    model.waitingToSave(false)
                     continue
+                }
+                if case .Locked = failure, await FileWork.run({ Self.isLockedBySystem(url) }) {
+                    // Only an administrator can clear `schg`: no Unlock.
+                    if await ask(SaveText.lockedBySystem(name: fileName)) == .duplicate { followUp(.duplicate) }
+                    return false
                 }
                 switch await refuse(failure, model: model) {
                 case .saveAnyway:
@@ -513,48 +597,178 @@ final class CSVDocument: NSDocument {
     /// notice, and `NSDocument` doesn't react to its own save). The core
     /// writes on a thread of its own; nothing here blocks the main thread.
     /// `nil` if the document failed or closed.
+    ///
+    /// The status bar says "Waiting to save…" until the core's save starts.
     private func saveCoordinated(_ url: URL, overwriteChanged: Bool, model: DocumentModel) async -> Result<DocumentModel.Saved?, SaveFailure> {
-        let access = await fileAccess()
+        model.waitingToSave(true)
+        defer { model.waitingToSave(false) }
+        return await Self.write(url, overwriteChanged: overwriteChanged, document: self, model: model)
+    }
+
+    /// `saveCoordinated`, off the main thread from the moment the document
+    /// has its file access until it ends it (task 2.5.3a review).
+    ///
+    /// While the access lasts, `NSDocument` waits for it, blocking the main
+    /// thread, wherever it reads its own `fileURL`, `isDocumentEdited` or
+    /// `fileModificationDate` (it does so inside
+    /// `performSynchronousFileAccess`). So nothing between the access
+    /// starting and ending may need the main thread, or it could wait for
+    /// a main thread that waits for it: no `await` here resumes on the main
+    /// actor. The work that must be on the main thread (starting the core's
+    /// save, and `NSDocument`'s bookkeeping once it has written the file)
+    /// goes through `continueAsynchronousWorkOnMainThread` (`onMain`),
+    /// which `NSDocument` lets in even while it waits. The coordinated write
+    /// and the access end here, off the main thread, as soon as the core's
+    /// save is over.
+    nonisolated private static func write(
+        _ url: URL,
+        overwriteChanged: Bool,
+        document: CSVDocument,
+        model: DocumentModel
+    ) async -> Result<DocumentModel.Saved?, SaveFailure> {
+        guard let access = await document.fileAccess() else { return .failure(.Cancelled) }
         defer { access.done() }
+        if Task.isCancelled { return .failure(.Cancelled) }
         let write: CoordinatedWrite
         do {
-            write = try await CoordinatedWrite.begin(replacing: url, presenter: self)
+            write = try await CoordinatedWrite.begin(replacing: url, presenter: document)
+        } catch is CancellationError {
+            return .failure(.Cancelled)
         } catch {
             Logger.document.error("Couldn’t coordinate the save: \(String(describing: error), privacy: .public)")
             return .failure(.Io(step: "coordinating the save", code: nil, message: String(describing: error)))
         }
         defer { write.end() }
-        do {
-            return .success(try await model.save(to: write.url, kind: .save, overwriteChanged: overwriteChanged))
-        } catch let failure as SaveFailure {
-            return .failure(failure)
-        } catch {
-            return .failure(.Internal(message: String(describing: error)))
+        // Cancelled while waiting, but given access all the same.
+        if Task.isCancelled { return .failure(.Cancelled) }
+        let target = write.url
+        let place = await DocumentModel.placeForSaving(target)
+        let started = await document.onMain {
+            model.waitingToSave(false)
+            return model.startSave(to: target, kind: .save, place: place, overwriteChanged: overwriteChanged)
         }
+        guard case let .success(job?) = started else {
+            place.removeLeftovers()
+            return started.map { _ -> DocumentModel.Saved? in nil }
+        }
+        let result = await DocumentModel.outcome(of: job)
+        await document.onMain {
+            model.saveEnded(job, place: place)
+            if case let .success(saved) = result {
+                document.noteWritten(saved, model: model)
+            }
+        }
+        return result.map { Optional($0) }
     }
 
-    /// Waits for the document's turn at its file, and returns what ends it.
-    private func fileAccess() async -> FileAccess {
+    /// Runs `body` on the main thread, even while `NSDocument` blocks it
+    /// waiting for this document's file access
+    /// (`continueAsynchronousWorkOnMainThread`), and returns what it
+    /// returned. For work done during the save's file access.
+    nonisolated private func onMain<T: Sendable>(_ body: @escaping @MainActor @Sendable () -> T) async -> T {
         await withCheckedContinuation { continuation in
-            performAsynchronousFileAccess { done in
-                continuation.resume(returning: FileAccess(done: done))
+            continueAsynchronousWorkOnMainThread {
+                MainActor.assumeIsolated {
+                    continuation.resume(returning: body())
+                }
             }
         }
     }
 
-    /// The end of one of `NSDocument`'s asynchronous file accesses.
+    /// Waits for the document's turn at its file, and returns what ends it.
+    /// The access is asked for on the main thread, as `NSDocument` needs,
+    /// but the wait resumes off it: once the access has begun, the main
+    /// thread may be blocked waiting for it to end.
+    ///
+    /// Cancelling the waiting task stops the wait at once (another app may
+    /// be writing the file, which `NSDocument` waits for): it returns `nil`,
+    /// and the access is ended as soon as it begins.
+    nonisolated private func fileAccess() async -> FileAccess? {
+        let waiting = AccessWait()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                waiting.wait(continuation)
+                DispatchQueue.main.async {
+                    self.performAsynchronousFileAccess { done in
+                        waiting.begin(FileAccess(done: done))
+                    }
+                }
+            }
+        } onCancel: {
+            waiting.cancel()
+        }
+    }
+
+    /// The end of one of `NSDocument`'s asynchronous file accesses. It may
+    /// be called from any thread.
     private struct FileAccess: @unchecked Sendable {
         let done: () -> Void
     }
 
-    /// A save wrote the file: `NSDocument` hears what it now has on disk
-    /// (its modification date, so its own "changed by another
-    /// application" check doesn't fire), the edits up to the save's
-    /// snapshot are saved (the change-count token noted at that version),
-    /// and the journal keeps only the commands after it, which a replay
-    /// into the saved file still applies. Edits made during the save stay
-    /// unsaved: the dirty state is the core's again.
+    /// A wait for a file access that may be cancelled (`fileAccess()`):
+    /// whichever comes first, the access or the cancel, resumes the
+    /// waiting task; an access that begins after a cancel ends at once.
+    private final class AccessWait: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<FileAccess?, Never>?
+        private var cancelled = false
+
+        func wait(_ continuation: CheckedContinuation<FileAccess?, Never>) {
+            lock.lock()
+            if cancelled {
+                lock.unlock()
+                continuation.resume(returning: nil)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+
+        func begin(_ access: FileAccess) {
+            lock.lock()
+            let waiting = continuation
+            continuation = nil
+            lock.unlock()
+            if let waiting {
+                waiting.resume(returning: access)
+            } else {
+                access.done()
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let waiting = continuation
+            continuation = nil
+            lock.unlock()
+            waiting?.resume(returning: nil)
+        }
+    }
+
+    /// The core wrote the file: `NSDocument` hears what it now has on disk,
+    /// while the save's file access still lasts, as its own saving does
+    /// (`continueAsynchronousWorkOnMainThread`): its modification date, so
+    /// its own "changed by another application" check doesn't fire, and
+    /// the change-count token noted at the save's snapshot, so the edits
+    /// up to it are saved. Nothing, if the document now shows another
+    /// model.
+    private func noteWritten(_ saved: DocumentModel.Saved, model: DocumentModel) {
+        guard self.model === model, !model.isFailed else { return }
+        fileModificationDate = saved.outcome.modified
+        if let version = saved.snapshotVersion, let token = history.token(atVersion: version) {
+            updateChangeCount(withToken: token, for: .saveOperation)
+        }
+    }
+
+    /// A save wrote the file (`noteWritten` told `NSDocument`): the
+    /// journal keeps only the commands after the save's snapshot, which a
+    /// replay into the saved file still applies, and the model hears the
+    /// file's new status. Edits made during the save stay unsaved: the
+    /// dirty state is the core's again once every Save has ended
+    /// (`savesEnded`). Nothing, if the document now shows another model.
     private func saveFinished(_ saved: DocumentModel.Saved, model: DocumentModel) {
+        guard self.model === model, !model.isFailed else { return }
         let outcome = saved.outcome
         if !outcome.skippedMetadata.isEmpty {
             Logger.document.info("Saved without some of the file’s metadata: \(outcome.skippedMetadata.joined(separator: ", "), privacy: .public)")
@@ -566,15 +780,10 @@ final class CSVDocument: NSDocument {
             // SEAM(2.5.3b): move it somewhere lasting and tell the user.
             Logger.document.error("Saved; the old file was kept at \(kept, privacy: .private)")
         }
-        fileModificationDate = outcome.modified
         if let version = saved.snapshotVersion {
-            if let token = history.token(atVersion: version) {
-                updateChangeCount(withToken: token, for: .saveOperation)
-            }
             history.savedThrough(version: version)
         }
         model.saved(outcome)
-        updateDirtyState()
     }
 
     /// Says why Save didn't write the file and offers what the user can
@@ -597,17 +806,24 @@ final class CSVDocument: NSDocument {
     }
 
     /// Shows `refusal` as a sheet and waits for the choice; the way out
-    /// (its last) if there is no window.
+    /// (its last) if there is no window. Return is the first choice's,
+    /// unless that one writes over another app's changes (Save Anyway):
+    /// then Return is Cancel's.
     private func ask(_ refusal: SaveText.Refusal) async -> SaveChoice {
         let way = refusal.choices.last ?? .cancel
         guard let window = windowControllers.first?.window else { return way }
         let alert = NSAlert()
         alert.messageText = refusal.title
         alert.informativeText = refusal.detail
+        let destructive = refusal.choices.contains(.saveAnyway)
         for choice in refusal.choices {
             let button = alert.addButton(withTitle: SaveText.button(choice))
             button.hasDestructiveAction = choice == .saveAnyway
-            if choice == .cancel { button.keyEquivalent = "\u{1b}" }
+            if choice == .cancel {
+                button.keyEquivalent = destructive ? "\r" : "\u{1b}"
+            } else if destructive, button.keyEquivalent == "\r" {
+                button.keyEquivalent = ""
+            }
         }
         return await withCheckedContinuation { continuation in
             showSheet(alert, window) { response in
@@ -640,16 +856,32 @@ final class CSVDocument: NSDocument {
         return stat(url.path(percentEncoded: false), &info) == 0
     }
 
+    /// The user locks (Finder's Locked, `uchg`, and append-only, `uappnd`),
+    /// which Unlock clears, and the system's (`schg`, `sappnd`), which only
+    /// an administrator can. The core's Locked is any of them.
+    nonisolated private static let userLocks = UInt32(UF_IMMUTABLE | UF_APPEND)
+    nonisolated private static let systemLocks = UInt32(SF_IMMUTABLE | SF_APPEND)
+
+    /// Whether the system locked the file (`schg` or `sappnd`), which Leal
+    /// can't undo: Save then offers no Unlock. It touches the file: call it
+    /// off the main thread.
+    nonisolated static func isLockedBySystem(_ url: URL) -> Bool {
+        var info = stat()
+        guard stat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_flags & systemLocks != 0
+    }
+
     /// Clears the file's user locks (immutable and append-only, as the
-    /// Finder's Locked does), for Save's **Unlock**. Returns whether they
-    /// are off. It touches the file: call it off the main thread.
+    /// Finder's Locked does), for Save's **Unlock**. Returns whether it is
+    /// unlocked: not if the system's locks are on too (`schg`, `sappnd`),
+    /// which only an administrator can clear. It touches the file: call it
+    /// off the main thread.
     nonisolated static func unlock(_ url: URL) -> Bool {
         let path = url.path(percentEncoded: false)
         var info = stat()
-        guard stat(path, &info) == 0 else { return false }
-        let locks = UInt32(UF_IMMUTABLE | UF_APPEND)
-        guard info.st_flags & locks != 0 else { return true }
-        return chflags(path, info.st_flags & ~locks) == 0
+        guard stat(path, &info) == 0, info.st_flags & systemLocks == 0 else { return false }
+        guard info.st_flags & userLocks != 0 else { return true }
+        return chflags(path, info.st_flags & ~userLocks) == 0
     }
 
     // MARK: Undo, the journal and dirty state (task 2.5.2)
@@ -684,7 +916,15 @@ final class CSVDocument: NSDocument {
         history.register(command, as: direction) { [weak self] command, direction in
             self?.applyStep(command, direction)
         }
-        updateDirtyState()
+        if saving != nil {
+            // Whatever it does, a command during a save keeps the document
+            // edited until the save ends: the save's token, noted before
+            // it, mustn't mark it saved, and closing and quitting wait for
+            // the save before they decide (`savesEnded`).
+            updateChangeCount(.changeDone)
+        } else {
+            updateDirtyState()
+        }
         history.noteToken(changeCountToken(for: .saveOperation), version: version)
     }
 
@@ -735,11 +975,15 @@ final class CSVDocument: NSDocument {
     /// back by hand, or undone, leaves it clean. The change count is
     /// `NSDocument`'s, moved by this alone, so a save's token (2.5.3) marks
     /// the edits up to its snapshot as saved and those after as not.
+    /// While a save runs it is never cleared: closing or quitting then
+    /// would lose an edit set back by hand during the save, which the save
+    /// doesn't write (task 2.5.3a review). It is cleared once every save
+    /// has ended (`savesEnded`).
     func updateDirtyState() {
         guard let model, !model.isFailed else { return }
         if model.hasUnsavedEdits {
             updateChangeCount(.changeDone)
-        } else if isDocumentEdited {
+        } else if isDocumentEdited, saving == nil {
             updateChangeCount(.changeCleared)
         }
     }
@@ -775,10 +1019,23 @@ final class CSVDocument: NSDocument {
     /// Closing commits an open edit first, so it counts as an unsaved
     /// change, then asks as `NSDocument` does (Save, Don't Save, Cancel).
     /// Save then saves through the core (`save(withDelegate:didSave:contextInfo:)`).
+    /// During a Save it waits for the save to end, without blocking the
+    /// main thread, and then decides: what the save wrote, and an edit
+    /// made meanwhile, are known only then.
     override func canClose(withDelegate delegate: Any, shouldClose shouldCloseSelector: Selector?, contextInfo: UnsafeMutableRawPointer?) {
         guard commitEditing() else {
             // The core refused the open edit: it stays open, saying why.
             return Self.answer(delegate, shouldCloseSelector, document: self, flag: false, contextInfo: contextInfo)
+        }
+        if saving != nil {
+            let decide: @MainActor () -> Void = { [weak self] in
+                self?.canClose(withDelegate: delegate, shouldClose: shouldCloseSelector, contextInfo: contextInfo)
+            }
+            Task { [weak self] in
+                await self?.waitForSaves()
+                decide()
+            }
+            return
         }
         if isDocumentEdited, let prompt = unsavedChangesPromptForTesting {
             prompt { [weak self] close in
