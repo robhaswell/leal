@@ -73,6 +73,13 @@ was rejected.
    original had missing cells, and a command that expected a missing cell
    accepts an empty field (ADR-0012 decision 4, decision 3 above).
 
+8. **"By value" restores an unedited field's own bytes.** When undo after
+   a save (or a replay) puts back a field the user never edited, it puts
+   back the field's original bytes, converted only if the document's
+   encoding has changed (e.g. after Save As UTF-8). Invalid bytes are never
+   replaced unasked (ADR-0004 decision 9, DESIGN §3.5). Clarified during
+   task 2.4c.
+
 ## Consequences
 
 - **DESIGN §3.6:** add when structural edits are allowed; that their undo

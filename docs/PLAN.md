@@ -486,7 +486,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       can't be encoded;
     - `SaveError::EncodingNotSupported` becomes F5's `Unencodable`, and the
       save property's `TODO(2.3)` branch goes.
-- [ ] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
+- [x] **2.4 Row and column insert/delete** — piece list, column map; F6 tests.
   Split into parts of about a day (CLAUDE.md, token budget):
   - [x] **2.4d Design.** A short design in `docs/tasks/2.4.md` covering
     everything below (piece list and row ids, `RowMap`, column map and
@@ -498,7 +498,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - [x] **2.4b Columns.** Insert and delete columns: the column map, per-row
     applied flags, cell identities for undo, per-column quoting in the
     oracle and the product (ADR-0004 decision 2). Not saved yet.
-  - [ ] **2.4c Saving them.** The writer walks the piece list, the splices
+  - [x] **2.4c Saving them.** The writer walks the piece list, the splices
     for inserted and deleted rows and columns, the rebase, the carry-over,
     and 2.2's oracle replay extended to every edit kind (F6).
   The bullets below are the acceptance criteria across the parts.
