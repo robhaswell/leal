@@ -55,6 +55,112 @@ final class DocumentController: NSDocumentController {
         }
     }
 
+    // MARK: Quitting with unsaved edits (task 2.5.2)
+
+    /// Stands in for AppKit's review once the open edits are committed, for
+    /// tests: with two or more edited documents AppKit asks in an app-modal
+    /// alert. `answer` is the review's answer: whether to go on quitting.
+    var reviewForTesting: ((_ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
+
+    /// Answers the review `shouldTerminate` started.
+    private var quitReply: ((Bool) -> Void)?
+
+    /// Commits every document's open edit (in the in-cell editor or the
+    /// inspector). Returns whether none is left open: one the core refuses
+    /// stays open, saying why.
+    func commitOpenEdits() -> Bool {
+        documents.compactMap { $0 as? CSVDocument }.reduce(true) { $1.commitEditing() && $0 }
+    }
+
+    /// **Quit** with an edit still being typed (task 2.5.2 review). Quit
+    /// (and Log Out and Restart) reviews the documents with unsaved
+    /// changes before it asks the app delegate's `applicationShouldTerminate`,
+    /// but only if `hasEditedDocuments` says there are some, and an edit
+    /// not yet committed isn't one. So the app delegate asks here: every
+    /// open edit is committed, and if that left a document edited that
+    /// wasn't before, the documents are reviewed now (Save, Don't Save,
+    /// Cancel), and `reply` hears whether to quit
+    /// (`NSApplication.reply(toApplicationShouldTerminate:)`). A document
+    /// edited before was reviewed already, by AppKit, which committed every
+    /// open edit (`reviewUnsavedDocuments`). An open edit the core refuses
+    /// stops the quit, as it stops a close.
+    func shouldTerminate(reply: @escaping (Bool) -> Void) -> NSApplication.TerminateReply {
+        let csv = documents.compactMap { $0 as? CSVDocument }
+        let editedBefore = csv.filter(\.isDocumentEdited)
+        guard commitOpenEdits() else {
+            NSSound.beep()
+            return .terminateCancel
+        }
+        let newlyEdited = csv.contains { document in
+            document.isDocumentEdited && !editedBefore.contains { $0 === document }
+        }
+        guard newlyEdited else { return .terminateNow }
+        quitReply = reply
+        reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: self,
+            didReviewAllSelector: #selector(quitReviewEnded(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
+        return .terminateLater
+    }
+
+    @objc private func quitReviewEnded(_ controller: NSDocumentController, didReviewAll: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        let reply = quitReply
+        quitReply = nil
+        reply?(didReviewAll)
+    }
+
+    /// AppKit reviews the documents with unsaved changes (Quit, when some
+    /// are edited) by `hasEditedDocuments`, before any document's
+    /// `canClose` runs, so an edit still being typed in another document
+    /// wouldn't count. Every document commits its open edit first. One
+    /// the core refuses stays open, saying why, and stops a review that
+    /// can be cancelled, as it stops a close.
+    override func reviewUnsavedDocuments(
+        withAlertTitle title: String?,
+        cancellable: Bool,
+        delegate: Any?,
+        didReviewAllSelector: Selector?,
+        contextInfo: UnsafeMutableRawPointer?
+    ) {
+        let committed = commitOpenEdits()
+        let answer: @MainActor (Bool) -> Void = { [weak self] reviewed in
+            guard let self else { return }
+            Self.answer(delegate, didReviewAllSelector, controller: self, didReviewAll: reviewed, contextInfo: contextInfo)
+        }
+        if !committed, cancellable {
+            NSSound.beep()
+            return answer(false)
+        }
+        if let review = reviewForTesting {
+            return review(answer)
+        }
+        super.reviewUnsavedDocuments(
+            withAlertTitle: title,
+            cancellable: cancellable,
+            delegate: delegate,
+            didReviewAllSelector: didReviewAllSelector,
+            contextInfo: contextInfo
+        )
+    }
+
+    /// Calls the review's delegate, as AppKit does:
+    /// `documentController:didReviewAll:contextInfo:`.
+    private static func answer(
+        _ delegate: Any?,
+        _ selector: Selector?,
+        controller: NSDocumentController,
+        didReviewAll: Bool,
+        contextInfo: UnsafeMutableRawPointer?
+    ) {
+        guard let selector, let object = delegate as? NSObject, object.responds(to: selector) else { return }
+        typealias Callback = @convention(c) (NSObject, Selector, NSDocumentController, Bool, UnsafeMutableRawPointer?) -> Void
+        let callback = unsafeBitCast(object.method(for: selector), to: Callback.self)
+        callback(object, selector, controller, didReviewAll, contextInfo)
+    }
+
     /// The file's type from its name, so AppKit needn't ask the file system
     /// on the main thread; failing that, the type the background open read
     /// (`PendingOpens`); only then AppKit's own answer.

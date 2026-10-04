@@ -58,6 +58,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CoreRelease.finish()
     }
 
+    /// Quit commits the edits still being typed, and asks about them
+    /// (`DocumentController.shouldTerminate`).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let controller = NSDocumentController.shared as? DocumentController else { return .terminateNow }
+        return controller.shouldTerminate { quit in
+            NSApp.reply(toApplicationShouldTerminate: quit)
+        }
+    }
+
     /// Leal is a viewer: launching it doesn't make an empty document.
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         false

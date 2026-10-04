@@ -242,6 +242,212 @@ final class UndoTests: XCTestCase {
         XCTAssertEqual(sheets.first?.messageText, "Leal couldn’t undo “Typing”.")
     }
 
+    /// An undo the core refuses only for now (a row delete undone while
+    /// the Header row's new reading is still being read) is put back, to
+    /// try again, and so is a redo; the history isn't cleared.
+    func testAStepRefusedForNowIsPutBack() async throws {
+        // Big enough (about 16 MB) that the new reading's index is still
+        // running when the undo comes, straight after the toggle.
+        var text = "id,name,qty\n"
+        for row in 1...1_000_000 { text += "\(row),name \(row),\(row % 10)\n" }
+        let opened = try await open(try file("big.csv", text))
+        let (document, model, content, undo) = (opened.document, opened.model, opened.content, opened.undo)
+        var sheets: [NSAlert] = []
+        document.showSheet = { alert, _, _ in sheets.append(alert) }
+        let readAgain = { model.call { try $0.progress() }?.complete == true }
+        // The file's row 3 (logical, header row or not): "3" while it is
+        // there, "4" once it is deleted.
+        let row3 = { (model.call { try $0.fullValue(row: 3, column: 0) } ?? nil) ?? "" }
+        try set(model, 0, 1, "first")
+        try apply(model) { try $0.deleteRows(at: 3, count: 1) }
+        XCTAssertEqual(row3(), "4")
+
+        content.toggleHeaderRow(nil)
+        undo.undo()
+        XCTAssertEqual(row3(), "4", "refused: still reading")
+        XCTAssertEqual(sheets.last?.messageText, "Leal couldn’t undo “Delete Row”.")
+        XCTAssertEqual(sheets.last?.informativeText, "Leal is still reading the file. Try again in a moment.")
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertEqual(undo.undoActionName, "Delete Row")
+        try await waitUntil("read again", readAgain)
+        undo.undo()
+        XCTAssertEqual(row3(), "3")
+        XCTAssertEqual(undo.undoActionName, "Typing", "the history before it is kept")
+
+        content.toggleHeaderRow(nil)
+        undo.redo()
+        XCTAssertEqual(row3(), "3", "refused: still reading")
+        XCTAssertEqual(sheets.last?.messageText, "Leal couldn’t redo “Delete Row”.")
+        XCTAssertTrue(undo.canRedo)
+        XCTAssertEqual(undo.redoActionName, "Delete Row")
+        XCTAssertEqual(undo.undoActionName, "Typing")
+        try await waitUntil("read again", readAgain)
+        undo.redo()
+        XCTAssertEqual(row3(), "4")
+        XCTAssertEqual(sheets.count, 2)
+        undo.undo()
+        undo.undo()
+        XCTAssertFalse(document.isDocumentEdited)
+    }
+
+    /// ⌘Z with an open edit the core refuses to commit: nothing is
+    /// undone, and the edit stays open, saying why.
+    func testUndoStopsWhenTheOpenEditIsRefused() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let (model, content, undo) = (opened.model, opened.content, opened.undo)
+        try set(model, 0, 1, "Marlowe")
+        content.grid.activeCell = CellPosition(row: 1, column: 1)
+        content.editActiveCell()
+        let editor = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        editor.insertText("Typed", replacementRange: editor.selectedRange())
+        model.refusalForTesting = .valueChanged
+        undo.undo()
+        XCTAssertEqual(value(model, 0, 1), "Marlowe", "not undone")
+        XCTAssertTrue(content.cellEditor.isEditing)
+        XCTAssertTrue(undo.canUndo)
+        undo.redo()
+        XCTAssertTrue(content.cellEditor.isEditing)
+        model.refusalForTesting = nil
+        undo.undo()
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 1, 1), "Ostrava")
+        XCTAssertEqual(value(model, 0, 1), "Marlowe")
+    }
+
+    // MARK: Editing while the document is replaced
+
+    /// While a Reload reads the file again, editing is off (the in-cell
+    /// editor, the inspector, Rename Column) as undo is; an edit made all
+    /// the same keeps the document, with its edits and history, and the
+    /// user is told.
+    func testEditingIsOffDuringAReloadAndAnEditMadeAllTheSameIsKept() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let (document, model, content, undo) = (opened.document, opened.model, opened.content, opened.undo)
+        var alerts: [NSAlert] = []
+        content.showAlert = { alert, _ in alerts.append(alert) }
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        XCTAssertNotNil(content.inspectorEdit)
+
+        content.reloadFromDisk(nil)
+        let reload = try XCTUnwrap(content.reloading)
+        XCTAssertTrue(content.isReplacingDocument)
+        content.editActiveCell()
+        XCTAssertFalse(content.cellEditor.isEditing)
+        content.rename(column: 1)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertNil(content.headerMenu(column: 1))
+        let text = content.inspector.textView
+        content.view.window?.makeFirstResponder(text)
+        text.insertText("Typed", replacementRange: NSRange(location: 0, length: 0))
+        XCTAssertEqual(text.string, "Marlow")
+        XCTAssertEqual(content.inspectorEdit?.changed, false)
+
+        // An edit made all the same, behind the window's back.
+        try set(model, 0, 1, "Marlowe")
+        XCTAssertFalse(undo.canUndo, "off while the file is read again")
+        await reload.value
+        XCTAssertEqual(value(model, 0, 1), "Marlowe")
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertEqual(document.history.journal.count, 1)
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertEqual(alerts.map(\.messageText), ["Leal didn’t reload “a.csv”."])
+        XCTAssertFalse(content.isReplacingDocument)
+        content.editActiveCell()
+        XCTAssertTrue(content.cellEditor.isEditing)
+    }
+
+    // MARK: Quitting (task 2.5.2 review)
+
+    /// Quit with one document whose only change is still being typed:
+    /// `NSApplication.terminate` reviews the documents, which commits the
+    /// edit first, so the document asks (and here cancels the quit).
+    func testQuittingCommitsAnOpenEditThenAsks() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let (document, model, content) = (opened.document, opened.model, opened.content)
+        let controller = try XCTUnwrap(NSDocumentController.shared as? DocumentController)
+        controller.addDocument(document)
+        var asked = 0
+        document.unsavedChangesPromptForTesting = { answer in
+            asked += 1
+            answer(false)
+        }
+        content.grid.activeCell = CellPosition(row: 0, column: 1)
+        content.editActiveCell()
+        let editor = try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        editor.insertText("Typed", replacementRange: editor.selectedRange())
+        XCTAssertFalse(controller.hasEditedDocuments, "not committed yet")
+
+        let quit = QuitProbe()
+        quit.terminate()
+        try await waitUntil("reviewed") { !quit.reviewed.isEmpty }
+        XCTAssertEqual(value(model, 0, 1), "Typed")
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertEqual(asked, 1)
+        XCTAssertEqual(quit.replies, [.terminateLater])
+        XCTAssertEqual(quit.reviewed, [false], "Cancel: no quit")
+
+        // Quit again: the document was edited before, so AppKit itself
+        // reviews it, and the app delegate has nothing more to ask.
+        quit.terminate()
+        try await waitUntil("asked again") { asked == 2 }
+        XCTAssertEqual(quit.replies, [.terminateLater], "the review cancelled the quit first")
+    }
+
+    /// As above with two documents, each with an edit still being typed:
+    /// both are committed before AppKit counts the edited documents (its
+    /// app-modal question is replaced here).
+    func testQuittingCommitsEveryDocumentsOpenEdit() async throws {
+        let first = try await open(try file("a.csv", csv))
+        let second = try await open(try file("b.csv", csv))
+        let controller = try XCTUnwrap(NSDocumentController.shared as? DocumentController)
+        defer { controller.reviewForTesting = nil }
+        for opened in [first, second] {
+            controller.addDocument(opened.document)
+            opened.content.grid.activeCell = CellPosition(row: 1, column: 2)
+            opened.content.editActiveCell()
+            let editor = try XCTUnwrap(opened.content.cellEditor.field.currentEditor() as? NSTextView)
+            editor.selectAll(nil)
+            editor.insertText("42", replacementRange: editor.selectedRange())
+        }
+        XCTAssertFalse(controller.hasEditedDocuments)
+        var reviewed: [Bool] = []
+        controller.reviewForTesting = { answer in
+            reviewed = [first, second].map(\.document.isDocumentEdited)
+            answer(false)
+        }
+
+        let quit = QuitProbe()
+        quit.terminate()
+        try await waitUntil("reviewed") { !quit.reviewed.isEmpty }
+        XCTAssertEqual(reviewed, [true, true])
+        XCTAssertEqual(value(first.model, 1, 2), "42")
+        XCTAssertEqual(value(second.model, 1, 2), "42")
+        XCTAssertEqual(quit.replies, [.terminateLater])
+        XCTAssertEqual(quit.reviewed, [false])
+
+        // AppKit's own review (Quit with edited documents) commits every
+        // document's open edit before it counts them.
+        second.content.grid.activeCell = CellPosition(row: 0, column: 2)
+        second.content.editActiveCell()
+        let editor = try XCTUnwrap(second.content.cellEditor.field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        editor.insertText("7", replacementRange: editor.selectedRange())
+        let probe = ReviewProbe()
+        controller.reviewUnsavedDocuments(
+            withAlertTitle: nil,
+            cancellable: true,
+            delegate: probe,
+            didReviewAllSelector: #selector(ReviewProbe.documentController(_:didReviewAll:contextInfo:)),
+            contextInfo: nil
+        )
+        XCTAssertEqual(value(second.model, 0, 2), "7")
+        XCTAssertEqual(probe.answers, [false])
+    }
+
     // MARK: Dirty state
 
     func testTheChangeCountFollowsTheCoresDirtyState() async throws {
@@ -477,15 +683,87 @@ final class UndoTests: XCTestCase {
         XCTAssertEqual(document.history.journal.count, 1)
     }
 
+    /// The words for edits Recover changes couldn't put back count in the
+    /// right number (the String Catalog's plural variants).
+    func testRecoveryWordsCountInTheRightNumber() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let model = opened.model
+        func describe(_ make: (LealFFI.Document) throws -> EditCommand?) throws -> String {
+            HistoryText.describe(try XCTUnwrap(model.call { try make($0) } ?? nil), header: true)
+        }
+        XCTAssertEqual(try describe { try $0.insertRows(at: 2, rows: [["9", "Vane", "1"]]) }, "Inserting 1 row at Row 2")
+        XCTAssertEqual(try describe { try $0.insertRows(at: 1, rows: [["7", "a", "1"], ["8", "b", "2"]]) }, "Inserting 2 rows at Row 1")
+        XCTAssertEqual(try describe { try $0.deleteRows(at: 3, count: 1) }, "Deleting 1 row at Row 3")
+        XCTAssertEqual(try describe { try $0.deleteRows(at: 1, count: 2) }, "Deleting 2 rows at Row 1")
+        XCTAssertEqual(
+            try describe { try $0.setCells(cells: [CellEdit(row: 1, column: 1, value: "A"), CellEdit(row: 2, column: 1, value: "B")]) },
+            "Row 1, column 2 and 1 more cell"
+        )
+        XCTAssertEqual(
+            try describe {
+                try $0.setCells(cells: [
+                    CellEdit(row: 1, column: 1, value: "C"),
+                    CellEdit(row: 2, column: 1, value: "D"),
+                    CellEdit(row: 2, column: 2, value: "E"),
+                ])
+            },
+            "Row 1, column 2 and 2 more cells"
+        )
+    }
+
+    /// Recover Changes is offered while the journal has commands; then
+    /// the alert says Reopen and Close discard the edits.
     func testAFailureWithNoEditsOffersNoRecovery() async throws {
         let opened = try await open(try file("a.csv", csv))
         let (document, model, undo) = (opened.document, opened.model, opened.undo)
+        XCTAssertFalse(document.canRecover, "no edits")
+        let plain = document.failureAlert()
+        XCTAssertEqual(plain.buttons.map(\.title), ["Reopen", "Close"])
+        XCTAssertFalse(plain.buttons.contains(where: \.hasDestructiveAction))
         try set(model, 0, 1, "Marlowe")
         undo.undo()
-        XCTAssertFalse(document.canRecover, "nothing unsaved")
-        XCTAssertEqual(document.failureAlert().buttons.map(\.title), ["Reopen", "Close"])
-        try set(model, 0, 1, "Marlowe")
-        XCTAssertTrue(document.canRecover)
+        XCTAssertTrue(document.canRecover, "the journal, not the dirty state")
+        let alert = document.failureAlert()
+        XCTAssertEqual(alert.buttons.map(\.title), ["Recover Changes", "Reopen", "Close"])
+        XCTAssertTrue(alert.informativeText.hasSuffix("Recover Changes opens the file again and puts your unsaved edits back. Reopen and Close discard them."), alert.informativeText)
+        XCTAssertEqual(alert.buttons.map(\.hasDestructiveAction), [false, true, true])
+    }
+}
+
+/// Quits through `NSApplication.terminate`, as ⌘Q does, with an app
+/// delegate in place of Leal's. It asks the document controller as Leal's
+/// does, but hears the answer itself, and never lets the app quit, so a
+/// review that doesn't stop the quit can't end the test host.
+@MainActor
+private final class QuitProbe: NSObject, NSApplicationDelegate {
+    /// What `DocumentController.shouldTerminate` returned.
+    private(set) var replies: [NSApplication.TerminateReply] = []
+    /// What its review answered later.
+    private(set) var reviewed: [Bool] = []
+
+    func terminate() {
+        let saved = NSApp.delegate
+        NSApp.delegate = self
+        defer { NSApp.delegate = saved }
+        NSApp.terminate(nil)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let controller = NSDocumentController.shared as? DocumentController
+        if let reply = controller?.shouldTerminate(reply: { [weak self] quit in self?.reviewed.append(quit) }) {
+            replies.append(reply)
+        }
+        return .terminateCancel
+    }
+}
+
+/// `reviewUnsavedDocuments`'s delegate, which hears the answer.
+@MainActor
+private final class ReviewProbe: NSObject {
+    private(set) var answers: [Bool] = []
+
+    @objc func documentController(_ controller: NSDocumentController, didReviewAll: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        answers.append(didReviewAll)
     }
 }
 

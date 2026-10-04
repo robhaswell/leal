@@ -36,8 +36,10 @@ struct JournalEntry {
 /// edit still open in the window, so ⌘Z while typing undoes the typing.
 @MainActor
 final class DocumentUndoManager: UndoManager {
-    /// Called before an undo or a redo: commits an open edit.
-    var willUndoOrRedo: (() -> Void)?
+    /// Called before an undo or a redo: commits an open edit. `false`
+    /// (the core refused it, and it stays open, saying why) stops the
+    /// step, with a beep, as Reload and Treat As stop.
+    var willUndoOrRedo: (() -> Bool)?
     /// Called after one: the document deals with a command the core
     /// refused meanwhile.
     var didUndoOrRedo: (() -> Void)?
@@ -45,27 +47,64 @@ final class DocumentUndoManager: UndoManager {
     /// failed (its journal recovers the edits), nor while a save replaces
     /// the file.
     var isAvailable: () -> Bool = { true }
+    /// A step refused for now waits to go back where it came from once
+    /// its undo or redo is over (`putBack`): `true` to its undo stack.
+    private var putBackOnUndoStack: Bool?
+    /// A refused step is being put back: the undo or redo that does it is
+    /// allowed whatever `isAvailable` says.
+    private var puttingBack = false
 
     override init() {
         super.init()
         groupsByEvent = false
     }
 
-    override var canUndo: Bool { isAvailable() && super.canUndo }
-    override var canRedo: Bool { isAvailable() && super.canRedo }
+    override var canUndo: Bool { (puttingBack || isAvailable()) && super.canUndo }
+    override var canRedo: Bool { (puttingBack || isAvailable()) && super.canRedo }
 
     override func undo() {
-        willUndoOrRedo?()
+        guard willUndoOrRedo?() ?? true else { return NSSound.beep() }
         guard canUndo else { return }
         super.undo()
+        finishPuttingBack()
         didUndoOrRedo?()
     }
 
     override func redo() {
-        willUndoOrRedo?()
+        guard willUndoOrRedo?() ?? true else { return NSSound.beep() }
         guard canRedo else { return }
         super.redo()
+        finishPuttingBack()
         didUndoOrRedo?()
+    }
+
+    /// Called during an undo or a redo the core refused for now (the file
+    /// is still being read, a save runs): the step goes back where it came
+    /// from, `action` named `name`, so the user can try again, and both
+    /// histories stay as they were. A step registered during the undo
+    /// lands on the redo stack (during a redo, the undo stack), so this
+    /// registers one there whose own undo (or redo) registers `action`,
+    /// and takes it straight back once the undo is over
+    /// (`finishPuttingBack`): registered during that redo (or undo),
+    /// `action` lands on the stack the refused step came from, and nothing
+    /// clears the redo stack, as a new step would.
+    func putBack(named name: String, _ action: @escaping @MainActor () -> Void) {
+        guard isUndoing || isRedoing else { return }
+        registerUndo(withTarget: self) { [unowned self] _ in registerStep(named: name, action) }
+        setActionName(name)
+        putBackOnUndoStack = isUndoing
+    }
+
+    private func finishPuttingBack() {
+        guard let onUndoStack = putBackOnUndoStack else { return }
+        putBackOnUndoStack = nil
+        puttingBack = true
+        defer { puttingBack = false }
+        if onUndoStack {
+            super.redo()
+        } else {
+            super.undo()
+        }
     }
 
     /// Registers `action` as one undo step named `name`. Inside an undo or
@@ -115,6 +154,13 @@ final class EditHistory {
         undoManager.registerStep(named: Self.actionName(for: command)) { apply(command, next) }
     }
 
+    /// Puts back an undo or redo step of `command` the core refused for now
+    /// (`direction` is the step's), to try again: called during that undo
+    /// or redo. `apply` applies it.
+    func putBack(_ command: EditCommand, as direction: CommandDirection, apply: @escaping @MainActor (EditCommand, CommandDirection) -> Void) {
+        undoManager.putBack(named: Self.actionName(for: command)) { apply(command, direction) }
+    }
+
     func noteToken(_ token: Any, version: UInt64) {
         tokens.append((version, token))
     }
@@ -158,6 +204,12 @@ final class EditHistory {
     /// in the new document's lineage, and the undo history the steps still
     /// done, oldest first (a redo history isn't kept). `apply` applies a
     /// step's undo or redo.
+    ///
+    /// The pairing: the core's `replay` returns in `applied` one command
+    /// for each command passed that wasn't refused, in the order passed,
+    /// and `replayCommands` passes the journal's entries in order. So the
+    /// journal's entries not named in `refused`, in order, pair with
+    /// `applied` one for one.
     func rebuild(
         from report: ReplayReport,
         version: UInt64,
@@ -167,6 +219,10 @@ final class EditHistory {
         let old = journal
         reset(choices: choices)
         let refused = Set(report.refused.map { Int($0.index) })
+        assert(
+            report.applied.count == old.count - refused.count,
+            "a replay applies each command it doesn't refuse: \(report.applied.count) applied, \(refused.count) refused of \(old.count)"
+        )
         var applied = report.applied.makeIterator()
         var done: [EditCommand] = []
         for (index, entry) in old.enumerated() where !refused.contains(index) {

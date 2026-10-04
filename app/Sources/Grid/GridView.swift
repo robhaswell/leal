@@ -338,7 +338,8 @@ final class GridView: StripContentView, NSMenuItemValidation {
                 let cell = source.cell(row: row, column: column)
                 if source.isEdited(row: row, column: column) {
                     glyphs.draw(in: context)
-                    CellPainter.drawEditedMark(in: rect, palette: palette, context: context)
+                    let rightToLeft = if case let .text(value, _) = cell { CellPainter.isRightToLeft(value) } else { false }
+                    CellPainter.drawEditedMark(in: rect, rightToLeft: rightToLeft, palette: palette, context: context)
                 }
                 switch cell {
                 case let .text(value, truncated):

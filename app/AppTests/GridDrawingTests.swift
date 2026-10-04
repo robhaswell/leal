@@ -285,6 +285,28 @@ final class GridDrawingTests: XCTestCase {
         }
     }
 
+    /// An edited cell's triangle sits in its top leading corner: the top
+    /// right for a value that reads right to left (task 2.5.2 review).
+    func testTheEditedMarkIsInTheLeadingCornerOfTheValuesDirection() {
+        XCTAssertFalse(CellPainter.isRightToLeft("Marlow"))
+        XCTAssertFalse(CellPainter.isRightToLeft("123 Marlow שלום"))
+        XCTAssertFalse(CellPainter.isRightToLeft("123"))
+        XCTAssertFalse(CellPainter.isRightToLeft(""))
+        XCTAssertTrue(CellPainter.isRightToLeft("שלום"))
+        XCTAssertTrue(CellPainter.isRightToLeft("12 – مرحبا Marlow"))
+        XCTAssertTrue(CellPainter.isRightToLeft("\u{064B}ܫܠܡܐ"), "a mark isn't strong; Syriac is")
+
+        let rect = CGRect(x: 100, y: 20, width: 80, height: 22)
+        XCTAssertEqual(
+            CellPainter.editedMarkPoints(in: rect, rightToLeft: false),
+            [CGPoint(x: 101, y: 21), CGPoint(x: 107, y: 21), CGPoint(x: 101, y: 27)]
+        )
+        XCTAssertEqual(
+            CellPainter.editedMarkPoints(in: rect, rightToLeft: true),
+            [CGPoint(x: 179, y: 21), CGPoint(x: 173, y: 21), CGPoint(x: 179, y: 27)]
+        )
+    }
+
     func testCaretOffsetsAgreeWithCoreText() {
         let palette = performDrawing { GridPalette.current() }
         for value in values + ["SKU-SKU-SKU-", "  spaced  ", "x"] {

@@ -132,7 +132,7 @@ final class SaveAsUTF8Tests: XCTestCase {
         XCTAssertEqual(items.map(content.validateMenuItem), [true, true, true])
 
         content.chooseUTF8Destination = { _, _, _, done in done(self.directory.appending(path: "slow (UTF-8).csv")) }
-        content.onSaveAsUTF8 = { _ in
+        content.onSaveAsUTF8 = { _, _ in
             // A save that runs until it is cancelled, as the core's does.
             while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
             throw SaveFailure.Cancelled
@@ -150,6 +150,49 @@ final class SaveAsUTF8Tests: XCTestCase {
         await task.value
         XCTAssertNil(content.savingAsUTF8)
         XCTAssertNil(shown, "a cancelled save says nothing")
+    }
+
+    /// While Save As UTF-8 runs, editing and undo are off; an edit made all
+    /// the same keeps the window on the UTF-16 file, with its edits and
+    /// their history, and says so (task 2.5.2 review). The copy is saved.
+    func testAnEditDuringSaveAsUTF8KeepsTheWindowOnTheFile() async throws {
+        let (url, _) = try utf16File("edited.csv", "id\tname\r\n1\tZoë\r\n2\tAda\r\n")
+        let (document, model, controller) = try open(url)
+        let content = controller.content
+        let copy = directory.appending(path: "edited (UTF-8).csv")
+        content.chooseUTF8Destination = { _, _, _, done in done(copy) }
+        var shown: [NSAlert] = []
+        content.showAlert = { alert, _ in shown.append(alert) }
+        let cell = CellPosition(row: 0, column: 1)
+        guard case .edited = model.setCell(.cell(cell), to: "Zoe") else { return XCTFail("not edited") }
+        let undo = document.history.undoManager
+        XCTAssertTrue(undo.canUndo)
+
+        content.grid.activeCell = cell
+        content.saveAsUTF8(nil)
+        let saving = try XCTUnwrap(content.savingAsUTF8)
+        XCTAssertTrue(content.isReplacingDocument)
+        content.editActiveCell()
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertFalse(undo.canUndo)
+        // An edit made all the same, behind the window's back.
+        guard case .edited = model.setCell(.cell(CellPosition(row: 1, column: 1)), to: "Ada L") else { return XCTFail("not edited") }
+        await saving.value
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)), "the copy was saved")
+        XCTAssertEqual(document.fileURL?.standardizedFileURL, url.standardizedFileURL, "still the UTF-16 file")
+        XCTAssertEqual(model.url.standardizedFileURL, url.standardizedFileURL)
+        XCTAssertTrue(model.isReadOnly)
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertEqual(model.fullValue(.cell(cell)), "Zoe")
+        XCTAssertEqual(model.fullValue(.cell(CellPosition(row: 1, column: 1))), "Ada L")
+        XCTAssertEqual(document.history.journal.count, 2)
+        XCTAssertEqual(undo.undoActionName, "Typing")
+        XCTAssertEqual(shown.map(\.messageText), ["The UTF-8 copy was saved, but this window still shows “edited.csv”."])
+        content.editActiveCell()
+        XCTAssertTrue(content.cellEditor.isEditing)
+        content.discardEditing()
+        document.close()
     }
 
     /// During a Reload, Save As UTF-8 is off.

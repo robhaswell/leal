@@ -182,6 +182,9 @@ final class DocumentModel: GridDataSource {
     /// A Reload is under way (`reloadInBackground`): Reload, Treat As,
     /// Reopen with Encoding and the Header row are off until it is done.
     private(set) var isReloading = false
+    /// The edit version when the Reload under way was asked for
+    /// (`willReload`): one made since stops it being adopted.
+    private var reloadVersion: UInt64?
     /// Looks at a disconnected share's file again, now and then.
     private var shareRecheck: Task<Void, Never>?
     /// Where the index had got to at the share's last disconnection, and
@@ -1594,8 +1597,17 @@ final class DocumentModel: GridDataSource {
     /// re-readings (Reload, Treat As, Reopen with Encoding, the Header row)
     /// are off meanwhile (`isReloading`). Returns whether the new document
     /// was adopted: not if the model failed or closed meanwhile.
+    ///
+    /// Editing is off meanwhile (the window's `isReplacingDocument`), but
+    /// as a second guard the new document isn't adopted if the edit
+    /// version moved past `version` (by default, the one when the Reload
+    /// was asked for, `willReload`): adopting it would throw away edits
+    /// the user made since, and mark the document clean.
+    ///
+    /// - Throws: the open error, or `EditedDuringReload` if it wasn't
+    ///   adopted because of edits made meanwhile, which are kept.
     @discardableResult
-    func reloadInBackground(from url: URL? = nil) async throws -> Bool {
+    func reloadInBackground(from url: URL? = nil, editVersion version: UInt64? = nil) async throws -> Bool {
         guard failure == nil else { return false }
         let url = url ?? self.url
         let number = handleNumber + 1
@@ -1603,6 +1615,7 @@ final class DocumentModel: GridDataSource {
         let environment = environment
         let options = reloadOptions
         willReload()
+        let since = version ?? reloadVersion ?? editVersion
         defer { reloadEnded() }
         var new: LealFFI.Document? = try await FileWork.run {
             try Self.openReloaded(url: url, environment: environment, options: options, reference: reference, number: number)
@@ -1611,6 +1624,10 @@ final class DocumentModel: GridDataSource {
             // Let go of it off the main thread, and hold no other reference.
             CoreRelease.later(&new)
             return false
+        }
+        guard editVersion == since else {
+            CoreRelease.later(&new)
+            throw EditedDuringReload()
         }
         new = nil
         try adoptReloaded(opened, url: url, reference: reference, number: number)
@@ -1661,6 +1678,7 @@ final class DocumentModel: GridDataSource {
     func willReload() {
         guard !isReloading else { return }
         isReloading = true
+        reloadVersion = editVersion
         onChange?(.progress)
     }
 
@@ -1668,6 +1686,7 @@ final class DocumentModel: GridDataSource {
     func reloadEnded() {
         guard isReloading else { return }
         isReloading = false
+        reloadVersion = nil
         onChange?(.progress)
     }
 
@@ -1811,13 +1830,19 @@ final class DocumentModel: GridDataSource {
             if let choices {
                 let shown = try opened.firstScreen().interpretation
                 if shown.delimiter != choices.delimiter || shown.encoding != choices.encoding {
-                    _ = try? opened.reinterpret(options: OpenOptions(
-                        delimiter: choices.delimiter,
-                        header: choices.header,
-                        encoding: choices.encoding,
-                        firstScreenRows: 1,
-                        maxChars: GridMetrics.maxCellCharacters
-                    ))
+                    do {
+                        _ = try opened.reinterpret(options: OpenOptions(
+                            delimiter: choices.delimiter,
+                            header: choices.header,
+                            encoding: choices.encoding,
+                            firstScreenRows: 1,
+                            maxChars: GridMetrics.maxCellCharacters
+                        ))
+                    } catch {
+                        // Replayed into another split, every edit would be
+                        // refused or land in the wrong cells.
+                        throw RecoveryError.readingDoesNotFit(underlying: error)
+                    }
                 }
             }
             return opened
@@ -1866,6 +1891,18 @@ final class DocumentModel: GridDataSource {
     /// The whole file's most common line ending, once the review knows it,
     /// else first paint's.
     var lineEnding: LineEnding? { reviewedLineEnding ?? interpretation.lineEnding }
+}
+
+/// A Reload, or Save As UTF-8's reading of its copy, wasn't adopted: the
+/// document was edited while the file was read, and those edits are kept
+/// (`DocumentModel.reloadInBackground`).
+struct EditedDuringReload: Error {}
+
+/// Why Recover changes couldn't put the edits back.
+enum RecoveryError: Error {
+    /// The file no longer reads with the delimiter and encoding the edits
+    /// were made in.
+    case readingDoesNotFit(underlying: any Error)
 }
 
 /// A core document (by `DocumentModel`'s count of Reloads) and a reading

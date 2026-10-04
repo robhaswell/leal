@@ -142,9 +142,6 @@ fn an_edit_reads_everywhere_the_row_is_read() {
     assert_eq!(row_text(&document, 1), ["1", "Marlow", "ok"]);
 }
 
-/// An edit changes the overlay in place unless a reader holds it (a copy
-/// in progress): with 100,000 edited rows, copying it on every edit made
-/// one take 1.7 ms instead of under 1 µs (`edits/set_cell_100k_edited_rows`).
 /// The grid's window of cells says which hold an edit (task 2.5.2, the
 /// edited-cell triangles of mockup 05a): an edited value, in the file's own
 /// fields or a hatched cell, but not a new row's own values, a column
@@ -188,6 +185,9 @@ fn a_window_of_cells_names_the_edited_ones() {
     assert_eq!(edited(1..3, 0..4), [vec![2], vec![0, 2]]);
 }
 
+/// An edit changes the overlay in place unless a reader holds it (a copy
+/// in progress): with 100,000 edited rows, copying it on every edit made
+/// one take 1.7 ms instead of under 1 µs (`edits/set_cell_100k_edited_rows`).
 #[test]
 fn an_edit_copies_the_overlay_only_while_a_reader_holds_it() {
     let dir = Dir::new("edit-in-place");

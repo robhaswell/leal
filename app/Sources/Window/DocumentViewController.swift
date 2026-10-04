@@ -639,6 +639,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 } else {
                     try await model.reloadInBackground()
                 }
+            } catch is EditedDuringReload {
+                self?.showEditedDuringReplace(saveAsUTF8: false)
             } catch {
                 self?.showReloadError(error)
             }
@@ -669,6 +671,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard let key = driveBanner?.identifier?.rawValue else { return }
         dismissed.insert(key)
         updateBanners()
+    }
+
+    /// A Reload or Save As UTF-8 kept the window on the file it showed,
+    /// because it was edited meanwhile (`EditedDuringReload`): say so.
+    private func showEditedDuringReplace(saveAsUTF8: Bool) {
+        let name = model.url.lastPathComponent
+        let alert = NSAlert()
+        alert.messageText = saveAsUTF8 ? HistoryText.editedDuringSaveAsUTF8(name) : HistoryText.editedDuringReload(name)
+        alert.informativeText = saveAsUTF8 ? HistoryText.editedDuringSaveAsUTF8Detail : HistoryText.editedDuringReloadDetail
+        present(alert)
     }
 
     private func showReloadError(_ error: any Error) {
@@ -1124,7 +1136,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // value (ADR-0008 decision 3), where the core allows an edit. A
             // missing (hatched) cell is edited in the grid.
             var editable: InspectorEdit?
-            if case let .value(shown) = content, model.editRefusal(.cell(cell)) == nil {
+            if case let .value(shown) = content, !isReplacingDocument, model.editRefusal(.cell(cell)) == nil {
                 editable = InspectorEdit(cell: cell, original: shown.text, truncated: shown.truncated)
             }
             showInInspector(column: column, row: cell.row + 1, content: content, edit: editable)
@@ -1144,13 +1156,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// the active cell.
     func editActiveCell(typing: NSEvent? = nil) {
         guard let cell = grid.activeCell, !model.isFailed else { return }
+        guard !isReplacingDocument else { return NSSound.beep() }
         cellEditor.begin(.cell(cell), typing: typing)
+    }
+
+    /// A Reload or Save As UTF-8 is replacing the document shown: editing
+    /// (the in-cell editor, the inspector, Rename Column) and undo are off
+    /// meanwhile, as an edit made now would be thrown away with the old
+    /// document. (`DocumentModel.reloadInBackground` also won't adopt the
+    /// new one over an edit made all the same.)
+    var isReplacingDocument: Bool {
+        savingAsUTF8 != nil || reloading != nil || model.isReloading
     }
 
     /// A column header's context menu: "Rename Column…", which edits the
     /// header row's cell in place (docs/tasks/2.1.md, "The header row").
     func headerMenu(column: Int) -> NSMenu? {
-        guard model.interpretation.header, !model.isFailed else { return nil }
+        guard model.interpretation.header, !model.isFailed, !isReplacingDocument else { return nil }
         let menu = NSMenu()
         let item = NSMenuItem(title: EditText.renameColumn, action: #selector(renameColumn(_:)), keyEquivalent: "")
         item.target = self
@@ -1166,6 +1188,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// Edits column `column`'s header-row cell in place.
     func rename(column: Int) {
         guard model.interpretation.header, !model.isFailed else { return }
+        guard !isReplacingDocument else { return NSSound.beep() }
         cellEditor.begin(.header(column: column))
     }
 
@@ -1402,7 +1425,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// **Save As UTF-8**, through the `NSDocument`
     /// (`CSVDocument.saveAsUTF8(to:)`), so it follows the copy. Returns
     /// whether it saved. Without one, the model saves and reloads.
-    var onSaveAsUTF8: ((URL) async throws -> Bool)?
+    /// The edit version as the save starts goes with it: an edit made
+    /// after it keeps the window on this file (`EditedDuringReload`).
+    var onSaveAsUTF8: ((URL, UInt64) async throws -> Bool)?
     /// A Save As UTF-8, while it is under way. Reload, Treat As and Reopen
     /// with Encoding are off meanwhile: each would read the file again
     /// while the save replaces it.
@@ -1440,15 +1465,21 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     private func startSavingAsUTF8(to url: URL) {
+        // An edit still open goes in the copy (or, refused, stays open,
+        // and nothing is saved).
+        guard commitEditing() else { return NSSound.beep() }
         let save = onSaveAsUTF8
         let model = model
+        let version = model.editVersion
         savingAsUTF8 = Task { [weak self] in
             do {
                 if let save {
-                    _ = try await save(url)
+                    _ = try await save(url, version)
                 } else if try await model.saveAsUTF8(to: url) != nil {
-                    try await model.reloadInBackground(from: url)
+                    try await model.reloadInBackground(from: url, editVersion: version)
                 }
+            } catch is EditedDuringReload {
+                self?.showEditedDuringReplace(saveAsUTF8: true)
             } catch let failure as SaveFailure {
                 // Including the core refusing to start it
                 // (`DocumentModel.saveAsUTF8`).
@@ -1643,6 +1674,11 @@ struct InspectorEdit: Equatable {
 extension DocumentViewController: NSTextViewDelegate {
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
         guard textView === inspector.textView, let edit = inspectorEdit else { return true }
+        if isReplacingDocument {
+            // A Reload or Save As UTF-8 would throw the edit away.
+            NSSound.beep()
+            return false
+        }
         if edit.truncated {
             // Only the start is shown: read the whole value, then edit it.
             loadWholeValueForEditing()

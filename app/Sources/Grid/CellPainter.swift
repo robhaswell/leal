@@ -818,18 +818,51 @@ enum CellPainter {
     }
 
     /// An edited, unsaved cell's mark (mockup 05a, task 2.5.2): a small
-    /// triangle in the accent colour in the cell's top leading corner.
-    static func drawEditedMark(in rect: CGRect, palette: GridPalette, context: CGContext) {
-        let size: CGFloat = 6
-        let x = rect.minX + 1
-        let y = rect.minY + 1
+    /// triangle in the accent colour in the cell's top leading corner, the
+    /// top right for a value that reads right to left.
+    static func drawEditedMark(in rect: CGRect, rightToLeft: Bool, palette: GridPalette, context: CGContext) {
+        let points = editedMarkPoints(in: rect, rightToLeft: rightToLeft)
         context.setFillColor(palette.accent)
         context.beginPath()
-        context.move(to: CGPoint(x: x, y: y))
-        context.addLine(to: CGPoint(x: x + size, y: y))
-        context.addLine(to: CGPoint(x: x, y: y + size))
+        context.addLines(between: points)
         context.closePath()
         context.fillPath()
+    }
+
+    /// The edited mark's corners: the corner of the cell (top left, or top
+    /// right for right-to-left text), then along the top, then down.
+    static func editedMarkPoints(in rect: CGRect, rightToLeft: Bool) -> [CGPoint] {
+        let size: CGFloat = 6
+        let y = rect.minY + 1
+        let x = rightToLeft ? rect.maxX - 1 : rect.minX + 1
+        let along = rightToLeft ? -size : size
+        return [CGPoint(x: x, y: y), CGPoint(x: x + along, y: y), CGPoint(x: x, y: y + size)]
+    }
+
+    /// Whether `text` reads right to left: its first strong character (a
+    /// letter, not a mark, digit or punctuation) is from a right-to-left
+    /// script. Unicode's rule for a paragraph's direction (UAX #9, P2),
+    /// with the scripts told apart by their blocks.
+    static func isRightToLeft(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            let properties = scalar.properties
+            switch properties.generalCategory {
+            case .nonspacingMark, .spacingMark, .enclosingMark:
+                continue
+            default:
+                guard properties.isAlphabetic else { continue }
+            }
+            switch scalar.value {
+            // Hebrew to Arabic Extended-A (Arabic, Syriac, Thaana, NKo,
+            // Samaritan, Mandaic), their presentation forms, and the
+            // supplementary planes' right-to-left blocks.
+            case 0x0590...0x08FF, 0xFB1D...0xFDFF, 0xFE70...0xFEFF, 0x10800...0x10FFF, 0x1E800...0x1EFFF:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
     }
 
     /// The gutter's marker for a row with a warning or an error (ADR-0002
