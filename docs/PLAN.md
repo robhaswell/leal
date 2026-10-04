@@ -604,112 +604,122 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       command on its stack, disable Undo/Redo for it while the save runs
       with the reason, and offer it again when the save ends. (2.4,
       ADR-0014 decision 1)
-  - [ ] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save
-    over the core's save job, the rebase after it, Revert, the failures.
-    - Override NSDocument's save to start the core's job, inside an
-      `NSFileCoordinator` write with `.forReplacing` (the document as file
-      presenter), serialised with `performAsynchronousFileAccess`.
-      (2.2; ADR-0012's consequences)
-    - Swift wraps the save's await in `withTaskCancellationHandler`, which
-      calls the job's `cancel()` (2.2; ADR-0005 decision 6).
-    - Set `fileModificationDate` from `SaveOutcome.modified`.
-    - Always pass an item-replacement folder on the file's volume, and a
-      second one for the snapshot, with a defined fallback where AppKit
-      can't make one (shares, FAT).
-    - Check the swap under the real sandbox entitlements (a user-selected
-      file's security scope, `renamex_np` in the item-replacement folder).
-    - Test on a real SMB share while Leal holds descriptors on the file:
-      the swap, its fallback, and close-time updates.
-    - Save asks before writing over a file that changed elsewhere
-      (`OriginalStatus.diverged`, which stays set after Keep Editing; DESIGN
-      §3.1), and **re-checks the original's identity immediately before
-      writing**, whatever the watcher last said: a network share's watcher
-      sees only this Mac's changes, and a change can land between the last
-      event and the save. (1.9 review)
-    - The check before writing opens the file afresh and reads its identity
-      with `fstat`, so network file systems revalidate; tested on a share if
-      one is available. (ADR-0008 decision 9)
-    - When the open couldn't read the file's modification date
-      (`PendingOpens.Facts.modified` is nil), Save's check before writing
-      looks at the file afresh rather than take it as unchanged. (2.0,
-      `SEAM(2.5)`)
-    - The user sees one prompt about a file changed elsewhere, never both
-      Leal's and NSDocument's own. Decide what Save does for a deleted file
-      (`can_save()` is true today; the core's save refuses it as `missing`,
-      and Save As works). (phase 1 review, 2.2)
-    - Ask on `diverged` before Save and on `changedElsewhere`, then save
-      again with `overwriteChanged`; offer Duplicate on `notWritable` and
-      Unlock on `locked`; try again after `moving`. (2.2)
-    - Word each `SaveFailure` (`notAFile` included); name `skippedEdits`
-      and `encodingNotSupported`'s cells; log `skippedMetadata` and
-      `rereadError`. (2.2)
-    - `SaveFailure::Unencodable` (and Save As UTF-8's unconvertible cells)
-      name at most 1,000 cells, by logical row and column, with a `more`
-      flag: say "and more" when it is set. Edited cells, inserted rows'
-      values and a column insert's cells can all be named. (2.4c)
-    - Leal's own save is not an outside change. After a successful save the
-      document is rebased onto the file just written: a new snapshot (clone,
-      or copy on removable drives), re-indexed; the watcher gets the new
-      identity and treats the event from Leal's own replace as expected;
-      `diverged` is cleared; edits and undo carry on. A hosted test saves
-      twice in a row and sees no banner and no prompt. (ADR-0008 decision 1)
-    - After a save (`SaveOutcome.firstScreen` set), as after a re-read:
-      adopt the new generation; drop the tiles and flag blocks; reset the
-      diagnostics and the review and wait for the new reading's; restart
-      Find on it; keep the column widths and the undo stack; drop the old
-      search and copy objects; count `editsDuringSave` as unsaved. (2.2)
-    - When `keptOldFile` is set, move it at once somewhere lasting (a
-      Recovered folder in Application Support, say), then tell the user
-      where it is. (2.2)
-    - When a save ends with `SaveJob.restarted()` set (a drive back during
-      the save), do what `restarted(_:)` does after `checkOriginal`. (2.2)
-    - Disable Treat As, Reopen with Encoding and the header toggle while a
-      save runs (`LealError.saving` otherwise). (2.2)
-    - Show the save's `SavePhase::Checking` (bytes of the file read, for the
-      census of a column's quoting) as its own step before writing, with
-      its own progress. (2.4c)
-    - After a save, `IndexProgress` says `complete` at once (the index and
-      field counts come from the save's plan), so rows and columns can be
-      inserted and deleted straight away. Don't take that for the
-      diagnostics: wait for the diagnostics report's own `is_complete`
-      before showing or clearing the diagnostics banner and the review,
-      which the new reading's index pass still has to build. (2.4c)
-    - Reload and Revert to Saved ask before discarding unsaved edits, and
-      Revert goes through the model's Reload, never NSDocument's default
-      `read(from:)`. Treat As and Reopen with Encoding are disabled while
-      there are unsaved edits ("Save or revert your changes first"); the
-      Header row toggle stays available; a drive coming back keeps the
-      edits. Each has a test. (ADR-0008 decision 4)
-    - Revert runs off the main thread, like Reload (`reloadInBackground`):
-      AppKit's `read(from:)` reads on the main thread, where a share must
-      never be read. (2.0, `SEAM(2.5)` in `CSVDocument.read(from:)`)
-    - Revert to Saved only, with no Versions browser: autosave-in-place
-      stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
-    - Save As from an incomplete document says plainly that the copy is
-      incomplete ("about N of M rows"); this wires the drive and
-      deleted-elsewhere banners' Save As… (`SEAM(2.5)`). (ADR-0008
-      decision 6, ADR-0010)
-    - Save As UTF-8 needs a progress display (the `SEAM(2.5)` in
-      `DocumentViewController`), and adopting the core's rebased reading
-      should replace the app's reload after Save As UTF-8.
-    - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
-      guess a different encoding, and updates it if the file already has one
-      (ADR-0004 decision 11).
-    - Writes the interpretation attribute when a reopen would guess a
-      different delimiter or header choice, or the user chose them.
-      (ADR-0005 decision 1)
-    - On every save, the interpretation attribute is written with
-      `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
-      paint or whole-file review would guess differently, when the user
-      chose the delimiter or header, or when the choice came from the
-      attribute; otherwise any old attribute is removed. The same rule for
-      `com.apple.TextEncoding`, against both the first-64 KB and the
-      whole-file guess. A hosted test checks that after Save the attributes
-      are the new values, not ones NSDocument copied from the old file.
-      (ADR-0008 decision 8)
-    - The whole-file delimiter review's part of ADR-0008 decision 8
-      (`SEAM(2.5)`): write the interpretation attribute when the rebased
-      reading's review suggests another delimiter. (2.2)
+  - [ ] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save over
+    the core's save job, the rebase after it, Revert, the failures. Split
+    into three parts of about a day (CLAUDE.md, token budget); the bullets
+    in each part are its acceptance criteria.
+    - [ ] **2.5.3a App: Save** — the save job inside a file coordination, the
+      refusals and their wording, progress, the guards on Treat As and the
+      like while it runs.
+      - Override NSDocument's save to start the core's job, inside an
+        `NSFileCoordinator` write with `.forReplacing` (the document as file
+        presenter), serialised with `performAsynchronousFileAccess`.
+        (2.2; ADR-0012's consequences)
+      - Swift wraps the save's await in `withTaskCancellationHandler`, which
+        calls the job's `cancel()` (2.2; ADR-0005 decision 6).
+      - Set `fileModificationDate` from `SaveOutcome.modified`.
+      - Always pass an item-replacement folder on the file's volume, and a
+        second one for the snapshot, with a defined fallback where AppKit
+        can't make one (shares, FAT).
+      - Save asks before writing over a file that changed elsewhere
+        (`OriginalStatus.diverged`, which stays set after Keep Editing; DESIGN
+        §3.1), and **re-checks the original's identity immediately before
+        writing**, whatever the watcher last said: a network share's watcher
+        sees only this Mac's changes, and a change can land between the last
+        event and the save. (1.9 review)
+      - The check before writing opens the file afresh and reads its identity
+        with `fstat`, so network file systems revalidate; tested on a share if
+        one is available. (ADR-0008 decision 9)
+      - When the open couldn't read the file's modification date
+        (`PendingOpens.Facts.modified` is nil), Save's check before writing
+        looks at the file afresh rather than take it as unchanged. (2.0,
+        `SEAM(2.5)`)
+      - The user sees one prompt about a file changed elsewhere, never both
+        Leal's and NSDocument's own. Decide what Save does for a deleted file
+        (`can_save()` is true today; the core's save refuses it as `missing`,
+        and Save As works). (phase 1 review, 2.2)
+      - Ask on `diverged` before Save and on `changedElsewhere`, then save
+        again with `overwriteChanged`; offer Duplicate on `notWritable` and
+        Unlock on `locked`; try again after `moving`. (2.2)
+      - Word each `SaveFailure` (`notAFile` included); name `skippedEdits`
+        and `encodingNotSupported`'s cells; log `skippedMetadata` and
+        `rereadError`. (2.2)
+      - `SaveFailure::Unencodable` (and Save As UTF-8's unconvertible cells)
+        name at most 1,000 cells, by logical row and column, with a `more`
+        flag: say "and more" when it is set. Edited cells, inserted rows'
+        values and a column insert's cells can all be named. (2.4c)
+      - Disable Treat As, Reopen with Encoding and the header toggle while a
+        save runs (`LealError.saving` otherwise). (2.2)
+      - Show the save's `SavePhase::Checking` (bytes of the file read, for the
+        census of a column's quoting) as its own step before writing, with
+        its own progress. (2.4c)
+    - [ ] **2.5.3b App: after a save** — adopting the core's rebased reading,
+      `keptOldFile`, and the attributes written on save.
+      - Leal's own save is not an outside change. After a successful save the
+        document is rebased onto the file just written: a new snapshot (clone,
+        or copy on removable drives), re-indexed; the watcher gets the new
+        identity and treats the event from Leal's own replace as expected;
+        `diverged` is cleared; edits and undo carry on. A hosted test saves
+        twice in a row and sees no banner and no prompt. (ADR-0008 decision 1)
+      - After a save (`SaveOutcome.firstScreen` set), as after a re-read:
+        adopt the new generation; drop the tiles and flag blocks; reset the
+        diagnostics and the review and wait for the new reading's; restart
+        Find on it; keep the column widths and the undo stack; drop the old
+        search and copy objects; count `editsDuringSave` as unsaved. (2.2)
+      - When `keptOldFile` is set, move it at once somewhere lasting (a
+        Recovered folder in Application Support, say), then tell the user
+        where it is. (2.2)
+      - After a save, `IndexProgress` says `complete` at once (the index and
+        field counts come from the save's plan), so rows and columns can be
+        inserted and deleted straight away. Don't take that for the
+        diagnostics: wait for the diagnostics report's own `is_complete`
+        before showing or clearing the diagnostics banner and the review,
+        which the new reading's index pass still has to build. (2.4c)
+      - Writes `com.apple.TextEncoding` on save when a reopen would otherwise
+        guess a different encoding, and updates it if the file already has one
+        (ADR-0004 decision 11).
+      - Writes the interpretation attribute when a reopen would guess a
+        different delimiter or header choice, or the user chose them.
+        (ADR-0005 decision 1)
+      - On every save, the interpretation attribute is written with
+        `Fingerprint::of` the saved bytes (ADR-0007) when a reopen's first
+        paint or whole-file review would guess differently, when the user
+        chose the delimiter or header, or when the choice came from the
+        attribute; otherwise any old attribute is removed. The same rule for
+        `com.apple.TextEncoding`, against both the first-64 KB and the
+        whole-file guess. A hosted test checks that after Save the attributes
+        are the new values, not ones NSDocument copied from the old file.
+        (ADR-0008 decision 8)
+      - The whole-file delimiter review's part of ADR-0008 decision 8
+        (`SEAM(2.5)`): write the interpretation attribute when the rebased
+        reading's review suggests another delimiter. (2.2)
+    - [ ] **2.5.3c App: Save As and Revert** — Save As (incomplete copies
+      included), Revert through Reload, `restarted()`, and the sandbox and
+      SMB checks.
+      - When a save ends with `SaveJob.restarted()` set (a drive back during
+        the save), do what `restarted(_:)` does after `checkOriginal`. (2.2)
+      - Save As from an incomplete document says plainly that the copy is
+        incomplete ("about N of M rows"); this wires the drive and
+        deleted-elsewhere banners' Save As… (`SEAM(2.5)`). (ADR-0008
+        decision 6, ADR-0010)
+      - Save As UTF-8 needs a progress display (the `SEAM(2.5)` in
+        `DocumentViewController`), and adopting the core's rebased reading
+        should replace the app's reload after Save As UTF-8.
+      - Reload and Revert to Saved ask before discarding unsaved edits, and
+        Revert goes through the model's Reload, never NSDocument's default
+        `read(from:)`. Treat As and Reopen with Encoding are disabled while
+        there are unsaved edits ("Save or revert your changes first"); the
+        Header row toggle stays available; a drive coming back keeps the
+        edits. Each has a test. (ADR-0008 decision 4)
+      - Revert runs off the main thread, like Reload (`reloadInBackground`):
+        AppKit's `read(from:)` reads on the main thread, where a share must
+        never be read. (2.0, `SEAM(2.5)` in `CSVDocument.read(from:)`)
+      - Revert to Saved only, with no Versions browser: autosave-in-place
+        stays off and `preservesVersions` stays false. (ADR-0008 decision 10)
+      - Check the swap under the real sandbox entitlements (a user-selected
+        file's security scope, `renamex_np` in the item-replacement folder).
+      - Test on a real SMB share while Leal holds descriptors on the file:
+        the swap, its fallback, and close-time updates.
 - [ ] **2.5a App: insert and delete rows and columns** (DESIGN §4.2).
   - Insert row and delete row (⌘↩ / ⌘⌫), and commands to insert and
     delete columns, all undoable, on top of 2.4.
