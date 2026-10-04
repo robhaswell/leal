@@ -228,6 +228,9 @@ final class SaveTests: XCTestCase {
             "Details: coordinating the save failed (The operation couldn’t be completed.)."
         )
         XCTAssertNil(SaveText.saveFailure(.Locked, name: "a.csv", headerRows: 1)?.details)
+        // Save As (and Duplicate) too.
+        XCTAssertEqual(SaveText.saveAsFailure(failure, name: "b.csv", headerRows: 1)?.details, refusal.details)
+        XCTAssertNil(SaveText.saveAsFailure(.NotAFile, name: "b.csv", headerRows: 1)?.details)
     }
 
     /// ⌘S writes what the core's own save writes, and the document is

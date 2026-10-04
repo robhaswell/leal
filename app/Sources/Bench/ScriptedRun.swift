@@ -58,7 +58,10 @@ import os
 ///   is sent to the system), wait for the Save, write
 ///   what happened to the file, and quit (`just sandbox-save-check`: a
 ///   Save under the real sandbox, of a file outside the container that
-///   `open` handed the app).
+///   `open` handed the app). Then, if asked: `-LealRevert YES` (an edit,
+///   then Revert to Saved), `-LealSaveAsTo <path>` (Save As), and
+///   `-LealDuplicateTo <path>` (`-LealDuplicateCells`' edits, then
+///   Duplicate), to files `open` was also handed, which are deleted first.
 /// - `-LealBenchEdit <n>`: once the document is indexed, edit `n` cells
 ///   through the in-cell editor (Return, new text, Return), one at a time,
 ///   each once the last is on screen, then quit: each edit's "Cell edit to
@@ -180,19 +183,17 @@ final class ScriptedRun {
             }
         } else if let out = value(of: "LealSaveCheck") {
             Task { @MainActor in
-                var result = await self.saveCheck()
-                if let path = self.value(of: "LealSaveAsTo") {
-                    result["saveAs"] = await self.saveAsCheck(to: URL(filePath: path))
-                }
+                let result = await self.saveChecks()
                 Self.write(result, to: Self.outputURL(out))
                 Self.quit()
             }
         }
     }
 
-    /// `-LealSetCells`' edits, committed as the editor does (task 2.5.2).
-    private func setCells(_ model: DocumentModel) {
-        guard let edits = value(of: "LealSetCells") else { return }
+    /// `-LealSetCells`' edits (or another option's, in the same form),
+    /// committed as the editor does (task 2.5.2).
+    private func setCells(_ model: DocumentModel, option: String = "LealSetCells") {
+        guard let edits = value(of: option) else { return }
         for edit in edits.split(separator: "+") {
             let parts = edit.split(separator: "=", maxSplits: 1)
             let place = parts.first?.split(separator: ",").compactMap { Int($0) } ?? []
@@ -202,33 +203,63 @@ final class ScriptedRun {
         }
     }
 
-    /// `-LealSaveCheck`: makes `-LealSetCells`' edits, chooses File > Save
-    /// inside the app (nothing is sent to the system), and waits for the
-    /// Save to end or for its alert, which it dismisses. Returns what
-    /// happened: Save's key and whether it was on, whether it saved, and
-    /// the failure and the alert's text if not.
-    ///
-    /// With `-LealSaveAsTo`, `open` was handed that file too, and it opened
-    /// as a second document: the check saves the other one.
-    private func saveCheck() async -> [String: Any] {
+    /// `-LealSaveCheck` (`just sandbox-save-check`): Save, then, if asked,
+    /// Revert to Saved (`-LealRevert YES`), Save As (`-LealSaveAsTo`) and
+    /// Duplicate (`-LealDuplicateTo`), each as the File menu does it,
+    /// inside the app (nothing is sent to the system). `open` was handed
+    /// the Save As and Duplicate files too, which grants the sandboxed app
+    /// their paths as a save panel would; their documents are closed and
+    /// the files deleted first, so each makes a new file there, with no
+    /// access to the folder. Returns what happened at each step.
+    private func saveChecks() async -> [String: Any] {
         var result: [String: Any] = [:]
         let saveAsTo = value(of: "LealSaveAsTo").map { URL(filePath: $0).standardizedFileURL }
+        let duplicateTo = value(of: "LealDuplicateTo").map { URL(filePath: $0).standardizedFileURL }
+        let targets = [saveAsTo, duplicateTo].compactMap { $0 }
         let documents: [CSVDocument] = await {
             let deadline = Date().addingTimeInterval(30)
             while Date() < deadline {
                 let all = NSDocumentController.shared.documents.compactMap { $0 as? CSVDocument }
-                if all.count == (saveAsTo == nil ? 1 : 2) { return all }
+                if all.count == 1 + targets.count { return all }
                 try? await Task.sleep(for: .milliseconds(20))
             }
             return []
         }()
-        guard let document = documents.first(where: { $0.fileURL?.standardizedFileURL != saveAsTo }),
+        guard let document = documents.first(where: { !targets.contains($0.fileURL?.standardizedFileURL ?? URL(filePath: "/")) }),
               let content = (document.windowControllers.first as? DocumentWindowController)?.content
         else {
             result["error"] = "the documents didn't open"
             return result
         }
-        result["file"] = document.fileURL?.path(percentEncoded: false) ?? ""
+        for other in documents where other !== document {
+            other.updateChangeCount(.changeCleared)
+            other.close()
+        }
+        for target in targets where unlink(target.path(percentEncoded: false)) != 0 {
+            result["error"] = "couldn’t delete \(target.lastPathComponent) first: errno \(errno)"
+            return result
+        }
+        result.merge(await saveCheck(document, content: content)) { $1 }
+        guard result["saved"] as? Bool == true else { return result }
+        if has("LealRevert") {
+            result["revert"] = await revertCheck(document, content: content)
+        }
+        if let saveAsTo {
+            result["saveAs"] = await saveAsCheck(document, to: saveAsTo, duplicate: false)
+        }
+        if let duplicateTo {
+            setCells(content.model, option: "LealDuplicateCells")
+            result["duplicate"] = await saveAsCheck(document, to: duplicateTo, duplicate: true)
+        }
+        return result
+    }
+
+    /// Makes `-LealSetCells`' edits, chooses File > Save, and waits for the
+    /// Save to end or for its alert, which it dismisses. Returns what
+    /// happened: Save's key and whether it was on, whether it saved, and
+    /// the failure and the alert's text if not.
+    private func saveCheck(_ document: CSVDocument, content: DocumentViewController) async -> [String: Any] {
+        var result: [String: Any] = ["file": document.fileURL?.path(percentEncoded: false) ?? ""]
         if let url = document.fileURL {
             result.merge(Self.folders(for: url)) { $1 }
         }
@@ -238,7 +269,6 @@ final class ScriptedRun {
         }
         setCells(content.model)
         result["editedBeforeSave"] = document.isDocumentEdited
-        let window = content.view.window
         let file = NSApp.mainMenu?.items.compactMap(\.submenu).first { $0.items.contains { $0.action == #selector(NSDocument.save(_:)) } }
         guard let save = file?.items.first(where: { $0.action == #selector(NSDocument.save(_:)) }) else {
             result["error"] = "the File menu has no Save"
@@ -250,18 +280,28 @@ final class ScriptedRun {
         // the frontmost app alone), so it has no key window for the
         // responder chain: the document is the target.
         NSApp.sendAction(#selector(NSDocument.save(_:)), to: document, from: save)
-        // The Save starts on a later turn of the run loop.
+        result.merge(await Self.saveEnded(document)) { $1 }
+        result["saved"] = !document.isDocumentEdited && document.lastSaveFailure == nil
+        return result
+    }
+
+    /// Waits for the saves under way to end, or for an alert, which it
+    /// dismisses (Cancel), and returns the failure, the alert's text and
+    /// what the save did.
+    private static func saveEnded(_ document: CSVDocument) async -> [String: Any] {
+        var result: [String: Any] = [:]
+        let window = document.windowControllers.first?.window
+        // The save starts on a later turn of the run loop.
         try? await Task.sleep(for: .milliseconds(100))
         let deadline = Date().addingTimeInterval(30)
         while document.saving != nil, window?.attachedSheet == nil, Date() < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
         if let window, let sheet = window.attachedSheet {
-            result["alert"] = Self.texts(in: sheet)
+            result["alert"] = texts(in: sheet)
             window.endSheet(sheet, returnCode: .cancel)
             _ = await document.saving?.value
         }
-        result["saved"] = !document.isDocumentEdited && document.lastSaveFailure == nil
         if let failure = document.lastSaveFailure {
             result["failure"] = String(describing: failure)
         }
@@ -272,6 +312,58 @@ final class ScriptedRun {
             result["keptOldFile"] = outcome.keptOldFile ?? ""
             result["skippedMetadata"] = outcome.skippedMetadata
         }
+        return result
+    }
+
+    /// `-LealRevert YES`: edits the first row's second cell, then chooses
+    /// File > Revert to Saved, answering its question (discard the edits)
+    /// with yes, and waits for the file to be read again. Reverted if the
+    /// question was asked and no edits are left.
+    private func revertCheck(_ document: CSVDocument, content: DocumentViewController) async -> [String: Any] {
+        var result: [String: Any] = [:]
+        _ = content.model.setCell(.cell(CellPosition(row: 0, column: 1)), to: "Unsaved")
+        result["editedBeforeRevert"] = document.isDocumentEdited
+        var asked = false
+        let confirm = content.confirmDiscardingEdits
+        content.confirmDiscardingEdits = { _, answer in
+            asked = true
+            answer(true)
+        }
+        defer { content.confirmDiscardingEdits = confirm }
+        NSApp.sendAction(#selector(NSDocument.revertToSaved(_:)), to: document, from: nil)
+        try? await Task.sleep(for: .milliseconds(100))
+        let deadline = Date().addingTimeInterval(30)
+        while content.reloading != nil || content.model.isReloading, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        result["asked"] = asked
+        result["reverted"] = asked && !document.isDocumentEdited && !content.model.hasUnsavedEdits
+        return result
+    }
+
+    /// Save As (`duplicate` false) or Duplicate to `url`, as File > Save
+    /// As… and Duplicate do, with the save panel's answer given here
+    /// (`chooseSaveAsDestination`). Saved if the document is then the
+    /// file at `url`, clean.
+    private func saveAsCheck(_ document: CSVDocument, to url: URL, duplicate: Bool) async -> [String: Any] {
+        var result: [String: Any] = ["file": url.path(percentEncoded: false)]
+        result.merge(Self.folders(for: url)) { $1 }
+        var suggested: String?
+        let choose = document.chooseSaveAsDestination
+        document.chooseSaveAsDestination = { request, _, done in
+            suggested = request.name
+            done(url)
+        }
+        defer { document.chooseSaveAsDestination = choose }
+        if duplicate {
+            NSApp.sendAction(#selector(NSDocument.duplicate(_:)), to: document, from: nil)
+        } else {
+            NSApp.sendAction(#selector(NSDocument.saveAs(_:)), to: document, from: nil)
+        }
+        result.merge(await Self.saveEnded(document)) { $1 }
+        result["suggestedName"] = suggested ?? ""
+        result["saved"] = document.fileURL?.standardizedFileURL == url.standardizedFileURL
+            && !document.isDocumentEdited && document.lastSaveFailure == nil
         return result
     }
 
@@ -294,45 +386,6 @@ final class ScriptedRun {
             result["folderNextToFile"] = "allowed"
         } else {
             result["folderNextToFile"] = "errno \(errno)"
-        }
-        return result
-    }
-
-    /// `-LealSaveAsTo <path>`: a Save As through the core to a new file at
-    /// `url`, outside the container, after the Save. A save panel would
-    /// grant the app that file's path; here `open` granted it, as the
-    /// second file it was handed. Its document is closed and the file
-    /// deleted first, so the Save As makes a new file there, with no
-    /// access to the folder, as after a save panel. The core's save to a
-    /// new place (`SaveKind.saveAs`) is what Save As uses (task 2.5.3c).
-    private func saveAsCheck(to url: URL) async -> [String: Any] {
-        var result: [String: Any] = ["file": url.path(percentEncoded: false)]
-        let documents = NSDocumentController.shared.documents.compactMap { $0 as? CSVDocument }
-        guard let source = documents.first(where: { $0.fileURL?.standardizedFileURL != url.standardizedFileURL }),
-              let model = source.model
-        else {
-            result["error"] = "no document to save"
-            return result
-        }
-        for document in documents where document !== source {
-            document.updateChangeCount(.changeCleared)
-            document.close()
-        }
-        if unlink(url.path(percentEncoded: false)) != 0 {
-            result["error"] = "couldn’t delete the file first: errno \(errno)"
-            return result
-        }
-        result.merge(Self.folders(for: url)) { $1 }
-        do {
-            let saved = try await model.save(to: url, kind: .saveAs)
-            result["saved"] = saved != nil
-            result["swapped"] = saved?.outcome.swapped ?? false
-        } catch {
-            result["saved"] = false
-            result["failure"] = String(describing: error)
-            if let failure = error as? SaveFailure {
-                Logger.document.error("Save As check failed: \(String(describing: failure), privacy: .public)")
-            }
         }
         return result
     }

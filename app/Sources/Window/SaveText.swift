@@ -426,10 +426,15 @@ extension SaveText {
             return saveFailure(failure, name: name, headerRows: headerRows)
         default:
             guard let message = saveAsUTF8Failure(failure, headerRows: headerRows) else { return nil }
+            var details: String?
+            if case let .Io(step, code, message) = failure {
+                details = ioDetails(step: step, code: code, message: message)
+            }
             return Refusal(
                 title: String(localized: "“\(name)” wasn’t saved.", comment: "Alert title: Save failed; the file's name"),
                 detail: message.detail,
-                choices: [.ok]
+                choices: [.ok],
+                details: details
             )
         }
     }

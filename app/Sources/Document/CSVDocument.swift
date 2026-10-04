@@ -631,15 +631,15 @@ final class CSVDocument: NSDocument {
     /// Logs why a Save failed, at error level: for a write that failed, the
     /// step, the OS error (`errno`) and the file, so the cause can be found
     /// in Console from the user's report.
-    private static func log(_ failure: SaveFailure, url: URL) {
+    private static func log(_ failure: SaveFailure, url: URL, what: String = "Save") {
         let path = url.path(percentEncoded: false)
         if case let .Io(step, code, message) = failure {
             let errno = code.map { String($0) } ?? "none"
             Logger.document.error(
-                "Save failed \(step, privacy: .public) (errno \(errno, privacy: .public): \(message, privacy: .public)) for \(path, privacy: .private)"
+                "\(what, privacy: .public) failed \(step, privacy: .public) (errno \(errno, privacy: .public): \(message, privacy: .public)) for \(path, privacy: .private)"
             )
         } else {
-            Logger.document.error("Save failed: \(String(describing: failure), privacy: .public) for \(path, privacy: .private)")
+            Logger.document.error("\(what, privacy: .public) failed: \(String(describing: failure), privacy: .public) for \(path, privacy: .private)")
         }
     }
 
@@ -1305,12 +1305,15 @@ final class CSVDocument: NSDocument {
     private func saveAsAndSay(_ url: URL) async -> Bool {
         guard let model else { return false }
         switch await saveAsNow(url, kind: .saveAs) {
-        case .success(.some):
+        case let .success(saved?):
+            lastSaveFailure = nil
+            lastSaveOutcome = saved.outcome
             return true
         case .success(nil):
             return false
         case let .failure(failure):
-            Logger.document.error("Save As failed: \(String(describing: failure), privacy: .public)")
+            lastSaveFailure = failure
+            Self.log(failure, url: url, what: "Save As")
             guard !model.isFailed,
                   let refusal = SaveText.saveAsFailure(failure, name: url.lastPathComponent, headerRows: model.headerRows)
             else { return false }
