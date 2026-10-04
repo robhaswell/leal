@@ -20,6 +20,23 @@ pub const COLUMN_LIMIT: usize = 1 << 20;
 /// ms, the undo included (`row_edits/duplicate_10k_rows`).
 pub const DUPLICATE_ROW_LIMIT: usize = 10_000;
 
+/// The most cells Paste or Clear changes at once (task 2.6): it reads each
+/// cell's row and makes the command on the main thread, and the command
+/// (with every cell's old and new value) goes to the app's undo history
+/// and journal, so Select All then Delete on a large file is refused
+/// rather than freezing the window and holding the file's values several
+/// times over. 100,000 cells of the reference file take about 44 ms in the
+/// core, the undo included (`edits/paste_100k_cells`; 39 ms to clear), and
+/// about 25 ms on the main thread in all (the app keeps such a command in
+/// Rust: `CellBatch` in `leal-ffi`).
+pub const CELL_BATCH_LIMIT: usize = 100_000;
+
+/// The most text Paste puts into cells at once (task 2.6), in bytes: the
+/// clipboard's text, or for one value pasted into every selected cell,
+/// the value times the cells. Each cell keeps its own copy, as does the
+/// command for undo.
+pub const PASTE_BYTE_LIMIT: usize = 32 << 20;
+
 /// Which set of edits a command belongs to: a document's edits, while the
 /// file is split into cells one way (ADR-0008 decision 4).
 ///
@@ -270,6 +287,29 @@ pub enum EditError {
         /// How many were asked for.
         count: usize,
     },
+    /// More cells than [`CELL_BATCH_LIMIT`] to paste into or clear at once
+    /// (task 2.6).
+    TooManyCells {
+        /// How many were asked for (for a paste, at least this many).
+        count: usize,
+    },
+    /// More text than [`PASTE_BYTE_LIMIT`] to paste at once (task 2.6).
+    TooMuchText {
+        /// About how many bytes.
+        bytes: usize,
+    },
+    /// The pasted cells run past the last row (task 2.6): rows aren't
+    /// added by a paste.
+    PastLastRow {
+        /// The pasted cells' rows.
+        rows: usize,
+    },
+    /// The pasted cells run past the last column the grid shows (task
+    /// 2.6): columns aren't added by a paste.
+    PastLastColumn {
+        /// The pasted cells' columns.
+        columns: usize,
+    },
     /// The row couldn't be read (see `Document::rows`).
     Read {
         /// The row.
@@ -310,6 +350,20 @@ impl fmt::Display for EditError {
                 f,
                 "{count} rows can't be duplicated at once: at most {DUPLICATE_ROW_LIMIT}"
             ),
+            EditError::TooManyCells { count } => write!(
+                f,
+                "{count} cells can't be changed at once: at most {CELL_BATCH_LIMIT}"
+            ),
+            EditError::TooMuchText { bytes } => write!(
+                f,
+                "{bytes} bytes can't be pasted at once: at most {PASTE_BYTE_LIMIT}"
+            ),
+            EditError::PastLastRow { rows } => {
+                write!(f, "the {rows} pasted rows run past the last row")
+            }
+            EditError::PastLastColumn { columns } => {
+                write!(f, "the {columns} pasted columns run past the last column")
+            }
             EditError::Read { row, error } => write!(f, "row {row} couldn't be read: {error}"),
         }
     }

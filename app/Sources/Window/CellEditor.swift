@@ -894,8 +894,9 @@ enum EditText {
             String(localized: "This cell is too far past the end of its row to edit.", comment: "Callout: a cell too far right can't be edited")
         case .unreadable:
             String(localized: "This row can’t be read: its drive or share isn’t available.", comment: "Callout: a cell whose row can't be read can't be edited")
-        // A cell edit never refuses `.tooManyRows`: that is Duplicate Row's.
-        case .noSuchRow, .noSuchColumn, .tooManyRows:
+        // A cell edit never refuses `.tooManyRows` and the like: those
+        // are Duplicate Row's, Paste's and Clear's (PasteText says them).
+        case .noSuchRow, .noSuchColumn, .tooManyRows, .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
             String(localized: "This cell isn’t in the file.", comment: "Callout: a cell that isn't in the file can't be edited")
         case .valueChanged, .otherLineage:
             String(localized: "The cell changed meanwhile, so the edit wasn’t made.", comment: "Callout: an edit refused because the cell changed")

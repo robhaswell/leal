@@ -79,11 +79,106 @@ pub struct EditCommand {
     /// The edits it belongs to ([`Document::lineage`]).
     pub lineage: u64,
     /// The cells it changes, in order: one for an edit, several for a
-    /// batch (all or nothing). Empty for a row insert or delete.
+    /// small batch (all or nothing). Empty for a row insert or delete, and
+    /// for a batch of more than `INLINE_CHANGES` cells, which is in
+    /// `cells`.
     pub changes: Vec<ValueChange>,
     /// The rows it inserts or deletes, for a row insert or delete, or the
     /// column, for a column insert or delete.
     pub structural: Option<Arc<StructuralEdit>>,
+    /// A batch of more than `INLINE_CHANGES` cells (a paste, a clear,
+    /// task 2.6), kept in Rust: handing Swift a value for each of 100,000
+    /// cells took over 100 ms, five times the edit itself. See
+    /// `CellBatch`.
+    pub cells: Option<Arc<CellBatch>>,
+}
+
+/// Batches of up to this many cells are given to Swift as their
+/// [`ValueChange`]s; larger ones stay in Rust, as a `CellBatch`.
+pub const INLINE_CHANGES: usize = 256;
+
+/// A batch of many cells' changes (a paste, a clear: task 2.6) inside an
+/// [`EditCommand`], kept in Rust: opaque to the app, which keeps it for
+/// undo, redo and its journal, but for what it needs to show the cells
+/// (where they are, and the values that may widen a column) and to name
+/// the step.
+#[derive(Debug, PartialEq, Eq, uniffi::Object)]
+pub struct CellBatch {
+    changes: Vec<CellChange>,
+}
+
+#[uniffi::export]
+impl CellBatch {
+    /// How many cells it changes.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        to_u64(self.changes.len())
+    }
+
+    /// The first cell it changes, to name it.
+    #[must_use]
+    pub fn first(&self) -> Option<ValueChange> {
+        self.changes.first().cloned().map(ValueChange::from)
+    }
+
+    /// The first and last logical rows it changes.
+    #[must_use]
+    pub fn rows(&self) -> Option<RowSpan> {
+        let first = self.changes.iter().map(|change| change.row).min()?;
+        let last = self.changes.iter().map(|change| change.row).max()?;
+        Some(RowSpan {
+            first: to_u64(first),
+            last: to_u64(last),
+        })
+    }
+
+    /// Each column's `per_column` longest values (by UTF-8 length), as the
+    /// cells read once it is applied, or once it is undone (`undone`): the
+    /// values that may widen their column. A missing cell has none.
+    #[must_use]
+    pub fn longest(&self, undone: bool, per_column: u32) -> Vec<ValueChange> {
+        let per_column = to_usize(per_column);
+        let mut by_column: std::collections::BTreeMap<usize, Vec<(usize, &CellChange)>> =
+            std::collections::BTreeMap::new();
+        for change in &self.changes {
+            let shown = if undone { &change.old } else { &change.new };
+            let Some(value) = shown else { continue };
+            let longest = by_column.entry(change.column).or_default();
+            if longest.len() == per_column
+                && longest.last().is_some_and(|&(len, _)| len >= value.len())
+            {
+                continue;
+            }
+            let at = longest.partition_point(|&(len, _)| len >= value.len());
+            longest.insert(at, (value.len(), change));
+            longest.truncate(per_column);
+        }
+        by_column
+            .into_values()
+            .flatten()
+            .map(|(_, change)| ValueChange::from(change.clone()))
+            .collect()
+    }
+}
+
+/// The first and last logical rows of a `CellBatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RowSpan {
+    /// The first.
+    pub first: u64,
+    /// The last.
+    pub last: u64,
+}
+
+impl From<CellChange> for ValueChange {
+    fn from(change: CellChange) -> Self {
+        ValueChange {
+            row: to_u64(change.row),
+            column: to_u32(change.column),
+            old_value: change.old,
+            new_value: change.new,
+        }
+    }
 }
 
 /// A row insert or delete (task 2.4a), or a column's (task 2.4b), inside an
@@ -200,6 +295,15 @@ pub enum EditRefusal {
     NoSuchColumn,
     /// More rows than `duplicate_row_limit()` to duplicate at once.
     TooManyRows,
+    /// More cells than `cell_batch_limit()` to paste into or clear at once
+    /// (task 2.6).
+    TooManyCells,
+    /// More text than `paste_byte_limit()` to paste at once (task 2.6).
+    TooMuchText,
+    /// The pasted cells run past the last row (task 2.6).
+    PastLastRow,
+    /// The pasted cells run past the last column shown (task 2.6).
+    PastLastColumn,
     /// The row couldn't be read (its drive or share went away).
     Unreadable,
 }
@@ -225,26 +329,24 @@ pub struct ReplayReport {
 
 impl From<Command> for EditCommand {
     fn from(command: Command) -> Self {
-        let (changes, structural) = match command.edit {
-            Edit::SetCell(change) => (vec![change], None),
-            Edit::SetCells(changes) => (changes, None),
+        let (changes, structural, cells) = match command.edit {
+            Edit::SetCell(change) => (vec![change], None, None),
+            Edit::SetCells(changes) if changes.len() > INLINE_CHANGES => {
+                (Vec::new(), None, Some(Arc::new(CellBatch { changes })))
+            }
+            Edit::SetCells(changes) => (changes, None, None),
             edit @ (Edit::InsertRows { .. }
             | Edit::DeleteRows { .. }
             | Edit::InsertColumn { .. }
-            | Edit::DeleteColumn { .. }) => (Vec::new(), Some(Arc::new(StructuralEdit { edit }))),
+            | Edit::DeleteColumn { .. }) => {
+                (Vec::new(), Some(Arc::new(StructuralEdit { edit })), None)
+            }
         };
         EditCommand {
             lineage: command.lineage.get(),
             structural,
-            changes: changes
-                .into_iter()
-                .map(|change| ValueChange {
-                    row: to_u64(change.row),
-                    column: to_u32(change.column),
-                    old_value: change.old,
-                    new_value: change.new,
-                })
-                .collect(),
+            changes: changes.into_iter().map(ValueChange::from).collect(),
+            cells,
         }
     }
 }
@@ -255,6 +357,12 @@ impl From<EditCommand> for Command {
             return Command {
                 lineage: Lineage::from_raw(command.lineage),
                 edit: structural.edit.clone(),
+            };
+        }
+        if let Some(cells) = command.cells {
+            return Command {
+                lineage: Lineage::from_raw(command.lineage),
+                edit: Edit::SetCells(cells.changes.clone()),
             };
         }
         let mut changes: Vec<CellChange> = command
@@ -287,6 +395,63 @@ pub fn duplicate_row_limit() -> u64 {
     to_u64(edit::DUPLICATE_ROW_LIMIT)
 }
 
+/// The most cells **Paste** or **Clear** changes at once (task 2.6), for
+/// the reason given when more are selected or pasted. See
+/// `leal_core::edit::CELL_BATCH_LIMIT`.
+#[uniffi::export]
+#[must_use]
+pub fn cell_batch_limit() -> u64 {
+    to_u64(edit::CELL_BATCH_LIMIT)
+}
+
+/// The most bytes of text **Paste** puts into cells at once (task 2.6).
+/// See `leal_core::edit::PASTE_BYTE_LIMIT`.
+#[uniffi::export]
+#[must_use]
+pub fn paste_byte_limit() -> u64 {
+    to_u64(edit::PASTE_BYTE_LIMIT)
+}
+
+/// The rows and columns of clipboard text, as **Paste** reads it (task
+/// 2.6): how many rows, and the longest row's cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PasteShape {
+    /// Rows.
+    pub rows: u64,
+    /// The longest row's cells.
+    pub columns: u32,
+}
+
+/// How **Paste** reads clipboard `text` (tab-separated values, see
+/// `leal_core::edit::parse_tsv`): its rows and columns, for the app to
+/// select the cells a block was pasted into. `nil` past
+/// `cell_batch_limit()` cells.
+#[uniffi::export]
+#[must_use]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "UniFFI passes a string from Swift by value"
+)]
+pub fn paste_shape(text: String) -> Option<PasteShape> {
+    let pasted = edit::parse_tsv(&text, edit::CELL_BATCH_LIMIT).ok()?;
+    Some(PasteShape {
+        rows: to_u64(pasted.height()),
+        columns: to_u32(pasted.width()),
+    })
+}
+
+/// Logical rows `start..start + count`, as the core takes them.
+fn row_range(start: u64, count: u64) -> std::ops::Range<usize> {
+    let start = to_index(start);
+    start..start.saturating_add(to_index(count))
+}
+
+/// Columns `start..start + count`.
+fn column_range(start: u32, count: u32) -> std::ops::Range<usize> {
+    let start = to_usize(start);
+    start..start.saturating_add(to_usize(count))
+}
+
 /// The command that undoes `command`: what [`Document::undo`] applies. The
 /// app's recovery journal (task 2.5.2) records an undo as this, so a replay
 /// applies what the undo did (ADR-0008 decision 5).
@@ -315,6 +480,10 @@ fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
         EditError::Saving => (EditRefusal::Saving, None, None),
         EditError::NoSuchColumn { column } => (EditRefusal::NoSuchColumn, None, Some(column)),
         EditError::TooManyRows { .. } => (EditRefusal::TooManyRows, None, None),
+        EditError::TooManyCells { .. } => (EditRefusal::TooManyCells, None, None),
+        EditError::TooMuchText { .. } => (EditRefusal::TooMuchText, None, None),
+        EditError::PastLastRow { .. } => (EditRefusal::PastLastRow, None, None),
+        EditError::PastLastColumn { .. } => (EditRefusal::PastLastColumn, None, None),
         EditError::Read { row, .. } => (EditRefusal::Unreadable, Some(row), None),
     }
 }
@@ -481,6 +650,121 @@ impl Document {
             Ok(self
                 .document
                 .can_duplicate_rows(to_index(at), to_index(count))
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// **Paste** (task 2.6): clipboard `text`, read as tab-separated
+    /// values, into the selection of logical rows `row_start..row_start +
+    /// row_count` and columns `column_start..column_start + column_count`,
+    /// as one command for the undo manager. One value goes into every
+    /// selected cell; more go in as a block from the selection's top-left
+    /// cell, which must fit within the rows and the `columns_shown`
+    /// columns the grid shows. The hatched-cell rule holds (ADR-0005
+    /// decision 2). `nil` if no cell changes. On the main thread: it takes
+    /// at most `cell_batch_limit()` cells. See
+    /// `leal_core::document::Document::paste`.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::EditRefused`] with [`EditRefusal::StillReading`],
+    /// [`EditRefusal::Saving`], [`EditRefusal::TooManyCells`],
+    /// [`EditRefusal::TooMuchText`], [`EditRefusal::PastLastRow`],
+    /// [`EditRefusal::PastLastColumn`] or
+    /// [`EditRefusal::AfterUnterminatedQuote`], with the document
+    /// unchanged; [`LealError::DocumentFailed`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "UniFFI passes a string from Swift by value"
+    )]
+    pub fn paste(
+        &self,
+        row_start: u64,
+        row_count: u64,
+        column_start: u32,
+        column_count: u32,
+        columns_shown: u32,
+        text: String,
+    ) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .paste(
+                    row_range(row_start, row_count),
+                    column_range(column_start, column_count),
+                    to_usize(columns_shown),
+                    &text,
+                )
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Whether **Paste** can run now: `nil` if it can, otherwise why not
+    /// ([`EditRefusal::StillReading`] or [`EditRefusal::Saving`]). What
+    /// is pasted is checked by [`paste`](Self::paste).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_paste(&self) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_paste()
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
+    /// **Clear** (Delete, task 2.6): every cell of the selection set to
+    /// `""`, as one command. A cell past its row's end stays missing.
+    /// `nil` if no cell changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`can_clear_cells`](Self::can_clear_cells) refuses, and
+    /// [`EditRefusal::AfterUnterminatedQuote`]; [`LealError::DocumentFailed`].
+    pub fn clear_cells(
+        &self,
+        row_start: u64,
+        row_count: u64,
+        column_start: u32,
+        column_count: u32,
+    ) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .clear_cells(
+                    row_range(row_start, row_count),
+                    column_range(column_start, column_count),
+                )
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Whether the selection can be cleared now: `nil` if it can,
+    /// otherwise why not ([`EditRefusal::StillReading`],
+    /// [`EditRefusal::Saving`], [`EditRefusal::TooManyCells`], or
+    /// [`EditRefusal::NoSuchRow`] for no rows). It reads no row.
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_clear_cells(
+        &self,
+        row_start: u64,
+        row_count: u64,
+        column_start: u32,
+        column_count: u32,
+    ) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_clear_cells(
+                    row_range(row_start, row_count),
+                    column_range(column_start, column_count),
+                )
                 .err()
                 .map(|error| refusal(&error).0))
         })

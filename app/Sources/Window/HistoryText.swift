@@ -36,7 +36,8 @@ enum HistoryText {
         switch refusal {
         case .stillReading, .notReadYet, .unreadable, .saving:
             true
-        case .noSuchRow, .tooFarRight, .afterUnterminatedQuote, .valueChanged, .otherLineage, .noSuchColumn, .tooManyRows:
+        case .noSuchRow, .tooFarRight, .afterUnterminatedQuote, .valueChanged, .otherLineage, .noSuchColumn, .tooManyRows,
+             .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
             false
         }
     }
@@ -125,10 +126,10 @@ enum HistoryText {
                 ? String(localized: "Inserting \(rows) rows at \(row)", comment: "An edit that couldn't be recovered: rows inserted; how many, where")
                 : String(localized: "Deleting \(rows) rows at \(row)", comment: "An edit that couldn't be recovered: rows deleted; how many, where")
         }
-        guard let first = command.changes.first else { return "" }
+        guard let first = command.firstChange else { return "" }
         let place = String(localized: "\(rowName(first.row, header: header)), column \(Int(first.column) + 1)", comment: "A cell: its row, then its column number")
-        guard command.changes.count > 1 else { return place }
-        let more = command.changes.count - 1
+        guard command.cellCount > 1 else { return place }
+        let more = command.cellCount - 1
         return String(localized: "\(place) and \(more) more cells", comment: "Several cells changed at once: the first, then how many more")
     }
 
@@ -145,8 +146,9 @@ enum HistoryText {
         switch refusal {
         case .valueChanged, .otherLineage:
             String(localized: "the cell changed", comment: "Why an edit couldn't be recovered: the file changed there")
-        // A replay never refuses `.tooManyRows`: that is Duplicate Row's.
-        case .noSuchRow, .noSuchColumn, .tooFarRight, .tooManyRows:
+        // A replay never refuses `.tooManyRows` and the like: those are
+        // Duplicate Row's, Paste's and Clear's, asked before a command.
+        case .noSuchRow, .noSuchColumn, .tooFarRight, .tooManyRows, .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
             String(localized: "it isn’t in the file any more", comment: "Why an edit couldn't be recovered: the row or column is gone")
         case .notReadYet, .unreadable, .stillReading, .saving:
             String(localized: "the row couldn’t be read", comment: "Why an edit couldn't be recovered: its row couldn't be read")

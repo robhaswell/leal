@@ -232,6 +232,9 @@
     "A quote at %@ is never closed, so the rest of the file is one cell. That cell can still be edited, but rows and columns can’t be added or duplicated after it: they would land inside the quote. Insert Row Above still works." : {
       "comment" : "Details popover: the unterminated quote, and what it stops (ADR-0004 decision 8); where its opening quote is, such as row 12"
     },
+    "A quote earlier in a row is never closed, so the cells after it are inside the quote and can’t be changed." : {
+      "comment" : "Alert: a paste or clear reached cells after an unterminated quote (ADR-0004 decision 8, task 2.6)"
+    },
     "A quote in the last row is never closed, so a column inserted after it would land inside the quote. Insert Column Before still works, and the cell can still be edited." : {
       "comment" : "Tooltip: Insert Column is off after an unterminated quote (ADR-0004 decision 8)"
     },
@@ -292,6 +295,12 @@
     "Cell value" : {
       "comment" : "VoiceOver name of the cell inspector's text"
     },
+    "Cells can be cleared once Leal has read the whole file." : {
+      "comment" : "Tooltip: Delete is off until the file is read (task 2.6)"
+    },
+    "Cells can be pasted into once Leal has read the whole file." : {
+      "comment" : "Tooltip: Paste is off until the file is read (task 2.6)"
+    },
     "Changed on disk" : {
       "comment" : "Status bar: another app changed the open file; Leal shows the version it opened (task 1.9)"
     },
@@ -300,6 +309,9 @@
     },
     "Checking the file before saving…" : {
       "comment" : "Status bar: a save reads every row first, to quote new cells the way the file's columns are quoted (task 2.4c)"
+    },
+    "Clear Cells" : {
+      "comment" : "The Undo menu's Undo Clear Cells: Delete emptied the selected cells (task 2.6)"
     },
     "Clear Menu" : {
       "comment" : "File > Open Recent"
@@ -612,11 +624,20 @@
     "Keep your changes in a duplicate, or ask the file’s owner for permission to write it." : {
       "comment" : "Alert text: Save refused a file Leal may not write; the buttons are Duplicate and Cancel"
     },
+    "Leal can’t clear these cells." : {
+      "comment" : "Alert title: Delete couldn't clear the selected cells (task 2.6)"
+    },
+    "Leal can’t paste these cells here." : {
+      "comment" : "Alert title: a paste was refused (task 2.6)"
+    },
     "Leal can’t save UTF-16 files. Save As UTF-8 saves a copy with your edits." : {
       "comment" : "Tooltip of the lock glyph by a UTF-16 file's title: Save is off (ADR-0013 decision 1)"
     },
     "Leal can’t show “%@” any more." : {
       "comment" : "Alert title after a panic in the core (DESIGN §3.9); the file's name"
+    },
+    "Leal clears up to %@ cells at a time. To empty a whole column, delete it and insert an empty one." : {
+      "comment" : "Tooltip and alert: Delete is off with more cells selected than it clears at once (task 2.6); the limit"
     },
     "Leal copied the file to this Mac and reads the copy, so the file’s drive or volume can go away safely." : {
       "comment" : "Status bar tooltip: Leal reads its own copy (DESIGN §3.1, ADR-0006)"
@@ -682,6 +703,12 @@
     },
     "Leal may not write the file at that place." : {
       "comment" : "Alert text: Save As UTF-8 onto a file Leal may not write"
+    },
+    "Leal pastes up to %@ cells at a time." : {
+      "comment" : "Alert: a paste of too many cells was refused (task 2.6); the limit"
+    },
+    "Leal pastes up to %@ of text at a time." : {
+      "comment" : "Alert: a paste of too much text was refused (task 2.6); the limit, as in 32 MB"
     },
     "Leal put back %lld of your %lld changes to “%@”." : {
       "comment" : "Alert title after Recover changes when some edits couldn't be applied; counts, the file's name",
@@ -773,7 +800,7 @@
       "comment" : "Status bar: a read error stopped Leal before the end of the file; it shows the rows it read"
     },
     "Paste" : {
-      "comment" : "Edit menu"
+      "comment" : "Edit menu\nThe Undo menu's Undo Paste (task 2.6)"
     },
     "Pipe" : {
       "comment" : "Status bar: the delimiter"
@@ -999,6 +1026,12 @@
     },
     "The change couldn’t be made." : {
       "comment" : "Error: an edit, undo or redo wasn't applied"
+    },
+    "The copied cells run past the last column. Paste them further left, or insert columns first." : {
+      "comment" : "Alert: a block of cells pasted would run past the last column (task 2.6)"
+    },
+    "The copied cells run past the last row. Paste them higher up, or insert rows first." : {
+      "comment" : "Alert: a block of cells pasted would run past the file's last row (task 2.6)"
     },
     "The copy would be too large for Leal to open again." : {
       "comment" : "Alert text: Save As UTF-8's file would be over 4 GiB (ADR-0012 decision 2)"

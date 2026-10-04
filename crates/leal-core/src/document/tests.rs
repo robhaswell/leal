@@ -2253,6 +2253,7 @@ fn a_write_to_a_file_read_without_a_clone_is_caught_by_its_event() {
 mod columns;
 mod edits;
 mod find;
+mod pasting;
 mod rows;
 mod saving;
 mod share;

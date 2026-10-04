@@ -993,26 +993,20 @@ final class DocumentModel: GridDataSource {
     /// values the cells read as now: after an undo, the old ones. Only
     /// `commandApplied` calls this.
     func valuesChanged(by command: EditCommand, direction: CommandDirection) {
-        guard failure == nil, !command.changes.isEmpty else { return }
-        var gridRows: [Int] = []
-        var header = false
-        for change in command.changes {
-            if interpretation.header, change.row == 0 {
-                header = true
-            } else {
-                gridRows.append(Int(clamping: change.row) - headerOffset)
-            }
-        }
-        if header { reloadHeaderTitles() }
-        if let first = gridRows.min(), let last = gridRows.max() {
+        guard failure == nil, let rows = command.changedRows else { return }
+        if interpretation.header, rows.lowerBound == 0 { reloadHeaderTitles() }
+        let offset = UInt64(headerOffset)
+        if rows.upperBound >= offset {
+            let first = Int(clamping: max(rows.lowerBound, offset) - offset)
+            let last = Int(clamping: rows.upperBound - offset)
             for block in (first / Self.flagBlockRows)...(last / Self.flagBlockRows) {
                 flagBlocks[block] = nil
             }
             cellsChanged(rows: first..<(last + 1))
         }
-        widenColumns(for: command.changes, direction: direction)
-        let sampled = UInt64(headerOffset) + UInt64(Self.sizingRows)
-        if refinedSizingStarted, command.changes.contains(where: { $0.row < sampled }) {
+        widenColumns(for: command.valuesShown(undone: direction == .undo), direction: direction)
+        let sampled = offset + UInt64(Self.sizingRows)
+        if refinedSizingStarted, rows.lowerBound < sampled {
             measureAgainAfterEdit()
         }
     }
@@ -1093,7 +1087,9 @@ final class DocumentModel: GridDataSource {
     /// (its new value, or after an undo its old one), as the sizing would
     /// have (up to `GridMetrics.maximumColumnWidth`), unless the user sized
     /// the column. A column never narrows here: that waits for the sample
-    /// to be measured again.
+    /// to be measured again. Of a paste of many cells (task 2.6), only each
+    /// column's longest few values come here (`EditCommand.valuesShown`):
+    /// measuring a hundred thousand values took longer than the paste.
     private func widenColumns(for changes: [ValueChange], direction: CommandDirection) {
         var widened = false
         for change in changes {

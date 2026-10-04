@@ -77,6 +77,7 @@
 mod columns;
 mod command;
 mod overlay;
+mod paste;
 mod rows;
 mod structural;
 mod value;
@@ -85,11 +86,13 @@ pub(crate) use columns::{
     CellId, ColumnOp, Columns, Fold, Layout, OpId, OpKind, Own, Parts, TABLE, fresh_appended,
 };
 pub use command::{
-    COLUMN_LIMIT, CellChange, Command, DUPLICATE_ROW_LIMIT, Edit, EditError, Lineage, Replay,
+    CELL_BATCH_LIMIT, COLUMN_LIMIT, CellChange, Command, DUPLICATE_ROW_LIMIT, Edit, EditError,
+    Lineage, PASTE_BYTE_LIMIT, Replay,
 };
 pub(crate) use overlay::{
     ColumnChange, EditStore, InsertedRow, Kinds, Overlay, OverlayRow, RowChange, RowEdits,
 };
+pub use paste::{Pasted, parse_tsv};
 pub use rows::RowId;
 pub(crate) use rows::{Piece, RowMap, Segment, Slot};
 pub(crate) use structural::{Changed, ColumnSource, RowSource};

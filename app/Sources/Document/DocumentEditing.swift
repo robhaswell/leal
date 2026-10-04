@@ -266,3 +266,37 @@ extension String {
         return utf8.elementsEqual(other.utf8)
     }
 }
+
+/// What the app reads of a cell command, whether its changes came to Swift
+/// (`changes`) or, for a batch of many (a paste, a clear: task 2.6), stay
+/// in Rust (`cells`, the core's `CellBatch`).
+extension EditCommand {
+    /// How many cells it changes.
+    var cellCount: Int {
+        cells.map { Int(clamping: $0.count()) } ?? changes.count
+    }
+
+    /// The first cell it changes, to name it.
+    var firstChange: ValueChange? {
+        cells.map { $0.first() } ?? changes.first
+    }
+
+    /// The first and last logical rows it changes; `nil` for none.
+    var changedRows: ClosedRange<UInt64>? {
+        if let cells {
+            return cells.rows().map { $0.first...$0.last }
+        }
+        guard let first = changes.map(\.row).min(), let last = changes.map(\.row).max() else { return nil }
+        return first...last
+    }
+
+    /// The values that may widen their columns, as the cells read now
+    /// (`undone`: their old values): every change of a small command; of
+    /// a batch, each column's longest few, by length.
+    func valuesShown(undone: Bool) -> [ValueChange] {
+        cells.map { $0.longest(undone: undone, perColumn: Self.longestPerColumn) } ?? changes
+    }
+
+    /// How many of a batch's values per column are measured.
+    static let longestPerColumn: UInt32 = 16
+}

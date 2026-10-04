@@ -102,6 +102,23 @@ final class GridContainerView: NSView {
         get { gridView.onCopy }
         set { gridView.onCopy = newValue }
     }
+    /// Edit > Paste (⌘V) in the grid (task 2.6).
+    var onPaste: (() -> Void)? {
+        get { gridView.onPaste }
+        set { gridView.onPaste = newValue }
+    }
+    /// Delete, Forward Delete or Edit > Delete in the grid: clear the
+    /// selected cells (task 2.6).
+    var onClear: (() -> Void)? {
+        get { gridView.onClear }
+        set { gridView.onClear = newValue }
+    }
+    /// Whether Edit > Paste or Edit > Delete is on in the grid, setting
+    /// its tooltip.
+    var validateCellItem: (NSMenuItem) -> Bool {
+        get { gridView.validateCellItem }
+        set { gridView.validateCellItem = newValue }
+    }
     /// Return or a double-click in the grid: edit the active cell (task
     /// 2.5.1).
     var onEdit: (() -> Void)? {

@@ -65,6 +65,13 @@ final class GridView: StripContentView, NSMenuItemValidation {
     var onCopy: (() -> Void)?
     /// Whether there is something to copy, for the menu item.
     var canCopy: () -> Bool = { false }
+    /// Edit > Paste (⌘V): paste into the selection (task 2.6).
+    var onPaste: (() -> Void)?
+    /// Delete or Forward Delete (no ⌘), or Edit > Delete: clear the
+    /// selected cells (task 2.6).
+    var onClear: (() -> Void)?
+    /// Whether Edit > Paste or Edit > Delete is on, setting its tooltip.
+    var validateCellItem: (NSMenuItem) -> Bool = { _ in false }
     /// Any key or click: the user is interacting (DESIGN §3.10 rule 3).
     var onUserInput: (() -> Void)?
     /// Return or a double-click: edit the active cell (task 2.5.1).
@@ -439,6 +446,9 @@ final class GridView: StripContentView, NSMenuItemValidation {
             onRowCommandKey?(key)
             return
         }
+        // A held Delete clears once: its repeats would only find the cells
+        // empty, or say again why they can't be cleared.
+        if event.isARepeat, Self.isClearKey(event) { return }
         interpretKeyEvents([event])
     }
 
@@ -454,6 +464,12 @@ final class GridView: StripContentView, NSMenuItemValidation {
         case (51, .command): return .delete
         default: return nil
         }
+    }
+
+    /// Whether `event` is Delete (⌫) or Forward Delete (⌦) without ⌘:
+    /// Clear's keys (task 2.6). (⌘⌫ is Delete Row's.)
+    static func isClearKey(_ event: NSEvent) -> Bool {
+        event.type == .keyDown && !event.modifierFlags.contains(.command) && (event.keyCode == 51 || event.keyCode == 117)
     }
 
     /// Whether `event` types text, rather than being a command: it gives
@@ -502,6 +518,29 @@ final class GridView: StripContentView, NSMenuItemValidation {
         onCopy?()
     }
 
+    // Paste and Delete (task 2.6) change cells, so they are user input.
+
+    @objc func paste(_ sender: Any?) {
+        onUserInput?()
+        onPaste?()
+    }
+
+    /// Edit > Delete.
+    @objc func delete(_ sender: Any?) {
+        onUserInput?()
+        onClear?()
+    }
+
+    /// ⌫ (and ⇧⌫, ⌃H), through the key bindings.
+    override func deleteBackward(_ sender: Any?) {
+        onClear?()
+    }
+
+    /// ⌦ (Fn-⌫ on a laptop), through the key bindings.
+    override func deleteForward(_ sender: Any?) {
+        onClear?()
+    }
+
     override func selectAll(_ sender: Any?) {
         onSelectAll?()
     }
@@ -509,6 +548,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(copy(_:)): canCopy()
+        case #selector(paste(_:)), #selector(delete(_:)): validateCellItem(menuItem)
         case #selector(selectAll(_:)): (dataSource?.rowCount ?? 0) > 0 && geometry.columnCount > 0
         default: true
         }

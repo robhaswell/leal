@@ -307,7 +307,7 @@ final class EditHistory {
                 return rows == 1 ? StructureText.deleteRow : StructureText.deleteRows
             }
         }
-        if command.changes.count == 1 {
+        if command.cellCount == 1 {
             return String(localized: "Typing", comment: "Undo menu: Undo Typing, a cell's edit")
         }
         return String(localized: "Edit Cells", comment: "Undo menu: Undo Edit Cells, several cells changed at once")

@@ -501,6 +501,10 @@ of splitting the file into cells. A command applies only in its own
 lineage, and only if its cells still hold what it expects, so a stale
 command never lands on the wrong cell. A command of several cells (a paste)
 is checked whole before anything changes, and applies whole or not at all.
+Paste and Clear (task 2.6) are such commands: like row and column edits
+they wait for the whole file to be read and for a save to end, take at
+most 100,000 cells, and never add rows or columns. The clipboard is read
+as tab-separated values (`edit/paste.rs`).
 Undoing a row or column delete restores the original bytes, not just the
 values (below).
 
@@ -978,11 +982,11 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Edit cell | Return, or start typing |
 | Commit / cancel | Return, Tab / Esc |
 | New line in a value (in-cell editor) | ⇧↩ or ⌥↩ |
-| Clear cells | Delete |
+| Clear cells | Delete or ⌦ (a missing cell stays missing; up to 100,000 cells) |
 | Undo / redo | ⌘Z / ⇧⌘Z |
 | Find | ⌘F, ⌘G / ⇧⌘G |
 | Go to row | ⌘L |
-| Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste) |
+| Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells) |
 | Insert row below / delete row | ⌘↩ / ⌘⌫ |
 | Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |

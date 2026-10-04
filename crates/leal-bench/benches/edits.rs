@@ -14,6 +14,12 @@
 //!   main thread (DESIGN §1's "Cell edit to screen < 16 ms" includes it).
 //! - `edits/set_cells_10k`: a batch of 10,000 cells (a paste of 1,000 rows
 //!   by 10 columns) and its undo, with those 100,000 edits in place.
+//! - `edits/paste_100k_cells` and `edits/clear_100k_cells`: Paste and
+//!   Clear (task 2.6) at their most cells at once (`CELL_BATCH_LIMIT`):
+//!   a block of 10,000 rows by 10 columns of tab-separated text pasted, or
+//!   the same cells cleared, from the middle of the file, and the undo,
+//!   with those 100,000 edits in place. What Paste and Delete cost the
+//!   main thread in the core at worst.
 //! - `edits/find_every_row_100k_edited_rows`: `find/every_row`'s search
 //!   (`SKU-`, in every row) with those edits: an edited row is checked
 //!   through the raw-byte search of its own bytes, then cell by cell.
@@ -36,6 +42,7 @@ use std::time::{Duration, Instant};
 use criterion::{Criterion, criterion_group, criterion_main};
 use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
+use leal_core::edit::CELL_BATCH_LIMIT;
 use leal_core::find::Query;
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
@@ -130,6 +137,39 @@ fn edits(c: &mut Criterion) {
             let command = document
                 .set_cells(black_box(&paste))
                 .expect("a batch")
+                .expect("a change");
+            document.apply(&command.inverse()).expect("an undo");
+        });
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("edits");
+    group.sample_size(20);
+    let batch_rows = CELL_BATCH_LIMIT / 10;
+    let block: Vec<String> = (0..batch_rows)
+        .map(|r| {
+            (0..10)
+                .map(|c| format!("p{r}.{c}"))
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
+    let block = block.join("\n");
+    let area = FIRST_ROW - batch_rows / 2..FIRST_ROW + batch_rows / 2;
+    group.bench_function("paste_100k_cells", |b| {
+        b.iter(|| {
+            let command = document
+                .paste(black_box(area.clone()), 0..10, 12, &block)
+                .expect("a paste")
+                .expect("a change");
+            document.apply(&command.inverse()).expect("an undo");
+        });
+    });
+    group.bench_function("clear_100k_cells", |b| {
+        b.iter(|| {
+            let command = document
+                .clear_cells(black_box(area.clone()), 0..10)
+                .expect("a clear")
                 .expect("a change");
             document.apply(&command.inverse()).expect("an undo");
         });

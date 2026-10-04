@@ -66,6 +66,7 @@
 
 mod columns;
 mod editing;
+mod pasting;
 mod remember;
 mod saving;
 mod search;

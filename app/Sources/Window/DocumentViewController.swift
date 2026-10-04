@@ -228,6 +228,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         statusBar.onBadge = { [weak self] in self?.showDetails(nil) }
         grid.onSelectionChanged = { [weak self] in self?.selectionChanged() }
         grid.onCopy = { [weak self] in self?.copySelection() }
+        grid.onPaste = { [weak self] in self?.pasteIntoSelection() }
+        grid.onClear = { [weak self] in self?.clearSelection() }
+        grid.validateCellItem = { [weak self] item in self?.validateCellItem(item) ?? false }
         confirmLargeCopy = { [weak self] bytes, answer in
             guard let self else { return answer(false) }
             askBeforeCopying(bytes, answer)
@@ -1573,7 +1576,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     /// Shows `alert` on the window, or once the view has one again.
-    private func present(_ alert: NSAlert) {
+    func present(_ alert: NSAlert) {
         guard let window = view.window else {
             queuedAlerts.append(alert)
             return

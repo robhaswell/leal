@@ -58,6 +58,7 @@ fn an_edit_gives_a_command_that_undoes_and_redoes() {
                 new_value: Some("Marlowe".into()),
             }],
             structural: None,
+            cells: None,
         }
     );
     assert!(document.has_unsaved_edits().unwrap());
@@ -198,6 +199,7 @@ fn replay_recovers_the_edits_and_names_those_that_no_longer_apply() {
                 new_value: Some("x".into()),
             }],
             structural: None,
+            cells: None,
         },
     ];
     let fresh = open(&dir, &scheduler, "fresh.csv");
@@ -437,4 +439,153 @@ fn an_undo_replays_as_the_inverse_and_cells_name_the_edits() {
     for row in 0..4 {
         assert_eq!(name(&fresh, row), name(&document, row));
     }
+}
+
+/// Paste and Clear (task 2.6): one command each, of their cells, undone
+/// and redone like an edit; the limits and refusals reach Swift.
+#[test]
+fn paste_and_clear_give_one_command_each() {
+    let dir = TempDir::new("edit-paste");
+    let scheduler = Scheduler::new().unwrap();
+    let document = open(&dir, &scheduler, "a.csv");
+    let path = dir.file("a.csv", FILE);
+    assert_eq!(document.can_paste().unwrap(), None);
+
+    // A block from row 1, column 0: row 2 (short) gets a hatched cell.
+    let paste = document
+        .paste(1, 1, 0, 1, 2, "A\tB\r\nC\tD\r\n".into())
+        .unwrap()
+        .unwrap();
+    assert_eq!(paste.changes.len(), 4);
+    assert_eq!(name(&document, 1), ["A", "B"]);
+    assert_eq!(name(&document, 2), ["C", "D"]);
+    document.undo(paste.clone()).unwrap();
+    assert!(!document.has_unsaved_edits().unwrap());
+    document.redo(paste.clone()).unwrap();
+
+    // Clear: the hatched cell goes back to missing.
+    assert_eq!(document.can_clear_cells(1, 2, 0, 2).unwrap(), None);
+    let clear = document.clear_cells(2, 1, 0, 2).unwrap().unwrap();
+    assert_eq!(name(&document, 2), [""]);
+    document.undo(clear).unwrap();
+    assert_eq!(name(&document, 2), ["C", "D"]);
+
+    // The refusals.
+    assert_eq!(cell_batch_limit(), 100_000);
+    assert_eq!(
+        paste_shape("a\tb\tc\r\nd\r\n".into()),
+        Some(PasteShape {
+            rows: 2,
+            columns: 3
+        })
+    );
+    assert_eq!(paste_shape("x\n".repeat(100_001)), None);
+    assert_eq!(paste_byte_limit(), 32 << 20);
+    assert_eq!(
+        document.paste(1, 1, 1, 1, 2, "a\tb".into()),
+        Err(refused(&path, EditRefusal::PastLastColumn, None, None))
+    );
+    assert_eq!(
+        document.paste(2, 1, 0, 1, 2, "a\nb\nc".into()),
+        Err(refused(&path, EditRefusal::PastLastRow, None, None))
+    );
+    assert_eq!(
+        document.can_clear_cells(0, 100_001, 0, 1).unwrap(),
+        Some(EditRefusal::TooManyCells)
+    );
+    assert_eq!(
+        document.clear_cells(0, 50_001, 0, 2),
+        Err(refused(&path, EditRefusal::TooManyCells, None, None))
+    );
+    assert_eq!(
+        document.paste(0, 1, 0, 1, 2, "x".repeat((32 << 20) + 1)),
+        Err(refused(&path, EditRefusal::TooMuchText, None, None))
+    );
+    // Past the unterminated quote's cell (row 3, column 1).
+    assert_eq!(
+        document.paste(3, 1, 2, 1, 3, "after".into()),
+        Err(refused(
+            &path,
+            EditRefusal::AfterUnterminatedQuote,
+            Some(3),
+            Some(2)
+        ))
+    );
+}
+
+/// A paste of more than `INLINE_CHANGES` cells stays in Rust as a
+/// `CellBatch`: Swift sees where it is and its longest values, and undoes,
+/// redoes and replays it like any command.
+#[test]
+fn a_large_batch_stays_in_rust() {
+    let dir = TempDir::new("edit-batch");
+    let scheduler = Scheduler::new().unwrap();
+    let mut bytes = b"a,b\n".to_vec();
+    for row in 0..400 {
+        bytes.extend_from_slice(format!("{row},x\n").as_bytes());
+    }
+    let path = dir.file("a.csv", &bytes);
+    let open_it = |path: &str| {
+        let document = open_document(
+            path,
+            VolumeInfo::default(),
+            dir.locations(),
+            &scheduler,
+            options(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(block_on(document.index_job().unwrap().wait()), Ok(()));
+        document
+    };
+    let document = open_it(&path);
+    let text: Vec<String> = (0..300)
+        .map(|row| format!("p{row}\tlonger value {row}"))
+        .collect();
+    let command = document
+        .paste(1, 1, 0, 1, 2, text.join("\n"))
+        .unwrap()
+        .unwrap();
+    assert!(command.changes.is_empty());
+    let cells = command.cells.clone().expect("a batch");
+    assert_eq!(cells.count(), 600);
+    assert_eq!(
+        cells.rows(),
+        Some(RowSpan {
+            first: 1,
+            last: 300
+        })
+    );
+    assert_eq!(
+        cells.first(),
+        Some(ValueChange {
+            row: 1,
+            column: 0,
+            old_value: Some("0".into()),
+            new_value: Some("p0".into()),
+        })
+    );
+    let longest = cells.longest(false, 2);
+    assert_eq!(longest.len(), 4);
+    assert!(
+        longest
+            .iter()
+            .any(|change| change.new_value.as_deref() == Some("longer value 100"))
+    );
+    let undone = cells.longest(true, 1);
+    assert_eq!(undone.len(), 2);
+    assert_eq!(undone[1].old_value.as_deref(), Some("x"));
+
+    document.undo(command.clone()).unwrap();
+    assert_eq!(name(&document, 1), ["0", "x"]);
+    document.redo(command.clone()).unwrap();
+    assert_eq!(name(&document, 300), ["p299", "longer value 299"]);
+    let inverse = inverse_command(command.clone());
+    assert_eq!(inverse.cells.as_ref().map(|cells| cells.count()), Some(600));
+
+    let fresh = open_it(&dir.file("b.csv", &bytes));
+    let report = fresh.replay(vec![command]).unwrap();
+    assert!(report.refused.is_empty());
+    assert!(report.applied[0].cells.is_some());
+    assert_eq!(name(&fresh, 300), ["p299", "longer value 299"]);
 }

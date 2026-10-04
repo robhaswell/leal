@@ -237,7 +237,7 @@ extension DocumentViewController {
     /// what `body` returns (`nil`: its last command's name). A `body` the
     /// core refused leaves no step: no nameless Undo, and Redo as it was
     /// (`DocumentUndoManager.registerAsOneStep`).
-    private func asOneStep(_ body: () -> String?) {
+    func asOneStep(_ body: () -> String?) {
         if let undo = undoHistory() {
             undo.registerAsOneStep(body)
         } else {
@@ -314,7 +314,8 @@ enum StructureText {
                 localized: "Duplicate up to \(Int(duplicateRowLimit()).formatted()) rows at a time.",
                 comment: "Tooltip: Duplicate Row is off with more rows selected than it copies at once (task 2.5a); the limit"
             )
-        case .noSuchRow, .notReadYet, .tooFarRight, .valueChanged, .otherLineage, .noSuchColumn, .unreadable:
+        case .noSuchRow, .notReadYet, .tooFarRight, .valueChanged, .otherLineage, .noSuchColumn, .unreadable,
+             .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
             nil
         }
     }
