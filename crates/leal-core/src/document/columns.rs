@@ -18,8 +18,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError, Weak};
 
 use super::structural::{open_quote_row, whole_file};
 use super::{Document, Reading, RowBytes, RowView};
@@ -95,8 +95,12 @@ impl Document {
     }
 
     /// Whether a column can be inserted before logical column `at` now,
-    /// for the app to enable **Insert Column** (task 2.5a). It walks the
-    /// marks as [`insert_column`](Self::insert_column) does.
+    /// for the app to enable **Insert Column** (task 2.5a). It refuses as
+    /// [`insert_column`](Self::insert_column) would, without working out
+    /// the operation: the Edit menu asks each time it opens. The longest
+    /// row is found once for each version of the edits (a walk over the
+    /// marks, about 3 ms a million rows), and only the open unterminated
+    /// quote's row, if any, is laid out with the column.
     ///
     /// # Errors
     ///
@@ -106,7 +110,7 @@ impl Document {
     }
 
     /// Whether logical column `at` can be deleted now, for **Delete
-    /// Column**.
+    /// Column**, as [`can_insert_column`](Self::can_insert_column) does.
     ///
     /// # Errors
     ///
@@ -115,14 +119,54 @@ impl Document {
         self.can_change_column(OpKind::Delete, at)
     }
 
+    /// What [`plan`] would refuse operation `kind` at `at` with, by the
+    /// rule: past the longest row, or the open quote's cell no longer its
+    /// row's last. (By the rule, no row is a misfit and none needs a
+    /// layout of its own, `plan`'s other refusals.)
     fn can_change_column(&self, kind: OpKind, at: usize) -> Result<(), EditError> {
         if self.saving.load(Ordering::Acquire) {
             return Err(EditError::Saving);
         }
         let reading = self.current();
         whole_file(&reading)?;
-        let overlay = reading.edits.overlay();
-        plan(&reading, &overlay, kind, at, Decide::Rule).map(|_| ())
+        let store = &reading.edits;
+        let (overlay, version) = store.snapshot();
+        let counts = Counts::of(&reading).ok_or(EditError::StillReading)?;
+        let widest = Widest::of(&reading, &overlay, version, counts);
+        let op = ColumnOp {
+            id: OpId(store.next_op()),
+            at,
+            kind,
+            inserted_before: store.next_inserted(),
+        };
+        let past = if op.inserts() {
+            at > widest
+        } else {
+            at >= widest
+        };
+        if past {
+            return Err(EditError::NoSuchColumn { column: at });
+        }
+        let Some(last) = open_quote_row(&reading, &overlay, &[]) else {
+            return Ok(());
+        };
+        // The quote's row as `plan` lays it out: an edited row's edits may
+        // change; an unedited one keeps its default layout.
+        let columns = overlay.columns();
+        let mut walk = Walk::new(&op, columns, Decide::Rule);
+        let id = RowId::original(last);
+        if let Some(edits) = overlay.edits(id)
+            && let Ok(logical) = overlay.map().logical_of(last)
+        {
+            walk.edited(logical, id, edits);
+        }
+        check_quote(
+            &reading,
+            &overlay,
+            &walk.rows,
+            &columns.with(op.clone()),
+            at,
+        )
     }
 
     /// Applies a column insert or delete command (`edit`), as
@@ -554,17 +598,7 @@ fn plan(
         kind,
         inserted_before: store.next_inserted(),
     };
-    let mut walk = Walk {
-        op: &op,
-        columns,
-        decide,
-        cursor: 0,
-        widest: 0,
-        applied: Vec::new(),
-        rows: Vec::new(),
-        fresh: Vec::new(),
-        misfit: None,
-    };
+    let mut walk = Walk::new(&op, columns, decide);
     each_row(
         overlay,
         counts,
@@ -632,6 +666,54 @@ enum Shape<'a> {
     Unedited(EditOwn),
     /// Its edits.
     Edited(&'a Arc<RowEdits>),
+}
+
+/// The longest row's length in one version of the edits, kept in its
+/// reading ([`Document::can_insert_column`]).
+pub(super) struct Widest {
+    /// The edits it was found in: held weakly, so a new version of them
+    /// never shares the pointer.
+    overlay: Weak<Overlay>,
+    version: usize,
+    len: usize,
+}
+
+impl Widest {
+    /// The longest row of `overlay` (version `version` of `reading`'s
+    /// edits), as [`plan`]'s walk finds it: worked out again only for
+    /// another version.
+    fn of(reading: &Reading, overlay: &Arc<Overlay>, version: usize, counts: Counts<'_>) -> usize {
+        let same = |known: &Widest| {
+            known.version == version && Weak::ptr_eq(&known.overlay, &Arc::downgrade(overlay))
+        };
+        let mut cached = reading
+            .widest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(known) = cached.as_ref().filter(|known| same(known)) {
+            return known.len;
+        }
+        let columns = overlay.columns();
+        let mut len = 0;
+        each_row(
+            overlay,
+            counts,
+            reading.index.row_count(),
+            &mut |_, id, shape| {
+                let row = match shape {
+                    Shape::Unedited(own) => columns.fold_len(own),
+                    Shape::Edited(edits) => edits.layout_in(columns, id.inserted_index()).len(),
+                };
+                len = len.max(row);
+            },
+        );
+        *cached = Some(Widest {
+            overlay: Arc::downgrade(overlay),
+            version,
+            len,
+        });
+        len
+    }
 }
 
 /// Hands each logical row of `overlay` to `each`, in order, with its id
@@ -758,7 +840,21 @@ struct Walk<'a> {
     misfit: Option<usize>,
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
+    fn new(op: &'a ColumnOp, columns: &'a Columns, decide: Decide<'a>) -> Self {
+        Walk {
+            op,
+            columns,
+            decide,
+            cursor: 0,
+            widest: 0,
+            applied: Vec::new(),
+            rows: Vec::new(),
+            fresh: Vec::new(),
+            misfit: None,
+        }
+    }
+
     /// Whether the operation applies to logical row `logical`, which rule 6
     /// says of `rule`.
     fn applies(&mut self, logical: usize, rule: bool) -> bool {

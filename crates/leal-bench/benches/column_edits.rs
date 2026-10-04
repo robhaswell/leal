@@ -13,6 +13,13 @@
 //!   file): Insert Column on the main thread, which looks at every row's
 //!   field count and at each edited row (DESIGN §1's 16 ms for an edit).
 //! - `column_edits/delete_column_100k_edits`: the same for a delete.
+//! - `column_edits/can_insert_column`, `…/can_insert_column_100k_edits`
+//!   and `…/can_delete_column_100k_edits`: whether Insert Column or
+//!   Delete Column is allowed (task 2.5a: the Edit menu asks, three times
+//!   each time it opens), with no edits and with the 100,000, asked again
+//!   with the edits unchanged. `…/can_insert_column_after_edit` and
+//!   `…/can_insert_column_after_edit_100k_edits`: the first time asked
+//!   after an edit, which finds the longest row again.
 //! - `column_census/census`: the per-column quoting census (task 2.4b, for
 //!   2.4c's writer, which makes it only when a save writes a new field),
 //!   with the 100,000 edits and no column operation: it reads rows until
@@ -22,12 +29,14 @@
 //!   inserted, which has no field of its own, so it never stops early:
 //!   the whole pass over a million rows.
 
+use std::cell::RefCell;
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, SamplingMode, criterion_group, criterion_main};
 use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
+use leal_core::edit::Command;
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
 
@@ -75,6 +84,20 @@ fn column_edits(c: &mut Criterion) {
     common::canary(c, "column_edits", Side::Before);
     let mut group = c.benchmark_group("column_edits");
     group.bench_function("screen", |b| b.iter(read_screen));
+    group.bench_function("can_insert_column", |b| {
+        b.iter(|| document.can_insert_column(black_box(3)).expect("allowed"));
+    });
+    let edited = RefCell::new(None);
+    group.bench_function("can_insert_column_after_edit", |b| {
+        b.iter_batched(
+            || toggle_edit(&document, &edited),
+            |()| document.can_insert_column(black_box(3)).expect("allowed"),
+            BatchSize::PerIteration,
+        );
+    });
+    if edited.borrow().is_some() {
+        toggle_edit(&document, &edited);
+    }
 
     // Ten operations, alternately inserting and deleting.
     let mut made = Vec::new();
@@ -109,6 +132,22 @@ fn column_edits(c: &mut Criterion) {
             document.apply(&command.inverse()).expect("an undo");
         });
     });
+    group.bench_function("can_insert_column_100k_edits", |b| {
+        b.iter(|| document.can_insert_column(black_box(3)).expect("allowed"));
+    });
+    group.bench_function("can_delete_column_100k_edits", |b| {
+        b.iter(|| document.can_delete_column(black_box(3)).expect("allowed"));
+    });
+    group.bench_function("can_insert_column_after_edit_100k_edits", |b| {
+        b.iter_batched(
+            || toggle_edit(&document, &edited),
+            |()| document.can_insert_column(black_box(3)).expect("allowed"),
+            BatchSize::PerIteration,
+        );
+    });
+    if edited.borrow().is_some() {
+        toggle_edit(&document, &edited);
+    }
     group.bench_function("delete_column_100k_edits", |b| {
         b.iter(|| {
             let command = document
@@ -145,6 +184,19 @@ fn column_edits(c: &mut Criterion) {
     common::canary(c, "column_census", Side::After);
     drop(document);
     let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// A new version of the edits each call, so the next question finds the
+/// longest row again: a cell of row 1 edited, then the edit undone, in
+/// turn. `None` afterwards leaves the edits as they were.
+fn toggle_edit(document: &Document, edited: &RefCell<Option<Command>>) {
+    let mut edited = edited.borrow_mut();
+    match edited.take() {
+        Some(command) => {
+            document.apply(&command.inverse()).expect("an undo");
+        }
+        None => *edited = document.set_cell(1, 0, "toggled").expect("an edit"),
+    }
 }
 
 criterion_group!(benches, column_edits);

@@ -456,6 +456,11 @@ struct Reading {
     /// the attribute's choice, which every later save records itself
     /// (ADR-0008 decision 8).
     remembered: AtomicBool,
+    /// The longest row's length, worked out for the edits as they were
+    /// when last asked: the Edit menu's column items ask each time it
+    /// opens ([`Document::can_insert_column`]), and finding it looks at
+    /// every row.
+    widest: Mutex<Option<columns::Widest>>,
 }
 
 /// First paint's result (P0), before any job starts.
@@ -2109,6 +2114,7 @@ fn start_jobs(
         counts: None,
         saved: false,
         remembered: AtomicBool::new(false),
+        widest: Mutex::new(None),
     }
 }
 

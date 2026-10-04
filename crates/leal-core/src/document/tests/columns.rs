@@ -323,6 +323,75 @@ fn nothing_goes_after_an_open_unterminated_quote() {
     assert!(!document.has_edits());
 }
 
+/// `can_insert_column` and `can_delete_column` (which don't work out the
+/// operation, and find the longest row once per version of the edits:
+/// task 2.5a's review) refuse exactly what the commands would, at every
+/// column, as cells, rows and columns change and are undone, in a file
+/// ending in an open quote: a longer row inserted, the widest row deleted,
+/// the quote's row edited.
+#[test]
+fn asking_first_agrees_with_the_commands() {
+    let dir = Dir::new("columns-ask");
+    let document = open_with(
+        &dir,
+        "a.csv",
+        b"a,b,c\nd\n\ne,f,g,h\ni,\"open\nquote",
+        false,
+    );
+    let agree = |step: &str| {
+        for at in 0..8 {
+            let asked = document.can_insert_column(at).err();
+            let made = document.insert_column(at, "x");
+            let refused = made.as_ref().err();
+            assert_eq!(
+                format!("{asked:?}"),
+                format!("{refused:?}"),
+                "{step}: insert at {at}"
+            );
+            if let Ok(Some(command)) = made {
+                document.apply(&command.inverse()).unwrap();
+            }
+            let asked = document.can_delete_column(at).err();
+            let made = document.delete_column(at);
+            let refused = made.as_ref().err();
+            assert_eq!(
+                format!("{asked:?}"),
+                format!("{refused:?}"),
+                "{step}: delete at {at}"
+            );
+            if let Ok(Some(command)) = made {
+                document.apply(&command.inverse()).unwrap();
+            }
+        }
+    };
+    agree("opened");
+    let mut made = Vec::new();
+    let steps: [(&str, &dyn Fn() -> Command); 6] = [
+        ("a longer row", &|| {
+            document
+                .insert_rows(1, &rows_of(&[&["1", "2", "3", "4", "5", "6"]]))
+                .unwrap()
+                .unwrap()
+        }),
+        ("the quote's row edited", &|| set_cell(&document, 5, 0, "j")),
+        ("a column inserted", &|| insert(&document, 1, "y")),
+        ("the longer row deleted", &|| {
+            document.delete_rows(1, 1).unwrap().unwrap()
+        }),
+        ("a short row padded", &|| set_cell(&document, 1, 3, "p")),
+        ("a column deleted", &|| delete(&document, 0)),
+    ];
+    for (step, make) in steps {
+        made.push(make());
+        agree(step);
+    }
+    for command in made.iter().rev() {
+        document.apply(&command.inverse()).unwrap();
+        agree("undone");
+    }
+    assert!(!document.has_edits());
+}
+
 #[test]
 fn columns_cant_change_until_the_file_is_read() {
     let dir = Dir::new("columns-reading");
