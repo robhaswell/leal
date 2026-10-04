@@ -26,9 +26,10 @@ use super::{Document, Reading, RowBytes, RowView};
 use crate::diagnostics::{CountsBuilder, Diagnostics, RowCode, RowMarks};
 use crate::edit::{
     CellId, Changed, Column, ColumnChange, ColumnOp, ColumnSource, Columns, Command, Edit,
-    EditError, Lineage, OpId, OpKind, Overlay, Own as EditOwn, RowEdits, RowId, Segment,
+    EditError, Lineage, OpId, OpKind, Overlay, Own as EditOwn, RowEdits, RowId, Segment, Value,
     fresh_appended,
 };
+use crate::rows::RowParser;
 use crate::save::ColumnQuoting;
 use crate::source::ReadError;
 
@@ -160,7 +161,7 @@ impl Document {
             let rows = Decide::Rows(&column.applied);
             let values = || {
                 column
-                    .values()
+                    .values(&reading.parser)
                     .map_err(|error| EditError::Read { row: 0, error })
             };
             match (&column.op.kind, again) {
@@ -172,7 +173,10 @@ impl Document {
                     restore(reading, at, &column.applied, values)
                 }
                 (OpKind::Delete, true) | (OpKind::Insert(_) | OpKind::Restore(_), false) => {
-                    let values = values()?;
+                    let values: Vec<String> = values()?
+                        .iter()
+                        .map(|value| value.text().to_owned())
+                        .collect();
                     make(reading, OpKind::Delete, at, rows, Some(&values))
                 }
             }
@@ -351,7 +355,7 @@ fn restore(
     reading: &Arc<Reading>,
     at: usize,
     rows: &[Range<u32>],
-    values: Vec<String>,
+    values: Vec<Value>,
 ) -> Result<Option<Command>, EditError> {
     let store = &reading.edits;
     let overlay = store.overlay();
@@ -367,7 +371,7 @@ fn restore(
             }
             None => return Err(EditError::NoSuchRow { row }),
         };
-        by_row.insert(id, Arc::from(value.as_str()));
+        by_row.insert(id, value.clone());
     }
     let kind = OpKind::Restore(Arc::new(by_row));
     let plan = plan(reading, &overlay, kind, at, Decide::Rows(rows))?;
@@ -384,7 +388,7 @@ fn commit(
     plan: Plan,
     before: Arc<Columns>,
     origin: Option<Arc<dyn ColumnSource>>,
-    restored: Option<Arc<[String]>>,
+    restored: Option<Arc<[Value]>>,
 ) -> Command {
     let store = &reading.edits;
     let edits = plan
@@ -962,15 +966,24 @@ struct TakenCells {
 }
 
 impl ColumnSource for TakenCells {
-    fn values(&self, rows: &[Range<u32>], at: usize) -> Result<Vec<String>, ReadError> {
+    fn values(
+        &self,
+        rows: &[Range<u32>],
+        at: usize,
+        parser: &RowParser,
+    ) -> Result<Vec<Value>, ReadError> {
         let mut values = Vec::new();
         for run in rows {
             let range = to_usize(run.start)..to_usize(run.end);
+            // An unedited field as its bytes (task 2.4c).
             values.extend(Document::read_rows_with(
                 &self.reading,
                 &self.overlay,
                 range,
-                |view| view.value(at).map_or_else(String::new, Cow::into_owned),
+                |view| {
+                    view.cell(at)
+                        .map_or_else(|| Value::from(""), |cell| view.put_back(cell, parser))
+                },
             )?);
         }
         Ok(values)

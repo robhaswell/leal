@@ -1232,15 +1232,24 @@ fn skipped_edits(reading: &Reading, overlay: &Overlay, rows: usize) -> Vec<(usiz
 }
 
 /// Calls `each` with each cell of inserted row `n` that holds a value (its
-/// own, an inserted column's, or an edit), by logical column.
-fn new_cells(reading: &Reading, overlay: &Overlay, n: u32, each: &mut dyn FnMut(usize, &str)) {
+/// own, an inserted column's, or an edit), by logical column, with the
+/// value if it is text (`None` for a field of the file put back as its
+/// bytes, which isn't encoded).
+fn new_cells(
+    reading: &Reading,
+    overlay: &Overlay,
+    n: u32,
+    each: &mut dyn FnMut(usize, Option<&str>),
+) {
     let Some((row, cells)) = inserted_row(overlay, n) else {
         return;
     };
     let view = RowView::inserted(&reading.parser, row, cells);
     for (column, cell) in view.filled() {
-        if let ViewCell::New(value) | ViewCell::Edited(value) = cell {
-            each(column, value);
+        match cell {
+            ViewCell::New(value) | ViewCell::Edited(value) => each(column, Some(value)),
+            ViewCell::Raw(_) => each(column, None),
+            ViewCell::Field(_) | ViewCell::Padding => {}
         }
     }
 }
@@ -1304,7 +1313,7 @@ fn check_encodable(
     let rows = overlay.map().rows_within(extent.rows);
     let bad = |value: &str| encode(value, encoding).is_err();
     let columns = overlay.columns();
-    let new_bad = columns.ops().iter().any(|op| op.values().any(&bad));
+    let new_bad = columns.ops().iter().any(|op| op.texts().any(&bad));
     let mut cells: Vec<(usize, usize)> = Vec::new();
     if new_bad {
         // Every original row, as it reads, for its inserted cells too.
@@ -1362,7 +1371,7 @@ fn check_encodable(
             continue;
         };
         new_cells(reading, overlay, n, &mut |column, value| {
-            if bad(value) {
+            if value.is_some_and(bad) {
                 cells.push((row, column));
             }
         });

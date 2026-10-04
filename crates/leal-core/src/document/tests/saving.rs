@@ -2313,6 +2313,54 @@ fn a_census_shows_in_the_saves_progress() {
     );
 }
 
+/// Task 2.4c: a row or column delete undone after a save puts the file's
+/// fields back as their bytes, not as how they read: bytes that aren't
+/// text in the file's encoding (or a NUL), and a field's own quoting, come
+/// back as they were. After Save As UTF-8 in between, they come back
+/// converted.
+#[test]
+fn deletes_undone_after_a_save_put_the_bytes_back() {
+    let cases: &[(&str, &[u8], Encoding)] = &[
+        ("utf8", b"a,b\xffc\nd,e\n", Encoding::Utf8),
+        ("1252", b"a,b\x81c\nd,\xe9\n", Encoding::Windows1252),
+        ("nul", b"a,b\x00c\nd,e\n", Encoding::Utf8),
+        ("quoted", b"\"a\",\"b\"\"x\"\nd,\"e\"z\n", Encoding::Utf8),
+    ];
+    for &(name, bytes, encoding) in cases {
+        for column in [false, true] {
+            let dir = Dir::new(&format!("undo-bytes-{name}-{column}"));
+            let path = dir.file("a.csv", bytes);
+            let scheduler = scheduler();
+            let document = open_as(&path, &dir, &scheduler, encoding);
+            let command = if column {
+                document.delete_column(1)
+            } else {
+                document.delete_rows(0, 1)
+            };
+            let command = command.unwrap().unwrap();
+            save(&document, &path, SaveKind::Save).unwrap();
+            document.apply(&command.inverse()).unwrap();
+            save(&document, &path, SaveKind::Save).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap().escape_ascii().to_string(),
+                bytes.escape_ascii().to_string(),
+                "{name}, column {column}"
+            );
+        }
+    }
+    // Converted to UTF-8 in between: the field comes back as UTF-8.
+    let dir = Dir::new("undo-bytes-converted");
+    let path = dir.file("a.csv", b"a,\"b\xe9\"\nd,e\n");
+    let scheduler = scheduler();
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1252);
+    let deleted = document.delete_column(1).unwrap().unwrap();
+    let copy = dir.0.join("u8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    document.apply(&deleted.inverse()).unwrap();
+    save(&document, &copy, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), "a,\"bé\"\nd,e\n".as_bytes());
+}
+
 /// ADR-0014 decision 3: a column command undone after a save works by
 /// value: a delete's cells are put back (`Restore`), an insert's are
 /// taken out if they still read as it left them.

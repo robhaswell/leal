@@ -10,9 +10,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::columns::{CellId, ColumnOp, Columns, Layout, Own};
+use super::columns::{CellId, ColumnOp, Columns, Layout, OpKind, Own};
 use super::overlay::{InsertedRow, Overlay, RowEdits};
 use super::rows::{Piece, RowId};
+use super::value::Value;
+use crate::rows::RowParser;
 use crate::source::ReadError;
 
 /// Which file a document's row ids are of: a new one for each
@@ -34,8 +36,15 @@ impl BaseId {
 /// file it was made on, kept alive by the command (ADR-0014 decision 3).
 pub(crate) trait RowSource: Send + Sync {
     /// Physical rows `rows` as they read with `edits` on top, each as its
-    /// cells' values: fewer if the file doesn't have them all.
-    fn values(&self, rows: Range<u32>, edits: &Overlay) -> Result<Vec<Vec<String>>, ReadError>;
+    /// cells' values: fewer if the file doesn't have them all. Unedited
+    /// fields come as their bytes where `parser` (the reading they go
+    /// back into) reads them the same (task 2.4c).
+    fn values(
+        &self,
+        rows: Range<u32>,
+        edits: &Overlay,
+        parser: &RowParser,
+    ) -> Result<Vec<Vec<Value>>, ReadError>;
 }
 
 /// The rows a row insert or delete command moves: an insert's new rows, or
@@ -77,9 +86,10 @@ impl Rows {
 
     /// Each row's cells as it read when the command was made: an inserted
     /// row's values with its edits, an original row's from the file it was
-    /// read from, with its edits. Original rows are read now (ADR-0014
+    /// read from, with its edits, its unedited fields as their bytes where
+    /// `parser` reads them the same. Original rows are read now (ADR-0014
     /// decision 3). Fewer than [`len`](Self::len) if some can't be had.
-    pub(crate) fn values(&self) -> Result<Vec<Vec<String>>, ReadError> {
+    pub(crate) fn values(&self, parser: &RowParser) -> Result<Vec<Vec<Value>>, ReadError> {
         let edits: BTreeMap<RowId, &Arc<RowEdits>> =
             self.edits.iter().map(|(id, edits)| (*id, edits)).collect();
         let inserted: BTreeMap<u32, &Arc<InsertedRow>> =
@@ -96,7 +106,7 @@ impl Rows {
                         Arc::clone(&self.columns),
                     );
                     if let Some(origin) = &self.origin {
-                        values.extend(origin.values(start..start + len, &originals)?);
+                        values.extend(origin.values(start..start + len, &originals, parser)?);
                     }
                 }
                 Piece::Inserted { first, len, .. } => {
@@ -120,22 +130,31 @@ pub(crate) fn inserted_values(
     row: &InsertedRow,
     edits: Option<&RowEdits>,
     columns: &Columns,
-) -> Vec<String> {
+) -> Vec<Value> {
     let fields = row.fields();
     let layout = Layout::of(columns, Own::inserted(n, fields.len()), edits);
+    let id_of_row = RowId::inserted(n);
     layout
         .ids()
         .iter()
         .map(|&id| {
-            let edited = edits.and_then(|edits| edits.get(id));
-            let own = match id {
+            if let Some(edited) = edits.and_then(|edits| edits.get(id)) {
+                return Value::from(edited);
+            }
+            match id {
                 CellId::Field(k) => fields
                     .get(usize::try_from(k).unwrap_or(usize::MAX))
-                    .map(AsRef::as_ref),
-                CellId::Inserted(op) => columns.inserted_value(op, RowId::inserted(n)),
-                CellId::Appended(_) => None,
-            };
-            edited.or(own).unwrap_or("").to_owned()
+                    .cloned()
+                    .unwrap_or_else(|| Value::from("")),
+                CellId::Inserted(op) => match columns.op(op).map(|op| &op.kind) {
+                    Some(OpKind::Restore(values)) => values
+                        .get(&id_of_row)
+                        .cloned()
+                        .unwrap_or_else(|| Value::from("")),
+                    _ => Value::from(columns.inserted_value(op, id_of_row).unwrap_or("")),
+                },
+                CellId::Appended(_) => Value::from(""),
+            }
         })
         .collect()
 }
@@ -143,8 +162,15 @@ pub(crate) fn inserted_values(
 /// A way to read the cells a column delete took, as they read before it
 /// (ADR-0014 decision 3): the reading it was made in, and its edits then.
 pub(crate) trait ColumnSource: Send + Sync {
-    /// Cell `at` of each of logical rows `rows`, in order.
-    fn values(&self, rows: &[Range<u32>], at: usize) -> Result<Vec<String>, ReadError>;
+    /// Cell `at` of each of logical rows `rows`, in order: an unedited
+    /// field as its bytes where `parser` (the reading it goes back into)
+    /// reads it the same (task 2.4c).
+    fn values(
+        &self,
+        rows: &[Range<u32>],
+        at: usize,
+        parser: &RowParser,
+    ) -> Result<Vec<Value>, ReadError>;
 }
 
 /// A row whose edits a column operation changed: its id, and its edits
@@ -170,7 +196,7 @@ pub struct Column {
     /// For a delete: the cells it took, read lazily.
     pub(crate) origin: Option<Arc<dyn ColumnSource>>,
     /// For cells put back by value: their values, in the rows' order.
-    pub(crate) restored: Option<Arc<[String]>>,
+    pub(crate) restored: Option<Arc<[Value]>>,
 }
 
 impl Column {
@@ -196,16 +222,17 @@ impl Column {
     }
 
     /// The cells it takes or puts back, by value: the inserted value in
-    /// each row it applied to, or the deleted cells as they read then.
-    pub(crate) fn values(&self) -> Result<Vec<String>, ReadError> {
+    /// each row it applied to, or the deleted cells as they read then (an
+    /// unedited field as its bytes where `parser` reads it the same).
+    pub(crate) fn values(&self, parser: &RowParser) -> Result<Vec<Value>, ReadError> {
         if let Some(value) = self.op.value() {
-            return Ok(vec![value.to_string(); self.rows()]);
+            return Ok(vec![Value::Text(Arc::clone(value)); self.rows()]);
         }
         if let Some(values) = &self.restored {
             return Ok(values.to_vec());
         }
         match &self.origin {
-            Some(origin) => origin.values(&self.applied, self.op.at),
+            Some(origin) => origin.values(&self.applied, self.op.at, parser),
             None => Ok(Vec::new()),
         }
     }

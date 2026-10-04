@@ -408,7 +408,11 @@ fn check_sources(
                     (Some(CellId::Field(k)), Some(ViewCell::Field(_))) => {
                         Some(CellSource::Original { field: k as usize })
                     }
-                    (_, Some(ViewCell::Edited(_) | ViewCell::New(_))) => Some(CellSource::Edited),
+                    // A field put back by value as its bytes is a new
+                    // cell, as the oracle has it.
+                    (_, Some(ViewCell::Edited(_) | ViewCell::New(_) | ViewCell::Raw(_))) => {
+                        Some(CellSource::Edited)
+                    }
                     (_, Some(ViewCell::Padding)) => Some(CellSource::Padding),
                     (_, Some(ViewCell::Field(_)) | None) => None,
                 };

@@ -12,6 +12,7 @@ use super::columns::{CellId, Columns, Fold, Layout, Own, Parts};
 use super::rows::Piece;
 use super::rows::{RowId, RowMap};
 use super::structural::BaseId;
+use super::value::Value;
 use crate::diagnostics::DiagnosticKind;
 
 /// The field-level diagnostics a row or a cell has (task 1.7's flagged
@@ -233,14 +234,17 @@ impl RowEdits {
                         kinds.insert(self.flagged[i].1);
                     }
                 }
-                CellId::Inserted(op) => {
-                    if columns
-                        .inserted_value(op, row)
-                        .is_some_and(|v| v.contains('\0'))
-                    {
-                        kinds.insert(Kinds::NUL_BYTES);
+                CellId::Inserted(op) => match columns.inserted_raw(op, row) {
+                    Some(raw) => kinds.insert(raw.kinds()),
+                    None => {
+                        if columns
+                            .inserted_value(op, row)
+                            .is_some_and(|v| v.contains('\0'))
+                        {
+                            kinds.insert(Kinds::NUL_BYTES);
+                        }
                     }
-                }
+                },
                 CellId::Appended(_) => {}
             },
         };
@@ -397,33 +401,36 @@ pub(crate) struct InsertedRow {
     /// The physical row it was inserted before (the file's row count at
     /// the end).
     gap: u32,
-    /// Its values: at least one, unless put back by value.
-    fields: Vec<Arc<str>>,
+    /// Its values: at least one, unless put back by value. A row put back
+    /// by value holds the file's fields as their bytes (task 2.4c).
+    fields: Vec<Value>,
 }
 
 impl InsertedRow {
     /// A row of `values` (an empty row has one empty cell, as a blank line
     /// reads), inserted before physical row `gap`.
-    pub(crate) fn new(gap: u32, values: &[String]) -> InsertedRow {
-        let mut fields: Vec<Arc<str>> = values.iter().map(|v| Arc::from(v.as_str())).collect();
+    pub(crate) fn new(gap: u32, values: &[Value]) -> InsertedRow {
+        let mut fields = values.to_vec();
         if fields.is_empty() {
-            fields.push(Arc::from(""));
+            fields.push(Value::from(""));
         }
         InsertedRow { gap, fields }
     }
 
     /// A row of exactly `values`, inserted before physical row `gap`: a
     /// row put back by value, which column deletes may have left with none.
-    pub(crate) fn exactly(gap: u32, values: &[String]) -> InsertedRow {
-        let fields = values.iter().map(|v| Arc::from(v.as_str())).collect();
-        InsertedRow { gap, fields }
+    pub(crate) fn exactly(gap: u32, values: &[Value]) -> InsertedRow {
+        InsertedRow {
+            gap,
+            fields: values.to_vec(),
+        }
     }
 
     pub(crate) fn gap(&self) -> u32 {
         self.gap
     }
 
-    pub(crate) fn fields(&self) -> &[Arc<str>] {
+    pub(crate) fn fields(&self) -> &[Value] {
         &self.fields
     }
 }

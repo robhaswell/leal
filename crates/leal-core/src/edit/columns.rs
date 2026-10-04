@@ -31,6 +31,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::value::{RawField, Value};
 use super::{RowEdits, RowId};
 
 /// A column operation's id, unique within one store's edits.
@@ -73,7 +74,7 @@ pub(crate) enum OpKind {
     /// Inserts a cell holding each row's own value: a column delete's
     /// cells put back by value, by its undo after a save or in a replay
     /// (ADR-0014 decision 3).
-    Restore(Arc<BTreeMap<RowId, Arc<str>>>),
+    Restore(Arc<BTreeMap<RowId, Value>>),
     /// Deletes a cell.
     Delete,
 }
@@ -145,21 +146,43 @@ impl ColumnOp {
         !matches!(self.kind, OpKind::Delete)
     }
 
-    /// The value it gives row `row`, for an insert.
+    /// The value it gives row `row`, for an insert, as it reads.
     pub(crate) fn value_for(&self, row: RowId) -> Option<&str> {
         match &self.kind {
             OpKind::Insert(value) => Some(value),
-            OpKind::Restore(values) => Some(values.get(&row).map_or("", AsRef::as_ref)),
+            OpKind::Restore(values) => Some(values.get(&row).map_or("", Value::text)),
             OpKind::Delete => None,
         }
     }
 
-    /// Every value it inserts.
+    /// The field it puts back in row `row` as its bytes, if it does.
+    pub(crate) fn raw_for(&self, row: RowId) -> Option<&RawField> {
+        match &self.kind {
+            OpKind::Restore(values) => values.get(&row).and_then(Value::raw),
+            OpKind::Insert(_) | OpKind::Delete => None,
+        }
+    }
+
+    /// Every value it inserts, as it reads.
     pub(crate) fn values(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         match &self.kind {
             OpKind::Insert(value) => Box::new(std::iter::once(value.as_ref())),
-            OpKind::Restore(values) => Box::new(values.values().map(AsRef::as_ref)),
+            OpKind::Restore(values) => Box::new(values.values().map(Value::text)),
             OpKind::Delete => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// Every value it inserts as text, which a save encodes: not the fields
+    /// it puts back as their bytes.
+    pub(crate) fn texts(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match &self.kind {
+            OpKind::Restore(values) => Box::new(
+                values
+                    .values()
+                    .filter(|value| value.raw().is_none())
+                    .map(Value::text),
+            ),
+            OpKind::Insert(_) | OpKind::Delete => self.values(),
         }
     }
 }
@@ -312,6 +335,12 @@ impl Columns {
     /// is in effect.
     pub(crate) fn inserted_value(&self, id: OpId, row: RowId) -> Option<&str> {
         self.op(id).and_then(|op| op.value_for(row))
+    }
+
+    /// The field inserted cell `id` of row `row` holds as its bytes, if
+    /// its operation is in effect and put it back so (task 2.4c).
+    pub(crate) fn inserted_raw(&self, id: OpId, row: RowId) -> Option<&RawField> {
+        self.op(id).and_then(|op| op.raw_for(row))
     }
 }
 

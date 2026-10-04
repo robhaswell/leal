@@ -53,7 +53,8 @@ use std::time::Duration;
 use leal_testkit::dialect as tk;
 use leal_testkit::fidelity::{Change, check_identical, check_only_changed};
 use leal_testkit::save::{
-    Document as Oracle, Edit as OracleEdit, Fix as OracleFix, SaveError as OracleError, SavedFile,
+    Document as Oracle, Edit as OracleEdit, Fix as OracleFix, Restored, SaveError as OracleError,
+    SavedFile,
 };
 use leal_testkit::strategies::csv::{CsvConfig, csv_file_utf16};
 use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for, single_byte_edit_case};
@@ -197,15 +198,22 @@ fn case_edits(case: &EditCase) -> Vec<OracleEdit> {
 #[derive(Clone, Debug)]
 enum Undo {
     Edit(OracleEdit),
+    /// A row delete's: the row put back, its unedited fields as their
+    /// bytes (task 2.4c).
+    RestoreRow {
+        at: usize,
+        cells: Vec<Restored>,
+    },
     /// A column insert's: its cells deleted from the rows it gave them.
     DeleteColumnFrom {
         column: usize,
         rows: Vec<usize>,
     },
-    /// A column delete's: its cells put back.
+    /// A column delete's: its cells put back, unedited fields as their
+    /// bytes (task 2.4c).
     RestoreColumn {
         at: usize,
-        cells: Vec<(usize, String)>,
+        cells: Vec<(usize, Restored)>,
     },
 }
 
@@ -213,6 +221,7 @@ impl Undo {
     fn apply(&self, oracle: &mut Oracle<'_>) -> Result<(), OracleError> {
         match self {
             Undo::Edit(edit) => oracle.apply(edit),
+            Undo::RestoreRow { at, cells } => oracle.restore_row(*at, cells),
             Undo::DeleteColumnFrom { column, rows } => oracle.delete_column_from(*column, rows),
             Undo::RestoreColumn { at, cells } => oracle.restore_column(*at, cells),
         }
@@ -276,12 +285,13 @@ fn open_and_edit(
                 vec![Undo::Edit(OracleEdit::DeleteRow { row: *at })],
             ),
             OracleEdit::DeleteRow { row } => {
-                let values: Vec<String> = (0..before.row_len(*row))
-                    .map(|column| before.value(*row, column).unwrap_or_default())
+                // Its unedited fields come back as their bytes (task 2.4c).
+                let cells: Vec<Restored> = (0..before.row_len(*row))
+                    .filter_map(|column| before.restored(*row, column))
                     .collect();
                 // A row column deletes emptied comes back with no cells
                 // (ADR-0014 decision 6), which the oracle makes in two.
-                let undo = if values.is_empty() {
+                let undo = if cells.is_empty() {
                     vec![
                         Undo::Edit(OracleEdit::InsertRow {
                             at: *row,
@@ -293,7 +303,7 @@ fn open_and_edit(
                         },
                     ]
                 } else {
-                    vec![Undo::Edit(OracleEdit::InsertRow { at: *row, values })]
+                    vec![Undo::RestoreRow { at: *row, cells }]
                 };
                 (document.delete_rows(*row, 1), undo)
             }
@@ -305,9 +315,13 @@ fn open_and_edit(
                 }],
             ),
             OracleEdit::DeleteColumn { column } => {
+                // Its unedited fields come back as their bytes (task 2.4c).
                 let cells = changed(false)
                     .into_iter()
-                    .map(|row| (row, before.value(row, *column).unwrap_or_default()))
+                    .map(|row| {
+                        let cell = before.restored(row, *column);
+                        (row, cell.unwrap_or(Restored::Text(String::new())))
+                    })
                     .collect();
                 (
                     document.delete_column(*column),
@@ -888,7 +902,16 @@ fn incomplete_save_as_matches_the_oracle(case: &EditCase, at: usize) -> Result<(
             Err(EditError::StillReading) => {
                 prop_assert!(!matches!(edit, OracleEdit::SetCell { .. }), "{:?}", edit);
             }
-            Err(_) => {}
+            // A cell past the cut (or of the row it cuts), or after an
+            // open quote: the oracle, which has every row, can't say.
+            Err(
+                EditError::NoSuchRow { .. }
+                | EditError::NotReadYet { .. }
+                | EditError::AfterUnterminatedQuote { .. },
+            ) => {
+                prop_assert!(matches!(edit, OracleEdit::SetCell { .. }), "{:?}", edit);
+            }
+            Err(error) => prop_assert!(false, "{:?} refused: {:?}", edit, error),
         }
     }
     let rows = document.row_count();

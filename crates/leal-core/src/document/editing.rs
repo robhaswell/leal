@@ -124,7 +124,7 @@ impl Work<'_> {
             } => parsed
                 .field(k)
                 .map(|field| parser.display_value_in(bytes, *base, field)),
-            Own::New(row) => row.fields().get(k).map(|v| Cow::Borrowed(v.as_ref())),
+            Own::New(row) => row.fields().get(k).map(|v| Cow::Borrowed(v.text())),
         }
     }
 

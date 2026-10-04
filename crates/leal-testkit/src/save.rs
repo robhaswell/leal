@@ -330,6 +330,38 @@ enum Cell {
     /// `None`, padding before an edited one, is written with no bytes;
     /// `Some` is its new value.
     Appended(Option<String>),
+    /// A field of a file put back by value (an undo after a save, ADR-0014
+    /// decision 3): a new cell, written as its bytes, or as `edit` if it
+    /// has been given one (set back to how the field reads, the edit goes,
+    /// as for an original field, §3.6).
+    Raw { raw: RawField, edit: Option<String> },
+}
+
+/// A field of a file as its bytes, put back by value ([`Restored::Raw`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawField {
+    /// Its bytes as written: quotes, escapes and any text after the
+    /// closing quote included.
+    pub bytes: Vec<u8>,
+    /// True if its first byte is `"`.
+    pub quoted: bool,
+    /// Its display value as bytes, before decoding ([`FieldLayout::value`]).
+    pub value: Vec<u8>,
+    /// The offset in `bytes` of the first byte after its closing quote, if
+    /// text follows it.
+    pub text_after_quote: Option<usize>,
+}
+
+/// A cell's value as a row or column delete undone after a save puts it
+/// back (task 2.4c): one of the file's fields, unedited, as its bytes (not
+/// an unterminated quote's, which would swallow what follows it); any other
+/// cell as its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// A value, written as a new field is.
+    Text(String),
+    /// A field, written as its bytes.
+    Raw(RawField),
 }
 
 /// Where a cell of the document comes from now, for tests that compare a
@@ -353,6 +385,22 @@ struct DocRow {
     /// The original row, or `None` for an inserted row.
     source: Option<usize>,
     cells: Vec<Cell>,
+}
+
+impl Cell {
+    /// A cell put back by value.
+    fn restored(value: &Restored) -> Cell {
+        match value {
+            Restored::Text(value) => Cell::Edited {
+                field: None,
+                value: value.clone(),
+            },
+            Restored::Raw(raw) => Cell::Raw {
+                raw: raw.clone(),
+                edit: None,
+            },
+        }
+    }
 }
 
 impl DocRow {
@@ -446,7 +494,33 @@ impl<'a> Document<'a> {
             Cell::Original(f) => self.field_display(r.source?, *f),
             Cell::Edited { value, .. } => value.clone(),
             Cell::Appended(value) => value.clone().unwrap_or_default(),
+            Cell::Raw { raw, edit } => edit
+                .clone()
+                .unwrap_or_else(|| decode_value(&raw.value, self.encoding)),
         })
+    }
+
+    /// Cell (`row`, `column`) as a delete undone after a save puts it back
+    /// ([`Restored`]), or `None` past the end of the row or the document.
+    #[must_use]
+    pub fn restored(&self, row: usize, column: usize) -> Option<Restored> {
+        let r = self.rows.get(row)?;
+        let cell = r.cells.get(column)?;
+        if let (Cell::Original(f), Some(source)) = (cell, r.source) {
+            let field = &self.layout.rows[source].fields[*f];
+            if !field.unterminated {
+                return Some(Restored::Raw(RawField {
+                    bytes: self.bytes[field.span.clone()].to_vec(),
+                    quoted: field.quoted,
+                    value: field.value.clone(),
+                    text_after_quote: field.text_after_quote.map(|t| t - field.span.start),
+                }));
+            }
+        }
+        if let Cell::Raw { raw, edit: None } = cell {
+            return Some(Restored::Raw(raw.clone()));
+        }
+        self.value(row, column).map(Restored::Text)
     }
 
     /// Where cell (`row`, `column`) comes from now, or `None` past the end
@@ -455,7 +529,8 @@ impl<'a> Document<'a> {
     pub fn cell_source(&self, row: usize, column: usize) -> Option<CellSource> {
         Some(match self.rows.get(row)?.cells.get(column)? {
             Cell::Original(field) => CellSource::Original { field: *field },
-            Cell::Edited { .. } | Cell::Appended(Some(_)) => CellSource::Edited,
+            // A field put back by value is a new cell.
+            Cell::Edited { .. } | Cell::Appended(Some(_)) | Cell::Raw { .. } => CellSource::Edited,
             Cell::Appended(None) => CellSource::Padding,
         })
     }
@@ -474,6 +549,7 @@ impl<'a> Document<'a> {
                     Cell::Original(f) => *f == k,
                     Cell::Edited { field, .. } => *field == Some(k),
                     Cell::Appended(_) => k >= fields,
+                    Cell::Raw { .. } => false,
                 }),
         )
     }
@@ -496,6 +572,7 @@ impl<'a> Document<'a> {
         let field = match r.cells.get(column) {
             Some(Cell::Original(f)) => Some(*f),
             Some(Cell::Edited { field, .. }) => *field,
+            Some(Cell::Raw { .. }) => None,
             Some(Cell::Appended(_)) | None => return Some(String::new()),
         }?;
         Some(self.field_display(source, field))
@@ -585,7 +662,7 @@ impl<'a> Document<'a> {
     pub fn restore_column(
         &mut self,
         at: usize,
-        cells: &[(usize, String)],
+        cells: &[(usize, Restored)],
     ) -> Result<(), SaveError> {
         if cells.iter().any(|&(r, _)| r >= self.rows.len()) {
             return Err(SaveError::InvalidEdit(Edit::InsertColumn {
@@ -598,11 +675,45 @@ impl<'a> Document<'a> {
             if row.len() < at {
                 row.resize(at, Cell::Appended(None));
             }
-            let cell = Cell::Edited {
-                field: None,
-                value: value.clone(),
-            };
-            row.insert(at, cell);
+            row.insert(at, Cell::restored(value));
+        }
+        Ok(())
+    }
+
+    /// Puts a deleted row back at `at` by value, its cells `cells` (at
+    /// least one): what undoing a row delete after a save does (ADR-0014
+    /// decision 3). Each is a new field (rule 3), or a field's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`SaveError::InvalidEdit`] (naming an `InsertRow`) if `at` is past
+    /// the end or `cells` is empty; nothing is changed then.
+    pub fn restore_row(&mut self, at: usize, cells: &[Restored]) -> Result<(), SaveError> {
+        if at > self.rows.len() || cells.is_empty() {
+            let values = cells
+                .iter()
+                .map(|cell| match cell {
+                    Restored::Text(value) => value.clone(),
+                    Restored::Raw(raw) => decode_value(&raw.value, self.encoding),
+                })
+                .collect();
+            return Err(SaveError::InvalidEdit(Edit::InsertRow { at, values }));
+        }
+        let row = DocRow {
+            source: None,
+            cells: cells.iter().map(Cell::restored).collect(),
+        };
+        let before = self.rows.clone();
+        self.rows.insert(at, row);
+        let swallows_nothing = self
+            .unterminated()
+            .is_none_or(|(r, c)| r + 1 == self.rows.len() && c + 1 == self.row_len(r));
+        if !swallows_nothing {
+            self.rows = before;
+            return Err(SaveError::AfterUnterminatedQuote(Edit::InsertRow {
+                at,
+                values: Vec::new(),
+            }));
         }
         Ok(())
     }
@@ -632,6 +743,12 @@ impl<'a> Document<'a> {
                     }
                     return Ok(());
                 }
+                if let Cell::Raw { raw, edit } = &mut r.cells[*column] {
+                    // Back to how the field reads, the edit goes (§3.6).
+                    let reads = decode_value(&raw.value, self.encoding);
+                    *edit = (*value != reads).then(|| value.clone());
+                    return Ok(());
+                }
                 let source = r.source;
                 let original = self.original_value(*row, *column);
                 let cell = self
@@ -642,7 +759,7 @@ impl<'a> Document<'a> {
                 let field = match cell {
                     Cell::Original(f) => Some(*f),
                     Cell::Edited { field, .. } => *field,
-                    Cell::Appended(_) => None,
+                    Cell::Appended(_) | Cell::Raw { .. } => None,
                 };
                 *cell = match (field, source) {
                     // §3.6: back to the original display value removes the edit.
@@ -930,7 +1047,9 @@ impl<'a> Document<'a> {
             for (column, cell) in row.cells.iter().enumerate() {
                 let field = match cell {
                     Cell::Original(f) | Cell::Edited { field: Some(f), .. } => *f,
-                    Cell::Edited { field: None, .. } | Cell::Appended(_) => continue,
+                    Cell::Edited { field: None, .. } | Cell::Appended(_) | Cell::Raw { .. } => {
+                        continue;
+                    }
                 };
                 let field = &self.layout.rows[source].fields[field];
                 if field.span.is_empty() {
@@ -1023,11 +1142,23 @@ impl<'a> Document<'a> {
                             text_after_quote: None,
                             unterminated: false,
                         },
+                        (Cell::Raw { raw, edit: None }, _) => FieldLayout {
+                            span: span.clone(),
+                            quoted: raw.quoted || bom_quoted,
+                            value: raw.value.clone(),
+                            text_after_quote: raw
+                                .text_after_quote
+                                .filter(|_| !bom_quoted)
+                                .map(|t| t + span.start),
+                            unterminated: false,
+                        },
                         _ => {
                             let value = match cell {
-                                Cell::Edited { value, .. } | Cell::Appended(Some(value)) => {
-                                    encode_value(value, self.encoding).unwrap_or_default()
-                                }
+                                Cell::Edited { value, .. }
+                                | Cell::Appended(Some(value))
+                                | Cell::Raw {
+                                    edit: Some(value), ..
+                                } => encode_value(value, self.encoding).unwrap_or_default(),
                                 _ => Vec::new(),
                             };
                             FieldLayout {
@@ -1090,6 +1221,26 @@ impl<'a> Document<'a> {
                 expected_field_bytes(value, target, self.delimiter, false, quoting.all)
                     .map_err(|_| Bad::Unencodable)
             }
+            Cell::Raw { raw, edit: None } => {
+                if transcode {
+                    decode_strict(&raw.bytes, self.encoding)
+                        .map(String::into_bytes)
+                        .ok_or(Bad::Unconvertible)
+                } else {
+                    Ok(raw.bytes.clone())
+                }
+            }
+            // An edited field put back is a new field (rule 3).
+            Cell::Raw {
+                edit: Some(value), ..
+            } => expected_field_bytes(
+                value,
+                target,
+                self.delimiter,
+                quoting.new_field(column),
+                false,
+            )
+            .map_err(|_| Bad::Unencodable),
             Cell::Edited { field, value } => {
                 let quoted = match (row.source, field) {
                     (Some(s), Some(f)) => self.layout.rows[s].fields[*f].quoted || quoting.all,
@@ -1172,6 +1323,7 @@ impl<'a> Document<'a> {
                 Cell::Original(f) => *f == k,
                 Cell::Edited { field, .. } => *field == Some(k),
                 Cell::Appended(_) => k >= fields,
+                Cell::Raw { .. } => false,
             });
         let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         if same_shape {

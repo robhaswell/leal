@@ -79,6 +79,7 @@ mod command;
 mod overlay;
 mod rows;
 mod structural;
+mod value;
 
 pub(crate) use columns::{
     CellId, ColumnOp, Columns, Fold, Layout, OpId, OpKind, Own, Parts, TABLE, fresh_appended,
@@ -91,3 +92,4 @@ pub use rows::RowId;
 pub(crate) use rows::{Piece, RowMap, Segment, Slot};
 pub(crate) use structural::{Changed, ColumnSource, RowSource};
 pub use structural::{Column, Rows};
+pub(crate) use value::{RawField, Value};

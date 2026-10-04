@@ -14,9 +14,10 @@ use std::sync::{Arc, PoisonError};
 use super::{Document, Reading};
 use crate::edit::{
     CellId, Command, Edit, EditError, InsertedRow, Lineage, Overlay, Own as EditOwn, Piece,
-    RowChange, RowEdits, RowId, RowMap, RowSource, Rows,
+    RowChange, RowEdits, RowId, RowMap, RowSource, Rows, Value,
 };
 use crate::index::Status;
+use crate::rows::RowParser;
 use crate::source::{ReadError, Storage};
 
 impl Document {
@@ -43,7 +44,15 @@ impl Document {
         at: usize,
         rows: &[Vec<String>],
     ) -> Result<Option<Command>, EditError> {
-        self.change_rows(|reading| insert_new(reading, at, rows, false))
+        let rows: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| Value::from(value.as_str()))
+                    .collect()
+            })
+            .collect();
+        self.change_rows(|reading| insert_new(reading, at, &rows, false))
     }
 
     /// Deletes logical rows `at..at + count`, as one command (undo puts
@@ -130,7 +139,7 @@ impl Document {
             }
             // Other edits (ADR-0014 decision 3): by value.
             let values = rows
-                .values()
+                .values(&reading.parser)
                 .map_err(|error| EditError::Read { row: at, error })?;
             if values.len() != rows.len() {
                 return Err(EditError::ValueChanged { row: at, column: 0 });
@@ -140,13 +149,17 @@ impl Document {
             }
             let now = values_of(reading, at..at + rows.len())?;
             for (i, expected) in values.iter().enumerate() {
+                let expected: Vec<String> = expected
+                    .iter()
+                    .map(|value| value.text().to_owned())
+                    .collect();
                 let Some(row) = now.get(i) else {
                     return Err(EditError::NoSuchRow { row: at + i });
                 };
                 // Empty cells at the end don't count: undoing an edit past a
                 // row's end after a save leaves an empty field there
                 // (ADR-0012 decision 4), which reads the same.
-                let (row, expected) = (filled(row), filled(expected));
+                let (row, expected) = (filled(row), filled(&expected));
                 if row != expected {
                     let column = row
                         .iter()
@@ -223,7 +236,7 @@ fn begun(reading: &Reading, overlay: &Overlay) -> RowMap {
 fn insert_new(
     reading: &Arc<Reading>,
     at: usize,
-    values: &[Vec<String>],
+    values: &[Vec<Value>],
     exact: bool,
 ) -> Result<Option<Command>, EditError> {
     if values.is_empty() {
@@ -527,9 +540,27 @@ fn row_values(view: &super::RowView<'_>) -> Vec<String> {
 struct BaseRows(Arc<Reading>);
 
 impl RowSource for BaseRows {
-    fn values(&self, rows: Range<u32>, edits: &Overlay) -> Result<Vec<Vec<String>>, ReadError> {
+    fn values(
+        &self,
+        rows: Range<u32>,
+        edits: &Overlay,
+        parser: &RowParser,
+    ) -> Result<Vec<Vec<Value>>, ReadError> {
         let rows = usize::try_from(rows.start).unwrap_or(usize::MAX)
             ..usize::try_from(rows.end).unwrap_or(usize::MAX);
-        Document::read_physical(&self.0, edits, rows, &mut |view| row_values(&view))
+        let mut values = Vec::with_capacity(rows.len());
+        // Unedited fields as their bytes (task 2.4c).
+        Document::each_physical(&self.0, edits, rows, &mut |view| {
+            let layout = view.layout();
+            values.push(
+                (0..layout.len())
+                    .map(|column| match view.cell_in(&layout, column) {
+                        Some((_, cell)) => view.put_back(cell, parser),
+                        None => Value::from(""),
+                    })
+                    .collect(),
+            );
+        })?;
+        Ok(values)
     }
 }

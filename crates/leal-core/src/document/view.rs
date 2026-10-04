@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use crate::diagnostics::{DiagnosticKind, field_has, value_has};
 use crate::edit::{
-    CellId, Columns, Fold, InsertedRow, Kinds, Layout, OverlayRow, Own, RowEdits, RowId,
+    CellId, Columns, Fold, InsertedRow, Kinds, Layout, OpKind, OverlayRow, Own, RawField, RowEdits,
+    RowId, Value,
 };
 use crate::rows::{FieldSpan, ParsedRow, RowParser};
 
@@ -37,16 +38,30 @@ pub(crate) enum ViewCell<'a> {
     /// A new cell, unedited: one of an inserted row's own values, or the
     /// value a column insert gave the row.
     New(&'a str),
+    /// A new cell, unedited, that is one of a file's fields put back by
+    /// value, as its bytes (task 2.4c): a row or column delete undone after
+    /// a save.
+    Raw(&'a Arc<RawField>),
     /// A cell between the end of the row's own fields and an edited cell
     /// past them: empty, with no bytes in the file.
     Padding,
+}
+
+impl<'a> ViewCell<'a> {
+    /// An inserted row's own value, or a column's put back.
+    fn of_value(value: &'a Value) -> ViewCell<'a> {
+        match value {
+            Value::Text(text) => ViewCell::New(text),
+            Value::Raw(raw) => ViewCell::Raw(raw),
+        }
+    }
 }
 
 /// A row's own cells: the file's fields, or an inserted row's values.
 #[derive(Clone, Copy, Debug)]
 enum OwnCells<'a> {
     Parsed(&'a ParsedRow),
-    New(&'a [Arc<str>]),
+    New(&'a [Value]),
 }
 
 impl OwnCells<'_> {
@@ -279,7 +294,7 @@ impl<'a> RowView<'a> {
     fn own_cell(&self, k: usize) -> Option<ViewCell<'a>> {
         match self.own {
             OwnCells::Parsed(row) => row.field(k).map(ViewCell::Field),
-            OwnCells::New(values) => values.get(k).map(|value| ViewCell::New(value)),
+            OwnCells::New(values) => values.get(k).map(ViewCell::of_value),
         }
     }
 
@@ -295,10 +310,15 @@ impl<'a> RowView<'a> {
                 .ok()
                 .and_then(|k| self.own_cell(k))
                 .unwrap_or(ViewCell::Padding),
-            CellId::Inserted(op) => self
-                .columns
-                .inserted_value(op, self.id)
-                .map_or(ViewCell::Padding, ViewCell::New),
+            CellId::Inserted(op) => match self.columns.op(op).map(|op| &op.kind) {
+                Some(OpKind::Restore(values)) => values
+                    .get(&self.id)
+                    .map_or(ViewCell::New(""), ViewCell::of_value),
+                _ => self
+                    .columns
+                    .inserted_value(op, self.id)
+                    .map_or(ViewCell::Padding, ViewCell::New),
+            },
         }
     }
 
@@ -342,7 +362,7 @@ impl<'a> RowView<'a> {
                 OwnCells::New(values) => values
                     .iter()
                     .enumerate()
-                    .map(|(column, value)| (column, ViewCell::New(value)))
+                    .map(|(column, value)| (column, ViewCell::of_value(value)))
                     .collect(),
             };
         }
@@ -413,6 +433,10 @@ impl<'a> RowView<'a> {
                     None => (Cow::Borrowed(value), false),
                 }
             }
+            ViewCell::Raw(raw) => {
+                self.parser
+                    .display_prefix_in(raw.bytes(), raw.base(), raw.field(), max_chars)
+            }
             ViewCell::Padding => (Cow::Borrowed(""), false),
         }
     }
@@ -423,10 +447,36 @@ impl<'a> RowView<'a> {
     }
 
     /// [`value`](Self::value), of a cell of this row.
+    /// `cell`, one of this row's, as a value to put back by value into a
+    /// reading `parser` reads (ADR-0014 decision 3, task 2.4c): one of the
+    /// file's fields, unedited, as its bytes, converted to UTF-8 if Save
+    /// As UTF-8 came between; otherwise, or if that can't be done (a field
+    /// whose bytes aren't text, converted; an unterminated quote's field,
+    /// which would swallow what follows it), as text.
+    pub(crate) fn put_back(&self, cell: ViewCell<'a>, parser: &RowParser) -> Value {
+        let raw = match cell {
+            ViewCell::Field(field) if !field.unterminated() => {
+                let start = field.start() - self.base;
+                Some((&self.bytes[start..start + field.len()], self.parser))
+            }
+            ViewCell::Raw(raw) => {
+                let start = raw.field().start() - raw.base();
+                Some((&raw.bytes()[start..start + raw.field().len()], self.parser))
+            }
+            _ => None,
+        };
+        raw.and_then(|(bytes, from)| raw_field(bytes, from, parser))
+            .map_or_else(
+                || Value::Text(Arc::from(self.value_of(cell).as_ref())),
+                |raw| Value::Raw(Arc::new(raw)),
+            )
+    }
+
     pub(crate) fn value_of(&self, cell: ViewCell<'a>) -> Cow<'a, str> {
         match cell {
             ViewCell::Field(field) => self.parser.display_value_in(self.bytes, self.base, field),
             ViewCell::Edited(value) | ViewCell::New(value) => Cow::Borrowed(value),
+            ViewCell::Raw(raw) => Cow::Borrowed(raw.text()),
             ViewCell::Padding => Cow::Borrowed(""),
         }
     }
@@ -440,6 +490,13 @@ impl<'a> RowView<'a> {
                 field_has(kind, self.parser.encoding(), self.bytes, self.base, field)
             }
             ViewCell::Edited(value) | ViewCell::New(value) => value_has(kind, value),
+            ViewCell::Raw(raw) => field_has(
+                kind,
+                self.parser.encoding(),
+                raw.bytes(),
+                raw.base(),
+                raw.field(),
+            ),
             ViewCell::Padding => false,
         }
     }
@@ -481,4 +538,40 @@ impl<'a> RowView<'a> {
         }
         flagged
     }
+}
+
+/// A field's bytes `raw`, as `from` read them, as a field `to` reads the
+/// same way (the same dialect, and the same encoding, or UTF-8 converted
+/// from it): `None` if it can't be.
+fn raw_field(raw: &[u8], from: &RowParser, to: &RowParser) -> Option<RawField> {
+    let (a, b) = (from.dialect(), to.dialect());
+    if (a.delimiter, a.quote) != (b.delimiter, b.quote) {
+        return None;
+    }
+    let bytes: Box<[u8]> = if from.encoding() == to.encoding() {
+        Box::from(raw)
+    } else if to.encoding() == crate::dialect::Encoding::Utf8 {
+        crate::save::Transcoder::convert(raw, from.encoding())?
+            .into_owned()
+            .into_boxed_slice()
+    } else {
+        return None;
+    };
+    let base = b.bom_len;
+    let span = base..base + bytes.len();
+    let parsed = to.parse_in(&bytes, base, span.clone())?;
+    let [field] = parsed.fields() else {
+        return None;
+    };
+    if field.span() != span || field.unterminated() {
+        return None;
+    }
+    let mut kinds = Kinds::default();
+    for &(kind, bit) in &Kinds::FIELD_KINDS {
+        if field_has(kind, to.encoding(), &bytes, base, field) {
+            kinds.insert(bit);
+        }
+    }
+    let text = to.display_value_in(&bytes, base, field).into_owned();
+    Some(RawField::new(bytes, base, *field, &text, kinds))
 }

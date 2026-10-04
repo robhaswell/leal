@@ -254,6 +254,16 @@ impl<'w, 's> Walk<'w, 's> {
         Ok((bytes, parsed, line_ending))
     }
 
+    /// A field's bytes `raw` as written: converted, for Save As UTF-8
+    /// (`None` if they can't be).
+    fn raw_bytes<'b>(&self, raw: &'b [u8]) -> Option<Cow<'b, [u8]>> {
+        if self.extent.converts() {
+            Transcoder::convert(raw, self.extent.source)
+        } else {
+            Some(Cow::Borrowed(raw))
+        }
+    }
+
     /// Original row `row`'s line ending, from the index alone.
     fn line_ending_of(&self, row: usize) -> Result<Option<LineEnding>, SaveError> {
         let unreadable = || SaveError::Failed(format!("row {row} can't be read"));
@@ -358,24 +368,41 @@ impl<'w, 's> Walk<'w, 's> {
                 return Err(SaveError::Failed(format!("inserted row {n} is missing")));
             };
             let view = RowView::inserted(&self.reading.parser, row, edits);
+            let layout = view.layout();
+            let mut unconvertible = Vec::new();
             // Its own values and a column insert's are new fields; an
-            // edited cell past them is a hatched one.
-            let cells: Vec<NewCell<'_>> = (0..view.len())
-                .map(|column| match (view.cell_id(column), view.cell(column)) {
-                    (Some(CellId::Appended(_)), Some(ViewCell::Edited(value))) => {
-                        NewCell::Hatched(value)
-                    }
-                    (_, Some(ViewCell::New(value) | ViewCell::Edited(value))) => {
+            // edited cell past them is a hatched one; a field of the file
+            // put back by value is its bytes.
+            let cells: Vec<NewCell<'_>> = (0..layout.len())
+                .map(|column| match view.cell_in(&layout, column) {
+                    Some((CellId::Appended(_), ViewCell::Edited(value))) => NewCell::Hatched(value),
+                    Some((_, ViewCell::New(value) | ViewCell::Edited(value))) => {
                         NewCell::New(value)
                     }
+                    Some((_, ViewCell::Raw(raw))) => self.raw_bytes(raw.bytes()).map_or_else(
+                        || {
+                            unconvertible.push(column);
+                            NewCell::Padding
+                        },
+                        NewCell::Bytes,
+                    ),
                     _ => NewCell::Padding,
                 })
                 .collect();
+            let ending = self.ending(None);
+            if !unconvertible.is_empty() {
+                // Save As UTF-8: the save will stop naming these cells.
+                let named: Vec<(usize, usize)> =
+                    unconvertible.iter().map(|&c| (self.out_row, c)).collect();
+                self.sink.refuse(&named)?;
+                self.out_row += 1;
+                self.prev = Prev::Ending(ending);
+                continue;
+            }
             if cells.iter().any(|cell| matches!(cell, NewCell::New(_))) {
                 self.census()?;
             }
             let rules = self.rules(true)?;
-            let ending = self.ending(None);
             let whole = WholeRow {
                 row: self.out_row,
                 cells: &cells,
@@ -670,6 +697,13 @@ impl<'w, 's> Walk<'w, 's> {
         for column in 0..len {
             let cell = view.cell_in(layout, column);
             let cell = match (cell.map(|(id, _)| id), cell.map(|(_, cell)| cell)) {
+                (_, Some(ViewCell::Raw(field))) => self.raw_bytes(field.bytes()).map_or_else(
+                    || {
+                        unconvertible.push(column);
+                        NewCell::Padding
+                    },
+                    NewCell::Bytes,
+                ),
                 (_, Some(ViewCell::Field(field))) => {
                     let bytes = if converts {
                         Transcoder::convert(raw(field), source)

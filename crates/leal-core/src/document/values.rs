@@ -112,6 +112,7 @@ impl Document {
                         .unwrap_or_default();
                     has_invalid(raw, encoding)
                 }
+                ViewCell::Raw(raw) => has_invalid(raw.bytes(), encoding),
                 ViewCell::Edited(_) | ViewCell::New(_) | ViewCell::Padding => false,
             };
             let characters = value.chars().count();
@@ -518,7 +519,7 @@ fn estimated_logical_copy_bytes(
                             .iter()
                             .enumerate()
                             .filter(|(column, _)| columns.contains(column))
-                            .map(|(_, value)| value.len())
+                            .map(|(_, value)| value.text().len())
                             .sum::<usize>();
                     }
                     if let Some(edits) = overlay.edits(RowId::inserted(n)) {
