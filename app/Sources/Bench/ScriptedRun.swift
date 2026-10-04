@@ -253,7 +253,7 @@ final class ScriptedRun {
         if let saveAsTo {
             result["saveAs"] = await saveAsCheck(document, to: saveAsTo, duplicate: false)
             // The new file is the document's now: Save and Revert there.
-            if has("LealSaveAsCells") {
+            if defaults.string(forKey: "LealSaveAsCells") != nil {
                 result["saveAsSave"] = await saveCheck(document, content: content, option: "LealSaveAsCells")
                 result["saveAsRevert"] = await revertCheck(document, content: content)
             }
