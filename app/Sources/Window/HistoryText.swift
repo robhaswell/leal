@@ -37,7 +37,7 @@ enum HistoryText {
         case .stillReading, .notReadYet, .unreadable, .saving:
             true
         case .noSuchRow, .tooFarRight, .afterUnterminatedQuote, .valueChanged, .otherLineage, .noSuchColumn, .tooManyRows,
-             .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
+             .tooManyCells, .tooMuchText, .tooMuchReplaced, .pastLastRow, .pastLastColumn:
             false
         }
     }
@@ -148,7 +148,8 @@ enum HistoryText {
             String(localized: "the cell changed", comment: "Why an edit couldn't be recovered: the file changed there")
         // A replay never refuses `.tooManyRows` and the like: those are
         // Duplicate Row's, Paste's and Clear's, asked before a command.
-        case .noSuchRow, .noSuchColumn, .tooFarRight, .tooManyRows, .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
+        case .noSuchRow, .noSuchColumn, .tooFarRight, .tooManyRows, .tooManyCells, .tooMuchText, .tooMuchReplaced, .pastLastRow,
+             .pastLastColumn:
             String(localized: "it isn’t in the file any more", comment: "Why an edit couldn't be recovered: the row or column is gone")
         case .notReadYet, .unreadable, .stillReading, .saving:
             String(localized: "the row couldn’t be read", comment: "Why an edit couldn't be recovered: its row couldn't be read")

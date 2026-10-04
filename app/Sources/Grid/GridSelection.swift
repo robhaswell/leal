@@ -18,6 +18,10 @@ struct GridSelection: Equatable, Sendable {
     /// that turns out to be: ⌘A, or ⇧⌘↓, while the row count is still an
     /// estimate (DESIGN §3.10 rule 5). Copy then copies to the end.
     var throughLastRow = false
+    /// Whole rows, picked by their row numbers (a click, a Shift-click):
+    /// Cut deletes them rather than emptying their cells (task 2.6). ⌘A
+    /// isn't: it is every cell.
+    var wholeRows = false
 
     /// One cell.
     init(_ cell: CellPosition) {
@@ -26,11 +30,12 @@ struct GridSelection: Equatable, Sendable {
         extent = cell
     }
 
-    init(active: CellPosition, anchor: CellPosition, extent: CellPosition, throughLastRow: Bool = false) {
+    init(active: CellPosition, anchor: CellPosition, extent: CellPosition, throughLastRow: Bool = false, wholeRows: Bool = false) {
         self.active = active
         self.anchor = anchor
         self.extent = extent
         self.throughLastRow = throughLastRow
+        self.wholeRows = wholeRows
     }
 
     /// Every cell of a `rows` × `columns` grid, with `active` still active.
@@ -49,7 +54,8 @@ struct GridSelection: Equatable, Sendable {
         GridSelection(
             active: CellPosition(row: row, column: column),
             anchor: CellPosition(row: row, column: 0),
-            extent: CellPosition(row: row, column: max(0, columns - 1))
+            extent: CellPosition(row: row, column: max(0, columns - 1)),
+            wholeRows: true
         )
     }
 
@@ -64,8 +70,13 @@ struct GridSelection: Equatable, Sendable {
     }
 
     /// The rectangle grown (or shrunk) so its moving corner is `cell`.
+    /// Whole rows stay whole rows if the corner moves only up or down
+    /// (⇧↓ after a click on a row number).
     func extended(to cell: CellPosition, throughLastRow: Bool = false) -> GridSelection {
-        GridSelection(active: active, anchor: anchor, extent: cell, throughLastRow: throughLastRow)
+        GridSelection(
+            active: active, anchor: anchor, extent: cell, throughLastRow: throughLastRow,
+            wholeRows: wholeRows && cell.column == extent.column
+        )
     }
 
     /// The same cells of the copies of `rows` (Duplicate Row, task 2.5a),
@@ -91,6 +102,8 @@ struct GridSelection: Equatable, Sendable {
         if throughLastRow, extent.row >= anchor.row {
             extent.row = rows - 1
         }
-        return GridSelection(active: clamp(active), anchor: clamp(anchor), extent: extent, throughLastRow: throughLastRow)
+        return GridSelection(
+            active: clamp(active), anchor: clamp(anchor), extent: extent, throughLastRow: throughLastRow, wholeRows: wholeRows
+        )
     }
 }

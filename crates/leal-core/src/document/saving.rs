@@ -1192,7 +1192,7 @@ fn carry_over(
         .collect();
     let mut carried = Vec::new();
     if !targets.is_empty() {
-        match Document::change_in(new, None, &targets, false) {
+        match Document::change_in(new, None, &targets, false, None) {
             Ok((_, changes)) => {
                 carried.extend(changes.iter().map(|change| (change.row, change.column)));
             }

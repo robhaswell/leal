@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use leal_bench::report::Side;
+use leal_core::dialect::LineEnding;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::edit::CELL_BATCH_LIMIT;
 use leal_core::find::Query;
@@ -159,8 +160,9 @@ fn edits(c: &mut Criterion) {
     group.bench_function("paste_100k_cells", |b| {
         b.iter(|| {
             let command = document
-                .paste(black_box(area.clone()), 0..10, 12, &block)
+                .paste(black_box(area.clone()), 0..10, 12, &block, LineEnding::Lf)
                 .expect("a paste")
+                .command
                 .expect("a change");
             document.apply(&command.inverse()).expect("an undo");
         });

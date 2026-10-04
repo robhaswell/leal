@@ -10,7 +10,8 @@ struct CellArea: Equatable, Sendable {
     let columnCount: UInt32
 }
 
-/// Paste and Clear (task 2.6, DESIGN §4.2): the core's `paste` and
+/// Paste and Clear (task 2.6, DESIGN §4.2; Cut is Copy then Clear or
+/// Delete Row): the core's `paste` and
 /// `clearCells`, with the grid's selection turned into the core's logical
 /// rows. Each is one command of its cells, which goes to `commandApplied`
 /// as a cell edit does, so undo, the journal, the grid, Find and the
@@ -56,15 +57,22 @@ extension DocumentModel {
 
     /// Pastes clipboard `text` into `area`: one value into each cell, or a
     /// block from its top-left cell, which must fit within the rows and the
-    /// grid's columns.
-    func paste(_ text: String, into area: CellArea) -> EditOutcome {
+    /// grid's columns. A line break inside a value becomes the file's own,
+    /// as one typed with ⌥↩ does (`lineBreak`). Also the size of what was
+    /// pasted, to select the block (`nil` if the call didn't run).
+    func paste(_ text: String, into area: CellArea) -> (EditOutcome, (rows: UInt64, columns: UInt32)?) {
         let shown = UInt32(clamping: columnCount)
-        return make {
-            try $0.paste(
+        let ending = lineEnding ?? .lf
+        var shape: (rows: UInt64, columns: UInt32)?
+        let outcome = make {
+            let pasting = try $0.paste(
                 rowStart: area.rowStart, rowCount: area.rowCount, columnStart: area.columnStart, columnCount: area.columnCount,
-                columnsShown: shown, text: text
+                columnsShown: shown, text: text, lineEnding: ending
             )
+            shape = (pasting.rows, pasting.columns)
+            return pasting.command
         }
+        return (outcome, shape)
     }
 
     /// Clears `area`: each cell empty, a missing (hatched) one left missing.

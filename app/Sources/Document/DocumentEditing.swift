@@ -150,8 +150,9 @@ extension DocumentModel {
     }
 
     /// The file's main line ending, for a line break typed into a value
-    /// (⌥↩ in the in-cell editor, Return in the inspector): `\n` until the
-    /// core reports one.
+    /// (⌥↩ in the in-cell editor, Return in the inspector) or pasted in
+    /// one (`paste`, which hands the core `lineEnding` itself): `\n` until
+    /// the core reports one.
     var lineBreak: String {
         switch lineEnding {
         case .crlf: "\r\n"
@@ -279,6 +280,12 @@ extension EditCommand {
     /// The first cell it changes, to name it.
     var firstChange: ValueChange? {
         cells.map { $0.first() } ?? changes.first
+    }
+
+    /// Whether it empties every cell it changes (a Clear, or a Cut of
+    /// cells): each new value `""` or a missing cell.
+    var clearsCells: Bool {
+        cells.map { $0.clears() } ?? changes.allSatisfy { ($0.newValue ?? "").isEmpty }
     }
 
     /// The first and last logical rows it changes; `nil` for none.

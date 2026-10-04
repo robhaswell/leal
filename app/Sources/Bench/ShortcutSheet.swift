@@ -44,7 +44,7 @@ enum ShortcutSheet {
             (title(#selector(NSText.selectAll(_:))), keys(#selector(NSText.selectAll(_:))), "every row, to the end of the file"),
             ("Find", "\(keys(#selector(DocumentViewController.showFind(_:))))  ·  \(keys(#selector(DocumentViewController.findNext(_:)))) next", "\(keys(#selector(DocumentViewController.findPrevious(_:)))) previous"),
             (title(#selector(DocumentViewController.goToRow(_:))), keys(#selector(DocumentViewController.goToRow(_:))), "past the indexed rows too"),
-            (title(#selector(NSText.copy(_:))), keys(#selector(NSText.copy(_:))), "TSV on the clipboard; ⌘V pastes, Delete clears"),
+            (title(#selector(NSText.copy(_:))), keys(#selector(NSText.copy(_:))), "TSV on the clipboard; ⌘X cuts, ⌘V pastes, Delete clears"),
             (title(#selector(DocumentViewController.toggleCellInspector(_:))), keys(#selector(DocumentViewController.toggleCellInspector(_:))), "shows long or multiline values; editing is task 2.5"),
             ("Edit cell, Undo, Insert row", "phase 2", "tasks 2.5 and 2.5a"),
         ]

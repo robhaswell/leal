@@ -499,17 +499,23 @@ impl Document {
         // One change at a time, and none while the file is read again.
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let reading = self.current();
-        Self::change_in(&reading, lineage, targets, replaying)
+        Self::change_in(&reading, lineage, targets, replaying, None)
     }
 
     /// [`change`](Self::change) in `reading`, with the writer lock held by
     /// the caller: a save carries edits over to the reading of the file it
     /// wrote before it becomes the current one.
+    ///
+    /// With `budget` (Paste and Clear, task 2.6), the cells' old values,
+    /// which the command keeps a copy of for undo, may come to at most
+    /// that many bytes between them: past it, [`EditError::TooMuchReplaced`],
+    /// found as the cells are read, before anything is applied.
     pub(super) fn change_in(
         reading: &Reading,
         lineage: Option<Lineage>,
         targets: &[Target<'_>],
         replaying: bool,
+        budget: Option<usize>,
     ) -> Result<(Lineage, Vec<CellChange>), EditError> {
         let store = &reading.edits;
         if lineage.is_some_and(|lineage| lineage != store.lineage()) {
@@ -524,6 +530,7 @@ impl Document {
         let rebased = store.is_rebased() || replaying;
         let mut rows: BTreeMap<usize, Work<'_>> = BTreeMap::new();
         let mut changes = Vec::new();
+        let mut old_bytes = 0_usize;
         for target in targets {
             let Target { row, column, .. } = *target;
             if let Entry::Vacant(entry) = rows.entry(row) {
@@ -533,7 +540,15 @@ impl Document {
                 continue;
             };
             check_column(work, row, column)?;
-            let old = work.value(parser, column).map(Cow::into_owned);
+            let old = work.value(parser, column);
+            if let Some(budget) = budget {
+                // Counted before the value is copied.
+                old_bytes = old_bytes.saturating_add(old.as_ref().map_or(0, |old| old.len()));
+                if old_bytes > budget {
+                    return Err(EditError::TooMuchReplaced { bytes: old_bytes });
+                }
+            }
+            let old = old.map(Cow::into_owned);
             if let Some(expected) = target.expected
                 && !holds(old.as_deref(), expected, rebased)
             {

@@ -503,8 +503,13 @@ command never lands on the wrong cell. A command of several cells (a paste)
 is checked whole before anything changes, and applies whole or not at all.
 Paste and Clear (task 2.6) are such commands: like row and column edits
 they wait for the whole file to be read and for a save to end, take at
-most 100,000 cells, and never add rows or columns. The clipboard is read
-as tab-separated values (`edit/paste.rs`).
+most 100,000 cells and replace at most 32 MB of old values (the command
+keeps them for undo), and never add rows or columns. The clipboard is read
+as tab-separated values (`edit/paste.rs`); a line break inside a pasted
+value becomes the file's own line ending, as a typed one does. Cut copies
+the selection, then deletes its rows (whole rows, picked by their row
+numbers) or clears its cells, as one undo step; refused as the delete or
+clear would be, it copies nothing.
 Undoing a row or column delete restores the original bytes, not just the
 values (below).
 
@@ -986,7 +991,8 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Undo / redo | ⌘Z / ⇧⌘Z |
 | Find | ⌘F, ⌘G / ⇧⌘G |
 | Go to row | ⌘L |
-| Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells) |
+| Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells; empty text pastes nothing) |
+| Cut | ⌘X (whole rows selected by their numbers: Copy, then delete them; otherwise Copy, then clear the cells) |
 | Insert row below / delete row | ⌘↩ / ⌘⌫ |
 | Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |

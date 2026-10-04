@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use leal_core::edit::{self, CellChange, Command, Edit, EditError, Lineage};
 
-use super::{Document, TextEncoding, read_error, to_index, to_u32, to_u64, to_usize};
+use super::{Document, LineEnding, TextEncoding, read_error, to_index, to_u32, to_u64, to_usize};
 use crate::LealError;
 
 #[cfg(test)]
@@ -132,9 +132,25 @@ impl CellBatch {
         })
     }
 
+    /// Whether it empties every cell it changes (each new value `""` or a
+    /// missing cell): a Clear, to name the step after Recover, when the
+    /// app no longer knows which command made it.
+    #[must_use]
+    pub fn clears(&self) -> bool {
+        self.changes
+            .iter()
+            .all(|change| change.new.as_deref().is_none_or(str::is_empty))
+    }
+
     /// Each column's `per_column` longest values (by UTF-8 length), as the
     /// cells read once it is applied, or once it is undone (`undone`): the
     /// values that may widen their column. A missing cell has none.
+    ///
+    /// Ranked by bytes, not by width on screen: counting bytes costs
+    /// nothing, and a value with fewer bytes is rarely wider (an emoji or
+    /// a CJK character takes three or four bytes, an ASCII letter one), so
+    /// the widest value is nearly always among a column's 16 longest. The
+    /// app measures those few in the grid's font.
     #[must_use]
     pub fn longest(&self, undone: bool, per_column: u32) -> Vec<ValueChange> {
         let per_column = to_usize(per_column);
@@ -300,6 +316,9 @@ pub enum EditRefusal {
     TooManyCells,
     /// More text than `paste_byte_limit()` to paste at once (task 2.6).
     TooMuchText,
+    /// The cells to paste into or clear hold more than
+    /// `paste_byte_limit()` bytes between them (task 2.6).
+    TooMuchReplaced,
     /// The pasted cells run past the last row (task 2.6).
     PastLastRow,
     /// The pasted cells run past the last column shown (task 2.6).
@@ -412,32 +431,16 @@ pub fn paste_byte_limit() -> u64 {
     to_u64(edit::PASTE_BYTE_LIMIT)
 }
 
-/// The rows and columns of clipboard text, as **Paste** reads it (task
-/// 2.6): how many rows, and the longest row's cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
-pub struct PasteShape {
-    /// Rows.
+/// What **Paste** did (task 2.6): its command, `nil` if no cell changed,
+/// and the size of what was pasted, for the app to select the block.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Pasting {
+    /// The command, for the undo manager.
+    pub command: Option<EditCommand>,
+    /// The pasted text's rows (0 for empty text).
     pub rows: u64,
-    /// The longest row's cells.
+    /// Its longest row's cells.
     pub columns: u32,
-}
-
-/// How **Paste** reads clipboard `text` (tab-separated values, see
-/// `leal_core::edit::parse_tsv`): its rows and columns, for the app to
-/// select the cells a block was pasted into. `nil` past
-/// `cell_batch_limit()` cells.
-#[uniffi::export]
-#[must_use]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "UniFFI passes a string from Swift by value"
-)]
-pub fn paste_shape(text: String) -> Option<PasteShape> {
-    let pasted = edit::parse_tsv(&text, edit::CELL_BATCH_LIMIT).ok()?;
-    Some(PasteShape {
-        rows: to_u64(pasted.height()),
-        columns: to_u32(pasted.width()),
-    })
 }
 
 /// Logical rows `start..start + count`, as the core takes them.
@@ -482,6 +485,7 @@ fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
         EditError::TooManyRows { .. } => (EditRefusal::TooManyRows, None, None),
         EditError::TooManyCells { .. } => (EditRefusal::TooManyCells, None, None),
         EditError::TooMuchText { .. } => (EditRefusal::TooMuchText, None, None),
+        EditError::TooMuchReplaced { .. } => (EditRefusal::TooMuchReplaced, None, None),
         EditError::PastLastRow { .. } => (EditRefusal::PastLastRow, None, None),
         EditError::PastLastColumn { .. } => (EditRefusal::PastLastColumn, None, None),
         EditError::Read { row, .. } => (EditRefusal::Unreadable, Some(row), None),
@@ -662,21 +666,27 @@ impl Document {
     /// selected cell; more go in as a block from the selection's top-left
     /// cell, which must fit within the rows and the `columns_shown`
     /// columns the grid shows. The hatched-cell rule holds (ADR-0005
-    /// decision 2). `nil` if no cell changes. On the main thread: it takes
-    /// at most `cell_batch_limit()` cells. See
+    /// decision 2). A line break inside a value becomes `line_ending`,
+    /// the file's, as a typed one does. Empty `text` pastes nothing. On
+    /// the main thread: it takes at most `cell_batch_limit()` cells. See
     /// `leal_core::document::Document::paste`.
     ///
     /// # Errors
     ///
     /// [`LealError::EditRefused`] with [`EditRefusal::StillReading`],
     /// [`EditRefusal::Saving`], [`EditRefusal::TooManyCells`],
-    /// [`EditRefusal::TooMuchText`], [`EditRefusal::PastLastRow`],
+    /// [`EditRefusal::TooMuchText`], [`EditRefusal::TooMuchReplaced`],
+    /// [`EditRefusal::PastLastRow`],
     /// [`EditRefusal::PastLastColumn`] or
     /// [`EditRefusal::AfterUnterminatedQuote`], with the document
     /// unchanged; [`LealError::DocumentFailed`].
     #[expect(
         clippy::needless_pass_by_value,
         reason = "UniFFI passes a string from Swift by value"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "UniFFI exports take plain values: the selection's four numbers, the grid's columns, the text and the line ending"
     )]
     pub fn paste(
         &self,
@@ -686,7 +696,8 @@ impl Document {
         column_count: u32,
         columns_shown: u32,
         text: String,
-    ) -> Result<Option<EditCommand>, LealError> {
+        line_ending: LineEnding,
+    ) -> Result<Pasting, LealError> {
         self.call(|| {
             self.document
                 .paste(
@@ -694,8 +705,13 @@ impl Document {
                     column_range(column_start, column_count),
                     to_usize(columns_shown),
                     &text,
+                    line_ending.into(),
                 )
-                .map(|command| command.map(EditCommand::from))
+                .map(|pasting| Pasting {
+                    command: pasting.command.map(EditCommand::from),
+                    rows: to_u64(pasting.rows),
+                    columns: to_u32(pasting.columns),
+                })
                 .map_err(|error| self.edit_error(&error))
         })
     }
@@ -724,6 +740,7 @@ impl Document {
     /// # Errors
     ///
     /// As [`can_clear_cells`](Self::can_clear_cells) refuses, and
+    /// [`EditRefusal::TooMuchReplaced`] or
     /// [`EditRefusal::AfterUnterminatedQuote`]; [`LealError::DocumentFailed`].
     pub fn clear_cells(
         &self,

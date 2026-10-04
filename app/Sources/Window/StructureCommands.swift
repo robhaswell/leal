@@ -315,7 +315,7 @@ enum StructureText {
                 comment: "Tooltip: Duplicate Row is off with more rows selected than it copies at once (task 2.5a); the limit"
             )
         case .noSuchRow, .notReadYet, .tooFarRight, .valueChanged, .otherLineage, .noSuchColumn, .unreadable,
-             .tooManyCells, .tooMuchText, .pastLastRow, .pastLastColumn:
+             .tooManyCells, .tooMuchText, .tooMuchReplaced, .pastLastRow, .pastLastColumn:
             nil
         }
     }

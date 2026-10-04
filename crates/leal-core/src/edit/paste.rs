@@ -13,13 +13,16 @@
 //! - a cell that starts with `"` and has a closing `"` followed by a tab, a
 //!   line break or the end of the text is quoted: its value is the text
 //!   between, with each `""` read as one `"`, and may hold tabs and line
-//!   breaks (kept as they are);
+//!   breaks (each, CRLF, LF or CR, becomes the file's own line ending when
+//!   it is pasted: [`Pasted::line_breaks_as`]);
 //! - any other cell is its text as it is, quotes included (so `"Hi" she
 //!   said` pastes as written);
 //! - one line break at the very end is dropped: spreadsheets end a copy
 //!   with one. So empty text, or a lone line break, is one empty value.
 
 use std::borrow::Cow;
+
+use crate::dialect::LineEnding;
 
 /// Clipboard text split into cells ([`parse_tsv`]): rows of cells, which
 /// may differ in length.
@@ -53,6 +56,26 @@ impl<'a> Pasted<'a> {
     #[must_use]
     pub fn cells(&self) -> usize {
         self.cells
+    }
+
+    /// Each line break inside a value (CRLF, LF or a lone CR) as `ending`,
+    /// the file's own (task 2.6, as a line break typed into a value is):
+    /// an Excel cell's LF goes into a CRLF file as CRLF. Only a value with
+    /// a line break other than `ending` is copied.
+    pub fn line_breaks_as(&mut self, ending: LineEnding) {
+        let ending = match ending {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+            LineEnding::Cr => "\r",
+        };
+        for cell in self.rows.iter_mut().flatten() {
+            if memchr::memchr2(b'\r', b'\n', cell.as_bytes()).is_some() {
+                let converted = with_line_breaks(cell, ending);
+                if converted != cell.as_ref() {
+                    *cell = Cow::Owned(converted);
+                }
+            }
+        }
     }
 
     /// The value, if the text is one cell: Paste puts it into every
@@ -113,6 +136,20 @@ pub fn parse_tsv(text: &str, limit: usize) -> Result<Pasted<'_>, usize> {
         }
     }
     Ok(Pasted { rows, width, cells })
+}
+
+/// `value` with each CRLF, LF and lone CR as `ending`.
+fn with_line_breaks(value: &str, ending: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find(['\r', '\n']) {
+        out.push_str(&rest[..at]);
+        out.push_str(ending);
+        let width = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[at + width..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The cell that starts at byte `at` of `text`, and where it ends: at the
@@ -245,6 +282,40 @@ mod tests {
         }
         let read: Vec<String> = rows(&text).into_iter().flatten().collect();
         assert_eq!(read, values);
+    }
+
+    #[test]
+    fn line_breaks_in_values_become_the_files() {
+        let text = "\"lf\nx\"\t\"crlf\r\nx\"\t\"cr\rx\"\t\"all\r\n\n\r\n\rx\"\tplain";
+        for (ending, line) in [
+            (LineEnding::Crlf, "\r\n"),
+            (LineEnding::Lf, "\n"),
+            (LineEnding::Cr, "\r"),
+        ] {
+            let mut pasted = parse_tsv(text, 10).unwrap();
+            pasted.line_breaks_as(ending);
+            let cells: Vec<&str> = pasted.rows()[0].iter().map(AsRef::as_ref).collect();
+            let all = format!("all{line}{line}{line}{line}x");
+            assert_eq!(
+                cells,
+                [
+                    format!("lf{line}x").as_str(),
+                    &format!("crlf{line}x"),
+                    &format!("cr{line}x"),
+                    &all,
+                    "plain"
+                ]
+            );
+            // A value already in the file's ending stays borrowed.
+            let kept = pasted.rows()[0]
+                .iter()
+                .filter(|cell| matches!(cell, Cow::Borrowed(_)))
+                .count();
+            assert_eq!(
+                kept, 2,
+                "{ending:?}: the plain cell and the one already right"
+            );
+        }
     }
 
     #[test]

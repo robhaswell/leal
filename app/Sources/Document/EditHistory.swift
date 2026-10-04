@@ -198,9 +198,13 @@ final class EditHistory {
 
     /// Registers the step that takes `command` back: after an edit or a
     /// redo, its undo; after an undo, its redo. `apply` applies it.
-    func register(_ command: EditCommand, as direction: CommandDirection, apply: @escaping @MainActor (EditCommand, CommandDirection) -> Void) {
+    /// `name`: the step's name, if not its command's (`actionName`).
+    func register(
+        _ command: EditCommand, as direction: CommandDirection, named name: String? = nil,
+        apply: @escaping @MainActor (EditCommand, CommandDirection) -> Void
+    ) {
         let next: CommandDirection = direction == .undo ? .redo : .undo
-        undoManager.registerStep(named: Self.actionName(for: command)) { apply(command, next) }
+        undoManager.registerStep(named: name ?? Self.actionName(for: command)) { apply(command, next) }
     }
 
     /// Puts back an undo or redo step of `command` the core refused for now
@@ -285,7 +289,7 @@ final class EditHistory {
             }
         }
         for command in done {
-            register(command, as: .edit, apply: apply)
+            register(command, as: .edit, named: Self.recoveredName(for: command), apply: apply)
         }
     }
 
@@ -311,5 +315,15 @@ final class EditHistory {
             return String(localized: "Typing", comment: "Undo menu: Undo Typing, a cell's edit")
         }
         return String(localized: "Edit Cells", comment: "Undo menu: Undo Edit Cells, several cells changed at once")
+    }
+
+    /// The name of a step Recover changes put back, whose own name (the
+    /// one `registerAsOneStep` gave it) is gone: as `actionName`, but a
+    /// command of several cells is named for what makes one in the app
+    /// (task 2.6): "Clear Cells" if it empties them all (a Clear, or a Cut
+    /// of cells), else "Paste".
+    static func recoveredName(for command: EditCommand) -> String {
+        guard command.structural == nil, command.cellCount > 1 else { return actionName(for: command) }
+        return command.clearsCells ? PasteText.clearCells : PasteText.paste
     }
 }

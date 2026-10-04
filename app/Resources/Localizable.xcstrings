@@ -295,6 +295,9 @@
     "Cell value" : {
       "comment" : "VoiceOver name of the cell inspector's text"
     },
+    "Cells and rows can be cut once Leal has read the whole file." : {
+      "comment" : "Tooltip: Cut is off until the file is read (task 2.6)"
+    },
     "Cells can be cleared once Leal has read the whole file." : {
       "comment" : "Tooltip: Delete is off until the file is read (task 2.6)"
     },
@@ -332,7 +335,7 @@
       "comment" : "Sheet before a very large Copy; the size, like “1.2 GB”"
     },
     "Cut" : {
-      "comment" : "Edit menu"
+      "comment" : "Edit menu\nThe Undo menu's Undo Cut: Cut copied the selection, then deleted its rows or emptied its cells (task 2.6)"
     },
     "Delete" : {
       "comment" : "Edit menu"
@@ -627,6 +630,9 @@
     "Leal can’t clear these cells." : {
       "comment" : "Alert title: Delete couldn't clear the selected cells (task 2.6)"
     },
+    "Leal can’t cut these cells." : {
+      "comment" : "Alert title: Cut couldn't delete the selected rows or clear the selected cells, so nothing was copied (task 2.6)"
+    },
     "Leal can’t paste these cells here." : {
       "comment" : "Alert title: a paste was refused (task 2.6)"
     },
@@ -677,6 +683,9 @@
     },
     "Leal couldn’t write the file. Check that the drive has room and that you may write to that folder." : {
       "comment" : "Alert text: Save failed writing the file (a full disk, no permission); the details are in the log"
+    },
+    "Leal cuts up to %@ cells at a time. To cut whole rows, select them by their row numbers." : {
+      "comment" : "Tooltip and alert: Cut is off with more cells selected than it clears at once (task 2.6); the limit"
     },
     "Leal didn’t reload “%@”." : {
       "comment" : "Alert title: a Reload wasn't adopted because the document was edited while the file was read; the file's name"
@@ -1024,6 +1033,9 @@
     "The cells no longer hold what the change left in them." : {
       "comment" : "Why an undo or redo was refused: the cells changed"
     },
+    "The cells pasted into hold more than %@ of text, more than Leal replaces at a time. Paste into fewer cells." : {
+      "comment" : "Alert: a paste over cells holding too much text was refused (task 2.6); the limit, as in 32 MB"
+    },
     "The change couldn’t be made." : {
       "comment" : "Error: an edit, undo or redo wasn't applied"
     },
@@ -1115,6 +1127,9 @@
     },
     "The header row" : {
       "comment" : "The file's first row while it is the header row"
+    },
+    "The selected cells hold more than %@ of text, more than Leal clears at a time. To empty a whole column, delete it and insert an empty one." : {
+      "comment" : "Alert: Delete or Cut of cells holding too much text was refused (task 2.6); the limit, as in 32 MB"
     },
     "The selected cells make a lot of text. Copying them takes a while and puts all of it on the clipboard." : {
       "comment" : "Sheet before a very large Copy"

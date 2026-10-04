@@ -14,9 +14,24 @@ use std::sync::Arc;
 
 use super::editing::Target;
 use super::{Document, Reading};
+use crate::dialect::LineEnding;
 use crate::edit::{
     CELL_BATCH_LIMIT, Command, Edit, EditError, PASTE_BYTE_LIMIT, Pasted, parse_tsv,
 };
+
+/// What a [`Document::paste`] did: its command (`None` if no cell
+/// changed), and the size of what was pasted, for the app to select the
+/// block (one row of one value: the selection stays). Empty text: none of
+/// it.
+#[derive(Debug, Default)]
+pub struct Pasting {
+    /// The command, for the undo history.
+    pub command: Option<Command>,
+    /// The pasted text's rows.
+    pub rows: usize,
+    /// Its longest row's cells.
+    pub columns: usize,
+}
 
 impl Document {
     /// Pastes clipboard `text` (read as tab-separated values,
@@ -27,34 +42,40 @@ impl Document {
     /// each row of the text changing only as many cells as it has. A value
     /// pasted into a cell past the end of its row (a hatched cell) pads the
     /// row as typing does, and `""` there is no edit (ADR-0005 decision 2).
-    /// `columns_shown` is how many columns the grid shows: the block must
-    /// fit within them, and within the rows. `None` if no cell changes.
+    /// `columns_shown` is how many columns the grid shows: the selection
+    /// and the block must fit within them, and within the rows. A line
+    /// break inside a value becomes `line_ending`, the file's own, as a
+    /// typed one does ([`Pasted::line_breaks_as`]). Empty `text` pastes
+    /// nothing. The [`Pasting`] says what changed and the block's size.
     ///
     /// It reads each row it changes on the caller's thread, so it takes at
-    /// most [`CELL_BATCH_LIMIT`] cells and [`PASTE_BYTE_LIMIT`] bytes.
+    /// most [`CELL_BATCH_LIMIT`] cells and [`PASTE_BYTE_LIMIT`] bytes, and
+    /// replaces at most [`PASTE_BYTE_LIMIT`] bytes of old values.
     ///
     /// # Errors
     ///
     /// [`EditError::StillReading`] or [`EditError::Saving`] (as for
     /// [`can_paste`](Self::can_paste)); [`EditError::TooMuchText`],
-    /// [`EditError::TooManyCells`]; [`EditError::PastLastRow`] or
-    /// [`EditError::PastLastColumn`] for a block that doesn't fit;
-    /// [`EditError::NoSuchRow`] for a selection past the end; and those of
-    /// [`set_cells`](Self::set_cells), such as
-    /// [`EditError::AfterUnterminatedQuote`] (ADR-0004 decision 8). The
-    /// document is then unchanged.
+    /// [`EditError::TooManyCells`], [`EditError::TooMuchReplaced`];
+    /// [`EditError::PastLastRow`] or [`EditError::PastLastColumn`] for a
+    /// block or selection that doesn't fit; [`EditError::NoSuchRow`] for a
+    /// selection past the end; and those of [`set_cells`](Self::set_cells),
+    /// such as [`EditError::AfterUnterminatedQuote`] (ADR-0004 decision 8).
+    /// The document is then unchanged.
     pub fn paste(
         &self,
         rows: Range<usize>,
         columns: Range<usize>,
         columns_shown: usize,
         text: &str,
-    ) -> Result<Option<Command>, EditError> {
-        if rows.is_empty() || columns.is_empty() {
-            return Ok(None);
+        line_ending: LineEnding,
+    ) -> Result<Pasting, EditError> {
+        if rows.is_empty() || columns.is_empty() || text.is_empty() {
+            return Ok(Pasting::default());
         }
         self.change_rows(|reading| {
-            let pasted = pasted(text)?;
+            let mut pasted = pasted(text)?;
+            pasted.line_breaks_as(line_ending);
             let row_count = Self::logical_rows(reading);
             let targets = if let Some(value) = pasted.single() {
                 let cells = cells_in(&rows, &columns)?;
@@ -64,6 +85,11 @@ impl Document {
                 }
                 if rows.end > row_count {
                     return Err(EditError::NoSuchRow { row: row_count });
+                }
+                if columns.end > columns_shown {
+                    return Err(EditError::PastLastColumn {
+                        columns: columns.len(),
+                    });
                 }
                 fill(&rows, &columns, value)
             } else {
@@ -80,7 +106,11 @@ impl Document {
                 }
                 block(&pasted, top, left)
             };
-            set_all(reading, &targets)
+            Ok(Pasting {
+                command: set_all(reading, &targets)?,
+                rows: pasted.height(),
+                columns: pasted.width(),
+            })
         })
     }
 
@@ -104,8 +134,11 @@ impl Document {
     ///
     /// # Errors
     ///
-    /// As for [`can_clear_cells`](Self::can_clear_cells), and those of
-    /// [`set_cells`](Self::set_cells). The document is then unchanged.
+    /// As for [`can_clear_cells`](Self::can_clear_cells);
+    /// [`EditError::TooMuchReplaced`] if the cells hold more than
+    /// [`PASTE_BYTE_LIMIT`] bytes between them (found as they are read);
+    /// and those of [`set_cells`](Self::set_cells). The document is then
+    /// unchanged.
     pub fn clear_cells(
         &self,
         rows: Range<usize>,
@@ -207,9 +240,11 @@ fn block<'a>(pasted: &'a Pasted<'_>, top: usize, left: usize) -> Vec<Target<'a>>
 }
 
 /// Sets `targets` in `reading`, all or none, as one command (`None` if no
-/// cell changes). The caller holds the writer lock (`change_rows`).
+/// cell changes), replacing at most [`PASTE_BYTE_LIMIT`] bytes of old
+/// values. The caller holds the writer lock (`change_rows`).
 fn set_all(reading: &Arc<Reading>, targets: &[Target<'_>]) -> Result<Option<Command>, EditError> {
-    let (lineage, changes) = Document::change_in(reading, None, targets, false)?;
+    let (lineage, changes) =
+        Document::change_in(reading, None, targets, false, Some(PASTE_BYTE_LIMIT))?;
     Ok((!changes.is_empty()).then_some(Command {
         lineage,
         edit: Edit::SetCells(changes),

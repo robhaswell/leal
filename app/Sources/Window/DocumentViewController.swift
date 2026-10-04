@@ -229,6 +229,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         grid.onSelectionChanged = { [weak self] in self?.selectionChanged() }
         grid.onCopy = { [weak self] in self?.copySelection() }
         grid.onPaste = { [weak self] in self?.pasteIntoSelection() }
+        grid.onCut = { [weak self] in self?.cutSelection() }
         grid.onClear = { [weak self] in self?.clearSelection() }
         grid.validateCellItem = { [weak self] item in self?.validateCellItem(item) ?? false }
         confirmLargeCopy = { [weak self] bytes, answer in
@@ -1071,28 +1072,53 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         copyPromise = nil
         let range = model.copyRange(selection)
         let bytes = model.estimatedCopyBytes(range)
-        if bytes <= Self.immediateCopyBytes, let text = model.copyCellsNow(range) {
-            Clipboard.write(text, to: pasteboard)
-            return
-        }
         guard bytes > askBeforeCopyBytes else {
-            startCopy(range)
+            if let copy = prepareCopy(range, bytes: bytes) { place(copy) }
             return
         }
         confirmLargeCopy(bytes) { [weak self] go in
-            if go { self?.startCopy(range) }
+            guard go, let self, let copy = prepareCopy(range, bytes: bytes) else { return }
+            place(copy)
         }
     }
 
-    private func startCopy(_ range: CopyRange) {
-        guard let job = model.copyCells(range) else { return }
-        copyPromise = Clipboard.promise(job, to: pasteboard)
-        let waiter = job.job()
-        // Only for tests to await: nothing cancels this task, since the
-        // copy outlives the window (`CopyPromise`).
-        copyTask = Task {
-            try? await waiter.finish()
+    /// A copy made but not yet on the clipboard: Cut (task 2.6) makes it
+    /// before its cells change and places it once they have.
+    enum PreparedCopy {
+        /// The text, read at once.
+        case text(String)
+        /// The core's job, building it off the main thread.
+        case job(CopyJob)
+    }
+
+    /// Copies `range` (about `bytes` bytes): at once if it is small and the
+    /// index has its rows, else as a P2 job in the core.
+    func prepareCopy(_ range: CopyRange, bytes: UInt64) -> PreparedCopy? {
+        if bytes <= Self.immediateCopyBytes, let text = model.copyCellsNow(range) { return .text(text) }
+        return model.copyCells(range).map { .job($0) }
+    }
+
+    /// Puts `copy` on the clipboard: its text, or a promise of the job's.
+    func place(_ copy: PreparedCopy) {
+        copyTask = nil
+        copyPromise = nil
+        switch copy {
+        case let .text(text):
+            Clipboard.write(text, to: pasteboard)
+        case let .job(job):
+            copyPromise = Clipboard.promise(job, to: pasteboard)
+            let waiter = job.job()
+            // Only for tests to await: nothing cancels this task, since the
+            // copy outlives the window (`CopyPromise`).
+            copyTask = Task {
+                try? await waiter.finish()
+            }
         }
+    }
+
+    /// Lets go of `copy` without placing it: a job still running stops.
+    func discard(_ copy: PreparedCopy) {
+        if case let .job(job) = copy { job.cancel() }
     }
 
     /// The sheet that asks before a very large copy.

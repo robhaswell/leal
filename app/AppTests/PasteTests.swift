@@ -200,11 +200,20 @@ final class PasteTests: XCTestCase {
         opened.undo.undo()
         XCTAssertFalse(model.hasUnsavedEdits)
 
-        // "" into the hatched cells: no edit, no undo step.
+        // "" into the hatched cells (a spreadsheet's copy of an empty
+        // cell): no edit, no undo step.
         select(opened, (1, 1), (1, 2))
-        copy("")
+        copy("\n")
         opened.grid.gridView.paste(nil)
         XCTAssertFalse(model.hasUnsavedEdits)
+        XCTAssertFalse(opened.undo.canUndo)
+
+        // Empty text pastes nothing (Rob, 2026-10-04): the cells aren't
+        // cleared.
+        select(opened, (0, 0), (0, 2))
+        copy("")
+        opened.grid.gridView.paste(nil)
+        XCTAssertEqual(row(model, 0), ["1", "2", "3"])
         XCTAssertFalse(opened.undo.canUndo)
 
         // Delete over the short row: its own cell empties, the hatched ones
@@ -378,8 +387,8 @@ final class PasteTests: XCTestCase {
 
     /// Only the cells pasted or cleared change on disk: quoted fields,
     /// escaped quotes and CRLFs elsewhere stay as they were; values that
-    /// need quotes are quoted; a pasted multi-line value keeps its line
-    /// break.
+    /// need quotes are quoted; a pasted multi-line value's LF becomes the
+    /// file's CRLF, as a typed line break would (Rob, 2026-10-04).
     func testOnlyThePastedAndClearedCellsChangeOnDisk() async throws {
         let text = "id,name,note\r\n1,\"Marlow\",\"say \"\"hi\"\"\"\r\n2, spaced ,\"multi\r\nline\"\r\n3,plain,last\r\n"
         let opened = try await open(file("bytes.csv", text))
@@ -395,8 +404,280 @@ final class PasteTests: XCTestCase {
         let saved = try await save(opened)
         XCTAssertEqual(
             String(decoding: saved, as: UTF8.self),
-            "id,name,note\r\n1,\"a, comma\",\"two\nlines\"\r\n2,\"says \"\"hi\"\"\",\"multi\r\nline\"\r\n3,plain,\r\n"
+            "id,name,note\r\n1,\"a, comma\",\"two\r\nlines\"\r\n2,\"says \"\"hi\"\"\",\"multi\r\nline\"\r\n3,plain,\r\n"
         )
+    }
+
+    /// A line break inside a pasted value is the file's own line ending:
+    /// CRLF in a CRLF file, LF in an LF file, whichever the clipboard had.
+    func testLineBreaksInPastedValuesAreTheFiles() async throws {
+        for (name, text, line) in [("crlf.csv", "a,b\r\n1,2\r\n", "\r\n"), ("lf.csv", "a,b\n1,2\n", "\n")] {
+            let opened = try await open(file(name, text))
+            opened.grid.select(CellPosition(row: 0, column: 0))
+            copy("\"lf\nx\"\t\"cr\rx\"\r\n")
+            opened.grid.gridView.paste(nil)
+            copy("\"crlf\r\nx\"")
+            opened.grid.select(CellPosition(row: 0, column: 1))
+            opened.grid.gridView.paste(nil)
+            let saved = try await save(opened)
+            XCTAssertEqual(String(decoding: saved, as: UTF8.self), "a,b\(line)\"lf\(line)x\",\"crlf\(line)x\"\(line)", name)
+        }
+    }
+
+    /// Of the clipboard's types, the tab-separated one is read first.
+    func testTheTabSeparatedTypeIsPreferredOverPlainText() async throws {
+        let opened = try await open(file("types.csv", csv))
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        pasteboard.clearContents()
+        pasteboard.declareTypes([.string, .tabularText], owner: nil)
+        pasteboard.setString("plain text", forType: .string)
+        pasteboard.setString("A\tB", forType: .tabularText)
+        opened.grid.gridView.paste(nil)
+        XCTAssertEqual(row(opened.model, 0), ["1", "A", "B"])
+    }
+
+    /// More text than the core takes is refused before it is handed over,
+    /// with an alert.
+    func testTooMuchTextIsRefusedBeforeTheCore() async throws {
+        let opened = try await open(file("much.csv", csv))
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        copy(String(repeating: "x", count: Int(pasteByteLimit()) + 1))
+        opened.grid.gridView.paste(nil)
+        XCTAssertEqual(alerts, ["Leal pastes up to 33.6 MB of text at a time."])
+        XCTAssertFalse(opened.model.hasUnsavedEdits)
+    }
+
+    /// Undo of a paste after a Save, into a short row's hatched cells too:
+    /// the cells read as before. The saved file has the hatched cells as
+    /// fields now, and no cell edit shortens a row, so undo empties them
+    /// (as for typing, task 2.2: `holds` in the core); saving again writes
+    /// every other byte as it was.
+    func testUndoOfAPasteAfterASave() async throws {
+        let text = "a,b,c\n1,2,3\n4\n5,6,7\n"
+        let opened = try await open(file("after-save.csv", text))
+        let model = opened.model
+        try await waitUntil("the short row known") { model.isHatched(row: 1, column: 1) }
+        select(opened, (0, 1), (0, 1))
+        copy("x\ty\nz\tw")
+        opened.grid.gridView.paste(nil)
+        var saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), "a,b,c\n1,x,y\n4,z,w\n5,6,7\n")
+        XCTAssertEqual(opened.undo.undoActionName, "Paste")
+        opened.undo.undo()
+        XCTAssertEqual(row(model, 0), ["1", "2", "3"])
+        XCTAssertEqual(row(model, 1), ["4", "", ""])
+        XCTAssertFalse(model.isHatched(row: 1, column: 1), "a field of the saved file, emptied")
+        saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), "a,b,c\n1,2,3\n4,,\n5,6,7\n")
+        opened.undo.redo()
+        XCTAssertEqual(row(model, 1), ["4", "z", "w"])
+    }
+
+    /// Edit > Delete reaches the grid through the menu's own item (the
+    /// standard `delete:`), and clears.
+    func testEditDeleteClearsThroughTheMenu() async throws {
+        let opened = try await open(file("menu.csv", csv))
+        let window = opened.window
+        window.makeFirstResponder(opened.grid.gridView)
+        select(opened, (0, 1), (1, 1))
+        let edit = try XCTUnwrap(NSApp.mainMenu?.items.first { $0.submenu?.title == "Edit" }?.submenu)
+        for title in ["Cut", "Paste", "Delete"] {
+            let item = try XCTUnwrap(edit.items.first { $0.title == title }, title)
+            XCTAssertTrue(handler(of: try XCTUnwrap(item.action), in: window) === opened.grid.gridView, "\(title) reaches the grid")
+        }
+        let delete = try XCTUnwrap(edit.items.first { $0.title == "Delete" })
+        XCTAssertTrue(opened.grid.gridView.validateMenuItem(delete))
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(delete.action), to: opened.grid.gridView, from: delete))
+        XCTAssertEqual([value(opened.model, 0, 1), value(opened.model, 1, 1)], ["", ""])
+        XCTAssertEqual(opened.undo.undoActionName, "Clear Cells")
+    }
+
+    /// The responder that takes `action`, as AppKit looks for it from the
+    /// window's first responder.
+    private func handler(of action: Selector, in window: NSWindow) -> NSResponder? {
+        var responder = window.firstResponder
+        while let current = responder, !current.responds(to: action) {
+            responder = current.nextResponder
+        }
+        return responder
+    }
+
+    /// With the inspector's text or Go to Row's field focused, ⌫, ⌘X, ⌘V
+    /// and Edit > Delete are the text's: they never reach the grid.
+    func testTheInspectorAndGoToRowKeepTheirKeys() async throws {
+        let opened = try await open(file("focus.csv", csv))
+        let (model, content, window) = (opened.model, opened.content, opened.window)
+        content.setInspectorShown(true)
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        window.makeFirstResponder(text)
+        for action in [#selector(NSText.cut(_:)), #selector(NSText.paste(_:)), #selector(NSText.delete(_:)), #selector(NSResponder.deleteBackward(_:))] {
+            XCTAssertTrue(handler(of: action, in: window) === text, "\(action) is the inspector's")
+        }
+        text.setSelectedRange(NSRange(location: 6, length: 0))
+        text.keyDown(with: try deleteKey(window))
+        XCTAssertEqual(text.string, "Marlo")
+        XCTAssertEqual(value(model, 0, 1), "Marlow", "no cell cleared")
+        XCTAssertFalse(model.hasUnsavedEdits)
+
+        let (alert, field) = content.goToRowAlert()
+        alert.layout()
+        let sheet = alert.window
+        sheet.makeFirstResponder(field)
+        let editor = try XCTUnwrap(sheet.firstResponder as? NSText)
+        for action in [#selector(NSText.cut(_:)), #selector(NSText.paste(_:)), #selector(NSText.delete(_:)), #selector(NSResponder.deleteBackward(_:))] {
+            XCTAssertTrue(handler(of: action, in: sheet) === editor, "\(action) is Go to Row's field's")
+        }
+    }
+
+    // MARK: Cut
+
+    /// Cut of cells: the cells go on the clipboard as Copy puts them, then
+    /// are emptied, as one undo step named Cut; the bytes saved change only
+    /// there; undo puts them back.
+    func testCutOfCellsCopiesThenClearsAsOneStep() async throws {
+        let opened = try await open(file("cut.csv", csv))
+        let (model, content) = (opened.model, opened.content)
+        select(opened, (0, 1), (1, 2))
+        content.copySelection()
+        let copied = pasteboard.string(forType: .string)
+        pasteboard.clearContents()
+        XCTAssertTrue(validate(opened, #selector(GridView.cut(_:))).0)
+        let journal = opened.document.history.journal.count
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(pasteboard.string(forType: .string), copied)
+        XCTAssertEqual(pasteboard.string(forType: .tabularText), copied)
+        XCTAssertEqual(copied, "Marlow\t3\nOstrava\t5")
+        XCTAssertEqual(row(model, 0), ["1", "", ""])
+        XCTAssertEqual(row(model, 1), ["2", "", ""])
+        XCTAssertEqual(opened.document.history.journal.count, journal + 1, "one command")
+        XCTAssertEqual(opened.undo.undoActionName, "Cut")
+        let saved = try await save(opened)
+        // A quoted field stays quoted, as for typing.
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), "id,name,qty\r\n1,,\r\n2,\"\",\r\n3,Halden,8\r\n")
+        opened.undo.undo()
+        XCTAssertEqual(row(model, 1), ["2", "Ostrava", "5"])
+        XCTAssertEqual(opened.undo.redoActionName, "Cut")
+        // Pasted back where it was.
+        opened.undo.redo()
+        select(opened, (0, 1), (0, 1))
+        opened.grid.gridView.paste(nil)
+        XCTAssertEqual(row(model, 1), ["2", "Ostrava", "5"])
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+    }
+
+    /// Cut of whole rows (picked by their row numbers): they go on the
+    /// clipboard, every column, and are deleted, as one step named Cut.
+    func testCutOfWholeRowsDeletesThem() async throws {
+        let opened = try await open(file("cut-rows.csv", csv))
+        let model = opened.model
+        opened.grid.selectRow(0)
+        opened.grid.extendRows(to: 1)
+        XCTAssertEqual(opened.grid.selection?.wholeRows, true)
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(pasteboard.string(forType: .string), "1\tMarlow\t3\n2\tOstrava\t5")
+        XCTAssertEqual(model.rowCount, 1)
+        XCTAssertEqual(row(model, 0), ["3", "Halden", "8"])
+        XCTAssertEqual(opened.undo.undoActionName, "Cut")
+        let saved = try await save(opened)
+        XCTAssertEqual(String(decoding: saved, as: UTF8.self), "id,name,qty\r\n3,Halden,8\r\n")
+        opened.undo.undo()
+        XCTAssertEqual(model.rowCount, 3)
+        XCTAssertEqual(row(model, 1), ["2", "Ostrava", "5"])
+        let again = try await save(opened)
+        XCTAssertEqual(String(decoding: again, as: UTF8.self), csv)
+
+        // ⇧↓ keeps whole rows whole; ⇧→ makes them cells.
+        let rows = GridSelection.row(0, columns: 3, column: 1)
+        XCTAssertTrue(rows.extended(to: CellPosition(row: 1, column: 2)).wholeRows)
+        XCTAssertFalse(rows.extended(to: CellPosition(row: 0, column: 1)).wholeRows)
+        XCTAssertFalse(GridSelection.all(rows: 3, columns: 3, active: CellPosition(row: 0, column: 0)).wholeRows, "⌘A is cells")
+    }
+
+    /// A Cut that can't delete or clear copies nothing: too many cells (an
+    /// alert, and the tooltip), or a save running (off, saying why).
+    func testARefusedCutCopiesNothing() async throws {
+        var text = "a,b,c,d,e,f,g,h,i,j\n"
+        for row in 0..<10_001 { text += (0..<10).map { "\(row).\($0)" }.joined(separator: ",") + "\n" }
+        let opened = try await open(file("cut-many.csv", text))
+        let model = opened.model
+        copy("kept")
+        opened.grid.gridView.selectAll(nil)
+        let limit = "Leal cuts up to 100,000 cells at a time. To cut whole rows, select them by their row numbers."
+        XCTAssertEqual(validate(opened, #selector(GridView.cut(_:))).1, limit)
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(alerts, [limit])
+        XCTAssertEqual(pasteboard.string(forType: .string), "kept")
+        XCTAssertFalse(model.hasUnsavedEdits)
+
+        opened.grid.select(CellPosition(row: 1, column: 1))
+        _ = model.setCell(.cell(CellPosition(row: 0, column: 1)), to: "edited")
+        debugHoldNextSave()
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
+        XCTAssertEqual(validate(opened, #selector(GridView.cut(_:))).1, "Wait for the save to finish.")
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(opened.content.lastAnnouncement, "Wait for the save to finish.")
+        XCTAssertEqual(pasteboard.string(forType: .string), "kept")
+        XCTAssertEqual(value(model, 1, 1), "1.1")
+        debugReleaseHeldSave()
+        _ = await saving.value
+    }
+
+    /// Cut of cells holding more text than Leal replaces at once is
+    /// refused when the clear finds it, and copies nothing.
+    func testACutOfTooMuchTextCopiesNothing() async throws {
+        let big = String(repeating: "v", count: Int(pasteByteLimit()) / 3 + 1)
+        let opened = try await open(file("cut-big.csv", "a,b\n" + String(repeating: "\(big),x\n", count: 3)))
+        copy("kept")
+        // Every row, whether or not "a,b" is taken for a header row.
+        select(opened, (0, 0), (3, 0))
+        opened.grid.gridView.cut(nil)
+        XCTAssertEqual(alerts, [
+            "The selected cells hold more than 33.6 MB of text, more than Leal clears at a time. To empty a whole column, delete it and insert an empty one.",
+        ])
+        XCTAssertEqual(pasteboard.string(forType: .string), "kept")
+        XCTAssertFalse(opened.model.hasUnsavedEdits)
+        XCTAssertFalse(opened.undo.canUndo)
+    }
+
+    // MARK: Recover changes
+
+    /// A paste and a clear of more than 256 cells (kept in Rust) come back
+    /// through Recover changes as steps named Paste and Clear Cells, and
+    /// the recovery report names a batch by its first cell.
+    func testLargeBatchesAfterRecover() async throws {
+        var text = "a,b\n"
+        for row in 0..<400 { text += "\(row),x\n" }
+        let opened = try await open(file("recover.csv", text))
+        let (document, model) = (opened.document, opened.model)
+        document.showSheet = { _, _, _ in }
+        opened.grid.select(CellPosition(row: 0, column: 0))
+        copy((0..<300).map { "p\($0)\tq\($0)" }.joined(separator: "\n"))
+        opened.grid.gridView.paste(nil)
+        select(opened, (300, 0), (399, 1))
+        opened.grid.gridView.delete(nil)
+        XCTAssertEqual(value(model, 299, 1), "q299")
+        XCTAssertEqual(value(model, 350, 0), "")
+        let batch = try XCTUnwrap(document.history.journal.first?.applied)
+        XCTAssertNotNil(batch.cells, "kept in Rust")
+        XCTAssertEqual(HistoryText.describe(batch, header: true), "Row 1, column 1 and 599 more cells")
+
+        _ = model.call { try $0.debugPanic() }
+        await document.recoverChanges()
+        let report = try XCTUnwrap(document.lastRecovery)
+        XCTAssertTrue(report.refused.isEmpty, "\(report.refused)")
+        XCTAssertEqual(value(model, 299, 1), "q299")
+        XCTAssertEqual(value(model, 350, 0), "")
+        XCTAssertEqual(opened.undo.undoActionName, "Clear Cells")
+        opened.undo.undo()
+        XCTAssertEqual(value(model, 350, 0), "350")
+        XCTAssertEqual(opened.undo.undoActionName, "Paste")
+        opened.undo.undo()
+        XCTAssertEqual(value(model, 299, 1), "x")
+        XCTAssertFalse(model.hasUnsavedEdits)
     }
 
     // MARK: Cost

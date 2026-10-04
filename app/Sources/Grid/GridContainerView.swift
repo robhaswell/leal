@@ -107,14 +107,19 @@ final class GridContainerView: NSView {
         get { gridView.onPaste }
         set { gridView.onPaste = newValue }
     }
+    /// Edit > Cut (⌘X) in the grid (task 2.6).
+    var onCut: (() -> Void)? {
+        get { gridView.onCut }
+        set { gridView.onCut = newValue }
+    }
     /// Delete, Forward Delete or Edit > Delete in the grid: clear the
     /// selected cells (task 2.6).
     var onClear: (() -> Void)? {
         get { gridView.onClear }
         set { gridView.onClear = newValue }
     }
-    /// Whether Edit > Paste or Edit > Delete is on in the grid, setting
-    /// its tooltip.
+    /// Whether Edit > Cut, Paste or Delete is on in the grid, setting its
+    /// tooltip.
     var validateCellItem: (NSMenuItem) -> Bool {
         get { gridView.validateCellItem }
         set { gridView.validateCellItem = newValue }
@@ -639,7 +644,8 @@ final class GridContainerView: NSView {
         selection = GridSelection(
             active: current.active,
             anchor: CellPosition(row: current.anchor.row, column: 0),
-            extent: CellPosition(row: clamped.row, column: geometry.columnCount - 1)
+            extent: CellPosition(row: clamped.row, column: geometry.columnCount - 1),
+            wholeRows: true
         )
         scrollToVisible(CellPosition(row: clamped.row, column: current.active.column))
     }

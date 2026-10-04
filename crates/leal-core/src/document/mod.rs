@@ -76,6 +76,7 @@ mod tests;
 mod values;
 mod view;
 
+pub use pasting::Pasting;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use saving::{AT_SWAP, BEFORE_ADOPT, ChunkHook};

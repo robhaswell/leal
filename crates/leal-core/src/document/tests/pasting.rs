@@ -7,9 +7,10 @@ use super::*;
 
 use leal_testkit::fidelity::assert_identical;
 
+use crate::dialect::{Encoding, LineEnding};
 use crate::edit::{CELL_BATCH_LIMIT, Command, Edit, EditError, PASTE_BYTE_LIMIT};
 use crate::find::Query;
-use crate::save::{SaveKind, SaveRequest};
+use crate::save::{SaveError, SaveKind, SaveRequest};
 
 /// A header row, rows of three cells, a short row and a blank line.
 const FILE: &[u8] = b"id,name,city\n1,Marlow,Leeds\n2,Ostrava\n\n3,Halden,York\n";
@@ -52,9 +53,20 @@ fn saved(document: &Arc<Document>) -> Vec<u8> {
     std::fs::read(&path).unwrap()
 }
 
-fn paste(document: &Document, rows: Range<usize>, columns: Range<usize>, text: &str) -> Command {
+/// Pastes `text` into an LF file's selection, three columns shown.
+fn try_paste(
+    document: &Document,
+    rows: Range<usize>,
+    columns: Range<usize>,
+    text: &str,
+) -> Result<Option<Command>, EditError> {
     document
-        .paste(rows, columns, 3, text)
+        .paste(rows, columns, 3, text, LineEnding::Lf)
+        .map(|pasting| pasting.command)
+}
+
+fn paste(document: &Document, rows: Range<usize>, columns: Range<usize>, text: &str) -> Command {
+    try_paste(document, rows, columns, text)
         .unwrap()
         .expect("a change")
 }
@@ -106,10 +118,40 @@ fn one_value_fills_the_selection_and_follows_the_hatched_cell_rule() {
 
     let fresh = open_with(&dir, "b.csv", FILE);
     assert!(
-        fresh.paste(2..4, 2..3, 3, "").unwrap().is_none(),
+        try_paste(&fresh, 2..4, 2..3, "\n").unwrap().is_none(),
         "\"\" into hatched cells is no edit"
     );
     assert!(!fresh.has_edits());
+}
+
+/// Empty clipboard text pastes nothing (Rob, 2026-10-04): it doesn't
+/// clear the selection. A lone line break is one empty value (a
+/// spreadsheet's copy of an empty cell), which does.
+#[test]
+fn empty_text_pastes_nothing() {
+    let dir = Dir::new("paste-empty");
+    let document = open_with(&dir, "a.csv", FILE);
+    let pasting = document.paste(1..2, 0..3, 3, "", LineEnding::Lf).unwrap();
+    assert!(pasting.command.is_none());
+    assert_eq!((pasting.rows, pasting.columns), (0, 0));
+    assert!(!document.has_edits());
+    paste(&document, 1..2, 0..1, "\r\n");
+    assert_eq!(texts(&document)[1], ["", "Marlow", "Leeds"]);
+}
+
+/// The paste says the size of what it pasted, for the app to select the
+/// block: no second reading of the text.
+#[test]
+fn a_paste_gives_the_blocks_size() {
+    let dir = Dir::new("paste-shape");
+    let document = open_with(&dir, "a.csv", FILE);
+    let pasting = document
+        .paste(1..2, 0..1, 3, "a\tb\tc\nd\n", LineEnding::Lf)
+        .unwrap();
+    assert!(pasting.command.is_some());
+    assert_eq!((pasting.rows, pasting.columns), (2, 3));
+    let one = document.paste(1..3, 0..2, 3, "v", LineEnding::Lf).unwrap();
+    assert_eq!((one.rows, one.columns), (1, 1));
 }
 
 /// Delete clears the selection as one command; a hatched cell stays
@@ -147,27 +189,32 @@ fn pastes_that_dont_fit_or_are_too_large_are_refused() {
     let document = open_with(&dir, "a.csv", FILE);
     let rows = document.row_count();
     assert!(matches!(
-        document.paste(rows - 1..rows, 0..1, 3, "a\nb"),
+        try_paste(&document, rows - 1..rows, 0..1, "a\nb"),
         Err(EditError::PastLastRow { rows: 2 })
     ));
     assert!(matches!(
-        document.paste(1..2, 2..3, 3, "a\tb"),
+        try_paste(&document, 1..2, 2..3, "a\tb"),
+        Err(EditError::PastLastColumn { columns: 2 })
+    ));
+    // One value into a selection wider than the grid's columns.
+    assert!(matches!(
+        try_paste(&document, 1..2, 2..4, "a"),
         Err(EditError::PastLastColumn { columns: 2 })
     ));
     // The grid's columns, not the row's: a block may reach hatched cells.
     paste(&document, 2..3, 1..2, "a\tb");
     let many = "x\n".repeat(CELL_BATCH_LIMIT + 1);
     assert!(matches!(
-        document.paste(1..2, 0..1, 3, &many),
+        try_paste(&document, 1..2, 0..1, &many),
         Err(EditError::TooManyCells { count }) if count == CELL_BATCH_LIMIT + 1
     ));
     let long = "y".repeat(PASTE_BYTE_LIMIT / 2 + 1);
     assert!(matches!(
-        document.paste(1..3, 0..1, 3, &long),
+        try_paste(&document, 1..3, 0..1, &long),
         Err(EditError::TooMuchText { .. })
     ));
     assert!(matches!(
-        document.paste(1..2, 0..1, 3, &"z".repeat(PASTE_BYTE_LIMIT + 1)),
+        try_paste(&document, 1..2, 0..1, &"z".repeat(PASTE_BYTE_LIMIT + 1)),
         Err(EditError::TooMuchText { .. })
     ));
     assert!(matches!(
@@ -195,7 +242,7 @@ fn a_paste_after_an_unterminated_quote_is_refused_whole() {
     let bytes = b"a,b,c\n1,2,3\n4,\"open\n5,6\n";
     let document = open_with(&dir, "a.csv", bytes);
     assert!(matches!(
-        document.paste(1..3, 2..3, 3, "x\ny"),
+        try_paste(&document, 1..3, 2..3, "x\ny"),
         Err(EditError::AfterUnterminatedQuote { row: 2, .. })
     ));
     assert!(!document.has_edits(), "none of the block went in");
@@ -224,7 +271,7 @@ fn paste_and_clear_wait_for_the_whole_file() {
     .unwrap();
     assert!(matches!(document.can_paste(), Err(EditError::StillReading)));
     assert!(matches!(
-        document.paste(1..2, 0..1, 3, "x"),
+        try_paste(&document, 1..2, 0..1, "x"),
         Err(EditError::StillReading)
     ));
     assert!(matches!(
@@ -237,7 +284,7 @@ fn paste_and_clear_wait_for_the_whole_file() {
     ));
     gate.open();
     wait_for_index(&document);
-    assert!(document.paste(1..2, 0..1, 3, "x").unwrap().is_some());
+    assert!(try_paste(&document, 1..2, 0..1, "x").unwrap().is_some());
     assert!(document.clear_cells(1..2, 0..1).unwrap().is_some());
 }
 
@@ -289,13 +336,19 @@ fn only_the_pasted_and_cleared_cells_change_on_disk() {
 2, spaced ,\"multi\r\nline\"\r\n\
 3,plain,last\r\n";
     let document = open_with(&dir, "a.csv", bytes);
-    // A block over row 1's name and note, and row 2's name.
-    paste(
-        &document,
-        1..3,
-        1..3,
-        "a, comma\t\"two\nlines\"\r\nsays \"\"x\"\"\r\n",
-    );
+    // A block over row 1's name and note, and row 2's name. The LF in
+    // the quoted value becomes the file's CRLF.
+    document
+        .paste(
+            1..3,
+            1..3,
+            3,
+            "a, comma\t\"two\nlines\"\r\nsays \"\"x\"\"\r\n",
+            LineEnding::Crlf,
+        )
+        .unwrap()
+        .command
+        .expect("a change");
     assert_eq!(
         texts(&document)[2][1],
         "says \"\"x\"\"",
@@ -304,7 +357,7 @@ fn only_the_pasted_and_cleared_cells_change_on_disk() {
     // Row 3's note cleared.
     document.clear_cells(3..4, 2..3).unwrap().unwrap();
     let expected: &[u8] = b"id,name,note\r\n\
-1,\"a, comma\",\"two\nlines\"\r\n\
+1,\"a, comma\",\"two\r\nlines\"\r\n\
 2,\"says \"\"\"\"x\"\"\"\"\",\"multi\r\nline\"\r\n\
 3,plain,\r\n";
     assert_eq!(
@@ -315,7 +368,11 @@ fn only_the_pasted_and_cleared_cells_change_on_disk() {
     // A one-value paste over cells already holding it changes nothing, so
     // the file saves as it was.
     let other = open_with(&dir, "b.csv", bytes);
-    assert!(other.paste(3..4, 1..2, 3, "plain\r\n").unwrap().is_none());
+    assert!(
+        try_paste(&other, 3..4, 1..2, "plain\r\n")
+            .unwrap()
+            .is_none()
+    );
     paste(&other, 3..4, 1..2, "PLAIN");
     paste(&other, 3..4, 1..2, "plain");
     assert_identical(bytes, &saved(&other));
@@ -342,4 +399,115 @@ fn a_paste_into_hatched_cells_appends_to_the_row() {
         String::from_utf8_lossy(&other_bytes),
         "id,name,city\n1,Marlow,Leeds\n2,\n\n3,Halden,York\n"
     );
+}
+
+/// A line break inside a pasted value (LF, CRLF or a lone CR on the
+/// clipboard) is saved as the file's own line ending, as a typed one is
+/// (Rob, 2026-10-04); the other rows keep their bytes.
+#[test]
+fn line_breaks_in_pasted_values_are_the_files() {
+    let dir = Dir::new("paste-line-breaks");
+    let text = "\"lf\nx\"\t\"crlf\r\nx\"\t\"cr\rx\"\r\n";
+    for (name, file, ending, saved_row) in [
+        (
+            "crlf.csv",
+            &b"a,b,c\r\n1,2,3\r\n4,5,6\r\n"[..],
+            LineEnding::Crlf,
+            "\"lf\r\nx\",\"crlf\r\nx\",\"cr\r\nx\"\r\n",
+        ),
+        (
+            "lf.csv",
+            &b"a,b,c\n1,2,3\n4,5,6\n"[..],
+            LineEnding::Lf,
+            "\"lf\nx\",\"crlf\nx\",\"cr\nx\"\n",
+        ),
+    ] {
+        let document = open_with(&dir, name, file);
+        document
+            .paste(1..2, 0..1, 3, text, ending)
+            .unwrap()
+            .command
+            .expect("a change");
+        let line = std::str::from_utf8(ending.bytes()).unwrap();
+        let expected = format!("a,b,c{line}{saved_row}4,5,6{line}");
+        assert_eq!(
+            String::from_utf8_lossy(&saved(&document)),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+/// Paste into a semicolon-separated and a tab-separated file: the pasted
+/// cells are written with the file's own delimiter, quoted only where it
+/// (or a quote, or a line break) needs it, and every other byte is the
+/// file's.
+#[test]
+fn a_paste_into_semicolon_and_tab_files_writes_their_delimiter() {
+    let dir = Dir::new("paste-delimiters");
+    let semicolons: &[u8] = b"id;name;note\n1;\"Marlow\";x, y\n2;Ostrava;z\n";
+    let document = open_with(&dir, "s.csv", semicolons);
+    paste(&document, 1..3, 1..3, "a;b\tc, d\ne\t\"f\tg\"");
+    assert_eq!(
+        String::from_utf8_lossy(&saved(&document)),
+        "id;name;note\n1;\"a;b\";c, d\n2;e;f\tg\n"
+    );
+    let tabs: &[u8] = b"id\tname\tnote\n1\tMarlow\tx; y\n2\tOstrava\t\"q\"\n";
+    let document = open_with(&dir, "t.tsv", tabs);
+    paste(&document, 1..3, 1..2, "a,b\n\"c\td\"");
+    assert_eq!(
+        String::from_utf8_lossy(&saved(&document)),
+        "id\tname\tnote\n1\ta,b\tx; y\n2\t\"c\td\"\t\"q\"\n"
+    );
+}
+
+/// A pasted value Windows-1252 can't hold stops Save, naming the cell,
+/// and the file is untouched; Save As UTF-8 writes it (DESIGN §3.7).
+#[test]
+fn a_pasted_value_the_encoding_cant_hold_is_saved_as_utf8() {
+    let dir = Dir::new("paste-1252");
+    let bytes: &[u8] = b"caf\xE9,b\r\n1,2\r\n3,4\r\n";
+    let document = open_with(&dir, "w.csv", bytes);
+    let path = document.original().path.clone();
+    assert_eq!(document.detection().encoding, Encoding::Windows1252);
+    paste(&document, 1..3, 1..2, "\u{1F600}\nok");
+    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+    assert!(
+        matches!(job.wait(), Err(SaveError::Unencodable { cells, .. }) if cells == &[(1, 1)]),
+        "{:?}",
+        job.wait()
+    );
+    assert_identical(bytes, &std::fs::read(&path).unwrap());
+    let copy = dir.0.join("u8.csv");
+    let job = document.save(SaveRequest::new(&copy, SaveKind::SaveAsUtf8));
+    job.wait().as_ref().unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "café,b\r\n1,\u{1F600}\r\n3,ok\r\n".as_bytes()
+    );
+}
+
+/// The cells' old values, which a paste's or a clear's command keeps for
+/// undo, may come to at most `PASTE_BYTE_LIMIT` bytes: past it the command
+/// is refused before anything changes, though it is within the cell limit.
+#[test]
+fn replacing_too_much_text_at_once_is_refused() {
+    let dir = Dir::new("paste-replaced");
+    let big = "v".repeat(PASTE_BYTE_LIMIT / 3 + 1);
+    let mut bytes = b"a,b\n".to_vec();
+    for _ in 0..3 {
+        bytes.extend_from_slice(format!("{big},x\n").as_bytes());
+    }
+    let document = open_with(&dir, "big.csv", &bytes);
+    assert!(matches!(
+        document.clear_cells(1..4, 0..2),
+        Err(EditError::TooMuchReplaced { bytes }) if bytes > PASTE_BYTE_LIMIT
+    ));
+    assert!(matches!(
+        try_paste(&document, 1..4, 0..1, "small"),
+        Err(EditError::TooMuchReplaced { .. })
+    ));
+    assert!(!document.has_edits());
+    // Two of them are within it.
+    assert!(document.clear_cells(1..3, 0..1).unwrap().is_some());
 }

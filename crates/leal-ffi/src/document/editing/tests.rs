@@ -452,10 +452,11 @@ fn paste_and_clear_give_one_command_each() {
     assert_eq!(document.can_paste().unwrap(), None);
 
     // A block from row 1, column 0: row 2 (short) gets a hatched cell.
-    let paste = document
-        .paste(1, 1, 0, 1, 2, "A\tB\r\nC\tD\r\n".into())
-        .unwrap()
+    let pasting = document
+        .paste(1, 1, 0, 1, 2, "A\tB\r\nC\tD\r\n".into(), LineEnding::Lf)
         .unwrap();
+    assert_eq!((pasting.rows, pasting.columns), (2, 2), "the block's size");
+    let paste = pasting.command.unwrap();
     assert_eq!(paste.changes.len(), 4);
     assert_eq!(name(&document, 1), ["A", "B"]);
     assert_eq!(name(&document, 2), ["C", "D"]);
@@ -472,21 +473,13 @@ fn paste_and_clear_give_one_command_each() {
 
     // The refusals.
     assert_eq!(cell_batch_limit(), 100_000);
-    assert_eq!(
-        paste_shape("a\tb\tc\r\nd\r\n".into()),
-        Some(PasteShape {
-            rows: 2,
-            columns: 3
-        })
-    );
-    assert_eq!(paste_shape("x\n".repeat(100_001)), None);
     assert_eq!(paste_byte_limit(), 32 << 20);
     assert_eq!(
-        document.paste(1, 1, 1, 1, 2, "a\tb".into()),
+        document.paste(1, 1, 1, 1, 2, "a\tb".into(), LineEnding::Lf),
         Err(refused(&path, EditRefusal::PastLastColumn, None, None))
     );
     assert_eq!(
-        document.paste(2, 1, 0, 1, 2, "a\nb\nc".into()),
+        document.paste(2, 1, 0, 1, 2, "a\nb\nc".into(), LineEnding::Lf),
         Err(refused(&path, EditRefusal::PastLastRow, None, None))
     );
     assert_eq!(
@@ -498,12 +491,23 @@ fn paste_and_clear_give_one_command_each() {
         Err(refused(&path, EditRefusal::TooManyCells, None, None))
     );
     assert_eq!(
-        document.paste(0, 1, 0, 1, 2, "x".repeat((32 << 20) + 1)),
+        document.paste(0, 1, 0, 1, 2, "x".repeat((32 << 20) + 1), LineEnding::Lf),
         Err(refused(&path, EditRefusal::TooMuchText, None, None))
     );
+    // Empty text pastes nothing; a line break in a value is the file's.
+    let empty = document
+        .paste(1, 1, 0, 1, 2, String::new(), LineEnding::Lf)
+        .unwrap();
+    assert_eq!((empty.command, empty.rows), (None, 0));
+    document
+        .paste(1, 1, 0, 1, 2, "\"two\nlines\"".into(), LineEnding::Crlf)
+        .unwrap()
+        .command
+        .unwrap();
+    assert_eq!(name(&document, 1)[0], "two\r\nlines");
     // Past the unterminated quote's cell (row 3, column 1).
     assert_eq!(
-        document.paste(3, 1, 2, 1, 3, "after".into()),
+        document.paste(3, 1, 2, 1, 3, "after".into(), LineEnding::Lf),
         Err(refused(
             &path,
             EditRefusal::AfterUnterminatedQuote,
@@ -543,12 +547,14 @@ fn a_large_batch_stays_in_rust() {
         .map(|row| format!("p{row}\tlonger value {row}"))
         .collect();
     let command = document
-        .paste(1, 1, 0, 1, 2, text.join("\n"))
+        .paste(1, 1, 0, 1, 2, text.join("\n"), LineEnding::Lf)
         .unwrap()
+        .command
         .unwrap();
     assert!(command.changes.is_empty());
     let cells = command.cells.clone().expect("a batch");
     assert_eq!(cells.count(), 600);
+    assert!(!cells.clears());
     assert_eq!(
         cells.rows(),
         Some(RowSpan {
@@ -582,6 +588,9 @@ fn a_large_batch_stays_in_rust() {
     assert_eq!(name(&document, 300), ["p299", "longer value 299"]);
     let inverse = inverse_command(command.clone());
     assert_eq!(inverse.cells.as_ref().map(|cells| cells.count()), Some(600));
+    let cleared = document.clear_cells(1, 300, 0, 2).unwrap().unwrap();
+    assert!(cleared.cells.as_ref().is_some_and(|cells| cells.clears()));
+    document.undo(cleared).unwrap();
 
     let fresh = open_it(&dir.file("b.csv", &bytes));
     let report = fresh.replay(vec![command]).unwrap();

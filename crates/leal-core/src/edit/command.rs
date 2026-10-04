@@ -34,7 +34,9 @@ pub const CELL_BATCH_LIMIT: usize = 100_000;
 /// The most text Paste puts into cells at once (task 2.6), in bytes: the
 /// clipboard's text, or for one value pasted into every selected cell,
 /// the value times the cells. Each cell keeps its own copy, as does the
-/// command for undo.
+/// command for undo. It is also the most text Paste, Clear or Cut may
+/// replace at once (the cells' old values, which the command keeps for
+/// undo): [`EditError::TooMuchReplaced`].
 pub const PASTE_BYTE_LIMIT: usize = 32 << 20;
 
 /// Which set of edits a command belongs to: a document's edits, while the
@@ -298,6 +300,13 @@ pub enum EditError {
         /// About how many bytes.
         bytes: usize,
     },
+    /// The cells to paste into or clear hold more than [`PASTE_BYTE_LIMIT`]
+    /// bytes of text between them (task 2.6): the command would keep a
+    /// copy of it all for undo.
+    TooMuchReplaced {
+        /// The bytes counted when it stopped (just past the limit).
+        bytes: usize,
+    },
     /// The pasted cells run past the last row (task 2.6): rows aren't
     /// added by a paste.
     PastLastRow {
@@ -357,6 +366,10 @@ impl fmt::Display for EditError {
             EditError::TooMuchText { bytes } => write!(
                 f,
                 "{bytes} bytes can't be pasted at once: at most {PASTE_BYTE_LIMIT}"
+            ),
+            EditError::TooMuchReplaced { bytes } => write!(
+                f,
+                "the cells hold over {bytes} bytes, more than can be replaced at once: at most {PASTE_BYTE_LIMIT}"
             ),
             EditError::PastLastRow { rows } => {
                 write!(f, "the {rows} pasted rows run past the last row")

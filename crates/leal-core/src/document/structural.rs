@@ -243,10 +243,10 @@ impl Document {
 
     /// Runs `change` on the current reading, one change at a time, once
     /// rows may be inserted or deleted.
-    pub(super) fn change_rows(
+    pub(super) fn change_rows<T>(
         &self,
-        change: impl FnOnce(&Arc<Reading>) -> Result<Option<Command>, EditError>,
-    ) -> Result<Option<Command>, EditError> {
+        change: impl FnOnce(&Arc<Reading>) -> Result<T, EditError>,
+    ) -> Result<T, EditError> {
         let _one_at_a_time = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         // Under the writer lock: a save takes its snapshot under it, after
         // saying it runs.

@@ -67,10 +67,13 @@ final class GridView: StripContentView, NSMenuItemValidation {
     var canCopy: () -> Bool = { false }
     /// Edit > Paste (⌘V): paste into the selection (task 2.6).
     var onPaste: (() -> Void)?
+    /// Edit > Cut (⌘X): copy the selection, then delete its rows or clear
+    /// its cells (task 2.6).
+    var onCut: (() -> Void)?
     /// Delete or Forward Delete (no ⌘), or Edit > Delete: clear the
     /// selected cells (task 2.6).
     var onClear: (() -> Void)?
-    /// Whether Edit > Paste or Edit > Delete is on, setting its tooltip.
+    /// Whether Edit > Cut, Paste or Delete is on, setting its tooltip.
     var validateCellItem: (NSMenuItem) -> Bool = { _ in false }
     /// Any key or click: the user is interacting (DESIGN §3.10 rule 3).
     var onUserInput: (() -> Void)?
@@ -518,7 +521,13 @@ final class GridView: StripContentView, NSMenuItemValidation {
         onCopy?()
     }
 
-    // Paste and Delete (task 2.6) change cells, so they are user input.
+    // Cut, Paste and Delete (task 2.6) change cells, so they are user
+    // input.
+
+    @objc func cut(_ sender: Any?) {
+        onUserInput?()
+        onCut?()
+    }
 
     @objc func paste(_ sender: Any?) {
         onUserInput?()
@@ -548,7 +557,7 @@ final class GridView: StripContentView, NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(copy(_:)): canCopy()
-        case #selector(paste(_:)), #selector(delete(_:)): validateCellItem(menuItem)
+        case #selector(cut(_:)), #selector(paste(_:)), #selector(delete(_:)): validateCellItem(menuItem)
         case #selector(selectAll(_:)): (dataSource?.rowCount ?? 0) > 0 && geometry.columnCount > 0
         default: true
         }
