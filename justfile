@@ -610,8 +610,11 @@ check-no-test-exports app="build/DerivedData/Build/Products/Release/Leal.app":
     # `debug_open_document_holding_copy`, `release_held_copy`,
     # `debug_release_held_copy`, and the private `hold_copy_at`,
     # `wait_while_copy_held` and `HeldCopy`; and the benchmarks' quoting
-    # census (task 2.4b), `bench_quoting_census`.
-    pattern='debug_?(panic|watch|open_?document|simulate|share)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share|clone)|set_?fault|share_?reads_?on_?main|sleep_?strictly|hold(ing)?_?copy|held_?copy|copy_?held|quoting_?census'
+    # census (task 2.4b), `bench_quoting_census`; and the save held at a
+    # checkpoint (task 2.5.3a): `debug_hold_next_save`,
+    # `debug_release_held_save` (`debugHoldNextSave`,
+    # `debugReleaseHeldSave`), and the core's `save_hooked` and `ChunkHook`.
+    pattern='debug_?(panic|watch|open_?document|simulate|share|hold|release_?held)|open_?simulating|simulated_?(fault|share|head|away|state)|simulate_?(drive|share|clone)|set_?fault|share_?reads_?on_?main|sleep_?strictly|hold(ing)?_?copy|held_?copy|copy_?held|quoting_?census|save_?hooked|chunk_?hook'
     for binary in "{{ app }}/Contents/Frameworks/LealFFI.framework/LealFFI" "{{ app }}/Contents/MacOS/Leal"; do
         if nm "$binary" | grep -Ei "$pattern" || strings "$binary" | grep -Ei "$pattern"; then
             echo "error: $binary has test-only exports or test hooks" >&2
