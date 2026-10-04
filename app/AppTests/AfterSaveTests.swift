@@ -86,6 +86,8 @@ final class AfterSaveTests: XCTestCase {
         content.view.layoutSubtreeIfNeeded()
         let model = try XCTUnwrap(document.model)
         try await waitUntil("indexed") { model.isIndexComplete }
+        // The window is never shown in tests, so it counts as on screen.
+        document.isOnScreen = { _ in true }
         document.showSheet = { [weak self] alert, _, done in
             self?.alerts.append(alert)
             done(.alertFirstButtonReturn)
@@ -480,6 +482,64 @@ final class AfterSaveTests: XCTestCase {
         XCTAssertEqual(alerts.first?.messageText, "Leal saved “closed.csv” and kept the version it replaced.")
         XCTAssertEqual(alerts.first?.informativeText, "Another app may have changed the file as Leal saved it. Its version is in Leal’s Recovered folder, as “closed (old).csv”.")
         document.close()
+    }
+
+    /// A window nobody can see (minimised, or ordered out as when the app
+    /// is hidden) gets no sheet, which would never be answered and would
+    /// hang the save, a close or a quit: the alert is app-modal instead.
+    func testAKeptOldFileIsReportedAppModallyWhileTheWindowIsOutOfSight() async throws {
+        let opened = try await open(try file("hidden.csv", "a,b\n1,2\n"))
+        var sheets = 0
+        opened.document.showSheet = { _, _, _ in sheets += 1 }
+        var modal = 0
+        opened.document.showAlert = { _, done in
+            modal += 1
+            done(.alertFirstButtonReturn)
+        }
+        func keep(_ name: String) async throws -> URL? {
+            let folder = directory.appending(path: "save-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let path = folder.appending(path: name)
+            try Data("old\n".utf8).write(to: path)
+            // A sheet that is never answered fails by the timeout, not by
+            // hanging the run.
+            let document = opened.document
+            let keeping = Task { await document.keepOldFile(path.path(percentEncoded: false)) }
+            var finished = false
+            Task {
+                _ = await keeping.value
+                finished = true
+            }
+            try await waitUntil("the kept file was reported", timeout: 10) { finished }
+            return finished ? await keeping.value : nil
+        }
+
+        // Minimised, as the real check sees it.
+        opened.document.isOnScreen = { _ in false }
+        let first = try await keep("hidden (old).csv")
+        XCTAssertNotNil(first)
+        XCTAssertEqual(modal, 1)
+        XCTAssertEqual(sheets, 0, "nobody would see a sheet")
+
+        // Ordered out, with the document's own check of the window.
+        opened.document.isOnScreen = { $0.isVisible && !$0.isMiniaturized }
+        opened.window.orderOut(nil)
+        XCTAssertFalse(opened.window.isVisible)
+        let second = try await keep("hidden (old) 2.csv")
+        XCTAssertNotNil(second)
+        XCTAssertEqual(modal, 2)
+        XCTAssertEqual(sheets, 0)
+
+        // Back on screen, the sheet is used.
+        opened.document.isOnScreen = { _ in true }
+        opened.document.showSheet = { _, _, done in
+            sheets += 1
+            done(.alertFirstButtonReturn)
+        }
+        let third = try await keep("hidden (old) 3.csv")
+        XCTAssertNotNil(third)
+        XCTAssertEqual(sheets, 1)
+        XCTAssertEqual(modal, 2)
     }
 
     // MARK: Attributes (ADR-0008 decision 8)

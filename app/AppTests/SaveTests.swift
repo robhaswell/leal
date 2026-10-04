@@ -104,6 +104,7 @@ final class SaveTests: XCTestCase {
         content.view.layoutSubtreeIfNeeded()
         let model = try XCTUnwrap(document.model)
         try await waitUntil("indexed") { model.isIndexComplete }
+        document.isOnScreen = { _ in true }
         document.showSheet = { [weak self] alert, _, done in
             guard let self else { return }
             alerts.append(alert)
@@ -300,6 +301,7 @@ final class SaveTests: XCTestCase {
         XCTAssertEqual(opened.document.history.journal.count, 1)
         XCTAssertTrue(alerts.isEmpty)
         XCTAssertNil(opened.model.saveJob)
+        XCTAssertFalse(opened.model.saveOutcomePending, "a cancelled save ends the flag")
     }
 
     /// A cancelled save leaves no temporary files behind: not in the
@@ -491,6 +493,7 @@ final class SaveTests: XCTestCase {
 
         let refused = try await save(opened)
         XCTAssertFalse(refused)
+        XCTAssertFalse(opened.model.saveOutcomePending, "a failed save ends the flag")
 
         XCTAssertEqual(alerts.map(\.messageText), ["“gone.csv” can’t be found."])
         XCTAssertEqual(alerts.first?.buttons.map(\.title), ["Save As…", "Cancel"])

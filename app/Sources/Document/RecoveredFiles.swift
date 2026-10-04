@@ -93,8 +93,9 @@ enum RecoveredFiles {
     }
 
     /// Renames `source` to `destination` if nothing is there
-    /// (`renamex_np` with `RENAME_EXCL`); across volumes, copies it there
-    /// (which fails if something is there) and removes it.
+    /// (`renamex_np` with `RENAME_EXCL`); across volumes, or where that
+    /// isn't supported, copies it there (which fails if something is
+    /// there) and removes it.
     ///
     /// - Throws: `POSIXError(.EEXIST)` or `CocoaError.fileWriteFileExists`
     ///   if `destination` is taken; otherwise why it couldn't be moved.
@@ -103,7 +104,9 @@ enum RecoveredFiles {
         let to = destination.path(percentEncoded: false)
         if renamex_np(from, to, UInt32(RENAME_EXCL)) == 0 { return }
         let code = errno
-        guard code == EXDEV else {
+        // Across volumes, or on one that can't rename exclusively (some
+        // network and FAT volumes: ENOTSUP, or EINVAL): copy instead.
+        guard code == EXDEV || code == ENOTSUP || code == EINVAL else {
             throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
         }
         let manager = FileManager.default

@@ -168,6 +168,7 @@ final class RemovableDriveTests: XCTestCase {
             let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
             document.makeWindowControllers()
             var alerts: [String] = []
+            document.isOnScreen = { _ in true }
             document.showSheet = { alert, _, done in
                 alerts.append(alert.messageText)
                 done(NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + alert.buttons.count - 1))

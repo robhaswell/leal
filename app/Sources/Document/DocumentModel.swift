@@ -1842,11 +1842,18 @@ final class DocumentModel: GridDataSource {
     func saveEnded(_ job: SaveJob, place: SavePlace, outcomeFollows: Bool) {
         place.removeLeftovers()
         guard saveJob === job else { return }
-        if !outcomeFollows { saveOutcomePending = false }
         saveWatching?.cancel()
         saveWatching = nil
         saveJob = nil
         saveProgress = nil
+        if !outcomeFollows {
+            saveOutcomePending = false
+            // While the flag was set `checkOriginal` left a new generation
+            // alone (a reconnect's restart, say): take it up now.
+            if failure == nil, let current = call({ try $0.progress() }), current.generation != generation {
+                restarted(current)
+            }
+        }
         onChange?(.progress)
     }
 

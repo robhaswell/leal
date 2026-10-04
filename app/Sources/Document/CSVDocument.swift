@@ -848,7 +848,10 @@ final class CSVDocument: NSDocument {
         alert.addButton(withTitle: SaveText.showInFinder)
         let window = windowControllers.first?.window
         let response = await withCheckedContinuation { continuation in
-            if let window {
+            // A sheet on a window nobody can see (minimised, or the app
+            // hidden) would never be answered, and the save, and a quit
+            // or close waiting on it, would hang.
+            if let window, isOnScreen(window) {
                 showSheet(alert, window) { continuation.resume(returning: $0) }
             } else {
                 showAlert(alert) { continuation.resume(returning: $0) }
