@@ -4,7 +4,7 @@
 //! ```text
 //! leal-perf --app Leal.app --bench-app Leal.app --file reference.csv
 //!           [--big-file big.csv] [--runs N] [--speed fast|moderate]
-//!           [--no-scroll | --only-scroll | --only-edit] [--compare-drawing]
+//!           [--no-scroll | --only-scroll | --only-edit | --only-launch] [--compare-drawing]
 //!           [--out DIR]
 //! ```
 //!
@@ -57,7 +57,7 @@ use leal_bench::perf::{
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: leal-perf --report FILE.json | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll | --only-scroll | --only-edit] [--compare-drawing] [--out DIR]";
+const USAGE: &str = "usage: leal-perf --report FILE.json | --only-launch --app APP [--runs N] | --app APP --bench-app APP --file CSV [--big-file CSV] [--runs N] [--speed fast|moderate] [--find TEXT] [--settle SECONDS] [--no-scroll | --only-scroll | --only-edit | --only-launch] [--compare-drawing] [--out DIR]";
 
 /// The app's sandbox container, where the scroll benchmark writes.
 const CONTAINER_TMP: &str = "Library/Containers/io.github.robhaswell.leal/Data/tmp";
@@ -86,6 +86,9 @@ struct Options {
     only_scroll: bool,
     /// Only the edit runs (task 2.5.1).
     only_edit: bool,
+    /// Only the launches, one line each (task 2.6a's slow-launch check);
+    /// needs just `--app`.
+    only_launch: bool,
     /// Each scroll run twice, with strips and with AppKit's drawing.
     compare_drawing: bool,
     out: PathBuf,
@@ -103,6 +106,7 @@ fn options() -> Result<Options, String> {
     let mut scroll = true;
     let mut only_scroll = false;
     let mut only_edit = false;
+    let mut only_launch = false;
     let mut compare_drawing = false;
     let mut out = PathBuf::from("target/perf");
     let mut args = std::env::args().skip(1);
@@ -124,6 +128,7 @@ fn options() -> Result<Options, String> {
             "--no-scroll" => scroll = false,
             "--only-scroll" => only_scroll = true,
             "--only-edit" => only_edit = true,
+            "--only-launch" => only_launch = true,
             "--compare-drawing" => compare_drawing = true,
             "--out" => out = PathBuf::from(value()?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -135,6 +140,11 @@ fn options() -> Result<Options, String> {
             "--only-scroll and --no-scroll leave nothing to run\n{USAGE}"
         ));
     }
+    if only_launch && (only_scroll || only_edit || !scroll) {
+        return Err(format!(
+            "--only-launch can't be combined with the other selections\n{USAGE}"
+        ));
+    }
     if only_edit && only_scroll {
         return Err(format!(
             "--only-edit and --only-scroll leave nothing to run\n{USAGE}"
@@ -144,16 +154,25 @@ fn options() -> Result<Options, String> {
         |p: PathBuf| std::path::absolute(&p).map_err(|e| format!("{}: {e}", p.display()));
     Ok(Options {
         app: absolute(app.ok_or(USAGE)?)?,
-        bench_app: absolute(bench_app.ok_or(USAGE)?)?,
-        file: absolute(file.ok_or(USAGE)?)?,
+        // Not needed to time launches alone.
+        bench_app: absolute(
+            bench_app
+                .or_else(|| only_launch.then(|| PathBuf::from(".")))
+                .ok_or(USAGE)?,
+        )?,
+        file: absolute(
+            file.or_else(|| only_launch.then(|| PathBuf::from(".")))
+                .ok_or(USAGE)?,
+        )?,
         big_file: big_file.map(absolute).transpose()?,
         runs: runs.max(1),
         speed,
         find,
         settle,
-        scroll: scroll && !only_edit,
+        scroll: scroll && !only_edit && !only_launch,
         only_scroll,
         only_edit,
+        only_launch,
         compare_drawing,
         out,
     })
@@ -171,7 +190,12 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let options = options()?;
-    for path in [&options.app, &options.bench_app, &options.file] {
+    let needed = if options.only_launch {
+        vec![&options.app]
+    } else {
+        vec![&options.app, &options.bench_app, &options.file]
+    };
+    for path in needed {
         if !path.exists() {
             return Err(format!("{} doesn't exist", path.display()));
         }
@@ -185,6 +209,19 @@ fn run() -> Result<(), String> {
     let mut opens = Vec::new();
     let mut reopens = Vec::new();
     let mut edits = Vec::new();
+    if options.only_launch {
+        // Each launch's time, in the order made, so a first launch after a
+        // build can be told from the rest. Nothing is saved.
+        let log = LogStream::start()?;
+        for run in 1..=options.runs {
+            let m = launch_run(&options, &log)?;
+            println!(
+                "launch {run}: {:.1} ms after the process started, {:.1} ms after `open`",
+                m["launchedAfterMs"], m["openCommandToLaunchedMs"]
+            );
+        }
+        return Ok(());
+    }
     if options.only_edit {
         let log = LogStream::start()?;
         for run in 1..=options.runs {

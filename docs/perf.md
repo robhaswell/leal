@@ -64,10 +64,43 @@ search, against 213 MB and 224–230 MB with AppKit's drawing); the heap is
 unchanged and passes.
 
 **One launch took 479 ms**, against a median of 170 ms (the three launches:
-156–479 ms). The 2 October run had the same: 433 ms against 159 ms. The
-first launch after a build is the likely cause. It is over the 300 ms
-budget, so the launch row says "mixed", and PLAN 2.6a has a task to look
-into it.
+156–479 ms). The 2 October run had the same: 433 ms against 159 ms. It is
+over the 300 ms budget, so the launch row says "mixed". Task 2.6a found the
+cause (below): it is the first launch of a new copy of the app, which macOS
+checks first, and not Leal.
+
+### The slow first launch (task 2.6a)
+
+Measured on 4 October 2026 (M5 Pro, screen locked, load 4–6), with
+`leal-perf --only-launch --app <Leal.app> --runs 10`: ten launches in a
+row of the Release app, each as the rest of `just perf` launches it
+(`open -n`), from process start to "Launched".
+
+| Case | Launch 1 | Launches 2–10 |
+|---|---|---|
+| The app just rebuilt (`just app release`, the old product deleted) | 387.7 ms | 104.5–138.5 ms (median 113) |
+| A `cp -R` of that app, same bytes and CDHash, at a new path (A) | 311.5 ms | 109.1–110.3 ms |
+| Another copy of A (B) | 289.4 ms | 110.6–112.5 ms |
+| Another copy of A (C) | 333.9 ms | 126.1 ms |
+
+The first launch of every new path is 180–280 ms slower, and the launches
+after it are the same whichever path. The system log (`/usr/bin/log show`)
+says why. For each of the four first launches, and for no other, `amfid`
+logged "Entering OSX path" for the new executable, and `syspolicyd` then
+logged "GK Xprotect results" (Gatekeeper's XProtect scan of it) 110–190 ms
+later; `amfid` was asked about the `LealFFI` framework 5–7 ms after that.
+So the process waits for the scan before `dyld` loads its first framework. A copy with the same CDHash is scanned again, so
+it is the file at a new path, not the signature, that the system checks.
+
+So it is not Leal's code: nothing in Leal runs before the scan finishes,
+and the launches after it (104–139 ms here, 156–170 ms in Rob's runs, when
+the Mac was busier) are within the 300 ms budget. The 433 and 479 ms
+launches were the first of each `just perf` run, which follows the build
+of the Release app. Nothing to fix in Leal. A user sees the same cost once
+after installing or updating the app (not measured here: a notarised
+release build may be assessed differently, which the beta can check). The
+table's median of three launches is not affected; expect the first launch
+after a build to be an outlier of about 200 ms.
 
 ### Cell edit to screen (task 2.5.1)
 
@@ -119,8 +152,9 @@ Also measured in the 2.0b run:
 ### To watch
 
 - **Slow launches:** 433 ms (2 October) and 479 ms (3 October), each the
-  first of three, against medians of 159 and 170 ms. Probably the first
-  launch after a build; PLAN 2.6a investigates.
+  first of three, against medians of 159 and 170 ms: the system's first-run
+  scan of a freshly built app, not Leal (task 2.6a, "The slow first
+  launch").
 - **The `bigFileNoPause` run 1 outlier of 2 October is ignored** (2,048 of
   5,455 late, 37.5%). Rob was using the Mac and moving windows around
   during it. The 3 October runs had no such outlier.
@@ -231,6 +265,7 @@ Everything at once, about 25 minutes (Leal's windows come to the front):
 ```sh
 just perf                       # builds the apps and files, runs everything, prints the table
 just perf --runs 1 --no-scroll  # launch, open, index and memory only: about a minute
+leal-perf --only-launch --app build/DerivedData/Build/Products/Release/Leal.app --runs 10  # launches only, one line each (cargo run --release -p leal-bench --bin leal-perf --)
 just perf --only-edit           # cell edit to screen only (task 2.5.1): about a minute
 ```
 
