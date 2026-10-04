@@ -2222,6 +2222,63 @@ fn a_column_save_counts_its_columns_at_once() {
     assert_eq!(document.column_count(), 11);
 }
 
+/// Task 2.4c: the census a column insert needs reads every row before the
+/// writer goes on; the save's progress says so (`Checking`) and moves as
+/// it reads, then it is writing again.
+#[test]
+fn a_census_shows_in_the_saves_progress() {
+    let mut bytes = Vec::new();
+    for row in 0..20_000 {
+        // Column 1 quotes every field, so the census reads every row.
+        bytes.extend_from_slice(format!("{row},\"n{row}\"\n").as_bytes());
+    }
+    let dir = Dir::new("save-census-progress");
+    let path = dir.file("a.csv", &bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    document.insert_column(0, "new").unwrap().unwrap();
+    let slot: Arc<OnceLock<SaveJob>> = Arc::default();
+    let seen: Arc<Mutex<Vec<crate::save::SaveProgress>>> = Arc::default();
+    let (go, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let hook: crate::document::saving::ChunkHook = {
+        let (slot, seen) = (Arc::clone(&slot), Arc::clone(&seen));
+        Arc::new(move |checkpoint| {
+            if checkpoint == 0 {
+                let _ = wait.lock().unwrap().recv();
+            } else if let Some(job) = slot.get() {
+                seen.lock().unwrap().push(job.progress());
+            }
+        })
+    };
+    let job = document.save_hooked(SaveRequest::new(&path, SaveKind::Save), hook);
+    slot.set(job.clone()).unwrap();
+    go.send(()).unwrap();
+    job.wait().unwrap();
+    let seen = seen.lock().unwrap();
+    let checking: Vec<_> = seen
+        .iter()
+        .filter(|progress| progress.phase == crate::save::SavePhase::Checking)
+        .collect();
+    let len = u64::try_from(bytes.len()).unwrap();
+    assert!(checking.len() >= 4, "{seen:?}");
+    assert!(checking.iter().all(|progress| progress.total == len));
+    assert!(
+        checking
+            .windows(2)
+            .all(|pair| pair[0].written < pair[1].written)
+    );
+    assert!(checking.last().unwrap().written < len);
+    let after = seen
+        .iter()
+        .skip_while(|progress| progress.phase != crate::save::SavePhase::Checking)
+        .find(|progress| progress.phase != crate::save::SavePhase::Checking);
+    assert_eq!(
+        after.map(|progress| progress.phase),
+        Some(crate::save::SavePhase::Writing)
+    );
+}
+
 /// ADR-0014 decision 3: a column command undone after a save works by
 /// value: a delete's cells are put back (`Restore`), an insert's are
 /// taken out if they still read as it left them.

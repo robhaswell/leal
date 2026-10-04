@@ -121,6 +121,11 @@ pub enum SavePhase {
     /// The edits' snapshot taken (`snapshot_version`): checking the file,
     /// then writing the new file.
     Writing,
+    /// Reading every row before writing on: for how new fields are quoted,
+    /// or for the cells a column insert's value can't be encoded in.
+    /// `written` and `total` are the bytes read and the file's length.
+    /// Then writing again.
+    Checking,
     /// Giving it the old file's metadata, and flushing it.
     Flushing,
     /// Putting it in place, and reading it back.
@@ -428,6 +433,7 @@ impl SaveJob {
                 save::SavePhase::Queued => SavePhase::Queued,
                 save::SavePhase::Indexing => SavePhase::Indexing,
                 save::SavePhase::Writing => SavePhase::Writing,
+                save::SavePhase::Checking => SavePhase::Checking,
                 save::SavePhase::Flushing => SavePhase::Flushing,
                 save::SavePhase::Replacing => SavePhase::Replacing,
                 save::SavePhase::Finished => SavePhase::Finished,

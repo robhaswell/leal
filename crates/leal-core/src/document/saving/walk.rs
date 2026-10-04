@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{Extent, QUOTE_SCAN_ROWS, ROWS_PER_CHECKPOINT, Sink, Streamed, to_i64};
+use super::{Extent, QUOTE_SCAN_ROWS, ROWS_PER_CHECKPOINT, SaveShared, Sink, Streamed, to_i64};
 use crate::diagnostics::CountsBuilder;
 use crate::dialect::{Bom, LineEnding};
 use crate::document::columns::Counts;
@@ -40,10 +40,12 @@ pub(super) fn stream(
     extent: &Extent<'_>,
     sink: &mut dyn Sink,
     checkpoint: &dyn Fn() -> Result<(), SaveError>,
+    progress: Option<&SaveShared>,
 ) -> Result<Streamed, SaveError> {
     let map = overlay.map();
     let rows = map.rows_within(extent.rows);
     let mut walk = Walk::new(reading, overlay, extent, sink, checkpoint, rows)?;
+    walk.progress = progress;
     let mut next: u32 = 0;
     for segment in map.segments(0..rows) {
         match segment {
@@ -77,6 +79,8 @@ struct Walk<'w, 's> {
     extent: &'w Extent<'w>,
     sink: &'s mut dyn Sink,
     checkpoint: &'w dyn Fn() -> Result<(), SaveError>,
+    /// The save's progress, told of the census's pass.
+    progress: Option<&'w SaveShared>,
     /// The logical rows written.
     rows: usize,
     /// The output rows written so far.
@@ -130,6 +134,7 @@ impl<'w, 's> Walk<'w, 's> {
             extent,
             sink,
             checkpoint,
+            progress: None,
             rows,
             out_row: 0,
             at: 0,
@@ -202,7 +207,13 @@ impl<'w, 's> Walk<'w, 's> {
     /// field on the way.
     fn census(&mut self) -> Result<(), SaveError> {
         if self.quoting.is_none() {
-            let census = ColumnQuoting::census(self.reading, self.overlay, self.checkpoint)?;
+            let (reading, overlay, checkpoint) = (self.reading, self.overlay, self.checkpoint);
+            let pass =
+                |read: &dyn Fn(usize)| ColumnQuoting::census(reading, overlay, checkpoint, read);
+            let census = match self.progress {
+                Some(progress) => progress.checking(self.extent.end, pass),
+                None => pass(&|_| {}),
+            }?;
             self.quote_all = Some(census.every_field());
             self.quoting = Some(census);
         }

@@ -16,7 +16,7 @@
 //! (ADR-0014 decision 2).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -196,7 +196,7 @@ impl Document {
         let reading = self.current();
         let overlay = reading.edits.overlay();
         let go = || Ok::<(), ReadError>(());
-        let census = ColumnQuoting::census(&reading, &overlay, &go)?;
+        let census = ColumnQuoting::census(&reading, &overlay, &go, &|_| {})?;
         Ok((0..columns).filter(|&column| census.quoted(column)).count())
     }
 }
@@ -209,30 +209,35 @@ impl ColumnQuoting {
     /// Every row counts for whether the file quotes every field; the rows
     /// still in the document count for their columns now.
     ///
-    /// It reads every row: about half a second per million rows (the
-    /// `column_edits/census` bench). So the writer makes it only when a
-    /// save writes a new field (an inserted row's or column's), and it
-    /// stops early once the answer can't change: the file doesn't quote
-    /// every field, and every column up to the widest row's end has an
-    /// unquoted non-empty field, so no column quotes every field. A
-    /// census stopped early answers [`quoted`](Self::quoted) and
-    /// [`every_field`](Self::every_field) as a whole one would.
+    /// It reads every row (without the grid's row cache): about half a
+    /// second per million rows (the `column_edits/census` bench). So the
+    /// writer makes it only when a save writes a new field (an inserted
+    /// row's or column's), and it stops early once the answer can't
+    /// change: the file doesn't quote every field, and every column that
+    /// any row's layout gives an original field has an unquoted non-empty
+    /// one, so no column quotes every field. (A column no row gives an
+    /// original field, such as an inserted one, quotes every field only if
+    /// the file does.) A census stopped early answers
+    /// [`quoted`](Self::quoted) and [`every_field`](Self::every_field) as a
+    /// whole one would. `read` is told how far it has read, in bytes,
+    /// after each batch.
     pub(in crate::document) fn census<E: From<ReadError>>(
         reading: &Reading,
         overlay: &Overlay,
         checkpoint: &dyn Fn() -> Result<(), E>,
+        read: &dyn Fn(usize),
     ) -> Result<ColumnQuoting, E> {
         const BATCH: usize = 4096;
         let mut census = ColumnQuoting::new();
         let map = overlay.map();
-        let rows = Document::rows_index(reading).1;
-        // Unknown until every row is marked: no early stop then.
-        let widest = widest(reading, overlay);
+        let (index, rows) = Document::rows_index(reading);
+        // Unknown until every row is counted: no early stop then.
+        let originals = original_columns(reading, overlay);
         let mut start = 0;
         while start < rows {
             checkpoint()?;
             let batch = start..rows.min(start + BATCH);
-            Document::read_physical(reading, overlay, batch.clone(), &mut |view| {
+            Document::each_physical(reading, overlay, batch.clone(), &mut |view| {
                 census.add_file_row(&view);
                 let live = view
                     .id()
@@ -242,7 +247,13 @@ impl ColumnQuoting {
                     census.add(&view);
                 }
             })?;
-            if widest.is_some_and(|widest| census.settled(widest)) {
+            if let Some(extent) = index.rows_extent(batch.clone()) {
+                read(extent.end);
+            }
+            if originals
+                .as_deref()
+                .is_some_and(|originals| census.settled(originals))
+            {
                 break;
             }
             start = batch.end;
@@ -676,21 +687,50 @@ fn each_row<'a>(
     }
 }
 
-/// The longest row of `overlay` now, in cells, from the field counts
-/// (`None` until every row has one).
-fn widest(reading: &Reading, overlay: &Overlay) -> Option<usize> {
+/// Which logical columns of `overlay` any row's layout gives one of the
+/// file's own fields, from the field counts (`None` until every row has
+/// one): the columns the quoting census looks at.
+fn original_columns(reading: &Reading, overlay: &Overlay) -> Option<Vec<bool>> {
     let counts = Counts::of(reading)?;
     let physical = reading.index.row_count();
     let columns = overlay.columns();
-    let mut widest = 0;
-    each_row(overlay, counts, physical, &mut |_, id, shape| {
-        let len = match shape {
-            Shape::Unedited(own) => columns.fold_len(own),
-            Shape::Edited(edits) => edits.len_in(columns, id.inserted_index()),
-        };
-        widest = widest.max(len);
+    let mut originals: Vec<bool> = Vec::new();
+    let mut mark = |ids: &[CellId]| {
+        for (column, id) in ids.iter().enumerate() {
+            if matches!(id, CellId::Field(_)) {
+                if originals.len() <= column {
+                    originals.resize(column + 1, false);
+                }
+                originals[column] = true;
+            }
+        }
+    };
+    // Unedited rows' layouts depend only on their field counts: each
+    // count's is worked out once.
+    let mut narrow = [false; 128];
+    let mut wide = BTreeSet::new();
+    each_row(overlay, counts, physical, &mut |_, id, shape| match shape {
+        Shape::Unedited(own) => {
+            if own.inserted.is_none() && !own.blank {
+                match narrow.get_mut(own.fields) {
+                    Some(seen) => *seen = true,
+                    None => {
+                        wide.insert(own.fields);
+                    }
+                }
+            }
+        }
+        Shape::Edited(edits) => {
+            if id.physical().is_some() {
+                mark(&edits.layout_in(columns, None).ids());
+            }
+        }
     });
-    Some(widest)
+    let narrow = (0..narrow.len()).filter(|&fields| narrow[fields]);
+    for fields in narrow.chain(wide) {
+        mark(&columns.fold(EditOwn::original(fields, false)).as_slice());
+    }
+    Some(originals)
 }
 
 /// [`plan`]'s walk over every logical row.

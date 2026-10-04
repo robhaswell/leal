@@ -183,11 +183,28 @@ impl SaveShared {
         self.phase.store(phase as u8, Ordering::Relaxed);
     }
 
+    /// Reads every row before writing on ([`SavePhase::Checking`]) with
+    /// `pass`, which is told how far it has read, in bytes, of the
+    /// snapshot's `total`; then writing again, where it was.
+    fn checking<T>(&self, total: usize, pass: impl FnOnce(&dyn Fn(usize)) -> T) -> T {
+        let written = self.written.load(Ordering::Relaxed);
+        let total_before = self.total.load(Ordering::Relaxed);
+        self.written.store(0, Ordering::Relaxed);
+        self.total.store(to_u64(total), Ordering::Relaxed);
+        self.set_phase(SavePhase::Checking);
+        let out = pass(&|read| self.written.store(to_u64(read), Ordering::Relaxed));
+        self.written.store(written, Ordering::Relaxed);
+        self.total.store(total_before, Ordering::Relaxed);
+        self.set_phase(SavePhase::Writing);
+        out
+    }
+
     fn phase(&self) -> SavePhase {
-        const PHASES: [SavePhase; 6] = [
+        const PHASES: [SavePhase; 7] = [
             SavePhase::Queued,
             SavePhase::Indexing,
             SavePhase::Writing,
+            SavePhase::Checking,
             SavePhase::Flushing,
             SavePhase::Replacing,
             SavePhase::Finished,
@@ -418,9 +435,9 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
-        check_encodable(&reading, &overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent, &|| Ok(()), None)?;
         let mut sink = Collect::default();
-        let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
+        let streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()), None)?;
         if !sink.refused.is_empty() {
             return Err(SaveError::Unconvertible {
                 encoding: extent.source,
@@ -453,7 +470,7 @@ impl Document {
         let reading = self.indexed_reading(&|| Ok(()), None)?;
         let overlay = reading.edits.overlay();
         let extent = extent_of(&reading, kind)?;
-        check_encodable(&reading, &overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent, &|| Ok(()), None)?;
         let progress = SaveShared::default();
         let mut census = (!extent.converts()).then(CensusStream::default);
         let mut sink = FileSink::new(
@@ -465,7 +482,7 @@ impl Document {
             census.as_mut(),
             &|| Ok(()),
         );
-        let mut streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()))?;
+        let mut streamed = stream(&reading, &overlay, &extent, &mut sink, &|| Ok(()), None)?;
         sink.finish(&mut streamed)?;
         Ok(streamed.len)
     }
@@ -558,7 +575,7 @@ impl Document {
             SaveKind::SaveAs | SaveKind::SaveAsUtf8 => existing_at(&destination)?,
         };
         let extent = extent_of(&reading, kind)?;
-        check_encodable(&reading, &overlay, &extent)?;
+        check_encodable(&reading, &overlay, &extent, checkpoint, Some(progress))?;
 
         // 4: the new file. Its length is known once it is written; until
         // then, the snapshot's bytes stand in for it.
@@ -596,7 +613,14 @@ impl Document {
                 census.as_mut(),
                 checkpoint,
             );
-            let mut streamed = stream(&reading, &overlay, &extent, &mut sink, checkpoint)?;
+            let mut streamed = stream(
+                &reading,
+                &overlay,
+                &extent,
+                &mut sink,
+                checkpoint,
+                Some(progress),
+            )?;
             let head = sink.finish(&mut streamed)?;
             out.flush().map_err(write("writing the new file"))?;
             (streamed, head)
@@ -1264,12 +1288,15 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
 /// (F5): checked before anything is written, naming each cell that isn't,
 /// by its logical row and column: edited cells shown (a deleted column's
 /// aren't written), inserted rows' cells, and the cells a column insert
-/// gave original rows, which are looked for (a pass over the file) only if
-/// one of its values can't be encoded.
+/// gave original rows, which are looked for (a pass over the file, without
+/// the grid's row cache, with a `checkpoint` before each batch, told to
+/// `progress`) only if one of its values can't be encoded.
 fn check_encodable(
     reading: &Reading,
     overlay: &Overlay,
     extent: &Extent<'_>,
+    checkpoint: &dyn Fn() -> Result<(), SaveError>,
+    progress: Option<&SaveShared>,
 ) -> Result<(), SaveError> {
     let encoding = extent.target;
     let rows = overlay.map().rows_within(extent.rows);
@@ -1279,22 +1306,35 @@ fn check_encodable(
     let mut cells: Vec<(usize, usize)> = Vec::new();
     if new_bad {
         // Every original row, as it reads, for its inserted cells too.
-        let mut start = 0;
-        while start < extent.rows {
-            let batch = start..extent.rows.min(start + QUOTE_SCAN_ROWS);
-            Document::read_physical(reading, overlay, batch.clone(), &mut |view| {
-                let Some(row) = logical_row(overlay, view.id()).filter(|&row| row < rows) else {
-                    return;
-                };
-                for (column, cell) in view.filled() {
-                    if let ViewCell::New(value) | ViewCell::Edited(value) = cell
-                        && bad(value)
-                    {
-                        cells.push((row, column));
+        let mut pass = |read: &dyn Fn(usize)| -> Result<(), SaveError> {
+            let index = extent.index;
+            let mut start = 0;
+            while start < extent.rows {
+                checkpoint()?;
+                let batch = start..extent.rows.min(start + QUOTE_SCAN_ROWS);
+                Document::each_physical(reading, overlay, batch.clone(), &mut |view| {
+                    let Some(row) = logical_row(overlay, view.id()).filter(|&row| row < rows)
+                    else {
+                        return;
+                    };
+                    for (column, cell) in view.filled() {
+                        if let ViewCell::New(value) | ViewCell::Edited(value) = cell
+                            && bad(value)
+                        {
+                            cells.push((row, column));
+                        }
                     }
+                })?;
+                if let Some(extent) = index.rows_extent(batch.clone()) {
+                    read(extent.end);
                 }
-            })?;
-            start = batch.end;
+                start = batch.end;
+            }
+            Ok(())
+        };
+        match progress {
+            Some(progress) => progress.checking(extent.end, pass)?,
+            None => pass(&|_| {})?,
         }
     } else {
         for (id, edits) in overlay.all() {

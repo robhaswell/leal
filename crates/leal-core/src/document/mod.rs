@@ -895,6 +895,41 @@ impl Document {
             .collect())
     }
 
+    /// Physical rows `rows` (as many as can be read now), each to `each`
+    /// with `overlay`'s edits on top, as [`read_physical`] gives them, but
+    /// parsed without the row cache: for a pass over every row (a save's,
+    /// task 2.4c), which would only evict the grid's rows, and hold the
+    /// cache's lock from the main thread a batch at a time.
+    ///
+    /// [`read_physical`]: Self::read_physical
+    fn each_physical(
+        reading: &Reading,
+        overlay: &Overlay,
+        rows: Range<usize>,
+        each: &mut dyn FnMut(RowView<'_>),
+    ) -> Result<(), ReadError> {
+        let stale = reading.head_is_stale();
+        let (index, available) = reading.rows_from(&reading.index, stale);
+        let rows = rows.start..rows.end.min(available);
+        let Some(extent) = index.rows_extent(rows.clone()) else {
+            return Ok(());
+        };
+        let bytes = reading.bytes_of(extent.clone(), stale)?;
+        let base = extent.start;
+        for row in rows {
+            if let Some(parsed) = reading.parser.parse_row_in(index, row, &bytes, base) {
+                each(RowView::new(
+                    &reading.parser,
+                    &bytes,
+                    base,
+                    &parsed,
+                    overlay.physical(row),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The number of rows that can be read now: the index's so far, or the
     /// first 64 KB's if the index hasn't got that far. Once indexing is
     /// complete, the file's row count. After the file changed while it was

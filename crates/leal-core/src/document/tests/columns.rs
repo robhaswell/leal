@@ -454,7 +454,7 @@ fn quoting_census_judges_each_column_now() {
         let reading = document.current();
         let overlay = reading.edits.overlay();
         let go = || Ok::<(), crate::save::SaveError>(());
-        crate::save::ColumnQuoting::census(&reading, &overlay, &go).unwrap()
+        crate::save::ColumnQuoting::census(&reading, &overlay, &go, &|_| {}).unwrap()
     };
     let now = census(&document);
     assert!(!now.every_field());
@@ -471,9 +471,9 @@ fn quoting_census_judges_each_column_now() {
 }
 
 /// The census stops once no row can change its answers (the file doesn't
-/// quote every field, and every column up to the widest row's end has an
-/// unquoted field), with a checkpoint before each batch of rows, which can
-/// cancel it.
+/// quote every field, and every column some row gives an original field
+/// has an unquoted one), with a checkpoint before each batch of rows,
+/// which can cancel it.
 #[test]
 fn quoting_census_stops_early_and_can_be_cancelled() {
     use crate::save::{ColumnQuoting, SaveError};
@@ -490,7 +490,7 @@ fn quoting_census_stops_early_and_can_be_cancelled() {
                 _ => Ok(()),
             }
         };
-        let census = ColumnQuoting::census(&reading, &overlay, &checkpoint);
+        let census = ColumnQuoting::census(&reading, &overlay, &checkpoint, &|_| {});
         (census, checkpoints.get())
     };
     let mut bytes = Vec::new();
@@ -519,12 +519,30 @@ fn quoting_census_stops_early_and_can_be_cancelled() {
     let early = early.unwrap();
     assert_eq!(checkpoints, 1);
     assert!(!early.every_field() && (0..5).all(|c| !early.quoted(c)));
-    // A column inserted has no original field, so it never settles.
+    // A column inserted has no original field, so no row can make it
+    // quote every field: it still stops there.
+    insert(&document, 1, "v");
+    let (early, checkpoints) = census(&document, None);
+    assert_eq!(checkpoints, 1);
+    let early = early.unwrap();
+    assert!((0..6).all(|c| !early.quoted(c)));
+    // A column only the last row reaches, quoted there: it isn't settled
+    // until that row is read.
+    let mut bytes = Vec::new();
+    for row in 0..10_000 {
+        bytes.extend_from_slice(format!("{row},x\n").as_bytes());
+    }
+    bytes.extend_from_slice(b"a,b,\"c\"\n");
+    let document = open_with(&dir, "late.csv", &bytes, false);
+    let (whole, checkpoints) = census(&document, None);
+    assert_eq!(checkpoints, 3);
+    let whole = whole.unwrap();
+    assert!(!whole.quoted(0) && !whole.quoted(1) && whole.quoted(2));
     insert(&document, 1, "v");
     let (whole, checkpoints) = census(&document, None);
     assert_eq!(checkpoints, 3);
     let whole = whole.unwrap();
-    assert!((0..6).all(|c| !whole.quoted(c)));
+    assert!((0..3).all(|c| !whole.quoted(c)) && whole.quoted(3));
 }
 
 /// The marks of unedited rows follow the columns: a deleted column takes a

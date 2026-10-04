@@ -74,15 +74,20 @@ impl ColumnQuoting {
     }
 
     /// Whether no row still to come can change the answers: the file
-    /// doesn't quote every field, and each of columns `0..widest` (the
-    /// widest row's end) has a non-empty field that isn't quoted, so none
-    /// quotes every field.
-    pub(crate) fn settled(&self, widest: usize) -> bool {
+    /// doesn't quote every field, and each column `originals` says some
+    /// row gives one of the file's own fields has a non-empty field that
+    /// isn't quoted, so none quotes every field. (The others, such as an
+    /// inserted column, have no original field, so none quotes every
+    /// field, whatever the rows to come.)
+    pub(crate) fn settled(&self, originals: &[bool]) -> bool {
         !self.every_field
-            && self.columns.len() >= widest
-            && self.columns[..widest]
-                .iter()
-                .all(|&(seen, quoted)| seen && !quoted)
+            && originals.iter().enumerate().all(|(column, &original)| {
+                !original
+                    || self
+                        .columns
+                        .get(column)
+                        .is_some_and(|&(seen, quoted)| seen && !quoted)
+            })
     }
 
     /// Whether the file quotes every field.

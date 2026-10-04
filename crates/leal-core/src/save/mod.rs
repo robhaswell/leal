@@ -389,6 +389,12 @@ pub enum SavePhase {
     /// ([`SaveProgress::snapshot_version`]): checking the file, then
     /// writing the new file.
     Writing,
+    /// Reading every row before writing on (task 2.4c): for how new fields
+    /// are quoted, the first time a row writes one (about half a second
+    /// per million rows, often much less), or for the cells a column
+    /// insert's value can't be encoded in. `written` and `total` are the
+    /// bytes read and the file's length. Then writing again.
+    Checking,
     /// Giving it the old file's metadata and flushing it.
     Flushing,
     /// Putting it in place and reading it back.
