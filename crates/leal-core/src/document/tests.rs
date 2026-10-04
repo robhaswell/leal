@@ -165,6 +165,13 @@ fn sample(size: usize) -> Vec<u8> {
     bytes
 }
 
+/// The cells a refusal names of `cells` (all of them, in order), and
+/// whether there are more: the first [`MAX_NAMED_CELLS`](crate::save::MAX_NAMED_CELLS).
+fn capped(cells: &[(usize, usize)]) -> (Vec<(usize, usize)>, bool) {
+    let max = crate::save::MAX_NAMED_CELLS;
+    (cells[..cells.len().min(max)].to_vec(), cells.len() > max)
+}
+
 fn wait_for_index(document: &Document) -> IndexSummary {
     let job = document.index_job();
     assert_eq!(job.control().wait_timeout(LONG), Some(Ok(())));

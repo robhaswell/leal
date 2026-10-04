@@ -118,6 +118,7 @@ fn refusals_reach_swift_with_their_reasons() {
         Err(SaveFailure::Unencodable {
             encoding: TextEncoding::Windows1252,
             cells: vec![CellPlace { row: 0, column: 0 }],
+            more: false,
         })
     );
 }

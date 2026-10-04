@@ -80,8 +80,8 @@ use crate::dialect::{Bom, Encoding};
 use crate::edit::{EditStore, Overlay, RowEdits, RowId};
 use crate::index::{RowIndex, Status};
 use crate::save::{
-    AttributeFacts, AttributePlan, Fix, Placed, SaveError, SaveKind, SavePhase, SaveProgress,
-    SaveRequest, Saved, Splice, encode, needs_census,
+    AttributeFacts, AttributePlan, Fix, MAX_NAMED_CELLS, Placed, SaveError, SaveKind, SavePhase,
+    SaveProgress, SaveRequest, Saved, Splice, encode, needs_census,
 };
 use crate::schedule::{Interval, JobError, JobHandle, Priority};
 use crate::source::{
@@ -1290,7 +1290,9 @@ fn extent_of(reading: &Reading, kind: SaveKind) -> Result<Extent<'_>, SaveError>
 /// aren't written), inserted rows' cells, and the cells a column insert
 /// gave original rows, which are looked for (a pass over the file, without
 /// the grid's row cache, with a `checkpoint` before each batch, told to
-/// `progress`) only if one of its values can't be encoded.
+/// `progress`) only if one of its values can't be encoded. The first
+/// [`MAX_NAMED_CELLS`] are named, as Save As UTF-8's refusal does: the
+/// pass ends once more than those are found.
 fn check_encodable(
     reading: &Reading,
     overlay: &Overlay,
@@ -1309,7 +1311,9 @@ fn check_encodable(
         let mut pass = |read: &dyn Fn(usize)| -> Result<(), SaveError> {
             let index = extent.index;
             let mut start = 0;
-            while start < extent.rows {
+            // Past the cap, every cell named is in a row read already (the
+            // inserted rows' are looked at after).
+            while start < extent.rows && cells.len() <= MAX_NAMED_CELLS {
                 checkpoint()?;
                 let batch = start..extent.rows.min(start + QUOTE_SCAN_ROWS);
                 Document::each_physical(reading, overlay, batch.clone(), &mut |view| {
@@ -1367,7 +1371,13 @@ fn check_encodable(
         return Ok(());
     }
     cells.sort_unstable();
-    Err(SaveError::Unencodable { encoding, cells })
+    let more = cells.len() > MAX_NAMED_CELLS;
+    cells.truncate(MAX_NAMED_CELLS);
+    Err(SaveError::Unencodable {
+        encoding,
+        cells,
+        more,
+    })
 }
 
 /// Row `id`'s logical row in `overlay`: an original row's (`None` if it is

@@ -436,8 +436,11 @@ pub enum SaveError {
     Unencodable {
         /// The file's encoding.
         encoding: Encoding,
-        /// Every such cell, in order.
+        /// The cells, in order: the first [`MAX_NAMED_CELLS`] (a column
+        /// insert can give a million).
         cells: Vec<(usize, usize)>,
+        /// Whether there are more than those.
+        more: bool,
     },
     /// Save As UTF-8 (ADR-0008 decision 7): these unedited cells (row,
     /// column) hold bytes that aren't text in the file's encoding (an
@@ -507,9 +510,14 @@ impl fmt::Display for SaveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SaveError::ReadOnly => f.write_str("UTF-16 files are read-only"),
-            SaveError::Unencodable { encoding, cells } => write!(
+            SaveError::Unencodable {
+                encoding,
+                cells,
+                more,
+            } => write!(
                 f,
-                "cells {cells:?} hold text that can't be saved in {}",
+                "cells {cells:?}{} hold text that can't be saved in {}",
+                if *more { " and more" } else { "" },
                 encoding.iana_name()
             ),
             SaveError::Unconvertible {

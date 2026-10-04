@@ -792,8 +792,13 @@ fn every_reader_agrees(
             prop_assert_eq!(&splices, &saved.changes);
             prop_assert_eq!(plan.rows(), oracle.row_count());
         }
-        (Err(SaveError::Unencodable(cells)), Err(SavingError::Unencodable { cells: got, .. })) => {
-            prop_assert_eq!(&got, cells);
+        (
+            Err(SaveError::Unencodable(cells)),
+            Err(SavingError::Unencodable {
+                cells: got, more, ..
+            }),
+        ) => {
+            prop_assert_eq!((got, more), capped(cells));
         }
         (expected, plan) => prop_assert!(false, "oracle {:?}, plan {:?}", expected, plan),
     }

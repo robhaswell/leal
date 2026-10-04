@@ -378,6 +378,40 @@ fn a_utf16_file_saved_as_utf8_reads_the_same_and_saves() {
     );
 }
 
+/// A column insert whose value the file's encoding can't hold names the
+/// first 1,000 cells it gave, in order, and says there are more, as Save
+/// As UTF-8's refusal does; an inserted row's cell among them counts.
+#[test]
+fn a_column_insert_that_cant_be_encoded_names_the_first_cells() {
+    let dir = Dir::new("save-unencodable-capped");
+    let scheduler = scheduler();
+    let mut bytes = b"caf\xE9,b\n".to_vec();
+    for row in 0..20_000 {
+        bytes.extend_from_slice(format!("{row},x\n").as_bytes());
+    }
+    let path = dir.file("w.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Windows1252);
+    document.insert_column(1, "😀").unwrap().unwrap();
+    document
+        .insert_rows(3, &[vec!["n".into(), "😀".into()]])
+        .unwrap();
+    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+    let Err(SaveError::Unencodable {
+        encoding,
+        cells,
+        more,
+    }) = job.wait()
+    else {
+        panic!("{:?}", job.wait());
+    };
+    assert_eq!(*encoding, Encoding::Windows1252);
+    assert!(*more);
+    let expected: Vec<(usize, usize)> = (0..1_000).map(|row| (row, 1)).collect();
+    assert_eq!(cells, &expected);
+    assert_identical(&bytes, &std::fs::read(&path).unwrap());
+}
+
 /// DESIGN §3.7: a value the file's encoding can't hold stops Save, naming
 /// the cell; Save As UTF-8 writes it, and every other character converted.
 #[test]
@@ -391,7 +425,7 @@ fn a_value_save_refuses_is_saved_as_utf8() {
     let error = save(&document, &path, SaveKind::Save).unwrap_err();
     assert_eq!(
         error,
-        "Unencodable { encoding: Windows1252, cells: [(1, 1)] }"
+        "Unencodable { encoding: Windows1252, cells: [(1, 1)], more: false }"
     );
     let copy = dir.0.join("u8.csv");
     save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();

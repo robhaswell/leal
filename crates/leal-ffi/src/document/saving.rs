@@ -209,8 +209,10 @@ pub enum SaveFailure {
     Unencodable {
         /// The file's encoding.
         encoding: TextEncoding,
-        /// Every such cell, in order.
+        /// The cells, in order: the first 1,000.
         cells: Vec<CellPlace>,
+        /// Whether there are more than those.
+        more: bool,
     },
     /// Save As UTF-8: these unedited cells hold bytes that aren't text in
     /// the file's encoding (an unpaired surrogate or a final odd byte in
@@ -300,9 +302,14 @@ impl From<&SaveError> for SaveFailure {
     fn from(error: &SaveError) -> Self {
         match error {
             SaveError::ReadOnly => Self::ReadOnly,
-            SaveError::Unencodable { encoding, cells } => Self::Unencodable {
+            SaveError::Unencodable {
+                encoding,
+                cells,
+                more,
+            } => Self::Unencodable {
                 encoding: (*encoding).into(),
                 cells: cell_places(cells),
+                more: *more,
             },
             SaveError::Unconvertible {
                 encoding,

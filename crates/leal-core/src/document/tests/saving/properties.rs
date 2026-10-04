@@ -401,8 +401,13 @@ fn check_undo_after_save(
             prop_assert_eq!(&fixes, &expected.fixes);
             prop_assert_eq!(plan.rows(), oracle.row_count());
         }
-        (Err(OracleError::Unencodable(cells)), Err(SaveError::Unencodable { cells: got, .. })) => {
-            prop_assert_eq!(got, cells);
+        (
+            Err(OracleError::Unencodable(cells)),
+            Err(SaveError::Unencodable {
+                cells: got, more, ..
+            }),
+        ) => {
+            prop_assert_eq!((got, more), capped(&cells));
         }
         (expected, plan) => prop_assert!(false, "oracle {:?}, plan {:?}", expected, plan),
     }
@@ -576,15 +581,25 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
             Err(SaveError::Unencodable {
                 encoding: planned,
                 cells: planned_cells,
+                more: planned_more,
             }),
             Err(SaveError::Unencodable {
                 encoding: refused,
                 cells: refused_cells,
+                more: refused_more,
             }),
         ) => {
-            // F5: the same cells, before anything was written.
-            prop_assert_eq!((planned, &planned_cells), (encoding, &cells));
-            prop_assert_eq!((*refused, refused_cells), (encoding, &cells));
+            // F5: the same cells (the first 1,000), before anything was
+            // written.
+            let (cells, more) = capped(&cells);
+            prop_assert_eq!(
+                (planned, &planned_cells, planned_more),
+                (encoding, &cells, more)
+            );
+            prop_assert_eq!(
+                (*refused, refused_cells, *refused_more),
+                (encoding, &cells, more)
+            );
             prop_assert_eq!(&std::fs::read(&opened).unwrap(), &case.file.bytes);
             if mode == Mode::SaveAs {
                 prop_assert!(!path.exists(), "nothing written");
@@ -883,8 +898,13 @@ fn incomplete_save_as_matches_the_oracle(case: &EditCase, at: usize) -> Result<(
     let (saved, done) = match (oracle.save(), job.wait()) {
         (Ok(saved), Ok(done)) => (saved, done),
         (Err(OracleError::ReadOnly), Err(SaveError::ReadOnly)) => return Ok(()),
-        (Err(OracleError::Unencodable(cells)), Err(SaveError::Unencodable { cells: got, .. })) => {
-            prop_assert_eq!(got, &cells);
+        (
+            Err(OracleError::Unencodable(cells)),
+            Err(SaveError::Unencodable {
+                cells: got, more, ..
+            }),
+        ) => {
+            prop_assert_eq!((got.clone(), *more), capped(&cells));
             return Ok(());
         }
         (expected, got) => {
