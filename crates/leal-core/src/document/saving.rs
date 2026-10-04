@@ -17,7 +17,10 @@
 //!    and lets go: edits carry on;
 //! 3. for Save, checks the user's file afresh: still the one Leal opened or
 //!    last saved (ADR-0008 decision 9), writable, and not locked (ADR-0012
-//!    decision 1);
+//!    decision 1). A Save As onto the document's own file, however its
+//!    path is spelled (the same `st_dev` and `st_ino`), is a Save, with
+//!    these checks and the ones in step 6; Save As UTF-8 there still
+//!    converts, after the same checks;
 //! 4. writes the new file next to the destination ([`Staged`]), walking
 //!    the rows in order through the piece list (task 2.4c), making each
 //!    row's splices as it reaches it (edited rows, deleted rows, inserted
@@ -562,26 +565,44 @@ impl Document {
                 break (now, overlay, version);
             }
         };
-        let kind = request.kind;
         let destination = resolve_link(&request.destination);
+        // Save As onto the file the document has open, under another
+        // spelling (case, Unicode normalization, a link or a firmlink): a
+        // Save, with all of Save's checks, and the file keeps its name.
+        // Save As UTF-8 there still converts, but only as Save would
+        // write: the whole file, unchanged elsewhere, replaceable.
+        let own_file = request.kind != SaveKind::Save && self.is_open_file(&destination);
+        let kind = if own_file && request.kind == SaveKind::SaveAs {
+            SaveKind::Save
+        } else {
+            request.kind
+        };
+        let destination = if own_file {
+            self.open_file_path()
+        } else {
+            destination
+        };
+        let as_save = kind == SaveKind::Save || own_file;
 
         // 3: the checks before writing.
-        let existing = match kind {
-            SaveKind::Save => {
-                if !reading.source.can_save() {
-                    return Err(SaveError::Incomplete);
-                }
-                if self.original.status().state == OriginalState::Unavailable {
-                    return Err(SaveError::Unavailable);
-                }
-                if self.original.is_moving() {
-                    return Err(SaveError::Moving);
-                }
-                Some(self.check_before_writing(&destination, request)?)
+        let existing = if as_save {
+            if !reading.source.can_save() {
+                return Err(SaveError::Incomplete);
             }
-            SaveKind::SaveAs | SaveKind::SaveAsUtf8 => existing_at(&destination)?,
+            if self.original.status().state == OriginalState::Unavailable {
+                return Err(SaveError::Unavailable);
+            }
+            if self.original.is_moving() {
+                return Err(SaveError::Moving);
+            }
+            Some(self.check_before_writing(&destination, request)?)
+        } else {
+            existing_at(&destination)?
         };
         let extent = extent_of(&reading, kind)?;
+        if as_save && !extent.complete {
+            return Err(SaveError::Incomplete);
+        }
         check_encodable(&reading, &overlay, &extent, checkpoint, Some(progress))?;
 
         // 4: the new file. Its length is known once it is written; until
@@ -702,7 +723,7 @@ impl Document {
             &destination,
             |opened, diverged| {
                 reached(AT_SWAP);
-                if kind != SaveKind::Save {
+                if !as_save {
                     return Ok(());
                 }
                 if diverged && !request.overwrite_changed {
@@ -827,6 +848,29 @@ impl Document {
             reread,
             reread_error,
         })
+    }
+
+    /// Whether `destination` is the document's own file, however it is
+    /// spelled: the same file (`st_dev` and `st_ino`) as the one Leal
+    /// opened or last saved, or as the one at its path now (which another
+    /// app may have replaced: Save's checks then say so). Two `stat`s, on
+    /// the save's thread.
+    fn is_open_file(&self, destination: &Path) -> bool {
+        let Ok(there) = std::fs::metadata(destination) else {
+            return false;
+        };
+        let opened = self.original.opened();
+        if (there.dev(), there.ino()) == (opened.device, opened.inode) {
+            return true;
+        }
+        std::fs::metadata(self.original.status().path)
+            .is_ok_and(|now| (now.dev(), now.ino()) == (there.dev(), there.ino()))
+    }
+
+    /// Where the document's own file is (a symbolic link followed), as
+    /// Save writes it.
+    fn open_file_path(&self) -> PathBuf {
+        resolve_link(&self.original.status().path)
     }
 
     /// The check before writing (ADR-0008 decision 9, ADR-0012 decision 1):

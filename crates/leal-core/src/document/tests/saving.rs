@@ -625,6 +625,77 @@ fn a_file_replaced_at_its_path_is_changed_elsewhere() {
     );
 }
 
+/// Another app appends a row to `path` (no watcher runs, so only the check
+/// before writing can see it).
+fn append_elsewhere(path: &Path) {
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut file, b"3,4\n").unwrap();
+}
+
+/// Save As onto the document's own file through a symbolic link is a Save
+/// (task 2.5.3c review): a change elsewhere is refused, as Save refuses it,
+/// for Save As UTF-8 too; unchanged, the file itself is replaced, the link
+/// stays a link, and the document's file is still the one it had.
+#[test]
+fn a_save_as_onto_its_own_file_through_a_link_is_a_save() {
+    let dir = Dir::new("save-as-own-link");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", b"a,b\n1,2\n");
+    let link = dir.0.join("link.csv");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 0, "x");
+    append_elsewhere(&path);
+    for kind in [SaveKind::SaveAs, SaveKind::SaveAsUtf8] {
+        assert_eq!(
+            save(&document, &link, kind).unwrap_err(),
+            "ChangedElsewhere"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\n1,2\n3,4\n");
+
+    let path = dir.file("b.csv", b"a,b\n1,2\n");
+    let link = dir.0.join("link-b.csv");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 0, "x");
+    let saved = save(&document, &link, SaveKind::SaveAs).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nx,2\n");
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(saved.path.file_name(), path.file_name());
+    assert_eq!(document.original().path.file_name(), path.file_name());
+}
+
+/// Save As onto the document's own file under a name that differs only in
+/// case (on a volume that ignores case) is a Save: a change elsewhere is
+/// refused, and an unchanged file keeps its own name.
+#[test]
+fn a_save_as_onto_its_own_file_by_another_case_is_a_save() {
+    let dir = Dir::new("save-as-own-case");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", b"a,b\n1,2\n");
+    let other_case = dir.0.join("A.CSV");
+    if !other_case.exists() {
+        eprintln!("skipped: the temporary folder's volume is case-sensitive");
+        return;
+    }
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 0, "x");
+    append_elsewhere(&path);
+    assert_eq!(
+        save(&document, &other_case, SaveKind::SaveAs).unwrap_err(),
+        "ChangedElsewhere"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\n1,2\n3,4\n");
+
+    let mut request = SaveRequest::new(&other_case, SaveKind::SaveAs);
+    request.overwrite_changed = true;
+    document.save(request).wait().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nx,2\n");
+    let names = leftovers(&dir.0, &["scratch", "records"]);
+    assert_eq!(names, ["a.csv"], "the file keeps its name");
+}
+
 // ---------------------------------------------------------------------------
 // What a save keeps (DESIGN §3.7)
 
