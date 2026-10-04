@@ -755,29 +755,42 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (`app/Scripts/disk-image-helper.sh`) ran from the scheme's pre-action,
     before xcodebuild compiled, so a slow build could use it all up; it is
     now an idle timeout that runs from the last request.
-  - [ ] Investigate the occasional slow launch (433 and 479 ms, against a
-    median of about 160 ms; probably the first launch after a build).
+  - [x] Investigate the occasional slow launch (433 and 479 ms, against a
+    median of about 160 ms; probably the first launch after a build). It is
+    the system's first-run scan (amfid, then syspolicyd's XProtect check) of
+    a new copy of the app, 110–190 ms before `dyld` loads its first
+    framework; not Leal (docs/perf.md, "The slow first launch").
   - [ ] From 2.6a's review: the `snapshot` helper's 5-pass loop should fail
     when strips never settle; `GridDataSource.readAhead`'s `wanted.set`
     should come before its early returns; queued alerts could skip a failed
     document; `updateWindowMinimum` with no window.
-  - [ ] From 2.5.3c's review: `kind_of_folder`'s doc comment
-    (`crates/leal-core/src/source/mod.rs`) should say it looks twice
-    (`stat`, then `statfs`), so a folder replaced in between is possible;
-    a test that `read(from:)`'s main-thread branch is never reached
-    through Revert to Saved; a test for cancelling (⌘.) a Save As
-    queued behind a Save; Save As onto a hard link of the open file
+  - [x] From 2.5.3c's review: `kind_of_folder`'s doc comment
+    (`crates/leal-core/src/source/mod.rs`) says it looks twice (`stat`, then
+    `statfs`), so a folder replaced in between is possible, and why that is
+    acceptable.
+  - [ ] From 2.5.3c's review: a test that `read(from:)`'s main-thread branch
+    is never reached through Revert to Saved; a test for cancelling (⌘.) a
+    Save As queued behind a Save; Save As onto a hard link of the open file
     is taken for the open file, since it is matched by `st_dev` and
     `st_ino` (documented, `is_open_file` in
     `crates/leal-core/src/document/saving.rs`), which may surprise;
     an edit made during AppKit's `revert(toContentsOf:ofType:)` stops
     the revert (`EditedDuringReload`) but is only logged as "Revert
     failed", with nothing said to the user.
-  - [ ] From 2.7's review: trim the fuzz corpus now and then (`cargo fuzz
-    cmin`); `detect`'s target checks only the encoding against the oracle;
-    seed `index`/`detect`/`rows` without the corpus's sidecar files; oracle
-    rule 1's comment should mention UTF-16 BOMs; watch the fuzz runs'
-    memory (about 3 MB per 1,000 runs) in the first nightlies.
+  - [x] From 2.7's review: `just fuzz-cmin <target>` trims a target's corpus
+    (`cargo fuzz cmin`); do it now and then. `detect`'s target also checks,
+    for a whole file, the BOM length, line ending, mixed line endings and
+    trailing newline against the oracle (the delimiter and header are
+    guesses with no oracle); `index`, `detect` and `rows` are seeded
+    without the corpus's sidecar files; oracle rule 1's comment mentions
+    UTF-16 BOMs.
+  - [ ] From 2.7's review: watch the fuzz runs' memory in the first
+    nightlies. Only one manual 60 s run of the five targets has succeeded
+    so far (peak RSS 586–885 MB, `index` highest), and a local 30–60 s run
+    peaks at 610–680 MB from a 46 MB start: about 14–20 MB per 1,000 runs,
+    not 3. libFuzzer's limit is 2,048 MB; a 600 s nightly (about 60,000
+    runs) should be under it, but check the first real nightlies'
+    `peak_rss_mb`.
 - [x] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
