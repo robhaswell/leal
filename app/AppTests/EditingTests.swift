@@ -61,6 +61,11 @@ final class EditingTests: XCTestCase {
     private func open(_ url: URL) async throws -> (CSVDocument, DocumentModel, DocumentViewController) {
         let document = try CSVDocument(contentsOf: url, ofType: "public.comma-separated-values-text")
         document.makeWindowControllers()
+        // A test that doesn't keep the document (`let (_, _, content)`) would
+        // let it go, and its window with it: `content.view.window` was
+        // then sometimes nil. The teardown block holds it until the test is
+        // over.
+        addTeardownBlock { @MainActor in withExtendedLifetime(document) {} }
         let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
         _ = controller.window
         let content = controller.content
