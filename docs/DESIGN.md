@@ -49,7 +49,7 @@ columns, UTF-8, quoted fields containing some newlines.
 | Cell edit to screen | < 16 ms |
 | Filter with full scan | < 300 ms |
 | Sort on one column | < 1 s |
-| Save after one edit | < 500 ms |
+| Save after one edit | < 500 ms (a column insert counts as one edit) |
 | Save As UTF-8 of the reference file from UTF-16 | < 1 s (ADR-0013) |
 | Leal's own heap for the reference file (see below) | < 40 MB |
 | Idle app with no document | < 30 MB physical footprint |
@@ -438,6 +438,62 @@ The original bytes are never modified. Edits live in an overlay:
   recording the rows it applied to, since a row too short for a column
   isn't changed (ADR-0004 §5).
 
+**Structural edits** (ADR-0014; the details are in `docs/tasks/2.4.md`).
+- **Rows.** Every row has an id: an original row's is its physical row, an
+  inserted row's comes from a counter of the store's. The piece list is a
+  tree of small shared leaves, so an edit rebuilds only the leaf it touches
+  and its neighbours, and a list that is one whole range of original rows
+  is the identity and costs every reader nothing. The row numbers the
+  document's API takes and gives are logical, through the list. Cell
+  edits, Find's catch-up and the saved file's carry-over are keyed by row
+  id, so they follow a row as others move around it. The header row is
+  logical row 0, whichever row that is.
+- **Columns.** A cell has an identity: one of the row's own fields, a cell
+  added by a column insert, or a hatched cell. Edits are keyed by it, so a
+  column insert or delete moves cells without rewriting an edit, and a
+  deleted column's edits stay, hidden, for its undo. A row's layout is its
+  own fields with each operation applied where it reaches (an insert at
+  column *c* reaches a row with a cell at *c* or past it; a delete, a row
+  with a cell past *c*; neither reaches a blank line), then its hatched
+  cells, which no operation reaches. An unedited row's layout is a look-up
+  by its field count; an edited row whose rows differ keeps its layout
+  written out.
+- **When they are allowed** (ADR-0014 decision 1). Only when the index
+  pass is complete and trusted, with a removable drive's or share's copy
+  done, and while no save runs. The core refuses with `StillReading` or
+  `Saving`, and the app disables the commands, giving the reason. Cell
+  edits are unchanged. A saved file's index and field counts come from the
+  save's plan (§3.7), so structural edits are open again as soon as a save
+  ends. Also refused: a row or column past the file's end, and a row or
+  cell after an unterminated quote (ADR-0004 §8).
+- **Undo within one base.** A structural command holds the rows or column
+  it changed, and in the same base (since the file was split or last
+  saved) it applies by identity: the rows must be absent, or exactly the
+  pieces, edits and inserted rows it recorded. Undoing a delete this
+  way brings back the original bytes, quoting and invalid bytes included.
+- **Undo after a save, and replay** (ADR-0014 decisions 3, 7 and 8). In
+  another base the command works by value. It keeps the reading it was
+  made on and reads the deleted rows' or column's fields from it lazily,
+  which keeps that snapshot until the undo history lets go of the command.
+  A delete first checks that the rows read as recorded (ignoring empty
+  cells at a row's end). A field the user never edited comes back as its
+  own bytes, converted only if the encoding has changed since, and never
+  with invalid bytes replaced unasked (§3.5); edited and hatched cells and
+  inserted values come back as text. Undoing a column insert or delete
+  after a save reads every row it touched. A replayed row delete comes back
+  as an inserted row, which has no missing cells, so a replay may leave
+  trailing empty fields where the original had missing cells.
+- **Padding** (ADR-0014 decision 5). A short row that gets an edit in a
+  missing cell is padded with empty fields up to it only so the edit can be
+  written. Deleting the column that holds its last hatched edit gives the
+  row its own bytes back (`a,,x` becomes `a`, not `a,`). After a save the
+  padding is a real field and stays.
+- **A row left with no cells** (ADR-0014 decision 6), by edits and column
+  deletes, reads as a blank line, and column inserts skip it like every
+  blank line (ADR-0004 §5). It is still written as `""` (ADR-0004
+  decision 6), so it survives a save, and after a reopen it is a row of
+  one empty field.
+
 **Commands.** Every change is a command storing both the old and new
 values, in logical coordinates. A missing cell is distinct from an empty
 one (`None` versus `""`), and a command's new value is what the cell reads
@@ -447,7 +503,7 @@ lineage, and only if its cells still hold what it expects, so a stale
 command never lands on the wrong cell. A command of several cells (a paste)
 is checked whole before anything changes, and applies whole or not at all.
 Undoing a row or column delete restores the original bytes, not just the
-values.
+values (below).
 
 **Undo is the app's.** The app's `NSUndoManager` holds the commands, and
 the core keeps no undo stack: undo applies a command's inverse, and redo
@@ -509,7 +565,8 @@ blank line edited in column *c* becomes a row of *c* + 1 fields. Committing
 makes it missing again, so the row's original bytes come back. This
 narrows ADR-0005 decision 2 and is for Rob to confirm at the phase 2 gate;
 padding a short row with empty fields would be a separate command, "Fill
-missing cells". Edits past an unterminated quote are still rejected
+missing cells". How a column delete takes the padding back is under
+Structural edits. Edits past an unterminated quote are still rejected
 (ADR-0004 §8).
 
 **Edits on rows that turn out stale** (§3.1). Rows of the first 64 KB can
@@ -544,6 +601,13 @@ Saving streams the document out:
    non-empty field and every non-empty field in it is quoted. A column's
    fields are the fields at that index in non-blank rows long enough to
    have one, header row included (ADR-0004 §2, ADR-0005 decision 3).
+   "Column" is the logical column at save time (ADR-0014 decision 4): its
+   fields are the original fields now at that position, in the rows now
+   live, with an edited field judged by its original bytes; new cells
+   (inserted or hatched) don't count. A column with no original field, such
+   as an inserted one, quotes only if the file quotes every field. A
+   hatched cell keeps 2.2's rule: quoted if needed, or if the file quotes
+   every field.
 4. The trailing newline at end of file is kept as it was.
 
 **Reopening** the saved file gives the same BOM, quote character, line
@@ -556,6 +620,38 @@ A save is a job on a thread of its own; the main thread never waits for it,
 and edits carry on while it runs (§3.9). One save of a document runs at a
 time. It waits for the index pass (and, on a removable drive or a share,
 the copy), takes a snapshot of the edits, and writes from that.
+
+**Structural edits in the walk** (`docs/tasks/2.4c.md`). The walk goes
+segment by segment through the piece list:
+- A stretch of original rows is copied in bulk, except the rows that need
+  a look of their own: its edited rows, its first row (which may now
+  follow other rows or start the file), and its last row if it now ends the
+  output or used to end the file.
+- A deleted row is one delete of its whole extent. A run of inserted rows
+  is one insert at the start of the next original row after the previous
+  live one, or at the end of the file.
+- **Whole-row writes.** A row is rewritten whole, not spliced, when its line
+  ending changes or, with any column operation in effect, when its shape
+  does (every original row is looked at, its layout folded once): its
+  unedited fields are copied as their bytes (converted for Save As UTF-8),
+  edited fields keep their own quoting, new fields take their column's, and
+  hatched cells follow rule 2 and the fixes of ADR-0004 (`""` for an empty
+  row, a split CR, a BOM-like first field of whichever row is first). A row
+  that comes out as the file has it is not spliced at all.
+- **Line endings** (ADR-0004 decisions 3 and 4). An inserted row takes the
+  file's most common ending (ties to the first seen, LF if there is none).
+  The last output row has an ending only if the file had a final newline,
+  so appending after the last row gives the old last row the common ending
+  and the new one none.
+- **The census.** The first time a row writes a new field, one pass reads
+  the file's rows in windows of its own, not through the grid's cache, to
+  decide each column's quoting. It stops once no row can change an answer:
+  the file doesn't quote every field, and every column an original field
+  reaches has an unquoted one. Its progress is its own phase
+  (`SavePhase::Checking`), before writing.
+- **Refusals** name logical rows and columns: edited cells, inserted rows'
+  values and a column insert's cells that can't be encoded, the first 1,000
+  with a `more` flag.
 
 **The check before writing** (§3.1, ADR-0008 decision 9). Save opens the
 user's file afresh and looks at it with `fstat`. Each refusal has its own
@@ -575,8 +671,9 @@ written until these pass.
 **Writing.** The new file is written in a folder on the destination's
 volume: the app's item-replacement folder, which a sandboxed app may write
 to, or, without one (the CLI, tests), a recorded hidden folder next to the
-file. The writer goes in file order, splicing in each edited row as it
-reaches it, and checks for a cancel before each chunk (§3.10 rule 3). On a
+file. The writer walks the snapshot's piece list in logical order, splicing in
+each edited row as it reaches it, and checks for a cancel before each
+chunk (§3.10 rule 3). On a
 removable drive or a share each byte is also teed to a copy on the internal
 disk. A file that would be 4 GiB or more, which Leal couldn't open again,
 is refused as soon as the output passes that size, before the new file
@@ -628,14 +725,22 @@ Once the new file is in place the save has succeeded, and nothing after
 returns an error. The watcher watches the new file as if just opened.
 
 **The rebase** (§3.1, ADR-0008 decision 1). The new reading is built with
-no lock held: its snapshot is the clone or the teed copy, its index the
-old one's, shifted, and its overlay empty, in the same lineage, so undo
-carries on, by value (§3.6, ADR-0012 decision 4). The document's lock is
+no lock held: its snapshot is the clone or the teed copy, its overlay
+empty, in the same lineage, so undo carries on, by value (§3.6, ADR-0012
+decision 4). Its **index and field counts come from the save's plan**: the
+walk notes where each output row starts and how many fields it has (copied
+rows keep the old file's count; a row written is counted as written), and
+the new reading's row index and column count (the mode of the counts) are
+built from them, so rows and columns can be inserted and deleted as soon as
+the save ends. The new file's own index pass still runs, for the
+diagnostics and the review, and a property checks its marks against the
+plan's counts. The document's lock is
 then taken briefly to carry over the edits made during the save and make
 the new reading current.
-- **Edits during a save carry over**, by value: each cell touched since
-  the snapshot is set to what it reads as now, on the new base, and stays
-  unsaved.
+- **Cell edits during a save carry over**, by value: each cell touched
+  since the snapshot is set to what it reads as now, on the new base, and
+  stays unsaved. The row it is in is found by its id in the snapshot's map,
+  because no structural edit can run during a save.
 - **Edit versions only ever increase**, across saves and re-reads, so the
   app's change-count token noted at the save's snapshot still says what
   was saved.
@@ -736,14 +841,20 @@ of physical row numbers to show, in order.
   rename into place run under the watcher's lock only, and the new reading
   is built under neither. While a save runs, the file isn't read again with
   other choices (Treat As, Reopen with Encoding and the header toggle are
-  refused), and a drive that comes back reconnects when the save ends. A
+  refused), and rows and columns can't be inserted or deleted (§3.6), and a
+  drive that comes back reconnects when the save ends. A
   cancel stops a save only until the new file is in place.
 - **Edits are synchronous** calls, safe on the main thread, and serialized
-  with each other and with re-reading. A search takes only the edits of the
+  with each other and with re-reading. During a save, "edits carry on"
+  means cell edits: structural edits (and their undo and redo) are refused
+  with `Saving`, so a save's carry-over only has to handle cells. A search takes only the edits of the
   rows it is reading, never the whole overlay, so an edit during one stays
   cheap. A copy snapshots the overlay when it is made (§3.6).
 - **Find catches up with edits** without restarting. A search recounts the
-  rows edited since it last looked. A query from the main thread does this
+  rows edited since it last looked, by row id, so cell edits and row inserts
+  and deletes are caught up; a column insert or delete can change every
+  row's matches, so it restarts the search instead (ADR-0014 decision 2).
+  The restart is lazy, at the search's next step or query. A query from the main thread does this
   itself only when the work is small; otherwise it starts a catch-up job
   (which checkpoints like any job, §3.10 rule 3) and, until that finishes,
   reports `catchingUp`, answers Next and Previous with `Pending`, and gives

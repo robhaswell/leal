@@ -599,6 +599,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       journal to the commands after that version. (2.2)
     - Clear the undo history when the split changes (a new lineage).
       (2.1 notes)
+    - Undo and redo of a row or column insert or delete come back with
+      `EditRefusal::Saving` while a save runs (cell edits don't); keep the
+      command on its stack, disable Undo/Redo for it while the save runs
+      with the reason, and offer it again when the save ends. (2.4,
+      ADR-0014 decision 1)
   - [ ] **2.5.3 App: Save, Save As and Revert** — the `NSDocument` save
     over the core's save job, the rebase after it, Revert, the failures.
     - Override NSDocument's save to start the core's job, inside an
@@ -638,6 +643,10 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     - Word each `SaveFailure` (`notAFile` included); name `skippedEdits`
       and `encodingNotSupported`'s cells; log `skippedMetadata` and
       `rereadError`. (2.2)
+    - `SaveFailure::Unencodable` (and Save As UTF-8's unconvertible cells)
+      name at most 1,000 cells, by logical row and column, with a `more`
+      flag: say "and more" when it is set. Edited cells, inserted rows'
+      values and a column insert's cells can all be named. (2.4c)
     - Leal's own save is not an outside change. After a successful save the
       document is rebased onto the file just written: a new snapshot (clone,
       or copy on removable drives), re-indexed; the watcher gets the new
@@ -656,6 +665,15 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
       the save), do what `restarted(_:)` does after `checkOriginal`. (2.2)
     - Disable Treat As, Reopen with Encoding and the header toggle while a
       save runs (`LealError.saving` otherwise). (2.2)
+    - Show the save's `SavePhase::Checking` (bytes of the file read, for the
+      census of a column's quoting) as its own step before writing, with
+      its own progress. (2.4c)
+    - After a save, `IndexProgress` says `complete` at once (the index and
+      field counts come from the save's plan), so rows and columns can be
+      inserted and deleted straight away. Don't take that for the
+      diagnostics: wait for the diagnostics report's own `is_complete`
+      before showing or clearing the diagnostics banner and the review,
+      which the new reading's index pass still has to build. (2.4c)
     - Reload and Revert to Saved ask before discarding unsaved edits, and
       Revert goes through the model's Reload, never NSDocument's default
       `read(from:)`. Treat As and Reopen with Encoding are disabled while
