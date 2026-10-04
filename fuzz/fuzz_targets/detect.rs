@@ -2,7 +2,13 @@
 //! same answer every time, and the testkit's encoding rules: ADR-0003
 //! decision 1 with no attribute, ADR-0004 decision 11 with one. A chosen
 //! encoding is accepted exactly when the BOM allows it, and a chosen
-//! delimiter or encoding is the one used. The bytes also serve as
+//! delimiter or encoding is the one used. For a file that fits the first
+//! paint, what detection reads off the file under its answer's dialect (the
+//! BOM length, the line ending, mixed line endings and the trailing
+//! newline) is the reference parser's too. The delimiter and the header
+//! row are guesses, with no reference answer to check them against (the
+//! reference parser takes the delimiter as given), so only their
+//! determinism and the choices above are checked. The bytes also serve as
 //! (garbled) attribute values, and as the head of a longer file.
 
 #![no_main]
@@ -12,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use leal_core::attributes::text_encoding_value;
 use leal_core::detect::{Choices, Detection, FIRST_PAINT_BYTES, Hints, Review, detect, review};
 use leal_core::dialect::{Bom, Delimiter, Encoding};
-use leal_fuzz::{core_encoding, tk_encoding};
+use leal_fuzz::{core_encoding, oracle, tk_delimiter, tk_encoding, tk_line_ending};
 use leal_testkit::dialect::{self as tk, HintWriter, expected_encoding, reopen_encoding};
 use libfuzzer_sys::fuzz_target;
 
@@ -35,6 +41,7 @@ fuzz_target!(|bytes: &[u8]| {
         assert_eq!(r.encoding_suggestion, None, "the head was the whole file");
         assert_eq!(r.delimiter_suggestion, None, "the head was the whole file");
         assert_eq!(Some(r.trailing_newline), plain.trailing_newline);
+        agrees_with_oracle(bytes, &plain, "no attributes");
     }
 
     // The attribute TextEdit writes, for the encodings ADR-0004 decision
@@ -52,6 +59,7 @@ fuzz_target!(|bytes: &[u8]| {
         };
         let d = twice(bytes, len, hints, Choices::default()).expect("no choices to refuse");
         if whole {
+            agrees_with_oracle(bytes, &d, "a hint");
             let expected = reopen_encoding(bytes, Some(hint), HintWriter::OtherApp);
             assert_eq!(
                 tk_encoding(d.encoding),
@@ -81,6 +89,9 @@ fuzz_target!(|bytes: &[u8]| {
                     (encoding, delimiter, i % 2 == 0)
                 );
                 review_twice(bytes, &d);
+                if whole {
+                    agrees_with_oracle(bytes, &d, "a choice");
+                }
             }
             Err(_) => assert!(
                 !bom.allows(encoding),
@@ -106,6 +117,26 @@ fuzz_target!(|bytes: &[u8]| {
     )
     .expect("no choices to refuse");
 });
+
+/// What detection read off a whole file under its dialect, against the
+/// reference parser's reading of the file in that dialect.
+fn agrees_with_oracle(bytes: &[u8], d: &Detection, what: &str) {
+    let analysis = oracle::analyze(bytes, tk_delimiter(d.delimiter), tk_encoding(d.encoding));
+    let layout = &analysis.layout;
+    assert_eq!(layout.bom_len, d.bom.len(), "{what}: BOM length");
+    let (line_ending, mixed) = layout.line_endings();
+    assert_eq!(
+        d.line_ending.map(tk_line_ending),
+        line_ending,
+        "{what}: line ending"
+    );
+    assert_eq!(d.mixed_line_endings, mixed, "{what}: mixed line endings");
+    assert_eq!(
+        d.trailing_newline,
+        Some(layout.trailing_newline()),
+        "{what}: trailing newline"
+    );
+}
 
 /// Detection, run twice: the same answer both times.
 fn twice(

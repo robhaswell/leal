@@ -74,6 +74,18 @@ fuzz target seconds="300" *args:
     # each corpus file with an edit script after it (src/harness.rs): a
     # few bytes that hash its name, so the same seeds every run.
     seeds=(../tests/corpus)
+    # `index`, `detect` and `rows` take raw bytes, so they get only the
+    # corpus's data files, not its sidecars (`*.toml`), README or generator,
+    # which are just text for them to wade through.
+    case "{{ target }}" in index|detect|rows)
+        data="corpus/{{ target }}.seeds"
+        rm -rf "$data"
+        mkdir -p "$data"
+        while IFS= read -r -d '' file; do
+            cp "$file" "$data/$(basename "$file")"
+        done < <(find ../tests/corpus -type f ! -name '*.toml' ! -name '*.md' ! -name '*.py' -print0)
+        seeds=("$data")
+    esac
     case "{{ target }}" in serialize|encodings)
         scripted="corpus/{{ target }}.seeds"
         rm -rf "$scripted"
@@ -92,6 +104,15 @@ fuzz target seconds="300" *args:
     host="$(rustc "+$toolchain" -vV | sed -n 's/^host: //p')"
     cargo "+$toolchain" fuzz run --target "$host" "{{ target }}" "$corpus" "${seeds[@]}" -- \
         -max_total_time={{ seconds }} -timeout=60 -dict=leal.dict -print_final_stats=1 {{ args }}
+
+# Trim a fuzz target's corpus (fuzz/corpus/<target>) to the smallest set of inputs with the same coverage (`cargo fuzz cmin`), in place. Do it now and then, after a long run has grown the corpus; the nightly job's cached corpus is restored from the last night, so trim a local copy, not CI's.
+fuzz-cmin target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd fuzz
+    toolchain="${LEAL_FUZZ_TOOLCHAIN:-nightly}"
+    host="$(rustc "+$toolchain" -vV | sed -n 's/^host: //p')"
+    cargo "+$toolchain" fuzz cmin --target "$host" "{{ target }}"
 
 # Format all code in place.
 fmt:

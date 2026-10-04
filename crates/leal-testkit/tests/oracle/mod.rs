@@ -9,7 +9,11 @@
 //!
 //! The rules, as this oracle reads them:
 //!
-//! 1. A UTF-8 BOM at offset 0 is skipped and belongs to no row.
+//! 1. A UTF-8 BOM at offset 0 is skipped and belongs to no row. A UTF-16
+//!    BOM is too, but only [`analyze`] knows the file is UTF-16: `parse`
+//!    reads bytes and checks for the UTF-8 BOM alone, so for UTF-16 `analyze`
+//!    skips the file's own BOM (either byte order) and parses the text after
+//!    it, which has no BOM; a U+FEFF at the start of that text is text.
 //! 2. A field is quoted only if its first byte is `"`. Otherwise it runs to
 //!    the next delimiter, CR or LF, and any `"` in it is literal.
 //! 3. In a quoted field, `""` is one literal `"`; any other `"` closes the
