@@ -51,8 +51,9 @@ impl<'a> ViewCell<'a> {
     /// An inserted row's own value, or a column's put back.
     fn of_value(value: &'a Value) -> ViewCell<'a> {
         match value {
-            Value::Text(text) => ViewCell::New(text),
+            Value::Text(text) | Value::Copied { text, .. } => ViewCell::New(text),
             Value::Raw(raw) => ViewCell::Raw(raw),
+            Value::Padding => ViewCell::Padding,
         }
     }
 }
@@ -470,6 +471,46 @@ impl<'a> RowView<'a> {
             || Value::Text(Arc::from(self.value_of(cell).as_ref())),
             |raw| Value::Raw(Arc::new(raw)),
         )
+    }
+
+    /// The row's cells as values for a copy of it (Duplicate Row, task
+    /// 2.5a), each written as this row writes it now, so the copy's line
+    /// is this row's: an unedited field of the file as its bytes
+    /// ([`put_back`](Self::put_back)); an edited field of the file, or a
+    /// hatched cell, as an edited field ([`Value::Copied`]); padding as
+    /// padding; a new cell (an inserted row's own value, a column
+    /// insert's, or an inserted row's edit) as its text, which its column
+    /// quotes as it quotes this one.
+    pub(crate) fn copy_values(&self, parser: &RowParser) -> Vec<Value> {
+        let layout = self.layout();
+        (0..layout.len())
+            .map(|column| match self.cell_in(&layout, column) {
+                Some((id, cell)) => self.copy_of(id, cell, parser),
+                None => Value::Padding,
+            })
+            .collect()
+    }
+
+    /// Cell `id`, `cell`, as [`copy_values`](Self::copy_values) copies it.
+    fn copy_of(&self, id: CellId, cell: ViewCell<'a>, parser: &RowParser) -> Value {
+        let k = |k: u32| usize::try_from(k).unwrap_or(usize::MAX);
+        match (id, cell, self.own) {
+            (_, ViewCell::Padding, _) => Value::Padding,
+            (CellId::Appended(_), ViewCell::Edited(value), _) => Value::Copied {
+                text: Arc::from(value),
+                quoted: false,
+            },
+            (CellId::Field(f), ViewCell::Edited(value), OwnCells::Parsed(row)) => Value::Copied {
+                text: Arc::from(value),
+                quoted: row.field(k(f)).is_some_and(FieldSpan::quoted),
+            },
+            // An inserted row's own value, a copy's edited cell included.
+            (CellId::Field(f), ViewCell::New(_), OwnCells::New(values)) => values
+                .get(k(f))
+                .cloned()
+                .unwrap_or_else(|| self.put_back(cell, parser)),
+            _ => self.put_back(cell, parser),
+        }
     }
 
     /// [`value`](Self::value), of a cell of this row.

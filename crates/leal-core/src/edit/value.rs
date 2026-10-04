@@ -1,7 +1,8 @@
 //! A value a row or column command puts back by value (ADR-0014 decision
 //! 3, task 2.4c): text, or one of the file's fields as its bytes, so a
 //! field whose bytes aren't text in the file's encoding (or that is quoted
-//! its own way) comes back byte for byte.
+//! its own way) comes back byte for byte. A duplicated row's cells (task
+//! 2.5a) are values too, each written as the row it copies writes it.
 
 use std::sync::Arc;
 
@@ -18,22 +19,41 @@ pub(crate) enum Value {
     Text(Arc<str>),
     /// One of the file's fields, as its bytes.
     Raw(Arc<RawField>),
+    /// A duplicated row's copy of an edited cell (task 2.5a): written as
+    /// the row it copies writes it, as an edited field of the file, quoted
+    /// if it needs it, if the file quotes every field, or if `quoted` (the
+    /// field it edited was). A hatched cell's copy has `quoted` false: it
+    /// is written the same way.
+    Copied { text: Arc<str>, quoted: bool },
+    /// A duplicated row's copy of a short row's padding (an empty cell
+    /// before a hatched one, task 2.5a): empty, written as no bytes.
+    Padding,
 }
 
 impl Value {
     /// How it reads.
     pub(crate) fn text(&self) -> &str {
         match self {
-            Value::Text(text) => text,
+            Value::Text(text) | Value::Copied { text, .. } => text,
             Value::Raw(raw) => raw.text(),
+            Value::Padding => "",
         }
     }
 
     /// The field's bytes, if it is one.
     pub(crate) fn raw(&self) -> Option<&RawField> {
         match self {
-            Value::Text(_) => None,
             Value::Raw(raw) => Some(raw),
+            Value::Text(_) | Value::Copied { .. } | Value::Padding => None,
+        }
+    }
+
+    /// For a copied edited cell, whether it is quoted as the field it
+    /// edited was ([`Value::Copied`]); `None` for any other value.
+    pub(crate) fn copied_quoting(&self) -> Option<bool> {
+        match self {
+            Value::Copied { quoted, .. } => Some(*quoted),
+            Value::Text(_) | Value::Raw(_) | Value::Padding => None,
         }
     }
 }
@@ -89,7 +109,7 @@ impl Value {
     /// that can't be done, its text.
     pub(crate) fn fit(&self, parser: &RowParser) -> Value {
         match self {
-            Value::Text(_) => self.clone(),
+            Value::Text(_) | Value::Copied { .. } | Value::Padding => self.clone(),
             Value::Raw(raw) => RawField::fit(raw, parser),
         }
     }

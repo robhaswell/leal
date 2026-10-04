@@ -11,7 +11,7 @@ use crate::dialect::{Bom, LineEnding};
 use crate::document::columns::Counts;
 use crate::document::view::{RowView, ViewCell};
 use crate::document::{Document, Reading, RowBytes, inserted_row, to_usize};
-use crate::edit::{CellId, Layout, Overlay, Segment};
+use crate::edit::{CellId, Layout, Overlay, Segment, Value};
 use crate::rows::{FieldSpan, ParsedRow};
 use crate::save::{
     ColumnQuoting, EditedRow, NewCell, RowRules, SaveError, Splice, Transcoder, WholeRow,
@@ -372,10 +372,23 @@ impl<'w, 's> Walk<'w, 's> {
             let mut unconvertible = Vec::new();
             // Its own values and a column insert's are new fields; an
             // edited cell past them is a hatched one; a field of the file
-            // put back by value is its bytes.
+            // put back by value is its bytes; a duplicated row's copy of
+            // an edited cell is written as the row it copies writes it
+            // (task 2.5a).
+            let copied = |id: CellId| match id {
+                CellId::Field(k) => usize::try_from(k)
+                    .ok()
+                    .and_then(|k| row.fields().get(k))
+                    .and_then(Value::copied_quoting),
+                CellId::Inserted(_) | CellId::Appended(_) => None,
+            };
             let cells: Vec<NewCell<'_>> = (0..layout.len())
                 .map(|column| match view.cell_in(&layout, column) {
                     Some((CellId::Appended(_), ViewCell::Edited(value))) => NewCell::Hatched(value),
+                    Some((id, ViewCell::New(value))) if copied(id).is_some() => NewCell::Edited {
+                        value,
+                        quoted: copied(id).unwrap_or(false),
+                    },
                     Some((_, ViewCell::New(value) | ViewCell::Edited(value))) => {
                         NewCell::New(value)
                     }

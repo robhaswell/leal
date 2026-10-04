@@ -2715,3 +2715,79 @@ fn column_commands_are_undone_by_value_after_a_save() {
     save(&document, &path, SaveKind::Save).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"a,b\nc,d\ne,\"\"\n");
 }
+
+/// Task 2.5a, Duplicate Row: each copy's line is its row's line, byte for
+/// byte, with the file's line ending: quotes, an escaped quote and spaces
+/// kept; an edited cell quoted as the row writes it (its field was
+/// quoted, or wasn't); a short row's hatched cell and its padding as the
+/// row writes them, in a file that quotes every field.
+#[test]
+fn a_duplicated_row_is_written_as_its_row_is() {
+    let file: &[u8] = b"id,name,note\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n3,c\n";
+    let saved = saved_after("dup-plain", file, |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+    });
+    assert_eq!(
+        saved,
+        b"id,name,note\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n2,  spaced ,x\r\n3,c\n"
+    );
+    // Two rows, each with an edited cell: copied after the last, in order.
+    let saved = saved_after("dup-edited", file, |document| {
+        set(document, 1, 1, "Brno");
+        set(document, 2, 2, "y");
+        document.duplicate_rows(1, 2).unwrap().unwrap();
+    });
+    assert_eq!(
+        saved,
+        b"id,name,note\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,y\r\n1,\"Brno\",\"say \"\"hi\"\"\"\r\n2,  spaced ,y\r\n3,c\n"
+    );
+    // A value that needs quotes gets them, in the row and its copy alike.
+    let saved = saved_after("dup-needs", file, |document| {
+        set(document, 2, 2, "a,b");
+        document.duplicate_rows(2, 1).unwrap().unwrap();
+    });
+    assert_eq!(
+        saved,
+        b"id,name,note\r\n1,\"Ostrava\",\"say \"\"hi\"\"\"\r\n2,  spaced ,\"a,b\"\r\n2,  spaced ,\"a,b\"\r\n3,c\n"
+    );
+    // Every field quoted; a short row with a hatched cell.
+    let quoted: &[u8] = b"\"a\",\"b\",\"c\"\n\"1\"\n";
+    let saved = saved_after("dup-hatched", quoted, |document| {
+        set(document, 1, 2, "z");
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"\"a\",\"b\",\"c\"\n\"1\",,\"z\"\n\"1\",,\"z\"\n");
+    // A copy of a copy, and of an inserted row.
+    let saved = saved_after("dup-copies", b"a\n\"b\"\n", |document| {
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+        document.duplicate_rows(2, 1).unwrap().unwrap();
+        document.insert_rows(0, &[vec!["n".into()]]).unwrap();
+        document.duplicate_rows(0, 1).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"n\nn\na\n\"b\"\n\"b\"\n\"b\"\n");
+}
+
+/// Task 2.5a: a duplicate is undone and redone after a save by value
+/// (ADR-0014 decisions 3 and 8), and its copy comes back byte for byte.
+#[test]
+fn a_duplicate_is_undone_and_redone_after_a_save() {
+    let dir = Dir::new("dup-undo");
+    let bytes: &[u8] = b"a,b\r\n1,\"x\"\"y\"\r\n2,  z \r\n";
+    let path = dir.file("a.csv", bytes);
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 1, "q");
+    let duplicate = document.duplicate_rows(1, 2).unwrap().unwrap();
+    let doubled: &[u8] = b"a,b\r\n1,\"q\"\r\n2,  z \r\n1,\"q\"\r\n2,  z \r\n";
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), doubled);
+    document.apply(&duplicate.inverse()).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"a,b\r\n1,\"q\"\r\n2,  z \r\n"
+    );
+    document.apply(&duplicate).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), doubled);
+}

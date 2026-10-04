@@ -430,6 +430,48 @@ impl Document {
         })
     }
 
+    /// Duplicates logical rows `at..at + count` (**Duplicate Row**, task
+    /// 2.5a): a copy of each goes after the last, in order, as one command
+    /// for the undo manager (undo deletes the copies). A copy is written as
+    /// its row is now, byte for byte, with the file's line ending. `nil` if
+    /// `count` is 0. It reads the rows: fast enough for the main thread for
+    /// a selection's.
+    ///
+    /// # Errors
+    ///
+    /// As for [`insert_rows`](Self::insert_rows), and
+    /// [`EditRefusal::Unreadable`] if a row can't be read.
+    pub fn duplicate_rows(&self, at: u64, count: u64) -> Result<Option<EditCommand>, LealError> {
+        self.call(|| {
+            self.document
+                .duplicate_rows(to_index(at), to_index(count))
+                .map(|command| command.map(EditCommand::from))
+                .map_err(|error| self.edit_error(&error))
+        })
+    }
+
+    /// Whether logical rows `at..at + count` can be duplicated now, for
+    /// enabling **Duplicate Row**: `nil` if they can, otherwise why not
+    /// (as [`can_change_rows`](Self::can_change_rows), a row that isn't
+    /// there, or the last being an unterminated quote's row).
+    ///
+    /// # Errors
+    ///
+    /// [`LealError::DocumentFailed`].
+    pub fn can_duplicate_rows(
+        &self,
+        at: u64,
+        count: u64,
+    ) -> Result<Option<EditRefusal>, LealError> {
+        self.call(|| {
+            Ok(self
+                .document
+                .can_duplicate_rows(to_index(at), to_index(count))
+                .err()
+                .map(|error| refusal(&error).0))
+        })
+    }
+
     /// Whether rows can be inserted or deleted now, for enabling **Insert
     /// Row** and **Delete Row**: `nil` if they can, otherwise why not
     /// ([`EditRefusal::StillReading`] or [`EditRefusal::Saving`]).

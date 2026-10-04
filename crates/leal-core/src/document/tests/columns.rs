@@ -7,6 +7,7 @@ use super::*;
 
 use crate::edit::{CellId, Command, EditError};
 use crate::find::Query;
+use crate::save::{SaveKind, SaveRequest};
 
 /// A short (ragged) row, a blank line, and a header.
 const FILE: &[u8] = b"name,n,x\na,1,p\nb\n\nc,3,q\n";
@@ -328,16 +329,17 @@ fn nothing_goes_after_an_open_unterminated_quote() {
 /// task 2.5a's review) refuse exactly what the commands would, at every
 /// column, as cells, rows and columns change and are undone, in a file
 /// ending in an open quote: a longer row inserted, the widest row deleted,
-/// the quote's row edited.
+/// the quote's row edited; then all of it redone and saved (a new
+/// reading, whose edits start again), and a row changed after the save.
 #[test]
 fn asking_first_agrees_with_the_commands() {
     let dir = Dir::new("columns-ask");
-    let document = open_with(
+    let document = Arc::new(open_with(
         &dir,
         "a.csv",
         b"a,b,c\nd\n\ne,f,g,h\ni,\"open\nquote",
         false,
-    );
+    ));
     let agree = |step: &str| {
         for at in 0..8 {
             let asked = document.can_insert_column(at).err();
@@ -390,6 +392,21 @@ fn asking_first_agrees_with_the_commands() {
         agree("undone");
     }
     assert!(!document.has_edits());
+    for command in &made {
+        document.apply(command).unwrap();
+    }
+    let path = dir.0.join("a.csv");
+    let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+    job.wait().as_ref().unwrap();
+    assert!(!document.has_edits());
+    agree("saved");
+    let longer = document
+        .insert_rows(0, &rows_of(&[&["1", "2", "3", "4", "5", "6", "7"]]))
+        .unwrap()
+        .unwrap();
+    agree("a longer row after the save");
+    document.apply(&longer.inverse()).unwrap();
+    agree("undone after the save");
 }
 
 #[test]

@@ -68,6 +68,57 @@ impl Document {
         self.change_rows(|reading| delete_at(reading, at, count, None))
     }
 
+    /// Duplicates logical rows `at..at + count` (Duplicate Row, task
+    /// 2.5a): a copy of each, in order, goes after the last, as one
+    /// command (undo deletes the copies). Each copy is written as its row
+    /// is written now, so its line is that row's, byte for byte: unedited
+    /// fields as their bytes, quotes and all; edited cells as the row
+    /// writes them; with the file's line ending (`RowView::copy_values`).
+    /// Undone and redone like any row insert: by identity, and by value
+    /// after a save or in a replay (ADR-0014 decisions 3 and 8). `None` if
+    /// `count` is 0. It reads the rows copied: fast enough for the main
+    /// thread for a selection's rows.
+    ///
+    /// # Errors
+    ///
+    /// As for [`insert_rows`](Self::insert_rows): [`EditError::NoSuchRow`]
+    /// if a row isn't there, [`EditError::AfterUnterminatedQuote`] if the
+    /// last is an unterminated quote's row (the copies would be inside the
+    /// quote), and [`EditError::Read`] if a row can't be read.
+    pub fn duplicate_rows(&self, at: usize, count: usize) -> Result<Option<Command>, EditError> {
+        if count == 0 {
+            return Ok(None);
+        }
+        self.change_rows(|reading| {
+            let end = rows_there(reading, at, count)?;
+            let parser = &reading.parser;
+            let copies = Self::read_rows_of(reading, at..end, |view| view.copy_values(parser))
+                .map_err(|error| EditError::Read { row: at, error })?;
+            if copies.len() != count {
+                return Err(EditError::NoSuchRow {
+                    row: at + copies.len(),
+                });
+            }
+            insert_new(reading, end, &copies, true)
+        })
+    }
+
+    /// Whether logical rows `at..at + count` can be duplicated now, for
+    /// the app to enable **Duplicate Row** (task 2.5a).
+    ///
+    /// # Errors
+    ///
+    /// As [`duplicate_rows`](Self::duplicate_rows) would refuse them
+    /// (without reading them): [`EditError::NoSuchRow`] for no rows.
+    pub fn can_duplicate_rows(&self, at: usize, count: usize) -> Result<(), EditError> {
+        if count == 0 {
+            return Err(EditError::NoSuchRow { row: at });
+        }
+        self.can_change_rows()?;
+        let end = rows_there(&self.current(), at, count)?;
+        self.can_insert_rows(end)
+    }
+
     /// Whether rows can be inserted or deleted now, for the app to enable
     /// **Insert Row** and **Delete Row** (task 2.5a).
     ///
@@ -191,6 +242,16 @@ impl Document {
         let reading = self.current();
         whole_file(&reading)?;
         change(&reading)
+    }
+}
+
+/// The end of logical rows `at..at + count`, if they are all there.
+fn rows_there(reading: &Reading, at: usize, count: usize) -> Result<usize, EditError> {
+    let overlay = reading.edits.overlay();
+    let len = begun(reading, &overlay).len().unwrap_or(0);
+    match at.checked_add(count) {
+        Some(end) if end <= len => Ok(end),
+        _ => Err(EditError::NoSuchRow { row: at.max(len) }),
     }
 }
 

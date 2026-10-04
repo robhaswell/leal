@@ -274,6 +274,33 @@ fn rows_inserted_and_deleted_undo_redo_and_replay() {
         Err(refused(&path, EditRefusal::NoSuchRow, Some(3), None))
     );
 
+    // Duplicate Row (task 2.5a): an insert of copies after the rows,
+    // refused (asked first, or made) where an insert would be.
+    assert_eq!(document.can_duplicate_rows(0, 2).unwrap(), None);
+    let duplicate = document.duplicate_rows(0, 2).unwrap().unwrap();
+    let copies = duplicate.structural.clone().unwrap();
+    assert!(copies.inserts());
+    assert_eq!((copies.first_row(), copies.row_count()), (2, 2));
+    assert_eq!(name(&document, 3), ["0", "Vale"]);
+    document.undo(duplicate).unwrap();
+    assert_eq!(
+        document.can_duplicate_rows(2, 1).unwrap(),
+        Some(EditRefusal::AfterUnterminatedQuote)
+    );
+    assert_eq!(
+        document.can_duplicate_rows(2, 2).unwrap(),
+        Some(EditRefusal::NoSuchRow)
+    );
+    assert_eq!(
+        document.duplicate_rows(2, 1),
+        Err(refused(
+            &path,
+            EditRefusal::AfterUnterminatedQuote,
+            Some(3),
+            Some(0)
+        ))
+    );
+
     // Undo, last first, back to the file; redo, and undo again.
     document.undo(delete.clone()).unwrap();
     assert_eq!(name(&document, 2), ["1", "Marlow"]);

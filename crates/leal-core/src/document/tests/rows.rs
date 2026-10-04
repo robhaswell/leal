@@ -581,3 +581,86 @@ fn a_replayed_hatched_cell_made_missing_in_a_row_put_back_is_emptied() {
         texts(&open_with(&dir, "c.csv", bytes, false))
     );
 }
+
+/// Task 2.5a, Duplicate Row: copies of the rows, as they read (edits
+/// included), go after the last, as one command, undone and redone by
+/// identity; a copy's own edits stay its own; it is replayed by value.
+#[test]
+fn duplicated_rows_are_copies_after_the_last() {
+    let dir = Dir::new("rows-duplicate");
+    let document = open_with(&dir, "a.csv", FILE, true);
+    let edit = set_cell(&document, 2, 1, "two");
+    let duplicate = document.duplicate_rows(1, 2).unwrap().unwrap();
+    assert!(matches!(
+        &duplicate.edit,
+        Edit::InsertRows { at: 3, rows } if rows.len() == 2
+    ));
+    let doubled = rows_of(&[
+        &["name", "n"],
+        &["a", "1"],
+        &["b", "two"],
+        &["a", "1"],
+        &["b", "two"],
+        &["c", "3"],
+        &["d", "4"],
+    ]);
+    assert_eq!(texts(&document), doubled);
+    // A copy's cell edited: the row it copies keeps its value.
+    let copy_edit = set_cell(&document, 4, 0, "B");
+    assert_eq!(texts(&document)[2], ["b", "two"]);
+    document.apply(&copy_edit.inverse()).unwrap();
+    document.apply(&duplicate.inverse()).unwrap();
+    assert_eq!(texts(&document)[3], ["c", "3"]);
+    document.apply(&duplicate).unwrap();
+    assert_eq!(texts(&document), doubled);
+    // Replayed into the file opened afresh: by value.
+    let fresh = open_with(&dir, "b.csv", FILE, true);
+    let replay = fresh.replay(&[edit.clone(), duplicate.clone()]);
+    assert!(replay.refused.is_empty(), "{:?}", replay.refused);
+    assert_eq!(texts(&fresh), doubled);
+    document.apply(&duplicate.inverse()).unwrap();
+    document.apply(&edit.inverse()).unwrap();
+    assert!(!document.has_edits());
+    assert_eq!(document.duplicate_rows(1, 0).unwrap(), None);
+}
+
+/// Task 2.5a: Duplicate Row is refused where a row insert after the rows
+/// would be (after an open unterminated quote's row, ADR-0004 decision
+/// 8), and past the end; `can_duplicate_rows` agrees with the command.
+#[test]
+fn duplicating_is_refused_after_an_open_quote_and_past_the_end() {
+    let dir = Dir::new("rows-duplicate-quote");
+    let document = open_with(&dir, "a.csv", b"a,b\nc,d\ne,\"open\nquote", false);
+    assert_eq!(document.row_count(), 3);
+    for (at, count) in [
+        (0, 1),
+        (1, 1),
+        (0, 2),
+        (1, 2),
+        (2, 1),
+        (0, 3),
+        (3, 1),
+        (2, 2),
+        (0, 0),
+    ] {
+        let asked = format!("{:?}", document.can_duplicate_rows(at, count).err());
+        match document.duplicate_rows(at, count) {
+            Ok(Some(command)) => {
+                assert_eq!(asked, "None", "{at}+{count}");
+                document.apply(&command.inverse()).unwrap();
+            }
+            Ok(None) => assert_eq!(count, 0),
+            Err(refused) => assert_eq!(asked, format!("{:?}", Some(refused)), "{at}+{count}"),
+        }
+    }
+    assert!(matches!(
+        document.duplicate_rows(1, 2),
+        Err(EditError::AfterUnterminatedQuote { row: 3, .. })
+    ));
+    assert!(matches!(
+        document.can_duplicate_rows(3, 1),
+        Err(EditError::NoSuchRow { .. })
+    ));
+    assert!(document.can_duplicate_rows(0, 2).is_ok());
+    assert!(!document.has_edits());
+}
