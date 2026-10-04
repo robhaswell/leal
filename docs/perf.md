@@ -69,6 +69,19 @@ first launch after a build is the likely cause. It is over the 300 ms
 budget, so the launch row says "mixed", and PLAN 2.6a has a task to look
 into it.
 
+### Cell edit to screen (task 2.5.1)
+
+Not in Rob's run above: task 2.5.1 added the row. The implementer's run of
+4 October 2026 (`just perf --only-edit --runs 2`, M5 Pro, screen locked,
+load average about 7–9, other agents' builds running):
+
+| Budget (DESIGN §1) | Measured on this Mac | How | Verdict |
+|---|---|---|---|
+| Cell edit to screen < 16 ms | 4.4 ms (1.6–10.7, 40 edits) | Return in the in-cell editor to the commit of the transaction that draws the edit ("Cell edit to screen" signpost), reference file, after indexing, 20 edits a run (bench build, `-LealBenchEdit`) | pass |
+
+The slowest edits are those that widen their column, which redraws every
+strip. Rob's next full run replaces this.
+
 ### Earlier runs
 
 - **2 October, after 2.0a** (AppKit's drawing alone, a loaded machine;
@@ -218,6 +231,7 @@ Everything at once, about 25 minutes (Leal's windows come to the front):
 ```sh
 just perf                       # builds the apps and files, runs everything, prints the table
 just perf --runs 1 --no-scroll  # launch, open, index and memory only: about a minute
+just perf --only-edit           # cell edit to screen only (task 2.5.1): about a minute
 ```
 
 `just perf` writes the table to `target/perf/perf-latest.md` and every
@@ -252,7 +266,7 @@ main thread on other cores at other clocks and isn't comparable
 (docs/tasks/1.6.md, "Scroll performance"). Nothing sends input to the
 system, and `leal-perf` quits only the processes it started, by PID.
 
-- **Signposts.** The app emits two of its own, beside the core's ("First
+- **Signposts.** The app emits three of its own, beside the core's ("First
   paint", "Index", "Review", "Find", …), in the `io.github.robhaswell.leal`
   subsystem, Points of Interest category:
   - **"Launched"**, an event at the end of `applicationDidFinishLaunching`,
@@ -260,6 +274,11 @@ system, and `leal-perf` quits only the processes it started, by PID.
     start time);
   - **"Open to first rows"**, an interval from `CSVDocument.read(from:)` to
     the grid's first draw with rows in it.
+  - **"Cell edit to screen"** (task 2.5.1), an interval from Return in the
+    in-cell editor to the completion of the Core Animation transaction
+    that draws the edited cell: the strips are drawn at that commit, so
+    it covers the core's edit, the invalidation and the redraw on the
+    main thread, not the render server's frame.
 
   `leal-perf` reads them with `log stream --signpost`. Any Instruments
   template shows them too, in the Points of Interest lane.

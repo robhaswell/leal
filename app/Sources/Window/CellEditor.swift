@@ -28,7 +28,12 @@ final class CellEditorField: NSTextField {
         lineBreakMode = .byClipping
         wantsLayer = true
         layer?.borderWidth = 2
+        updateBorder()
         setAccessibilityLabel(EditText.editorLabel)
+        // The accent colour can change while the editor is open.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(systemColorsChanged(_:)), name: NSColor.systemColorsDidChangeNotification, object: nil
+        )
     }
 
     @available(*, unavailable)
@@ -36,14 +41,26 @@ final class CellEditorField: NSTextField {
         fatalError("not used")
     }
 
-    override func updateLayer() {
-        super.updateLayer()
-        layer?.borderColor = NSColor.controlAccentColor.cgColor
+    /// The active cell's ring colour, the accent (mockup 05b), resolved for
+    /// the editor's appearance.
+    private func updateBorder() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.borderColor = NSColor.controlAccentColor.cgColor
+        }
+    }
+
+    @objc private func systemColorsChanged(_ notification: Notification) {
+        updateBorder()
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        layer?.borderColor = NSColor.controlAccentColor.cgColor
+        updateBorder()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateBorder()
     }
 
     /// The height for `lines` lines of text, at least a row's.
@@ -514,6 +531,14 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     /// Shows the callout under `place` (over it near the bottom of the
     /// visible area), with its arrow at the cell.
     private func show(callout message: String, at place: EditPlace) {
+        if callout.superview == nil || callout.message != message {
+            // VoiceOver hears it once, as it appears or changes.
+            NSAccessibility.post(
+                element: grid.window ?? callout,
+                notification: .announcementRequested,
+                userInfo: [.announcement: message, .priority: NSAccessibilityPriorityLevel.high.rawValue]
+            )
+        }
         callout.message = message
         let height = callout.fittingHeight
         let visible = grid.scrollView.contentView.bounds

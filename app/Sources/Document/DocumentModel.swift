@@ -204,13 +204,15 @@ final class DocumentModel: GridDataSource {
     private var headerTitles: [String] = []
     /// Columns the user has resized; sizing leaves them alone.
     private var resizedColumns: Set<Int> = []
-    /// Each column's widest edited value (task 2.5.1), so that measuring
-    /// the sample rows again after an edit doesn't narrow a column an edit
-    /// outside the sample widened.
+    /// Each column's widest edited value outside the sample rows (task
+    /// 2.5.1), so that measuring the sample again after an edit doesn't
+    /// narrow a column such an edit widened.
     private var editedWidest: [Int: CGFloat] = [:]
     /// Widths and number detection measured again after an edit inside the
     /// sample rows, as after a reinterpret (task 2.5.1).
     private var sizingAfterEdit: Task<Void, Never>?
+    /// The refined sizing under way is a measuring again after an edit.
+    private var remeasuring = false
     /// Each column's widest text in the rows the widths were measured from
     /// (up to `GridMetrics.fitMaximumWidth`), kept for double-click to fit
     /// instead of the rows themselves.
@@ -961,7 +963,9 @@ final class DocumentModel: GridDataSource {
                 Self.cellMeasure(numeric: numeric, cell: cellMeasurer, number: numberMeasurer)(column, shown, truncated)
             }
             let width = min(measured, GridMetrics.fitMaximumWidth)
-            editedWidest[column] = max(editedWidest[column] ?? 0, width)
+            if change.row >= UInt64(headerOffset) + UInt64(Self.sizingRows) {
+                editedWidest[column] = max(editedWidest[column] ?? 0, width)
+            }
             guard width > widestText[column] else { continue }
             widestText[column] = width
             guard !resizedColumns.contains(column), let fitted = ColumnSizer.widths(fromWidest: [width]).first,
@@ -982,7 +986,7 @@ final class DocumentModel: GridDataSource {
             try? await Task.sleep(for: Self.sizingAfterEditDelay)
             guard !Task.isCancelled, let self, readingID == reading, failure == nil else { return }
             sizingAfterEdit = nil
-            isSizingRefined = false
+            remeasuring = true
             startRefinedSizing()
         }
     }
@@ -991,7 +995,7 @@ final class DocumentModel: GridDataSource {
     static var sizingAfterEditDelay: Duration = .milliseconds(300)
 
     /// Whether a measuring after an edit is waiting or running, for tests.
-    var isMeasuringAfterEdit: Bool { sizingAfterEdit != nil || (refinedSizingStarted && !isSizingRefined) }
+    var isMeasuringAfterEdit: Bool { sizingAfterEdit != nil || remeasuring }
 
     /// How many of the grid's reads ahead have come back, kept or dropped,
     /// for tests.
@@ -1158,8 +1162,11 @@ final class DocumentModel: GridDataSource {
 
     private func applyRefinedSizing(_ result: Result<RefinedColumns, any Error>, reading: ReadingID) {
         guard reading == readingID, failure == nil else { return }
+        let again = remeasuring
+        remeasuring = false
         switch result {
         case let .success(refined):
+            let before = (numeric: numeric, widths: columnWidths, count: columnCount)
             numeric = refined.numeric
             widestSampleRow = max(widestSampleRow, refined.fieldCount)
             updateColumnCount()
@@ -1174,6 +1181,9 @@ final class DocumentModel: GridDataSource {
                 columnWidths[column] = width
             }
             isSizingRefined = true
+            // Measured again after an edit (task 2.5.1): redrawn only if
+            // something changed, since `.columns` lays out every line again.
+            if again, before == (numeric, columnWidths, columnCount) { return }
             onChange?(.columns)
         case let .failure(error):
             switch error as? LealError {
@@ -1283,6 +1293,7 @@ final class DocumentModel: GridDataSource {
         widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false
+        remeasuring = false
         isSizingRefined = false
         if let current = call({ try $0.progress() }) { progress = current }
         applyFirstScreen(screen)
@@ -1416,6 +1427,7 @@ final class DocumentModel: GridDataSource {
         flagBlocks.removeAll()
         tiles.removeAll()
         refinedSizingStarted = false
+        remeasuring = false
         isSizingRefined = false
         refreshDriveState()
         onChange?(.rows)
@@ -1603,6 +1615,7 @@ final class DocumentModel: GridDataSource {
         widestSampleRow = 0
         columnCount = 0
         refinedSizingStarted = false
+        remeasuring = false
         isSizingRefined = false
         storage = .clone
         changedOnDisk = false

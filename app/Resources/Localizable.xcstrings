@@ -204,6 +204,9 @@
     "Cancel" : {
       "comment" : "Go to Row sheet's cancel button"
     },
+    "Cell editor" : {
+      "comment" : "VoiceOver name of the in-cell editor (task 2.5.1)"
+    },
     "Cell inspector" : {
       "comment" : "VoiceOver name of the cell inspector pane (mockup 05a)"
     },
@@ -367,6 +370,9 @@
     "Keep Editing" : {
       "comment" : "Banner button: keep the version Leal opened, and hide the banner (task 1.9)"
     },
+    "Leal can’t save UTF-16 files. Save As UTF-8 saves a copy with your edits." : {
+      "comment" : "Tooltip of the lock glyph by a UTF-16 file's title: Save is off (ADR-0013 decision 1)"
+    },
     "Leal can’t show “%@” any more." : {
       "comment" : "Alert title after a panic in the core (DESIGN §3.9); the file's name"
     },
@@ -501,13 +507,16 @@
       "comment" : "Status bar: the file's volume can't make a snapshot, so Leal read the file into memory (DESIGN §3.1)"
     },
     "Read-only" : {
-      "comment" : "Status bar: the file can't be edited (UTF-16, DESIGN §4.3)\nThe lock glyph by a read-only file's title, for VoiceOver"
+      "comment" : "The lock glyph by a read-only file's title, for VoiceOver"
     },
     "Reading from the drive" : {
       "comment" : "Status bar: the file is on a removable drive, and Leal is still copying it (ADR-0006)"
     },
     "Reading from the network" : {
       "comment" : "Status bar: the file is on a network share, and Leal is still copying it (ADR-0009)"
+    },
+    "Reading the whole value to edit it…" : {
+      "comment" : "Cell inspector: a long value is read in full before it can be edited (ADR-0008 decision 3)"
     },
     "Redo" : {
       "comment" : "Edit menu"
@@ -520,6 +529,9 @@
     },
     "Remembered settings ignored" : {
       "comment" : "Status bar: Leal's own remembered delimiter and header choice were ignored (ADR-0005 decision 1)"
+    },
+    "Rename Column…" : {
+      "comment" : "Column header context menu: edit the header row's cell (task 2.5.1)"
     },
     "Reopen" : {
       "comment" : "Button: open the file again after a failure"
@@ -538,6 +550,9 @@
     },
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"
+    },
+    "Save As UTF-8 only" : {
+      "comment" : "Status bar: a UTF-16 file can be edited but only saved as a UTF-8 copy (ADR-0013 decision 1)"
     },
     "Save As UTF-8…" : {
       "comment" : "Banner button on a UTF-16 file"
@@ -613,6 +628,9 @@
         }
       }
     },
+    "The cell changed meanwhile, so the edit wasn’t made." : {
+      "comment" : "Callout: an edit refused because the cell changed"
+    },
     "The change couldn’t be made." : {
       "comment" : "Error: an edit, undo or redo wasn't applied"
     },
@@ -681,6 +699,21 @@
     "The selected cells make a lot of text. Copying them takes a while and puts all of it on the clipboard." : {
       "comment" : "Sheet before a very large Copy"
     },
+    "This cell can’t be edited right now. Try again in a moment." : {
+      "comment" : "Callout: a cell that can't be edited while the file is read or saved"
+    },
+    "This cell can’t be edited: a quote earlier in the row is never closed, so the rest of the row is inside it." : {
+      "comment" : "Callout: a cell after an unterminated quote can't be edited (ADR-0004 decision 8)"
+    },
+    "This cell holds bytes that aren’t valid %@ (shown as �). Committing the edit replaces them with the text you type. Esc keeps the original bytes." : {
+      "comment" : "Callout on a cell being edited whose bytes aren't valid text in the file's encoding (mockup 05b); the encoding's name"
+    },
+    "This cell is too far past the end of its row to edit." : {
+      "comment" : "Callout: a cell too far right can't be edited"
+    },
+    "This cell isn’t in the file." : {
+      "comment" : "Callout: a cell that isn't in the file can't be edited"
+    },
     "This file changed on disk. Leal still shows it as it was when you opened it." : {
       "comment" : "Banner: another app changed or replaced the open file (task 1.9, DESIGN §3.1)"
     },
@@ -693,8 +726,8 @@
     "This file has 1 kind of irregularity. It’s shown exactly as written." : {
       "comment" : "Diagnostics banner (DESIGN §3.5, mockup 03a) with one kind of warning or error"
     },
-    "This file is UTF-16, so Leal shows it read-only. Save a UTF-8 copy to edit it." : {
-      "comment" : "Banner on a UTF-16 file (DESIGN §4.3, mockup 06a)"
+    "This file is UTF-16, which Leal can’t save. You can edit it, then save a UTF-8 copy." : {
+      "comment" : "Banner on a UTF-16 file: it can be edited, and Save As UTF-8 is the only save (ADR-0013 decision 1, mockup 06a)"
     },
     "This file looks comma-separated." : {
       "comment" : "Suggestion banner: the whole file fits another delimiter (DESIGN §3.2)"
@@ -720,11 +753,17 @@
     "This file was deleted or moved to the Trash. Leal still shows it as it was; Save As keeps a copy." : {
       "comment" : "Banner: the open file was deleted or moved to the Trash (task 1.9)"
     },
+    "This row can’t be read: its drive or share isn’t available." : {
+      "comment" : "Callout: a cell whose row can't be read can't be edited"
+    },
     "This row has no field here: it is shorter than the others." : {
       "comment" : "Cell inspector on a short (ragged) row's missing cell"
     },
     "This row isn’t read yet." : {
       "comment" : "Cell inspector on a row past the indexed region"
+    },
+    "This row isn’t read yet. Try again once Leal has read it." : {
+      "comment" : "Callout: a cell that can't be edited yet (task 2.5.1)"
     },
     "This volume can’t make a snapshot of the file, so Leal read the whole file into memory." : {
       "comment" : "Status bar tooltip: why the file was read into memory (DESIGN §3.1)"
@@ -734,9 +773,6 @@
     },
     "Treat the file as separated by another delimiter" : {
       "comment" : "Status bar tooltip of the delimiter menu"
-    },
-    "UTF-16 files are read-only in this version of Leal." : {
-      "comment" : "Tooltip of the lock glyph by a read-only file's title"
     },
     "UTF-8" : {
       "comment" : "Save As UTF-8: added to the suggested file name, as in \"people (UTF-8).csv\""
@@ -791,6 +827,20 @@
     },
     "value truncated: the first %@ shown" : {
       "comment" : "Cell inspector: a very long value is shown only in part; how many characters are shown"
+    },
+    "“%@” can’t be saved in %@, so Save won’t be able to save this file. Save As UTF-8 can. Return keeps it." : {
+      "comment" : "Callout on a cell being edited: a character the file's encoding can't hold (task 2.3); the character, the encoding's name",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "“%1$@” can’t be saved in %2$@, so Save won’t be able to save this file. Save As UTF-8 can. Return keeps it."
+          }
+        }
+      }
+    },
+    "⌘↩ commits · Esc cancels" : {
+      "comment" : "Cell inspector: how to commit or cancel an edit (mockup 05a)"
     }
   },
   "version" : "1.0"
