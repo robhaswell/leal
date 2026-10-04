@@ -2,11 +2,88 @@ import AppKit
 import LealFFI
 import os
 
+/// A text view that keeps what is typed as typed (task 2.5.1): a cell's
+/// value is what the user typed, byte for byte. None of AppKit's
+/// substitutions (smart quotes and dashes, text replacement,
+/// autocorrection), smart insert and delete, data and link detection or
+/// completion. Both editors are one: the in-cell editor's field editor
+/// (`CellEditorCell.fieldEditor(for:)`) and the inspector's text view.
+/// Each stays off whatever turns it on (the user's defaults, a
+/// Substitutions menu): the setters keep them off.
+@MainActor
+class LiteralTextView: NSTextView {
+    /// The text checking that changes text, or adds links to it. Spelling
+    /// and grammar checking only mark text, and stay as the user has them.
+    static let changingChecks: NSTextCheckingTypes = NSTextCheckingResult.CheckingType([
+        .quote, .dash, .replacement, .correction, .link, .date, .address, .phoneNumber, .transitInformation,
+    ]).rawValue
+
+    /// Turns every substitution off: call once it is made.
+    func keepTextAsTyped() {
+        isAutomaticQuoteSubstitutionEnabled = false
+        isAutomaticDashSubstitutionEnabled = false
+        isAutomaticTextReplacementEnabled = false
+        isAutomaticSpellingCorrectionEnabled = false
+        smartInsertDeleteEnabled = false
+        isAutomaticDataDetectionEnabled = false
+        isAutomaticLinkDetectionEnabled = false
+        isAutomaticTextCompletionEnabled = false
+        enabledTextCheckingTypes = super.enabledTextCheckingTypes
+    }
+
+    override var isAutomaticQuoteSubstitutionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticQuoteSubstitutionEnabled = false }
+    }
+
+    override var isAutomaticDashSubstitutionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticDashSubstitutionEnabled = false }
+    }
+
+    override var isAutomaticTextReplacementEnabled: Bool {
+        get { false }
+        set { super.isAutomaticTextReplacementEnabled = false }
+    }
+
+    override var isAutomaticSpellingCorrectionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticSpellingCorrectionEnabled = false }
+    }
+
+    override var smartInsertDeleteEnabled: Bool {
+        get { false }
+        set { super.smartInsertDeleteEnabled = false }
+    }
+
+    override var isAutomaticDataDetectionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticDataDetectionEnabled = false }
+    }
+
+    override var isAutomaticLinkDetectionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticLinkDetectionEnabled = false }
+    }
+
+    override var isAutomaticTextCompletionEnabled: Bool {
+        get { false }
+        set { super.isAutomaticTextCompletionEnabled = false }
+    }
+
+    override var enabledTextCheckingTypes: NSTextCheckingTypes {
+        get { super.enabledTextCheckingTypes & ~Self.changingChecks }
+        set { super.enabledTextCheckingTypes = newValue & ~Self.changingChecks }
+    }
+}
+
 /// The in-cell editor (task 2.5.1, ADR-0001): an ordinary `NSTextField`
 /// over the cell, in the grid's overlay (above the strips, following the
 /// scroll; docs/tasks/2.0b.md, "For 2.5"), or over a header-row title. It
-/// gets the field editor's undo while typing, input methods and spell
-/// checking from the system.
+/// edits with a field editor of its own, which keeps text as typed
+/// (`LiteralTextView`); the window's shared one, which the find bar uses,
+/// is left as it is. Undo while typing, input methods and spell checking
+/// come from the system.
 @MainActor
 final class CellEditorField: NSTextField {
     override class var cellClass: AnyClass? {
@@ -72,14 +149,28 @@ final class CellEditorField: NSTextField {
 }
 
 /// Lays the editor's text out where the grid draws a cell's: inset by the
-/// cell padding, and a single line centred in the row.
+/// cell padding, and a single line centred in the row. It edits with its
+/// own field editor, which keeps text as typed.
 final class CellEditorCell: NSTextFieldCell {
+    /// The editor's field editor: made once, with every substitution off.
+    private lazy var literalEditor: LiteralTextView = {
+        let editor = LiteralTextView()
+        editor.isFieldEditor = true
+        editor.keepTextAsTyped()
+        editor.setAccessibilityLabel(EditText.editorLabel)
+        return editor
+    }()
+
+    override func fieldEditor(for controlView: NSView) -> NSTextView? {
+        literalEditor
+    }
+
     override func titleRect(forBounds rect: NSRect) -> NSRect {
         let font = font ?? GridFonts.cell
         let line = (font.ascender - font.descender + font.leading).rounded(.up)
         let inset = GridMetrics.cellPadding - 2
         var title = rect.insetBy(dx: inset, dy: 0)
-        let lines = max(1, ((stringValue as NSString).components(separatedBy: .newlines)).count)
+        let lines = max(1, EditorLines.ranges(in: stringValue as NSString, upTo: CellEditController.maximumLines).count)
         let height = min(rect.height, CGFloat(lines) * line)
         title.origin.y = rect.minY + ((rect.height - height) / 2).rounded(.down)
         title.size.height = height
@@ -200,19 +291,25 @@ final class EditCallout: NSView {
 /// double-click or typing opens it on the active cell (or "Rename
 /// Column…" on a header-row title); Return commits, Tab and Shift-Tab
 /// commit and move along the row, Esc cancels, and leaving the editor (a
-/// click elsewhere) commits. ⌥↩ puts a line break in the value.
+/// click elsewhere) commits. ⌥↩ puts a line break in the value (the
+/// file's own, `DocumentModel.lineBreak`).
 ///
 /// - It opens only where the core's `canEdit` allows; elsewhere the
 ///   callout says why.
 /// - It starts from the core's full display value (ADR-0008 decision 3),
 ///   read off the main thread for a value the grid shows cut short, and
-///   an untouched value commits as no edit.
+///   an untouched value commits as no edit. Text is compared scalar for
+///   scalar (`isIdentical(to:)`), never with `==`, which would drop a
+///   change between canonically equivalent forms.
 /// - A cell holding bytes that aren't text in the file's encoding says so
 ///   in the callout (mockup 05b): committing replaces them.
 /// - A character the encoding can't hold is named in the callout as it is
 ///   typed; Return then commits it anyway (Save will refuse it, and Save
 ///   As UTF-8 writes it; task 2.3). If it wasn't shown yet, the first
-///   Return shows it and the second commits.
+///   Return shows it and the second commits. A commit that doesn't wait
+///   (leaving the editor, `commitOpenEdit`) commits, then names it.
+/// - An edit the core refuses keeps the editor open with its text, and
+///   the callout says why.
 @MainActor
 final class CellEditController: NSObject, NSTextFieldDelegate {
     let field = CellEditorField()
@@ -229,7 +326,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         /// The user changed the text: an untouched value is never sent.
         var changed: Bool
         /// The cell has bytes that aren't text in the file's encoding.
-        let invalidBytes: Bool
+        var invalidBytes: Bool
         /// The character the encoding can't hold, as last checked.
         var unencodable: UnencodableCharacter?
         /// The text whose unencodable character the callout has shown.
@@ -237,13 +334,20 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     }
 
     private(set) var session: Session?
-    /// A long value being read before the editor opens.
+    /// A long value being read before the editor opens, or (after typing
+    /// opened it) read to see whether it holds invalid bytes.
     private(set) var loading: Task<Void, Never>?
     /// Ending the session: the field's end of editing is ours, not a
     /// commit.
     private var ending = false
     /// Why the last attempt to edit was refused, while its note shows.
     private(set) var shownRefusal: EditRefusal?
+    /// Where the callout points, while it shows.
+    private var calloutPlace: EditPlace?
+    /// The callout shows a note with no editor open (a refusal, or a
+    /// character named after its commit): it goes at the next key, click
+    /// or selection change.
+    private var noteShown = false
     /// The last committed edit's time from Return to the transaction that
     /// puts it on screen, in milliseconds (task 2.5.1, "Cell edit to
     /// screen"; DESIGN §1 < 16 ms).
@@ -270,9 +374,16 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     // MARK: Opening
 
     /// Opens the editor on `place`, from its full value; with `typing`, from
-    /// that key's text instead, which replaces the value.
+    /// that key's text instead, which replaces the value. An open editor
+    /// commits first; if the core refuses that, it stays open (with the
+    /// focus) and `place` isn't opened.
     func begin(_ place: EditPlace, typing: NSEvent? = nil) {
-        if session != nil { _ = commit(move: nil, refocus: false, confirmed: true) }
+        if session != nil {
+            guard commit(move: nil, refocus: false, confirmed: true) else {
+                grid.window?.makeFirstResponder(field)
+                return
+            }
+        }
         loading?.cancel()
         loading = nil
         dismissNote()
@@ -280,35 +391,33 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             showRefusal(refusal, at: place)
             return
         }
-        if let typing {
-            let shown = shownText(place)
-            open(place, value: "", invalidBytes: model.hasInvalidBytes(place, value: shown), typing: typing)
-        } else if model.isShownWhole(place) {
+        if model.isShownWhole(place) {
             guard let value = model.fullValue(place) else { return showRefusal(.notReadYet, at: place) }
-            open(place, value: value, invalidBytes: model.hasInvalidBytes(place, value: value), typing: nil)
+            let invalid = model.hasInvalidBytes(place, value: value)
+            open(place, value: typing == nil ? value : "", invalidBytes: invalid, typing: typing)
+        } else if let typing {
+            // Typing replaces a long value at once; whether it held
+            // invalid bytes is read meanwhile, from its full value.
+            open(place, value: "", invalidBytes: false, typing: typing)
+            loading = Task { [weak self] in
+                guard let self, let start = await model.fullValueInBackground(place) else { return }
+                guard !Task.isCancelled, session?.place == place else { return }
+                loading = nil
+                session?.invalidBytes = start.invalid
+                updateCallout()
+            }
         } else {
             // A long value: read in full first (ADR-0008 decision 3).
             let selection = grid.activeCell
             loading = Task { [weak self] in
                 guard let self else { return }
-                let value = await model.fullValueInBackground(place)
+                let start = await model.fullValueInBackground(place)
                 guard !Task.isCancelled else { return }
                 loading = nil
                 guard grid.activeCell == selection, session == nil else { return }
-                guard let value else { return showRefusal(.notReadYet, at: place) }
-                open(place, value: value, invalidBytes: model.hasInvalidBytes(place, value: value), typing: nil)
+                guard let start else { return showRefusal(.notReadYet, at: place) }
+                open(place, value: start.value, invalidBytes: start.invalid, typing: nil)
             }
-        }
-    }
-
-    /// The text the grid or the header shows for `place`.
-    private func shownText(_ place: EditPlace) -> String {
-        switch place {
-        case let .cell(cell):
-            if case let .text(text, _) = model.cell(row: cell.row, column: cell.column) { return text }
-            return ""
-        case let .header(column):
-            return model.headerTitle(column: column).text
         }
     }
 
@@ -321,6 +430,8 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         grid.window?.makeFirstResponder(field)
         if let editor = field.currentEditor() {
             if let typing {
+                // The key goes to the editor, whose input context composes
+                // it: a dead key or an input method's marked text included.
                 editor.string = ""
                 editor.keyDown(with: typing)
             } else {
@@ -342,12 +453,18 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         }
     }
 
+    /// The editor's frame over `cell`. Only the start of the text is
+    /// measured (`EditorLines`): its first lines, each to a length well
+    /// past the visible area's width, which caps the editor's anyway.
     private func fieldRect(_ cell: CellPosition) -> CGRect {
         var rect = grid.geometry.cellRect(row: cell.row, column: cell.column)
         let text = field.stringValue as NSString
-        let lines = text.components(separatedBy: .newlines)
+        let lines = EditorLines.ranges(in: text, upTo: Self.maximumLines * 4)
         let font = field.font ?? GridFonts.cell
-        let widest = lines.prefix(Self.maximumLines * 4).map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        let widest = lines.map { line in
+            let start = NSRange(location: line.location, length: min(line.length, EditorLines.measuredLength))
+            return (text.substring(with: start) as NSString).size(withAttributes: [.font: font]).width
+        }.max() ?? 0
         let visible = grid.scrollView.contentView.bounds
         let wanted = (widest + 2 * GridMetrics.cellPadding + 8).rounded(.up)
         rect.size.width = max(rect.width, min(wanted, visible.maxX - rect.minX))
@@ -390,14 +507,14 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     private func updateCallout() {
         guard let session else { return }
         var parts: [String] = []
-        if let bad = session.unencodable, session.warned == field.stringValue {
+        if let bad = session.unencodable, field.stringValue.isIdentical(to: session.warned) {
             parts.append(EditText.unencodable(bad))
         }
         if session.invalidBytes {
             parts.append(EditText.invalidBytes(encoding: StatusText.encodingName(model.interpretation.encoding)))
         }
         guard !parts.isEmpty else {
-            callout.removeFromSuperview()
+            removeCallout()
             return
         }
         show(callout: parts.joined(separator: "\n\n"), at: session.place)
@@ -413,6 +530,9 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             _ = commit(move: .previous)
         case #selector(NSResponder.cancelOperation(_:)):
             cancel()
+        case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            // ⌥↩: a line break, the file's own.
+            textView.insertText(model.lineBreak, replacementRange: textView.selectedRange())
         default:
             return false
         }
@@ -420,7 +540,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     }
 
     /// The editor lost the focus (a click elsewhere): commit, as a text
-    /// field does, without asking about the encoding again.
+    /// field does, without waiting on the encoding check.
     func controlTextDidEndEditing(_ notification: Notification) {
         guard !ending, session != nil else { return }
         _ = commit(move: nil, refocus: false, confirmed: true)
@@ -430,8 +550,13 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
 
     /// Commits the editor's value and closes it, then moves (Tab). Returns
     /// whether it closed: not if the callout first had to name a character
-    /// the encoding can't hold (`confirmed` skips that), nor if the core
-    /// refused the edit, which the callout says.
+    /// the encoding can't hold, nor if the core refused the edit, which the
+    /// callout says (the editor stays open with its text).
+    ///
+    /// `confirmed` (leaving the editor, opening another, `commitOpenEdit`)
+    /// doesn't wait on the encoding check: a value too long to have been
+    /// checked as it was typed is checked, committed, and then the
+    /// character is named.
     @discardableResult
     func commit(move: GridMove?, refocus: Bool = true, confirmed: Bool = false) -> Bool {
         guard var session else { return true }
@@ -439,31 +564,39 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         // An untouched value is no edit (ADR-0008 decision 3): it is never
         // sent, so a long or multiline value can't be changed by the round
         // trip through the editor.
-        let changed = session.changed && value != session.original
-        if changed, !confirmed, session.warned != value, let bad = model.unencodable(value) {
-            // Checked before committing (task 2.3): say so, and commit on
-            // the next Return.
-            session.unencodable = bad
-            session.warned = value
-            self.session = session
-            updateCallout()
-            return false
+        let changed = session.changed && !value.isIdentical(to: session.original)
+        var named: UnencodableCharacter?
+        if changed, !value.isIdentical(to: session.warned) {
+            if !confirmed, let bad = model.unencodable(value) {
+                // Checked before committing (task 2.3): say so, and commit
+                // on the next Return.
+                session.unencodable = bad
+                session.warned = value
+                self.session = session
+                updateCallout()
+                return false
+            }
+            if confirmed, value.utf16.count > Self.liveCheckLimit {
+                named = model.unencodable(value)
+            }
         }
         let signpost = Signposts.editCommitted()
         let started = CACurrentMediaTime()
         let outcome: EditOutcome = changed ? model.setCell(session.place, to: value) : .unchanged
         if case let .refused(refusal) = outcome {
+            // The typed text stays, to commit again or cancel.
             Signposts.editOnScreen(signpost)
-            if confirmed {
-                end(refocus: refocus)
-                NSSound.beep()
-            } else {
-                show(callout: EditText.refusal(refusal), at: session.place)
-            }
-            return confirmed
+            if confirmed { NSSound.beep() }
+            show(callout: EditText.refusal(refusal), at: session.place)
+            return false
         }
         end(refocus: refocus)
         if let move, case .cell = session.place { grid.move(move) }
+        if let named {
+            // Committed, as leaving it does: Save will refuse it.
+            NSSound.beep()
+            showNote(EditText.unencodable(named), at: session.place)
+        }
         guard case .edited = outcome else {
             Signposts.editOnScreen(signpost)
             return true
@@ -481,6 +614,21 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         return true
     }
 
+    /// Commits an open edit as leaving the editor would (for Reload, Treat
+    /// As, Reopen with Encoding, ⌘G, Go to Row and closing the window;
+    /// `DocumentViewController.commitEditing`). Returns whether no editor
+    /// is left open: one whose edit the core refused stays open.
+    @discardableResult
+    func commitOpenEdit() -> Bool {
+        guard session != nil else {
+            // A long value still being read: it doesn't open now.
+            loading?.cancel()
+            loading = nil
+            return true
+        }
+        return commit(move: nil, refocus: grid.window?.firstResponder === field.currentEditor(), confirmed: true)
+    }
+
     /// Esc: the cell keeps its value (and its bytes).
     func cancel() {
         loading?.cancel()
@@ -489,8 +637,8 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         end(refocus: true)
     }
 
-    /// The file was read again, or failed: the editor closes, committing
-    /// nothing.
+    /// The file was read again, or failed, or the window closes: the
+    /// editor closes, committing nothing.
     func abandon() {
         loading?.cancel()
         loading = nil
@@ -502,6 +650,8 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     private func end(refocus: Bool) {
         ending = true
         defer { ending = false }
+        loading?.cancel()
+        loading = nil
         session = nil
         if refocus, let window = grid.window {
             window.makeFirstResponder(grid.gridView)
@@ -509,23 +659,36 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             _ = field.abortEditing()
         }
         field.removeFromSuperview()
-        callout.removeFromSuperview()
+        removeCallout()
     }
 
     // MARK: The callout
 
-    /// The note saying why the active cell can't be edited goes (the
-    /// selection moved, or a key was pressed).
+    /// The note saying why the active cell can't be edited (or naming a
+    /// character just committed) goes: the selection moved, or a key was
+    /// pressed.
     func dismissNote() {
-        guard shownRefusal != nil else { return }
+        guard noteShown else { return }
         shownRefusal = nil
-        if session == nil { callout.removeFromSuperview() }
+        noteShown = false
+        if session == nil { removeCallout() }
     }
 
     private func showRefusal(_ refusal: EditRefusal, at place: EditPlace) {
         NSSound.beep()
-        show(callout: EditText.refusal(refusal), at: place)
+        showNote(EditText.refusal(refusal), at: place)
         shownRefusal = refusal
+    }
+
+    /// A note with no editor open, until `dismissNote`.
+    private func showNote(_ message: String, at place: EditPlace) {
+        show(callout: message, at: place)
+        noteShown = true
+    }
+
+    private func removeCallout() {
+        callout.removeFromSuperview()
+        calloutPlace = nil
     }
 
     /// Shows the callout under `place` (over it near the bottom of the
@@ -540,6 +703,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             )
         }
         callout.message = message
+        calloutPlace = place
         let height = callout.fittingHeight
         let visible = grid.scrollView.contentView.bounds
         var anchor: CGRect
@@ -561,10 +725,42 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         callout.needsDisplay = true
     }
 
-    /// The grid scrolled: a header editor's callout stays under the header.
+    /// The grid scrolled: the callout chooses again whether it goes under
+    /// or over its cell (a header editor's stays under the header).
     func gridScrolled() {
-        guard let session, case .header = session.place, callout.superview != nil else { return }
-        updateCallout()
+        guard let place = calloutPlace, callout.superview != nil else { return }
+        show(callout: callout.message, at: place)
+    }
+}
+
+/// The start of a value's lines, for sizing the in-cell editor (task
+/// 2.5.1) without going through all of a long value on each keystroke:
+/// line breaks are looked for in its first `scannedLength` UTF-16 units,
+/// and each line is measured to its first `measuredLength`, well past the
+/// width of any screen (the editor is no wider than the visible area).
+/// CRLF is one line break; so are LF, CR and the others `.newlines` has.
+enum EditorLines {
+    static let scannedLength = 100_000
+    static let measuredLength = 1_000
+
+    /// The ranges of `text`'s first `limit` lines (at least one).
+    static func ranges(in text: NSString, upTo limit: Int) -> [NSRange] {
+        let end = min(text.length, scannedLength)
+        var lines: [NSRange] = []
+        var start = 0
+        while lines.count < limit {
+            let found = text.rangeOfCharacter(from: .newlines, options: [], range: NSRange(location: start, length: end - start))
+            guard found.location != NSNotFound else {
+                lines.append(NSRange(location: start, length: end - start))
+                break
+            }
+            lines.append(NSRange(location: start, length: found.location - start))
+            start = found.location + found.length
+            if text.character(at: found.location) == 0x0D, start < end, text.character(at: start) == 0x0A {
+                start += 1
+            }
+        }
+        return lines
     }
 }
 

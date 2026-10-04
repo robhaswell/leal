@@ -34,6 +34,9 @@ final class CellInspectorView: NSView {
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = false
+        // What is typed reaches the cell as typed: no smart quotes or
+        // dashes, text replacement, autocorrection and the like.
+        textView.keepTextAsTyped()
         textView.font = .systemFont(ofSize: 13)
         textView.textColor = .labelColor
         textView.drawsBackground = true
@@ -159,15 +162,28 @@ enum InspectorContent: Equatable {
     case note(String)
 }
 
-/// The inspector's text view. ⌘↩ is the inspector's (it commits an edit
-/// from task 2.5, ADR-0002 question 11): consumed here, so it never reaches
-/// the grid's Insert Row (task 2.5a).
+/// The inspector's text view, which keeps text as typed
+/// (`LiteralTextView`). ⌘↩ is the inspector's (it commits an edit from
+/// task 2.5, ADR-0002 question 11): consumed here, so it never reaches the
+/// grid's Insert Row (task 2.5a). Return (and ⌥↩) put in the file's own
+/// line break.
 @MainActor
-final class InspectorTextView: NSTextView {
+final class InspectorTextView: LiteralTextView {
     /// ⌘↩ was pressed: commits the edit.
     var onCommit: (() -> Void)?
     /// Esc was pressed: cancels it.
     var onCancel: (() -> Void)?
+    /// The line break Return puts in (`DocumentModel.lineBreak`).
+    var lineBreak = "\n"
+
+    override func insertNewline(_ sender: Any?) {
+        guard isEditable else { return super.insertNewline(sender) }
+        insertText(lineBreak, replacementRange: selectedRange())
+    }
+
+    override func insertNewlineIgnoringFieldEditor(_ sender: Any?) {
+        insertNewline(sender)
+    }
 
     override func cancelOperation(_ sender: Any?) {
         guard isEditable, let onCancel else { return super.cancelOperation(sender) }

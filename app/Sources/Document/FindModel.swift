@@ -204,7 +204,7 @@ final class FindModel: GridHighlighter {
         isWatchingCatchUp = true
         let id = ObjectIdentifier(search)
         let job = search.catchUpJob()
-        tasks.append(Task { [weak self] in
+        keepUntilDone(Task { [weak self] in
             defer { self?.isWatchingCatchUp = false }
             if let job { try? await job.finish() }
             while !Task.isCancelled {
@@ -218,6 +218,16 @@ final class FindModel: GridHighlighter {
                 }
             }
         })
+    }
+
+    /// Keeps `task` (for `stop()` to cancel) until it ends, then forgets
+    /// it, so a watch started after each edit doesn't pile up.
+    private func keepUntilDone(_ task: Task<Void, Never>) {
+        tasks.append(task)
+        Task { [weak self] in
+            await task.value
+            self?.tasks.removeAll { $0 == task }
+        }
     }
 
     /// The selected cell, as last heard.

@@ -428,11 +428,18 @@ final class GridView: StripContentView, NSMenuItemValidation {
     /// Whether `event` types text, rather than being a command: it gives
     /// characters, none a control character or a function key's (arrows,
     /// Page Up and the like are in the private use area), with no ⌘ or ⌃.
+    /// A dead key (⌥E) types text too, though it gives no characters yet:
+    /// the editor opens on it, so its input context composes the accent
+    /// with the next key (task 2.5.1). An input method's keys give
+    /// characters, and compose there too.
     static func typesText(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard modifiers.isDisjoint(with: [.command, .control]), let characters = event.characters, !characters.isEmpty else {
-            return false
+        guard modifiers.isDisjoint(with: [.command, .control]), var characters = event.characters else { return false }
+        if characters.isEmpty {
+            // A dead key's characters are empty; its key's aren't.
+            characters = event.charactersIgnoringModifiers ?? ""
+            guard !characters.isEmpty else { return false }
         }
         return characters.unicodeScalars.allSatisfy { scalar in
             !CharacterSet.controlCharacters.contains(scalar) && !(0xF700...0xF8FF).contains(scalar.value)

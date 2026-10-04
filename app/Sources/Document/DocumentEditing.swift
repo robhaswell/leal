@@ -66,23 +66,48 @@ extension DocumentModel {
         return value ?? nil
     }
 
-    /// `fullValue(_:)` off the main thread, for a value that may be long.
-    /// `nil` if the file was read again meanwhile.
-    func fullValueInBackground(_ place: EditPlace) async -> String? {
-        guard let handle = backgroundHandle() else { return nil }
-        let row = logicalRow(place)
-        let column = UInt32(clamping: place.column)
+    /// `fullValue(_:)` off the main thread, for a value that may be long,
+    /// with whether the cell holds invalid bytes (`hasInvalidBytes`, read
+    /// there too: it decodes the whole value). `nil` if the file was read
+    /// again meanwhile, or the task was cancelled.
+    ///
+    /// Only the detached read holds the core's document, and only while a
+    /// call into the core runs: cancelling the task (closing the window, a
+    /// new edit) stops it before its next call, and this returns `nil`
+    /// without keeping the document.
+    func fullValueInBackground(_ place: EditPlace) async -> EditStart? {
+        guard let read = startFullValueRead(place) else { return nil }
         let reading = readingID
-        let result = await Task.detached(priority: .userInitiated) { () -> Result<String?, any Error> in
-            Result { try handle.fullValue(row: row, column: column) }
-        }.value
-        guard reading == readingID, !isFailed else { return nil }
+        let result = await withTaskCancellationHandler {
+            await read.value
+        } onCancel: {
+            read.cancel()
+        }
+        guard !Task.isCancelled, reading == readingID, !isFailed else { return nil }
         switch result {
-        case let .success(value):
-            return value
+        case let .success(start):
+            return start
         case let .failure(error):
             let _: Void? = call { _ -> Void in throw error }
             return nil
+        }
+    }
+
+    /// The detached read for `fullValueInBackground`, which alone holds the
+    /// core's document (`handle`), until it returns.
+    private func startFullValueRead(_ place: EditPlace) -> Task<Result<EditStart?, any Error>, Never>? {
+        guard let handle = backgroundHandle() else { return nil }
+        let row = logicalRow(place)
+        let column = UInt32(clamping: place.column)
+        return Task.detached(priority: .userInitiated) { () -> Result<EditStart?, any Error> in
+            Result { () throws -> EditStart? in
+                guard !Task.isCancelled, let value = try handle.fullValue(row: row, column: column) else { return nil }
+                guard value.unicodeScalars.contains("\u{FFFD}"), !Task.isCancelled else {
+                    return EditStart(value: value, invalid: false)
+                }
+                let cell = try handle.cellValue(row: row, column: column, maxChars: 0)
+                return EditStart(value: value, invalid: cell?.invalid ?? false)
+            }
         }
     }
 
@@ -106,8 +131,10 @@ extension DocumentModel {
 
     /// Whether the cell holds bytes that aren't text in the file's
     /// encoding, shown as U+FFFD (mockup 05b): for the callout that says
-    /// committing replaces them. `value` is its full value; only a value
-    /// with a U+FFFD in it is asked about.
+    /// committing replaces them. `value` is its full value (never the
+    /// grid's shortened text); only a value with a U+FFFD in it is asked
+    /// about. On the main thread only for a value the grid shows whole: the
+    /// core decodes the whole value (a long one: `fullValueInBackground`).
     func hasInvalidBytes(_ place: EditPlace, value: String) -> Bool {
         guard value.unicodeScalars.contains("\u{FFFD}") else { return false }
         let row = logicalRow(place)
@@ -120,6 +147,17 @@ extension DocumentModel {
     func unencodable(_ value: String) -> UnencodableCharacter? {
         let found: UnencodableCharacter?? = call { try $0.unencodable(value: value) }
         return found ?? nil
+    }
+
+    /// The file's main line ending, for a line break typed into a value
+    /// (⌥↩ in the in-cell editor, Return in the inspector): `\n` until the
+    /// core reports one.
+    var lineBreak: String {
+        switch lineEnding {
+        case .crlf: "\r\n"
+        case .cr: "\r"
+        case .lf, nil: "\n"
+        }
     }
 
     /// Commits an edit: `place` reads as `value` afterwards. Everything that
@@ -138,19 +176,50 @@ extension DocumentModel {
             return .failed
         }
         guard let command else { return .unchanged }
-        commandApplied(command)
+        commandApplied(command, as: .edit)
         return .edited(command)
     }
 
-    /// A command was applied to the core's document: everything showing
-    /// its cells catches up, and `onCommand` hears of it.
+    /// A command was applied to the core's document, as an edit, or undone
+    /// or redone: everything showing its cells catches up (`valuesChanged`,
+    /// which after an undo measures the old values), and `onCommand` hears
+    /// of it, with which way it went.
     ///
-    /// SEAM(2.5.2): this is the one place an edit is registered: 2.5.2's
-    /// `onCommand` registers its undo (whose undo and redo call
-    /// `valuesChanged(by:)` after `undo(command:)` and `redo(command:)`)
-    /// and appends it to the recovery journal.
-    private func commandApplied(_ command: EditCommand) {
-        valuesChanged(by: command)
-        onCommand?(command)
+    /// SEAM(2.5.2): every command goes through here, and only here. 2.5.2's
+    /// undo and redo call `commandApplied(_:as: .undo)` and `(_:as: .redo)`
+    /// after the core's `undo(command:)` and `redo(command:)`; its
+    /// `onCommand` registers the undo of an `.edit` and appends every
+    /// direction to the recovery journal.
+    func commandApplied(_ command: EditCommand, as direction: CommandDirection) {
+        valuesChanged(by: command, direction: direction)
+        onCommand?(command, direction)
+    }
+}
+
+/// Which way a command was applied (`commandApplied`).
+enum CommandDirection: Sendable {
+    /// The command was made: its cells read as their `newValue`s.
+    case edit
+    /// Undone: its cells read as their `oldValue`s again.
+    case undo
+    /// Redone: as `edit`.
+    case redo
+}
+
+/// A cell's full value read for editing (`fullValueInBackground`).
+struct EditStart: Sendable {
+    let value: String
+    /// The cell holds bytes that aren't text in the file's encoding.
+    let invalid: Bool
+}
+
+extension String {
+    /// Whether `other` is this text exactly, scalar for scalar. Swift's `==`
+    /// treats canonically equivalent text as equal (an NFC "é" and an NFD
+    /// "e" with U+0301), which for an edit would drop a change to the
+    /// bytes.
+    func isIdentical(to other: String?) -> Bool {
+        guard let other else { return false }
+        return utf8.elementsEqual(other.utf8)
     }
 }

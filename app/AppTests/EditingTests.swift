@@ -83,7 +83,7 @@ final class EditingTests: XCTestCase {
         }
     }
 
-    /// The in-cell editor's text view (the window's field editor).
+    /// The in-cell editor's text view (its own field editor).
     private func fieldEditor(_ content: DocumentViewController) throws -> NSTextView {
         try XCTUnwrap(content.cellEditor.field.currentEditor() as? NSTextView, "the editor isn't open")
     }
@@ -108,8 +108,15 @@ final class EditingTests: XCTestCase {
         ))
     }
 
-    private func value(_ model: DocumentModel, _ row: Int, _ column: Int) -> String? {
-        model.fullValue(.cell(CellPosition(row: row, column: column)))
+    /// The cell's value as the core holds it, as UTF-8 bytes: compared
+    /// byte for byte, as `String`'s `==` would let canonically equivalent
+    /// text pass.
+    private func value(_ model: DocumentModel, _ row: Int, _ column: Int) -> [UInt8]? {
+        model.fullValue(.cell(CellPosition(row: row, column: column))).map { Array($0.utf8) }
+    }
+
+    private func utf8(_ text: String) -> [UInt8] {
+        Array(text.utf8)
     }
 
     private func editedCells(_ model: DocumentModel) -> UInt64 {
@@ -157,7 +164,7 @@ final class EditingTests: XCTestCase {
         XCTAssertTrue(content.view.window?.firstResponder === grid.gridView)
         XCTAssertEqual(grid.activeCell, CellPosition(row: 0, column: 1), "Return stays on the cell")
         XCTAssertEqual(model.cell(row: 0, column: 1), .text("Sable Optics", truncated: false))
-        XCTAssertEqual(value(model, 0, 1), "Sable Optics")
+        XCTAssertEqual(value(model, 0, 1), utf8("Sable Optics"))
         XCTAssertEqual(editedCells(model), 1)
         await content.inspectorTask?.value
         XCTAssertEqual(content.inspector.textView.string, "Sable Optics")
@@ -183,7 +190,7 @@ final class EditingTests: XCTestCase {
         }
         XCTAssertEqual(editedCells(model), 0)
         XCTAssertEqual(model.call { try $0.hasUnsavedEdits() }, false)
-        XCTAssertEqual(value(model, 0, 1), "one\r\ntwo\rthree")
+        XCTAssertEqual(value(model, 0, 1), utf8("one\r\ntwo\rthree"))
 
         // The inspector: the long value is cut at 64,000 characters, and
         // read in full before it can be edited.
@@ -211,13 +218,13 @@ final class EditingTests: XCTestCase {
         try type("changed", in: content)
         try press(#selector(NSResponder.cancelOperation(_:)), in: content)
         XCTAssertFalse(content.cellEditor.isEditing)
-        XCTAssertEqual(value(model, 0, 0), "1")
+        XCTAssertEqual(value(model, 0, 0), utf8("1"))
 
         // Tab commits and moves along the row, Shift-Tab back.
         try await returnKey(on: CellPosition(row: 0, column: 0), content)
         try type("one", in: content)
         try press(#selector(NSResponder.insertTab(_:)), in: content)
-        XCTAssertEqual(value(model, 0, 0), "one")
+        XCTAssertEqual(value(model, 0, 0), utf8("one"))
         XCTAssertEqual(content.grid.activeCell, CellPosition(row: 0, column: 1))
         try await returnKey(on: CellPosition(row: 0, column: 2), content)
         try press(#selector(NSResponder.insertBacktab(_:)), in: content)
@@ -228,7 +235,7 @@ final class EditingTests: XCTestCase {
         try type("six", in: content)
         content.view.window?.makeFirstResponder(content.grid.gridView)
         XCTAssertFalse(content.cellEditor.isEditing)
-        XCTAssertEqual(value(model, 1, 2), "six")
+        XCTAssertEqual(value(model, 1, 2), utf8("six"))
         XCTAssertEqual(editedCells(model), 2)
     }
 
@@ -251,7 +258,7 @@ final class EditingTests: XCTestCase {
         XCTAssertEqual(content.cellEditor.field.stringValue, "n")
         try fieldEditor(content).insertText("ew", replacementRange: NSRange(location: NSNotFound, length: 0))
         try press(#selector(NSResponder.insertNewline(_:)), in: content)
-        XCTAssertEqual(value(model, 0, 0), "new")
+        XCTAssertEqual(value(model, 0, 0), utf8("new"))
     }
 
     /// ADR-0005 decision 2: a short row's hatched cell can be edited; it
@@ -293,7 +300,7 @@ final class EditingTests: XCTestCase {
         try press(#selector(NSResponder.insertNewline(_:)), in: content)
         XCTAssertEqual(model.headerTitle(column: 1), HeaderTitle(text: "customer", style: .name))
         XCTAssertEqual(model.fullValue(.header(column: 1)), "customer")
-        XCTAssertEqual(value(model, 0, 1), "Ada", "grid row 0 is unchanged")
+        XCTAssertEqual(value(model, 0, 1), utf8("Ada"), "grid row 0 is unchanged")
 
         // Find doesn't search the header row.
         content.showFindBar()
@@ -351,7 +358,7 @@ final class EditingTests: XCTestCase {
         content.grid.extend(to: CellPosition(row: 1, column: 0))
         content.copySelection()
         XCTAssertEqual(content.pasteboard.string(forType: .string), "2\tMarlow & Co")
-        XCTAssertEqual(value(model, 1, 1), "Marlow & Co")
+        XCTAssertEqual(value(model, 1, 1), utf8("Marlow & Co"))
     }
 
     /// Find catches up with an edit in a job of its own when there are many
@@ -380,7 +387,7 @@ final class EditingTests: XCTestCase {
         }
         XCTAssertEqual(content.find.matchCount, 69_999)
         XCTAssertEqual(content.grid.activeCell, CellPosition(row: 50_001, column: 1), "the edited cell is no match")
-        XCTAssertEqual(value(model, 50_000, 1), "y")
+        XCTAssertEqual(value(model, 50_000, 1), utf8("y"))
     }
 
     /// An edit redraws its row, its gutter mark and its column: the
@@ -457,7 +464,7 @@ final class EditingTests: XCTestCase {
         XCTAssertTrue(callout.message.contains("Save As UTF-8"))
         try press(#selector(NSResponder.insertNewline(_:)), in: content)
         XCTAssertFalse(content.cellEditor.isEditing, "named while typing: Return commits")
-        XCTAssertEqual(value(model, 0, 0), "Pho ế")
+        XCTAssertEqual(value(model, 0, 0), utf8("Pho ế"))
 
         let long = String(repeating: "a", count: CellEditController.liveCheckLimit) + "ế"
         try await returnKey(on: CellPosition(row: 1, column: 0), content)
@@ -466,10 +473,10 @@ final class EditingTests: XCTestCase {
         try press(#selector(NSResponder.insertNewline(_:)), in: content)
         XCTAssertTrue(content.cellEditor.isEditing, "the first Return names it")
         XCTAssertTrue(callout.message.contains("“ế”"))
-        XCTAssertEqual(value(model, 1, 0), "Bun")
+        XCTAssertEqual(value(model, 1, 0), utf8("Bun"))
         try press(#selector(NSResponder.insertNewline(_:)), in: content)
         XCTAssertFalse(content.cellEditor.isEditing)
-        XCTAssertEqual(value(model, 1, 0), long)
+        XCTAssertEqual(value(model, 1, 0), utf8(long))
     }
 
     /// ADR-0013 decision 1: a UTF-16 file can be edited; Save is off.
@@ -509,7 +516,7 @@ final class EditingTests: XCTestCase {
         text.setSelectedRange(NSRange(location: (text.string as NSString).length, length: 0))
         text.insertText("\nGate code 4471", replacementRange: text.selectedRange())
         text.onCommit?()
-        XCTAssertEqual(value(model, 0, 1), "Deliver to the rear entrance.\nCall on arrival.\nGate code 4471")
+        XCTAssertEqual(value(model, 0, 1), utf8("Deliver to the rear entrance.\nCall on arrival.\nGate code 4471"))
         XCTAssertTrue(content.view.window?.firstResponder === content.grid.gridView)
         await content.inspectorTask?.value
         XCTAssertEqual(text.string, "Deliver to the rear entrance.\nCall on arrival.\nGate code 4471")
@@ -518,7 +525,276 @@ final class EditingTests: XCTestCase {
         content.view.window?.makeFirstResponder(text)
         text.insertText("!", replacementRange: NSRange(location: (text.string as NSString).length, length: 0))
         content.grid.select(CellPosition(row: 1, column: 1))
-        XCTAssertEqual(value(model, 0, 1), "Deliver to the rear entrance.\nCall on arrival.\nGate code 4471!")
+        XCTAssertEqual(value(model, 0, 1), utf8("Deliver to the rear entrance.\nCall on arrival.\nGate code 4471!"))
+    }
+
+    // MARK: Text reaches the core as typed
+
+    /// Typed a character at a time, as the keyboard does, text reaches the
+    /// core unchanged in either editor: no smart quotes or dashes, no text
+    /// replacement ("omw"), no autocorrection. Every such feature is off,
+    /// and stays off, in the in-cell editor's own field editor (the
+    /// window's shared one, which the find bar uses, is another) and the
+    /// inspector's text view.
+    func testBothEditorsKeepTextAsTyped() async throws {
+        let (_, model, content) = try await open(try file("typed.csv", "id,note\n1,a\n2,b\n"))
+        let typed = "say \"hi\" -- it's omw "
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        let editor = try fieldEditor(content)
+        XCTAssertTrue(editor is LiteralTextView, "the in-cell editor has a field editor of its own")
+        XCTAssertFalse(editor === content.view.window?.fieldEditor(true, for: nil), "the window's shared field editor is left alone")
+        assertKeepsTextAsTyped(editor)
+        editor.selectAll(nil)
+        for character in typed {
+            editor.insertText(String(character), replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        XCTAssertEqual(utf8(editor.string), utf8(typed))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 0, 1), utf8(typed))
+
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        assertKeepsTextAsTyped(text)
+        content.view.window?.makeFirstResponder(text)
+        text.selectAll(nil)
+        for character in typed {
+            text.insertText(String(character), replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        text.onCommit?()
+        XCTAssertEqual(value(model, 1, 1), utf8(typed))
+    }
+
+    /// Every substitution is off, even after something turns it on.
+    private func assertKeepsTextAsTyped(_ view: NSTextView, line: UInt = #line) {
+        view.isAutomaticQuoteSubstitutionEnabled = true
+        view.isAutomaticDashSubstitutionEnabled = true
+        view.isAutomaticTextReplacementEnabled = true
+        view.isAutomaticSpellingCorrectionEnabled = true
+        view.smartInsertDeleteEnabled = true
+        view.isAutomaticDataDetectionEnabled = true
+        view.isAutomaticLinkDetectionEnabled = true
+        view.isAutomaticTextCompletionEnabled = true
+        view.enabledTextCheckingTypes = NSTextCheckingAllTypes
+        XCTAssertFalse(view.isAutomaticQuoteSubstitutionEnabled, "smart quotes", line: line)
+        XCTAssertFalse(view.isAutomaticDashSubstitutionEnabled, "smart dashes", line: line)
+        XCTAssertFalse(view.isAutomaticTextReplacementEnabled, "text replacement", line: line)
+        XCTAssertFalse(view.isAutomaticSpellingCorrectionEnabled, "autocorrection", line: line)
+        XCTAssertFalse(view.smartInsertDeleteEnabled, "smart insert", line: line)
+        XCTAssertFalse(view.isAutomaticDataDetectionEnabled, "data detection", line: line)
+        XCTAssertFalse(view.isAutomaticLinkDetectionEnabled, "link detection", line: line)
+        XCTAssertFalse(view.isAutomaticTextCompletionEnabled, "completion", line: line)
+        XCTAssertEqual(view.enabledTextCheckingTypes & LiteralTextView.changingChecks, 0, "text checking that changes text", line: line)
+    }
+
+    /// An edit between canonically equivalent forms (NFC and NFD) changes
+    /// the bytes, so it is an edit, in either editor: Swift's `==` would
+    /// call the two the same and drop it.
+    func testCanonicallyEquivalentTextIsAnEdit() async throws {
+        let nfc = "caf\u{E9}"
+        let nfd = "cafe\u{301}"
+        let (_, model, content) = try await open(try file("forms.csv", "id,name\n1,\(nfc)\n2,\(nfd)\n"))
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8(nfc))
+        try type(nfd, in: content)
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 0, 1), utf8(nfd))
+        try await returnKey(on: CellPosition(row: 1, column: 1), content)
+        try type(nfc, in: content)
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 1, 1), utf8(nfc))
+        XCTAssertEqual(editedCells(model), 2)
+
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        content.view.window?.makeFirstResponder(text)
+        text.selectAll(nil)
+        text.insertText(nfd, replacementRange: text.selectedRange())
+        text.onCommit?()
+        XCTAssertEqual(value(model, 1, 1), utf8(nfd))
+    }
+
+    /// Values come back byte for byte: a NUL and a tab in the starting
+    /// value stay (untouched, it is no edit); ⌥↩ puts in the file's own
+    /// line break (CRLF here), and a trailing one is kept; a value ending
+    /// in a line break, untouched, is no edit. The editor counts CRLF as
+    /// one line break.
+    func testControlCharactersAndLineBreaksArriveAsTyped() async throws {
+        let (_, model, content) = try await open(try file("controls.csv", "id,v\r\n1,\"a\u{0}b\tc\"\r\n2,abc\r\n3,\"end\r\n\"\r\n"))
+        XCTAssertEqual(model.lineBreak, "\r\n")
+
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8("a\u{0}b\tc"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(editedCells(model), 0)
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        try fieldEditor(content).insertText("!", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 0, 1), utf8("a\u{0}b\tc!"))
+
+        try await returnKey(on: CellPosition(row: 1, column: 1), content)
+        try press(#selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), in: content)
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8("abc\r\n"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 1, 1), utf8("abc\r\n"))
+
+        let edits = editedCells(model)
+        try await returnKey(on: CellPosition(row: 2, column: 1), content)
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8("end\r\n"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(editedCells(model), edits)
+        XCTAssertEqual(value(model, 2, 1), utf8("end\r\n"))
+
+        XCTAssertEqual(EditorLines.ranges(in: "end\r\n", upTo: 8).count, 2)
+        XCTAssertEqual(EditorLines.ranges(in: "a\r\nb\rc\nd", upTo: 8).count, 4)
+        XCTAssertEqual(EditorLines.ranges(in: "a\n\nb", upTo: 2).count, 2)
+    }
+
+    /// A value with invalid bytes, opened and left untouched (Return, or
+    /// leaving the editor), is no edit: its bytes stay. Whether a long
+    /// value has invalid bytes is read from its full value off the main
+    /// thread, past the grid's shortened text, typing over it included.
+    func testUntouchedInvalidBytesStay() async throws {
+        // The BOM makes it UTF-8, with the 0xE9s invalid.
+        var bytes = Data("\u{FEFF}id,name\n1,Caf".utf8)
+        bytes.append(0xE9)
+        bytes.append(Data("\n2,\(String(repeating: "a", count: 300))".utf8))
+        bytes.append(0xE9)
+        bytes.append(Data("\n3,Bo\n".utf8))
+        let (_, model, content) = try await open(try file("invalid.csv", bytes))
+        let place = EditPlace.cell(CellPosition(row: 0, column: 1))
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        XCTAssertEqual(content.cellEditor.session?.invalidBytes, true)
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        content.view.window?.makeFirstResponder(content.grid.gridView)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(editedCells(model), 0)
+        XCTAssertTrue(model.hasInvalidBytes(place, value: model.fullValue(place) ?? ""))
+
+        // A long value: the byte is past the grid's text.
+        try await returnKey(on: CellPosition(row: 1, column: 1), content)
+        XCTAssertEqual(content.cellEditor.session?.invalidBytes, true)
+        try press(#selector(NSResponder.cancelOperation(_:)), in: content)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        content.grid.gridView.keyDown(with: try key("z", code: 6, window: content.view.window))
+        XCTAssertTrue(content.cellEditor.isEditing)
+        await content.cellEditor.loading?.value
+        XCTAssertEqual(content.cellEditor.session?.invalidBytes, true, "read off the main thread")
+        XCTAssertTrue(content.cellEditor.callout.message.contains("aren’t valid UTF-8"))
+        try press(#selector(NSResponder.cancelOperation(_:)), in: content)
+        XCTAssertEqual(editedCells(model), 0)
+    }
+
+    /// A dead key (⌥E) opens the editor by itself, so the accent composes
+    /// there with the next key, not lost in the grid. The input method's
+    /// part is played through the editor's `NSTextInputClient` methods.
+    func testADeadKeyOpensTheEditorAndComposesThere() async throws {
+        let (_, model, content) = try await open(try file("dead.csv", "id,name\n1,Cafe\n2,Bo\n"))
+        let window = content.view.window
+        let dead = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .option, timestamp: 0, windowNumber: window?.windowNumber ?? 0,
+            context: nil, characters: "", charactersIgnoringModifiers: "e", isARepeat: false, keyCode: 14
+        ))
+        XCTAssertTrue(GridView.typesText(dead))
+        content.grid.select(CellPosition(row: 0, column: 1))
+        window?.makeFirstResponder(content.grid.gridView)
+        content.grid.gridView.keyDown(with: dead)
+        XCTAssertTrue(content.cellEditor.isEditing, "the dead key opens the editor")
+        let editor = try fieldEditor(content)
+        let all = NSRange(location: 0, length: (editor.string as NSString).length)
+        editor.setMarkedText("´", selectedRange: NSRange(location: 1, length: 0), replacementRange: all)
+        XCTAssertTrue(editor.hasMarkedText())
+        editor.insertText("é", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertFalse(editor.hasMarkedText())
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8("é"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 0, 1), utf8("é"))
+    }
+
+    // MARK: Committing and commands
+
+    /// `commitEditing` commits an edit still open, in either editor
+    /// (Reload, Treat As, Reopen with Encoding, ⌘G, Go to Row and closing
+    /// call it first); `discardEditing` closes them, committing nothing.
+    func testCommitEditingCommitsAnOpenEdit() async throws {
+        let (_, model, content) = try await open(try file("open.csv", "id,name\n1,Ada\n2,Bo\n"))
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        try type("Ada Lovelace", in: content)
+        XCTAssertTrue(content.commitEditing())
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 0, 1), utf8("Ada Lovelace"))
+
+        try await returnKey(on: CellPosition(row: 1, column: 1), content)
+        try type("Bob", in: content)
+        content.goTo(rowNumber: 1)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 1, 1), utf8("Bob"))
+
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        content.view.window?.makeFirstResponder(text)
+        text.insertText("!", replacementRange: NSRange(location: (text.string as NSString).length, length: 0))
+        XCTAssertTrue(content.commitEditing())
+        XCTAssertEqual(value(model, 1, 1), utf8("Bob!"))
+
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        try type("gone", in: content)
+        content.discardEditing()
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 0, 1), utf8("Ada Lovelace"))
+    }
+
+    /// Every command goes through `commandApplied`, with its direction:
+    /// `onCommand` hears edits, undos and redos, and after an undo the
+    /// column is measured with the old value (here a wide one, in a row
+    /// outside the sized sample).
+    func testCommandsGoThroughOneEntryPoint() async throws {
+        var text = "id,name\n"
+        for row in 0..<1_200 { text += row == 1_100 ? "\(row),\(String(repeating: "W", count: 40))\n" : "\(row),n\n" }
+        let (_, model, _) = try await open(try file("undo.csv", text))
+        try await waitUntil("sized") { model.isSizingRefined }
+        var heard: [CommandDirection] = []
+        model.onCommand = { _, direction in heard.append(direction) }
+        let width = model.columnWidths[1]
+        guard case let .edited(command) = model.setCell(.cell(CellPosition(row: 1_100, column: 1)), to: "x") else {
+            return XCTFail("no edit")
+        }
+        XCTAssertEqual(model.columnWidths[1], width)
+        let _: Void? = model.call { try $0.undo(command: command) }
+        model.commandApplied(command, as: .undo)
+        XCTAssertEqual(value(model, 1_100, 1), utf8(String(repeating: "W", count: 40)))
+        XCTAssertGreaterThan(model.columnWidths[1], width, "after an undo, the old value is measured")
+        let _: Void? = model.call { try $0.redo(command: command) }
+        model.commandApplied(command, as: .redo)
+        XCTAssertEqual(value(model, 1_100, 1), utf8("x"))
+        XCTAssertEqual(heard, [.edit, .undo, .redo])
+    }
+
+    /// When a commit that doesn't wait (leaving the editor) has a value too
+    /// long to have been checked as it was typed, it commits, then names a
+    /// character the encoding can't hold.
+    func testLeavingCommitsALongValueThenNamesTheCharacter() async throws {
+        let (_, model, content) = try await open(try file("viet2.csv", "a,b\nPho,1\nBun,2\n"))
+        model.reopen(encoding: .windows1258)
+        try await waitUntil("read again") { model.isIndexComplete && model.interpretation.encoding == .windows1258 }
+        let long = String(repeating: "b", count: CellEditController.liveCheckLimit) + "ế"
+        try await returnKey(on: CellPosition(row: 0, column: 0), content)
+        try type(long, in: content)
+        content.view.window?.makeFirstResponder(content.grid.gridView)
+        XCTAssertFalse(content.cellEditor.isEditing)
+        XCTAssertEqual(value(model, 0, 0), utf8(long))
+        let callout = content.cellEditor.callout
+        XCTAssertTrue(callout.superview === content.grid.overlay, "named after the commit")
+        XCTAssertTrue(callout.message.contains("“ế”"), callout.message)
+        content.grid.select(CellPosition(row: 1, column: 0))
+        XCTAssertNil(callout.superview, "a note: it goes at the next selection change")
     }
 
     // MARK: Cell edit to screen (DESIGN §1, < 16 ms)

@@ -230,10 +230,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case .content, .rows, .reloaded, .failed:
             // The values may be different, or gone: an open editor
             // commits nothing (task 2.5.1).
-            cellEditor.abandon()
-            inspectorEdit = nil
-            inspectorLoading?.cancel()
-            inspectorLoading = nil
+            discardEditing()
         default:
             break
         }
@@ -308,6 +305,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         case .failed:
             grid.invalidateContent()
             detailsPopover?.close()
+            // Nothing can be edited any more.
+            inspector.textView.isEditable = false
             find.stop()
             onFailure?()
         case let .cells(rows):
@@ -587,6 +586,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // always off the main thread (task 2.0, ADR-0009). The window shows
         // the old snapshot until the new one is ready.
         guard reloading == nil, savingAsUTF8 == nil else { return }
+        // An edit still open is committed first (or, if the core refuses
+        // it, stays open, and the file isn't read again).
+        guard commitEditing() else { return NSSound.beep() }
         let reload = onReload
         let model = model
         model.willReload()
@@ -657,19 +659,19 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     private func setHeaderRow(_ header: Bool) {
         scheduler.noteUserInput()
-        guard savingAsUTF8 == nil else { return NSSound.beep() }
+        guard savingAsUTF8 == nil, commitEditing() else { return NSSound.beep() }
         model.setHeaderRow(header)
     }
 
     func treatAs(_ delimiter: Delimiter) {
         scheduler.noteUserInput()
-        guard savingAsUTF8 == nil else { return NSSound.beep() }
+        guard savingAsUTF8 == nil, commitEditing() else { return NSSound.beep() }
         model.treatAs(delimiter)
     }
 
     func reopen(encoding: TextEncoding) {
         scheduler.noteUserInput()
-        guard savingAsUTF8 == nil else { return NSSound.beep() }
+        guard savingAsUTF8 == nil, commitEditing() else { return NSSound.beep() }
         model.reopen(encoding: encoding)
     }
 
@@ -813,6 +815,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// Next or Previous from the active cell.
     func step(forward: Bool) {
+        // An open edit is committed first, as a selection change does.
+        guard commitEditing() else { return NSSound.beep() }
         if find.search == nil, !findBar.field.stringValue.isEmpty {
             // Searching again (the bar was closed, or the file read again).
             find.find(findBar.field.stringValue, caseSensitive: !findBar.ignoresCase, from: nil)
@@ -902,6 +906,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// (DESIGN §3.10 rule 5).
     func goTo(rowNumber number: Int) {
         scheduler.noteUserInput()
+        // An open edit is committed first, as a selection change does.
+        guard commitEditing() else { return NSSound.beep() }
         find.cancelPendingStep()
         view.window?.makeFirstResponder(grid.gridView)
         grid.goTo(row: number - 1)
@@ -983,6 +989,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// its own reading and the file's clone until the pasteboard has its
     /// text (`CopyPromise`).
     func documentWillClose() {
+        // An open edit is committed, as leaving it does; one the core
+        // refuses goes. Neither editor's read of a long value goes on.
+        commitEditing()
+        discardEditing()
         find.stop()
         inspectorTask?.cancel()
         // The save stops (its job is cancelled with the task), writing
@@ -1013,9 +1023,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             if view.window?.firstResponder === inspector.textView {
                 view.window?.makeFirstResponder(grid.gridView)
             }
-            // Hiding it commits its edit, as leaving it does.
-            if inspectorEdit?.changed == true { commitInspector(refocus: false, confirmed: true) }
-            inspectorEdit = nil
+            // Hiding it commits its edit, as leaving it does. One the core
+            // refuses is kept, to commit again when it shows.
+            if commitInspector(refocus: false, confirmed: true) { inspectorEdit = nil }
         }
     }
 
@@ -1029,7 +1039,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// edit in the inspector of the cell it showed is committed first.
     func updateInspector() {
         guard isInspectorShown else { return }
-        if inspectorEdit?.changed == true { commitInspector(refocus: false, confirmed: true) }
+        // An edit the core refuses keeps the inspector on its cell, with
+        // the text typed and the reason, until it commits or Esc.
+        guard commitInspector(refocus: false, confirmed: true) else { return }
         inspectorEdit = nil
         inspectorLoading?.cancel()
         inspectorLoading = nil
@@ -1067,6 +1079,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private func showInInspector(column: String, row: Int?, content: InspectorContent, edit: InspectorEdit? = nil) {
         inspectorContent = content
         inspectorEdit = edit
+        inspector.textView.lineBreak = model.lineBreak
         inspector.show(column: column, row: row, content: content, editable: edit != nil)
     }
 
@@ -1103,33 +1116,77 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// ⌘↩ in the inspector (or leaving it): commits its text to the cell it
     /// shows. As in the in-cell editor, an untouched value is no edit, and
-    /// a character the encoding can't hold is named first (`confirmed`
-    /// skips that).
-    func commitInspector(refocus: Bool, confirmed: Bool = false) {
-        guard var edit = inspectorEdit else { return }
+    /// a character the encoding can't hold is named first. `confirmed`
+    /// (leaving it, another cell, hiding it) doesn't wait on that check: a
+    /// value too long to have been checked as it was typed is checked,
+    /// committed, and then the character is named. Returns whether no
+    /// edit is left: one the core refuses keeps its text, and says why.
+    @discardableResult
+    func commitInspector(refocus: Bool, confirmed: Bool = false) -> Bool {
+        guard var edit = inspectorEdit else { return true }
         let value = inspector.textView.string
-        guard edit.changed, value != edit.original else {
+        guard edit.changed, !value.isIdentical(to: edit.original) else {
             if refocus { view.window?.makeFirstResponder(grid.gridView) }
-            return
+            return true
         }
-        if !confirmed, edit.warned != value, let bad = model.unencodable(value) {
-            edit.warned = value
-            inspectorEdit = edit
-            inspector.showWarning(EditText.unencodable(bad))
-            return
+        var named: UnencodableCharacter?
+        if !value.isIdentical(to: edit.warned) {
+            if !confirmed, let bad = model.unencodable(value) {
+                edit.warned = value
+                inspectorEdit = edit
+                inspector.showWarning(EditText.unencodable(bad))
+                return false
+            }
+            if confirmed, value.utf16.count > CellEditController.liveCheckLimit {
+                named = model.unencodable(value)
+            }
         }
-        // Not changed any more, whatever happens: the commit below redraws
-        // the inspector from the cell.
+        // Not changed any more: the commit below redraws the inspector
+        // from the cell.
         edit.changed = false
         inspectorEdit = edit
-        switch model.setCell(.cell(edit.cell), to: value) {
-        case let .refused(refusal):
+        if case let .refused(refusal) = model.setCell(.cell(edit.cell), to: value) {
+            // The typed text stays, to commit again or cancel.
+            edit.changed = true
+            inspectorEdit = edit
             NSSound.beep()
             inspector.showWarning(EditText.refusal(refusal))
-        case .edited, .unchanged, .failed:
-            break
+            return false
+        }
+        if let named {
+            // Committed, as leaving it does: Save will refuse it.
+            NSSound.beep()
+            inspector.showWarning(EditText.unencodable(named))
         }
         if refocus { view.window?.makeFirstResponder(grid.gridView) }
+        return true
+    }
+
+    /// Commits an open edit, in the in-cell editor or the inspector, as
+    /// leaving it would (the encoding check doesn't stop it). Returns
+    /// whether no edit is left open: one the core refuses stays open, with
+    /// its text and the reason. (`NSEditor`'s, which `NSViewController`
+    /// has.)
+    ///
+    /// Reload, Treat As, Reopen with Encoding, ⌘G, Go to Row and closing
+    /// the window call it first. SEAM(2.5.2, 2.5.3): so must anything that
+    /// asks whether there are unsaved changes (dirty state, `canClose`,
+    /// Save, Revert), before it asks, so the edit being typed counts.
+    @discardableResult
+    override func commitEditing() -> Bool {
+        let cell = cellEditor.commitOpenEdit()
+        let inspector = commitInspector(refocus: false, confirmed: true)
+        return super.commitEditing() && cell && inspector
+    }
+
+    /// Closes both editors, committing nothing, and stops their reads of
+    /// a long value.
+    override func discardEditing() {
+        super.discardEditing()
+        cellEditor.abandon()
+        inspectorEdit = nil
+        inspectorLoading?.cancel()
+        inspectorLoading = nil
     }
 
     /// Esc in the inspector: its text goes back to the cell's value.
@@ -1153,10 +1210,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         inspector.showWarning(InspectorText.loadingWhole)
         inspectorLoading = Task { [weak self] in
             guard let self else { return }
-            let value = await model.fullValueInBackground(.cell(edit.cell))
+            let start = await model.fullValueInBackground(.cell(edit.cell))
             guard !Task.isCancelled, grid.activeCell == edit.cell, inspectorEdit?.cell == edit.cell else { return }
             inspectorLoading = nil
-            guard let value else { return }
+            guard let value = start?.value else { return }
             inspectorEdit = InspectorEdit(cell: edit.cell, original: value, truncated: false)
             inspector.showWhole(value)
         }

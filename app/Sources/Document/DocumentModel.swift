@@ -119,9 +119,10 @@ final class DocumentModel: GridDataSource {
 
     /// Called on the main actor when something the window shows changed.
     var onChange: ((DocumentChange) -> Void)?
-    /// A command was applied (an edit; task 2.5.1). SEAM(2.5.2): undo
-    /// and the recovery journal register it here (`commandApplied`).
-    var onCommand: ((EditCommand) -> Void)?
+    /// A command was applied (an edit, or an undo or redo; task 2.5.1),
+    /// and which way. SEAM(2.5.2): undo and the recovery journal register
+    /// it here (`commandApplied`).
+    var onCommand: ((EditCommand, CommandDirection) -> Void)?
     /// Called when the file was moved, with its new place (task 1.9), so
     /// the `NSDocument` follows it.
     var onMoved: ((URL) -> Void)?
@@ -907,8 +908,10 @@ final class DocumentModel: GridDataSource {
     ///   thread, as after a reinterpret.
     ///
     /// Find (`FindModel.valuesChanged`) and the inspector hear of it from
-    /// the window, through `.cells` and `.header`.
-    func valuesChanged(by command: EditCommand) {
+    /// the window, through `.cells` and `.header`. `direction` says which
+    /// values the cells read as now: after an undo, the old ones. Only
+    /// `commandApplied` calls this.
+    func valuesChanged(by command: EditCommand, direction: CommandDirection) {
         guard failure == nil, !command.changes.isEmpty else { return }
         var gridRows: [Int] = []
         var header = false
@@ -926,7 +929,7 @@ final class DocumentModel: GridDataSource {
             }
             cellsChanged(rows: first..<(last + 1))
         }
-        widenColumns(for: command.changes)
+        widenColumns(for: command.changes, direction: direction)
         let sampled = UInt64(headerOffset) + UInt64(Self.sizingRows)
         if refinedSizingStarted, command.changes.contains(where: { $0.row < sampled }) {
             measureAgainAfterEdit()
@@ -944,15 +947,17 @@ final class DocumentModel: GridDataSource {
         onChange?(.header)
     }
 
-    /// Widens each changed cell's column to fit its new value, as the
-    /// sizing would have (up to `GridMetrics.maximumColumnWidth`), unless
-    /// the user sized the column. A column never narrows here: that waits
-    /// for the sample to be measured again.
-    private func widenColumns(for changes: [ValueChange]) {
+    /// Widens each changed cell's column to fit the value it reads as now
+    /// (its new value, or after an undo its old one), as the sizing would
+    /// have (up to `GridMetrics.maximumColumnWidth`), unless the user sized
+    /// the column. A column never narrows here: that waits for the sample
+    /// to be measured again.
+    private func widenColumns(for changes: [ValueChange], direction: CommandDirection) {
         var widened = false
         for change in changes {
             let column = Int(change.column)
-            guard column < columnWidths.count, column < widestText.count, let value = change.newValue else { continue }
+            let now = direction == .undo ? change.oldValue : change.newValue
+            guard column < columnWidths.count, column < widestText.count, let value = now else { continue }
             let limit = Int(GridMetrics.maxCellCharacters)
             let start = value.unicodeScalars.prefix(limit + 1)
             let truncated = start.count > limit
@@ -1157,7 +1162,17 @@ final class DocumentModel: GridDataSource {
             }
             await self?.applyRefinedSizing(result, reading: reading)
         }
+        keepUntilDone(task)
+    }
+
+    /// Keeps `task` (for cancelling) until it ends, then forgets it, so a
+    /// task started again after each edit doesn't pile up.
+    private func keepUntilDone(_ task: Task<Void, Never>) {
         tasks.append(task)
+        Task { [weak self] in
+            await task.value
+            self?.tasks.removeAll { $0 == task }
+        }
     }
 
     private func applyRefinedSizing(_ result: Result<RefinedColumns, any Error>, reading: ReadingID) {
