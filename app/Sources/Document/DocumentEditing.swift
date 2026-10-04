@@ -181,18 +181,60 @@ extension DocumentModel {
         return .edited(command)
     }
 
+    /// Undoes `command` (task 2.5.2): the core applies its inverse, and it
+    /// goes to `commandApplied` as `.undo`. The core refuses it if a cell
+    /// no longer holds what the command made, or (for rows and columns)
+    /// while a save runs.
+    func undo(_ command: EditCommand) -> EditOutcome {
+        apply(command, as: .undo) { try $0.undo(command: command) }
+    }
+
+    /// Redoes `command`: as `undo`, the other way.
+    func redo(_ command: EditCommand) -> EditOutcome {
+        apply(command, as: .redo) { try $0.redo(command: command) }
+    }
+
+    private func apply(_ command: EditCommand, as direction: CommandDirection, _ body: (LealFFI.Document) throws -> Void) -> EditOutcome {
+        guard failure == nil, let handle = backgroundHandle() else { return .failed }
+        do {
+            try body(handle)
+        } catch let LealError.EditRefused(_, refusal, _, _) {
+            return .refused(refusal)
+        } catch {
+            report(error)
+            return .failed
+        }
+        commandApplied(command, as: direction)
+        return .edited(command)
+    }
+
+    /// The core's edit version (2.2): it goes up with every command, never
+    /// down. 0 once the document has failed.
+    var editVersion: UInt64 {
+        call { try $0.editVersion() } ?? 0
+    }
+
+    /// How this reading splits the file, for the recovery journal.
+    var choices: ReadingChoices { ReadingChoices(interpretation) }
+
     /// A command was applied to the core's document, as an edit, or undone
     /// or redone: everything showing its cells catches up (`valuesChanged`,
-    /// which after an undo measures the old values), and `onCommand` hears
-    /// of it, with which way it went.
+    /// which after an undo measures the old values; `structureChanged` for
+    /// rows and columns), the dirty state is read again, and `onCommand`
+    /// hears of it, with which way it went.
     ///
-    /// SEAM(2.5.2): every command goes through here, and only here. 2.5.2's
-    /// undo and redo call `commandApplied(_:as: .undo)` and `(_:as: .redo)`
-    /// after the core's `undo(command:)` and `redo(command:)`; its
-    /// `onCommand` registers the undo of an `.edit` and appends every
-    /// direction to the recovery journal.
+    /// Every command goes through here, and only here: the document's
+    /// `onCommand` registers its undo or redo and appends it to the
+    /// recovery journal (task 2.5.2).
     func commandApplied(_ command: EditCommand, as direction: CommandDirection) {
-        valuesChanged(by: command, direction: direction)
+        // First, so the window's status (Treat As off) is up to date when
+        // it hears of the cells.
+        refreshUnsavedEdits()
+        if let structural = command.structural {
+            structureChanged(by: structural, direction: direction)
+        } else {
+            valuesChanged(by: command, direction: direction)
+        }
         onCommand?(command, direction)
     }
 }

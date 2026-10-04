@@ -54,6 +54,9 @@ protocol GridDataSource: AnyObject {
     /// Whether a `.missing` cell is drawn hatched: the row is ragged
     /// (ADR-0002 question 5).
     func isHatched(row: Int, column: Int) -> Bool
+    /// Whether the cell holds an unsaved edit, drawn with a corner
+    /// triangle (mockup 05a, task 2.5.2). Asked after `cell(row:column:)`.
+    func isEdited(row: Int, column: Int) -> Bool
     /// The cell, if it is already read; `nil` if it would need a read from
     /// the core now. For laying out text ahead of the scroll (task 2.0a).
     func cachedCell(row: Int, column: Int) -> GridCell?
@@ -64,6 +67,7 @@ protocol GridDataSource: AnyObject {
 extension GridDataSource {
     func rowHasMarker(_ row: Int) -> Bool { false }
     func isHatched(row: Int, column: Int) -> Bool { false }
+    func isEdited(row: Int, column: Int) -> Bool { false }
     func cachedCell(row: Int, column: Int) -> GridCell? { cell(row: row, column: column) }
     func readAhead(rows: Range<Int>, columns: Range<Int>) {}
 }
@@ -73,6 +77,9 @@ extension GridDataSource {
 struct TileRow: Equatable, Sendable {
     let fieldCount: Int
     let cells: [GridCell]
+    /// The columns whose cells hold an edit (the core's `edited`), in
+    /// order; empty for a row with none.
+    var edited: [Int] = []
 }
 
 /// Cells read from the core in tiles of 64 rows × 32 columns, with the
@@ -233,6 +240,18 @@ final class CellTileCache {
         if column >= tileRow.fieldCount { return .missing }
         let cellIndex = column - key.columnBlock * Self.columnsPerTile
         return cellIndex < tileRow.cells.count ? tileRow.cells[cellIndex] : .missing
+    }
+
+    /// Whether the cell, read already, holds an edit (the core names them in
+    /// each row it reads). `false` for a cell not read yet.
+    func isEdited(row: Int, column: Int) -> Bool {
+        guard row >= 0, column >= 0 else { return false }
+        let key = Key(rowBlock: row / Self.rowsPerTile, columnBlock: column / Self.columnsPerTile)
+        guard let tile = tiles[key] else { return false }
+        let offset = row - key.rowBlock * Self.rowsPerTile
+        guard offset < tile.rows.count else { return false }
+        let edited = tile.rows[offset].edited
+        return !edited.isEmpty && edited.contains(column)
     }
 
     /// The reads ahead, one at a time, for every document: each holds the

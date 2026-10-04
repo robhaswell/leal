@@ -354,7 +354,11 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
     private(set) var session: Session?
     /// A long value being read before the editor opens, or (after typing
     /// opened it) read to see whether it holds invalid bytes.
-    private(set) var loading: Task<Void, Never>?
+    private(set) var loading: Task<Void, Never>? {
+        didSet { if loading == nil { loadingPlace = nil } }
+    }
+    /// The cell whose value `loading` reads.
+    private var loadingPlace: EditPlace?
     /// Ending the session: the field's end of editing is ours, not a
     /// commit.
     private var ending = false
@@ -417,6 +421,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             // Typing replaces a long value at once; whether it held
             // invalid bytes is read meanwhile, from its full value.
             open(place, value: "", invalidBytes: false, typing: typing)
+            defer { loadingPlace = place }
             loading = Task { [weak self] in
                 guard let self, let start = await model.fullValueInBackground(place) else { return }
                 guard !Task.isCancelled, session?.place == place else { return }
@@ -427,6 +432,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         } else {
             // A long value: read in full first (ADR-0008 decision 3).
             let selection = grid.activeCell
+            defer { loadingPlace = place }
             loading = Task { [weak self] in
                 guard let self else { return }
                 let start = await model.fullValueInBackground(place)
@@ -657,6 +663,15 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
             return true
         }
         return commit(move: nil, refocus: grid.window?.firstResponder === field.currentEditor(), confirmed: true)
+    }
+
+    /// The values of grid rows `rows` changed (an undo or a redo, task
+    /// 2.5.2): a long value being read for the editor from one of them is
+    /// stale, so the read stops. An editor already open stays.
+    func valuesChanged(rows: Range<Int>) {
+        guard case let .cell(cell)? = loadingPlace, rows.contains(cell.row) else { return }
+        loading?.cancel()
+        loading = nil
     }
 
     /// Esc: the cell keeps its value (and its bytes).

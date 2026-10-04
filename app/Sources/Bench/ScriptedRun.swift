@@ -50,6 +50,9 @@ import os
 ///   on the selected cell (with its callout, mockup 05b), and
 ///   `-LealInspectorFocus YES`, with `-LealInspector`, puts the caret at
 ///   the end of the inspector's value, as when editing it (05a).
+///   For task 2.5.2: `-LealSetCells row,column=value+row,column=value`
+///   commits those edits (grid rows; "_" for a space) first, so the
+///   edited-cell marks and "— Edited" show (05a).
 /// - `-LealBenchEdit <n>`: once the document is indexed, edit `n` cells
 ///   through the in-cell editor (Return, new text, Return), one at a time,
 ///   each once the last is on screen, then quit: each edit's "Cell edit to
@@ -151,25 +154,34 @@ final class ScriptedRun {
             let bench = ScrollBench(document: document, content: content, profile: value(of: "LealBenchSpeed") ?? "fast")
             bench.start { result in
                 Self.write(result, to: Self.outputURL(out))
-                NSApp.terminate(nil)
+                Self.quit()
             }
             keep = bench
         } else if let count = value(of: "LealBenchEdit").flatMap({ Int($0) }) {
             Task { @MainActor in
                 await self.edit(document, content: content, times: count)
-                NSApp.terminate(nil)
+                Self.quit()
             }
         } else if let count = value(of: "LealReopen").flatMap({ Int($0) }) {
             Task { @MainActor in
                 await self.reopen(document, times: count)
-                NSApp.terminate(nil)
+                Self.quit()
             }
         } else if let out = value(of: "LealSnapshot") {
             Task { @MainActor in
                 await self.snapshot(content: content, to: Self.outputURL(out))
-                NSApp.terminate(nil)
+                Self.quit()
             }
         }
+    }
+
+    /// Quits. A scripted run's edits are never saved, and since task 2.5.2
+    /// an edited document would ask first: its edits are let go.
+    private static func quit() {
+        for document in NSDocumentController.shared.documents {
+            document.updateChangeCount(.changeCleared)
+        }
+        NSApp.terminate(nil)
     }
 
     private var keep: AnyObject?
@@ -268,6 +280,17 @@ final class ScriptedRun {
             let deadline = Date().addingTimeInterval(30)
             while content.find.isSearching || content.find.pendingStep != nil, Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        if let edits = value(of: "LealSetCells") {
+            let model = content.model
+            // Edits, committed as the editor does (task 2.5.2).
+            for edit in edits.split(separator: "+") {
+                let parts = edit.split(separator: "=", maxSplits: 1)
+                let place = parts.first?.split(separator: ",").compactMap { Int($0) } ?? []
+                guard parts.count == 2, place.count == 2 else { continue }
+                let text = parts[1].replacingOccurrences(of: "_", with: " ")
+                _ = model.setCell(.cell(CellPosition(row: place[0], column: place[1])), to: text)
             }
         }
         if has("LealInspector") {

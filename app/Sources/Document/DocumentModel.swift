@@ -37,6 +37,25 @@ enum DocumentChange: Equatable, Sendable {
     /// Only the column widths changed: an edited value is wider than its
     /// column (task 2.5.1).
     case widths
+    /// Rows or a column were inserted or deleted (an undo or a redo of
+    /// one, task 2.5.2): every row after the change moved, and the column
+    /// count and widths may be different.
+    case structure
+}
+
+/// How the reading under the edits changed (task 2.5.2), for the edit
+/// history.
+enum ReadingChange: Equatable, Sendable {
+    /// Read again with the same split (the Header row toggle): the edits
+    /// and their undo history stay.
+    case sameSplit
+    /// Read with another delimiter or encoding (Treat As, Reopen with
+    /// Encoding), which only a document with no edits can be: a new
+    /// lineage, so the commands before it no longer apply.
+    case newSplit
+    /// Reloaded (Reload, Revert, a Save As UTF-8's copy): a new core
+    /// document, with no edits.
+    case replaced
 }
 
 /// One open file, as the window shows it: the core's `Document` (through
@@ -128,6 +147,16 @@ final class DocumentModel: GridDataSource {
     /// and which way. SEAM(2.5.2): undo and the recovery journal register
     /// it here (`commandApplied`).
     var onCommand: ((EditCommand, CommandDirection) -> Void)?
+    /// The file was read again, or replaced, under the edits (task 2.5.2):
+    /// the edit history follows.
+    var onReadingChanged: ((ReadingChange) -> Void)?
+    /// Whether some cell reads differently from the file (the core's
+    /// `hasUnsavedEdits`), as of the last command or reading. It stays as
+    /// it was once the document fails: its edits are recovered from the
+    /// journal.
+    private(set) var hasUnsavedEdits = false
+    /// Recover changes is under way (`recover`).
+    private(set) var isRecovering = false
     /// Called when the file was moved, with its new place (task 1.9), so
     /// the `NSDocument` follows it.
     var onMoved: ((URL) -> Void)?
@@ -390,6 +419,7 @@ final class DocumentModel: GridDataSource {
         onChange = nil
         onMoved = nil
         onCommand = nil
+        onReadingChanged = nil
     }
 
     var isFailed: Bool { failure != nil }
@@ -770,6 +800,12 @@ final class DocumentModel: GridDataSource {
         column < fileColumnCount && flags(row: row).ragged
     }
 
+    /// An edited cell carries a corner triangle until it is saved (mockup
+    /// 05a): the core names the edited cells in each row the grid reads.
+    func isEdited(row: Int, column: Int) -> Bool {
+        failure == nil && hasUnsavedEdits && tiles.isEdited(row: row, column: column)
+    }
+
     /// The grid row's flags, from the core one block at a time.
     private func flags(row: Int) -> RowFlags {
         guard failure == nil, row >= 0, row < loadedRowCount else { return RowFlags(marked: false, ragged: false) }
@@ -857,9 +893,16 @@ final class DocumentModel: GridDataSource {
                 maxChars: GridMetrics.maxCellCharacters
             )
         }) else { return nil }
-        return read.map { row in
-            TileRow(fieldCount: Int(row.fieldCount), cells: row.cells.map { .text($0.text, truncated: $0.truncated) })
-        }
+        return read.map(Self.tileRow)
+    }
+
+    /// A row the core read, as the tile cache keeps it.
+    nonisolated private static func tileRow(_ row: RowCells) -> TileRow {
+        TileRow(
+            fieldCount: Int(row.fieldCount),
+            cells: row.cells.map { .text($0.text, truncated: $0.truncated) },
+            edited: row.edited.map(Int.init)
+        )
     }
 
     /// `readTile` for the grid's reads ahead, off the main thread (task
@@ -881,9 +924,7 @@ final class DocumentModel: GridDataSource {
                 columnStart: UInt32(columns.lowerBound),
                 columnCount: UInt32(columns.count),
                 maxChars: GridMetrics.maxCellCharacters
-            ).map { row in
-                TileRow(fieldCount: Int(row.fieldCount), cells: row.cells.map { .text($0.text, truncated: $0.truncated) })
-            }
+            ).map(Self.tileRow)
         }
     }
 
@@ -939,6 +980,55 @@ final class DocumentModel: GridDataSource {
         if refinedSizingStarted, command.changes.contains(where: { $0.row < sampled }) {
             measureAgainAfterEdit()
         }
+    }
+
+    /// Rows or a column were inserted or deleted (task 2.5.2: an undo or a
+    /// redo of one; inserting and deleting them is task 2.5a). Every row
+    /// after the change moved, so every tile and row flag is read again;
+    /// the row count comes from the core. A column moves the widths after
+    /// it, and the titles, column count and sample are read again.
+    func structureChanged(by structural: StructuralEdit, direction: CommandDirection) {
+        guard failure == nil else { return }
+        flagBlocks.removeAll()
+        tiles.removeAll()
+        if let current = call({ try $0.progress() }) { progress = current }
+        if let count = call({ try $0.columnCount() }) { fileColumnCount = Int(count) }
+        if structural.isColumn(), let at = structural.column().map(Int.init) {
+            // An undo inserts what a delete took, and the reverse.
+            let inserted = structural.inserts() == (direction != .undo)
+            moveColumns(at: at, inserted: inserted)
+            // The sample's widest row is measured again, if at all.
+            widestSampleRow = 0
+            if interpretation.header {
+                reloadHeaderTitles()
+            }
+            updateColumnCount()
+            if refinedSizingStarted { measureAgainAfterEdit() }
+        }
+        onChange?(.structure)
+    }
+
+    /// A column was inserted at `at`, or deleted there: the widths and
+    /// what is known of each column after it move with it.
+    private func moveColumns(at: Int, inserted: Bool) {
+        func move<T>(_ values: inout [T], filler: T) {
+            if inserted {
+                if at <= values.count { values.insert(filler, at: at) }
+            } else if at < values.count {
+                values.remove(at: at)
+            }
+        }
+        move(&columnWidths, filler: GridMetrics.defaultColumnWidth)
+        move(&widestText, filler: 0)
+        move(&numeric, filler: false)
+        let shift = inserted ? 1 : -1
+        resizedColumns = Set(resizedColumns.compactMap { column in
+            column < at ? column : (!inserted && column == at ? nil : column + shift)
+        })
+        editedWidest = Dictionary(uniqueKeysWithValues: editedWidest.compactMap { column, width in
+            column < at ? (column, width) : (!inserted && column == at ? nil : (column + shift, width))
+        })
+        columnCount = 0
     }
 
     /// The header row's titles, read again after an edit to it.
@@ -1281,10 +1371,26 @@ final class DocumentModel: GridDataSource {
     /// off and says to Reload first.
     var canReinterpret: Bool { failure == nil && !changedOnDisk && !isReloading }
 
+    /// Whether the file may be read with another delimiter or encoding
+    /// (Treat As, Reopen with Encoding): as `canReinterpret`, and not while
+    /// there are unsaved edits, which are tied to how the file was split
+    /// (ADR-0008 decision 4). The Header row toggle stays available.
+    var canChangeSplit: Bool { canReinterpret && !hasUnsavedEdits }
+
+    /// Reads the core's dirty state again.
+    func refreshUnsavedEdits() {
+        guard failure == nil else { return }
+        hasUnsavedEdits = call { try $0.hasUnsavedEdits() } ?? hasUnsavedEdits
+    }
+
     /// Reads the file again with the given choices, keeping the user's
     /// earlier ones for the rest. Nothing is reopened (PLAN 1.3).
     private func reinterpret(delimiter: Delimiter? = nil, header: Bool? = nil, encoding: TextEncoding? = nil) {
         guard canReinterpret else { return }
+        // Edits are tied to the split (ADR-0008 decision 4): the core
+        // refuses another delimiter or encoding while there are any.
+        if delimiter != nil || encoding != nil, hasUnsavedEdits { return }
+        let lineage = call { try $0.lineage() }
         let current = interpretation
         let options = OpenOptions(
             delimiter: delimiter ?? (current.delimiterSource == .user ? current.delimiter : nil),
@@ -1317,6 +1423,9 @@ final class DocumentModel: GridDataSource {
         isSizingRefined = false
         if let current = call({ try $0.progress() }) { progress = current }
         applyFirstScreen(screen)
+        refreshUnsavedEdits()
+        let split = call { try $0.lineage() } == lineage
+        onReadingChanged?(split ? .sameSplit : .newSplit)
         onChange?(.content)
         startWaiting()
         progressArrived(progress)
@@ -1594,8 +1703,15 @@ final class DocumentModel: GridDataSource {
     }
 
     /// Swaps in the core document a Reload opened, as handle `number`.
-    private func adoptReloaded(_ new: LealFFI.Document, url: URL, reference: ModelReference, number: Int) throws {
+    /// `recovered`: Recover changes opened it, after a failure, with the
+    /// failed document's edits replayed into it (task 2.5.2).
+    private func adoptReloaded(_ new: LealFFI.Document, url: URL, reference: ModelReference, number: Int, recovered: Bool = false) throws {
         let screen = try new.firstScreen()
+        if recovered {
+            // The failed document's state goes: calls work again.
+            failure = nil
+            observeVolumesAndActivation()
+        }
 
         // From here on, the new core document.
         for task in tasks { task.cancel() }
@@ -1644,15 +1760,77 @@ final class DocumentModel: GridDataSource {
         canSave = true
         original = call({ try $0.original() }) ?? OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
         isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
+        if recovered {
+            // The first screen was read before the replay: the counts and
+            // the header row are as the edits leave them now.
+            if let current = call({ try $0.progress() }) { progress = current }
+            if let count = call({ try $0.columnCount() }) { fileColumnCount = Int(count) }
+        }
         applyFirstScreen(screen)
+        if recovered, interpretation.header { reloadHeaderTitles() }
         for column in resizedColumns where column < columnWidths.count && column < resized.count {
             columnWidths[column] = resized[column]
         }
         refreshDriveState()
+        hasUnsavedEdits = false
+        refreshUnsavedEdits()
+        if !recovered { onReadingChanged?(.replaced) }
         onChange?(.reloaded)
         startWaiting()
         watchOriginal()
         progressArrived(progress)
+    }
+
+    // MARK: Recover changes (task 2.5.2, ADR-0008 decision 5)
+
+    /// **Recover changes** after a failure (DESIGN §3.9): opens the file
+    /// afresh, with the journal's `choices` where the file still reads
+    /// that way, waits for its index (a row not reached yet would be
+    /// refused as `NotReadYet`), replays `commands` into it, and adopts it,
+    /// so the window carries on. All of it but the adoption runs off the
+    /// main thread (the open reads the file, ADR-0009). Returns the
+    /// replay's report, or `nil` if the model closed meanwhile or hasn't
+    /// failed.
+    ///
+    /// - Throws: the open error, if the file can't be opened; the model is
+    ///   then still failed.
+    func recover(_ commands: [EditCommand], choices: ReadingChoices?) async throws -> ReplayReport? {
+        guard failure != nil, handle != nil, !isRecovering else { return nil }
+        isRecovering = true
+        defer { isRecovering = false }
+        let url = url
+        let number = handleNumber + 1
+        let reference = ModelReference()
+        let environment = environment
+        let options = reloadOptions
+        let opened: LealFFI.Document = try await FileWork.run {
+            let opened = try Self.openReloaded(url: url, environment: environment, options: options, reference: reference, number: number)
+            // The split the edits were made in, where detection now says
+            // otherwise (Treat As or Reopen with Encoding before the
+            // edits). Header row or not, the rows are the same.
+            if let choices {
+                let shown = try opened.firstScreen().interpretation
+                if shown.delimiter != choices.delimiter || shown.encoding != choices.encoding {
+                    _ = try? opened.reinterpret(options: OpenOptions(
+                        delimiter: choices.delimiter,
+                        header: choices.header,
+                        encoding: choices.encoding,
+                        firstScreenRows: 1,
+                        maxChars: GridMetrics.maxCellCharacters
+                    ))
+                }
+            }
+            return opened
+        }
+        var held: LealFFI.Document? = opened
+        defer { CoreRelease.later(&held) }
+        // A read error stops the index: the rows past it are refused, and
+        // named.
+        try? await opened.indexJob().finish()
+        let report = try await FileWork.run { try opened.replay(commands: commands) }
+        guard handle != nil, number == handleNumber + 1 else { return nil }
+        try adoptReloaded(opened, url: url, reference: reference, number: number, recovered: true)
+        return report
     }
 
     // MARK: Status bar
@@ -1680,7 +1858,8 @@ final class DocumentModel: GridDataSource {
             infoKinds: diagnostics?.diagnostics.filter { $0.severity == .info }.map(\.kind) ?? [],
             warningKinds: Int(diagnostics?.bannerKinds ?? 0),
             notes: interpretation.notes,
-            encodingChoices: interpretation.encodingChoices
+            encodingChoices: interpretation.encodingChoices,
+            unsavedEdits: failure == nil && hasUnsavedEdits
         )
     }
 

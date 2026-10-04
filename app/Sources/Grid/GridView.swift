@@ -335,7 +335,12 @@ final class GridView: StripContentView, NSMenuItemValidation {
                     CellPainter.drawSkeleton(row: row, column: column, in: rect, alignment: alignment, palette: palette, context: context)
                     continue
                 }
-                switch source.cell(row: row, column: column) {
+                let cell = source.cell(row: row, column: column)
+                if source.isEdited(row: row, column: column) {
+                    glyphs.draw(in: context)
+                    CellPainter.drawEditedMark(in: rect, palette: palette, context: context)
+                }
+                switch cell {
                 case let .text(value, truncated):
                     guard !value.isEmpty || truncated else { continue }
                     let number = alignment == .trailing

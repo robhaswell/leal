@@ -817,6 +817,21 @@ enum CellPainter {
         context.restoreGState()
     }
 
+    /// An edited, unsaved cell's mark (mockup 05a, task 2.5.2): a small
+    /// triangle in the accent colour in the cell's top leading corner.
+    static func drawEditedMark(in rect: CGRect, palette: GridPalette, context: CGContext) {
+        let size: CGFloat = 6
+        let x = rect.minX + 1
+        let y = rect.minY + 1
+        context.setFillColor(palette.accent)
+        context.beginPath()
+        context.move(to: CGPoint(x: x, y: y))
+        context.addLine(to: CGPoint(x: x + size, y: y))
+        context.addLine(to: CGPoint(x: x, y: y + size))
+        context.closePath()
+        context.fillPath()
+    }
+
     /// The gutter's marker for a row with a warning or an error (ADR-0002
     /// question 7, mockup 03a): an orange dot at the gutter's leading edge.
     static func drawGutterMarker(rowRect rect: CGRect, context: CGContext) {

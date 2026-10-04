@@ -28,6 +28,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// so it stays in step with the file shown. It opens the file off the
     /// main thread (task 2.0). Without one, the model reloads.
     var onReload: (() async throws -> Void)?
+    /// Asks whether to throw the unsaved edits away (task 2.5.2), before a
+    /// Reload, through the `NSDocument`: `answer` hears whether to go on.
+    /// Without one, the edits go without asking.
+    var confirmDiscardingEdits: ((_ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
     /// A Reload, while it is under way.
     private(set) var reloading: Task<Void, Never>? {
         didSet { updateSaveAsUTF8Button() }
@@ -309,7 +313,30 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             inspector.textView.isEditable = false
             find.stop()
             onFailure?()
+        case .structure:
+            // Rows or a column inserted or deleted (an undo or a redo of
+            // one): every row after it moved.
+            grid.setColumnWidths(model.columnWidths)
+            grid.invalidateContent()
+            grid.reloadData()
+            grid.headerView.invalidateContent()
+            if let cell = grid.activeCell, cell.row >= model.rowCount || cell.column >= model.columnCount {
+                grid.activeCell = model.rowCount > 0 && model.columnCount > 0
+                    ? CellPosition(row: min(cell.row, model.rowCount - 1), column: min(cell.column, model.columnCount - 1))
+                    : nil
+            }
+            cellEditor.relayout()
+            if isFindBarShown { find.restart(from: grid.activeCell) }
+            updateInspector()
         case let .cells(rows):
+            // A long value being read for an editor, of a row whose
+            // values changed, is stale.
+            cellEditor.valuesChanged(rows: rows)
+            if let edit = inspectorEdit, inspectorLoading != nil, rows.contains(edit.cell.row) {
+                inspectorLoading?.cancel()
+                inspectorLoading = nil
+                inspectorEdit = nil
+            }
             grid.cellsChanged(rows: rows)
             // Find and the inspector read the cells as they are now
             // (ADR-0008 decision 2).
@@ -376,7 +403,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             encoding: model.review?.encodingSuggestion.map { "\($0)" },
             dismissed: dismissed,
             canSaveAsUTF8: canSaveAsUTF8,
-            canReinterpret: canReinterpret,
+            canReinterpret: canChangeSplit,
             minimumContentHeight: minimumContentHeight
         )
     }
@@ -589,6 +616,19 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // An edit still open is committed first (or, if the core refuses
         // it, stays open, and the file isn't read again).
         guard commitEditing() else { return NSSound.beep() }
+        // Reload throws unsaved edits away: ask first (ADR-0008 decision 4).
+        if model.hasUnsavedEdits, let confirm = confirmDiscardingEdits {
+            confirm { [weak self] proceed in
+                guard proceed, let self, reloading == nil, savingAsUTF8 == nil else { return }
+                startReload()
+            }
+            return
+        }
+        startReload()
+    }
+
+    /// Reads the file again, off the main thread.
+    private func startReload() {
         let reload = onReload
         let model = model
         model.willReload()
@@ -699,12 +739,27 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         model.canReinterpret && savingAsUTF8 == nil
     }
 
-    /// The suggestions read the file again too: off until a Reload, and
-    /// while Save As UTF-8 is under way.
+    /// Whether the file can be read with another delimiter or encoding:
+    /// as `canReinterpret`, and not while there are unsaved edits, which
+    /// are tied to how the file is split (ADR-0008 decision 4).
+    private var canChangeSplit: Bool {
+        model.canChangeSplit && savingAsUTF8 == nil
+    }
+
+    /// Why Treat As and Reopen with Encoding are off, if for a reason the
+    /// user can act on: Reload first, or save or revert the edits first.
+    var splitReason: String? {
+        if let reason = rereadReason { return reason }
+        return model.hasUnsavedEdits && !model.isFailed ? StatusText.saveOrRevertFirst : nil
+    }
+
+    /// The suggestions read the file again another way too: off until a
+    /// Reload, while there are unsaved edits, and while Save As UTF-8 is
+    /// under way.
     private func updateSuggestionButtons() {
         for suggestion in [delimiterBanner, encodingBanner] {
-            suggestion?.button?.isEnabled = canReinterpret
-            suggestion?.button?.toolTip = rereadReason
+            suggestion?.button?.isEnabled = canChangeSplit
+            suggestion?.button?.toolTip = splitReason
         }
     }
 
@@ -724,13 +779,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             return canReinterpret
         case #selector(treatAsDelimiter(_:)):
             menuItem.state = MainMenu.delimiter(of: menuItem) == model.interpretation.delimiter ? .on : .off
-            menuItem.toolTip = rereadReason
-            return canReinterpret
+            menuItem.toolTip = splitReason
+            return canChangeSplit
         case #selector(reopenWithEncoding(_:)):
             let encoding = MainMenu.encoding(of: menuItem)
             menuItem.state = encoding == model.interpretation.encoding ? .on : .off
-            menuItem.toolTip = rereadReason
-            return canReinterpret
+            menuItem.toolTip = splitReason
+            return canChangeSplit
                 && encoding.map(model.interpretation.encodingChoices.contains) == true
         case #selector(showDetails(_:)):
             return !model.isFailed && model.diagnostics?.diagnostics.isEmpty == false
@@ -1467,7 +1522,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 /// A document's window. `NSDocument` keeps its title, proxy icon, tabs and
 /// restoration in step.
 @MainActor
-final class DocumentWindowController: NSWindowController {
+final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// The mockups' window: 1200 × 780 points with its title bar.
     static let contentSize = NSSize(width: 1200, height: 752)
     /// The smallest the window's content may be with no banners or panes;
@@ -1494,10 +1549,32 @@ final class DocumentWindowController: NSWindowController {
         // bar work either way.
         window.tabbingMode = .automatic
         super.init(window: window)
+        // For the document's undo manager (`windowWillReturnUndoManager`).
+        window.delegate = self
         shouldCascadeWindows = true
         window.center()
         content.onReadOnlyChanged = { [weak self] readOnly in self?.showLock(readOnly) }
         content.updateReadOnly()
+    }
+
+    /// The window's undo manager is the document's edit history's (task
+    /// 2.5.2): ⌘Z and ⇧⌘Z, and the Edit menu's "Undo Typing", reach the
+    /// core's commands. Text fields keep their own while they are edited.
+    func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? {
+        (document as? CSVDocument)?.history.undoManager
+    }
+
+    /// "orders.csv — Edited" while there are unsaved edits (mockup 05a).
+    /// AppKit shows that itself only for documents that autosave in place,
+    /// which Leal's don't (DESIGN §4.3); without it only the close button's
+    /// dot would say so.
+    override func windowTitle(forDocumentDisplayName displayName: String) -> String {
+        (document as? NSDocument)?.isDocumentEdited == true ? HistoryText.editedTitle(displayName) : displayName
+    }
+
+    override func setDocumentEdited(_ dirtyFlag: Bool) {
+        super.setDocumentEdited(dirtyFlag)
+        synchronizeWindowTitleWithDocumentName()
     }
 
     /// The lock glyph by the title, while the file is read-only.

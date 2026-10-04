@@ -127,10 +127,14 @@ final class StatusBarView: NSView {
         let reread = !status.changedOnDisk
         headerToggle.isEnabled = reread
         headerToggle.toolTip = reread ? Self.headerToggleHelp : StatusText.reloadFirst
-        delimiterButton?.isEnabled = reread
-        delimiterButton?.toolTip = reread ? StatusText.treatAsHelp : StatusText.reloadFirst
-        encodingButton?.isEnabled = reread
-        encodingButton?.toolTip = reread ? StatusText.reopenHelp : StatusText.reloadFirst
+        // Edits are tied to how the file is split: no other delimiter or
+        // encoding while there are any (ADR-0008 decision 4).
+        let split = reread && !status.unsavedEdits
+        let splitReason = reread ? StatusText.saveOrRevertFirst : StatusText.reloadFirst
+        delimiterButton?.isEnabled = split
+        delimiterButton?.toolTip = split ? StatusText.treatAsHelp : splitReason
+        encodingButton?.isEnabled = split
+        encodingButton?.toolTip = split ? StatusText.reopenHelp : splitReason
         badge.isHidden = status.warningKinds == 0
         badge.title = status.warningKinds.formatted()
         badge.toolTip = DiagnosticsText.badgeHelp(kinds: status.warningKinds)

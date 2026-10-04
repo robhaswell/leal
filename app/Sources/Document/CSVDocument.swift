@@ -35,6 +35,31 @@ final class CSVDocument: NSDocument {
     /// the file itself (tests).
     private(set) var openedModificationDate: Date?
 
+    /// The edit history (task 2.5.2): the undo manager over the core's
+    /// commands, the recovery journal and the change-count tokens. The
+    /// window uses its undo manager (`DocumentWindowController`);
+    /// `NSDocument`'s own is off, so the change count follows the core's
+    /// dirty state (`updateDirtyState`), not the undo manager's steps.
+    let history = EditHistory()
+    /// What the last Recover changes did, for tests.
+    private(set) var lastRecovery: ReplayReport?
+    /// A step's undo or redo the core refused, dealt with once the undo
+    /// manager is done (`stepEnded`).
+    private var refusedStep: (command: EditCommand, direction: CommandDirection, refusal: EditRefusal)?
+    /// Asks whether to save the changes before closing, in place of
+    /// `NSDocument`'s alert. Only tests set it: `answer` says whether to
+    /// close.
+    var unsavedChangesPromptForTesting: ((_ answer: @escaping @MainActor (Bool) -> Void) -> Void)?
+
+    override init() {
+        super.init()
+        hasUndoManager = false
+        let manager = history.undoManager
+        manager.willUndoOrRedo = { [weak self] in _ = self?.commitEditing() }
+        manager.didUndoOrRedo = { [weak self] in self?.stepEnded() }
+        manager.isAvailable = { [weak self] in self?.canUndoNow ?? false }
+    }
+
     /// Leal writes the file only when the user saves (DESIGN §4.3).
     nonisolated override class var autosavesInPlace: Bool { false }
 
@@ -121,6 +146,9 @@ final class CSVDocument: NSDocument {
                 guard let self, url != fileURL else { return }
                 fileURL = url
             }
+            opened.onCommand = { [weak self] command, direction in self?.commandApplied(command, as: direction) }
+            opened.onReadingChanged = { [weak self] change in self?.readingChanged(change) }
+            history.reset(choices: opened.choices)
             model = opened
         } catch {
             if case let .success(core) = core, model == nil {
@@ -237,6 +265,10 @@ final class CSVDocument: NSDocument {
         controller.content.onFailure = { [weak self] in self?.presentFailure() }
         controller.content.onReload = { [weak self] in try await self?.reloadInBackground() }
         controller.content.onSaveAsUTF8 = { [weak self] url in try await self?.saveAsUTF8(to: url) ?? false }
+        controller.content.confirmDiscardingEdits = { [weak self] answer in
+            guard let self else { return answer(true) }
+            confirmDiscardingEdits(answer)
+        }
         watchWindow(controller.window)
         if let opening {
             self.opening = nil
@@ -295,6 +327,140 @@ final class CSVDocument: NSDocument {
         super.save(sender)
     }
 
+    // MARK: Undo, the journal and dirty state (task 2.5.2)
+
+    /// Commits an edit still open in the window (the in-cell editor or the
+    /// inspector), so that it counts: before undo and redo, closing, and
+    /// anything that asks about unsaved changes. Returns whether none is
+    /// left open (the core refused it, and it stays open, saying why).
+    @discardableResult
+    func commitEditing() -> Bool {
+        windowControllers
+            .compactMap { ($0 as? DocumentWindowController)?.content }
+            .reduce(true) { $1.commitEditing() && $0 }
+    }
+
+    /// Undo and redo are off once the document has failed (Recover changes
+    /// replays the journal instead), while it recovers, and while Save As
+    /// UTF-8 replaces the file shown.
+    private var canUndoNow: Bool {
+        guard let model, !model.isFailed, !model.isRecovering else { return false }
+        return windowControllers.allSatisfy { ($0 as? DocumentWindowController)?.content.savingAsUTF8 == nil }
+    }
+
+    /// Every command the core applied (an edit, an undo, a redo) comes
+    /// here, through the model's `commandApplied`: it goes in the journal,
+    /// its undo (or redo) is registered, and the change count follows the
+    /// core's dirty state, with a token noted at the edit version.
+    private func commandApplied(_ command: EditCommand, as direction: CommandDirection) {
+        guard let model else { return }
+        let version = model.editVersion
+        history.record(command, as: direction, version: version, choices: model.choices)
+        history.register(command, as: direction) { [weak self] command, direction in
+            self?.applyStep(command, direction)
+        }
+        updateDirtyState()
+        history.noteToken(changeCountToken(for: .saveOperation), version: version)
+    }
+
+    /// An undo or redo step: the core applies it, and it comes back
+    /// through `commandApplied`. A refusal waits for the undo manager to
+    /// finish (`stepEnded`).
+    private func applyStep(_ command: EditCommand, _ direction: CommandDirection) {
+        guard let model else { return }
+        let outcome = direction == .undo ? model.undo(command) : model.redo(command)
+        if case let .refused(refusal) = outcome {
+            refusedStep = (command, direction, refusal)
+        }
+        // `.failed`: the document failed, and offers to recover the
+        // journal's edits.
+    }
+
+    /// The undo manager finished an undo or a redo. If the core refused
+    /// it (a cell no longer holds what the command left there), the steps
+    /// around it can't be trusted to apply either: the history is cleared,
+    /// with the edits left as they are, and the user is told.
+    private func stepEnded() {
+        guard let (command, direction, refusal) = refusedStep else { return }
+        refusedStep = nil
+        history.undoManager.removeAllActions()
+        NSSound.beep()
+        guard let window = windowControllers.first?.window else { return }
+        let alert = NSAlert()
+        alert.messageText = HistoryText.undoRefused(EditHistory.actionName(for: command), undo: direction == .undo)
+        alert.informativeText = HistoryText.undoRefusedDetail(refusal)
+        showSheet(alert, window) { _ in }
+    }
+
+    /// The document is edited while some cell reads differently from the
+    /// file (the core's `hasUnsavedEdits`, DESIGN §3.6), so an edit set
+    /// back by hand, or undone, leaves it clean. The change count is
+    /// `NSDocument`'s, moved by this alone, so a save's token (2.5.3) marks
+    /// the edits up to its snapshot as saved and those after as not.
+    func updateDirtyState() {
+        guard let model, !model.isFailed else { return }
+        if model.hasUnsavedEdits {
+            updateChangeCount(.changeDone)
+        } else if isDocumentEdited {
+            updateChangeCount(.changeCleared)
+        }
+    }
+
+    /// The file was read again (the model's `onReadingChanged`). The
+    /// Header row keeps the edits and their history; a new split or a new
+    /// core document has none, and the commands from before it no longer
+    /// apply, so the history goes (docs/tasks/2.1.md).
+    private func readingChanged(_ change: ReadingChange) {
+        guard let model else { return }
+        switch change {
+        case .sameSplit:
+            history.readingChanged(model.choices)
+        case .newSplit, .replaced:
+            history.reset(choices: model.choices)
+            updateChangeCount(.changeCleared)
+        }
+    }
+
+    /// Asks before a Reload throws the unsaved edits away (ADR-0008
+    /// decision 4). `answer` hears whether to go on.
+    func confirmDiscardingEdits(_ answer: @escaping @MainActor (Bool) -> Void) {
+        guard let window = windowControllers.first?.window else { return answer(true) }
+        let alert = NSAlert()
+        alert.messageText = HistoryText.discardForReload(displayName ?? "")
+        alert.informativeText = HistoryText.discardForReloadDetail
+        let reload = alert.addButton(withTitle: HistoryText.reload)
+        reload.hasDestructiveAction = true
+        alert.addButton(withTitle: HistoryText.cancel)
+        showSheet(alert, window) { response in answer(response == .alertFirstButtonReturn) }
+    }
+
+    /// Closing commits an open edit first, so it counts as an unsaved
+    /// change, then asks as `NSDocument` does (Save, Don't Save, Cancel).
+    /// SEAM(2.5.3): Save then saves through the core.
+    override func canClose(withDelegate delegate: Any, shouldClose shouldCloseSelector: Selector?, contextInfo: UnsafeMutableRawPointer?) {
+        guard commitEditing() else {
+            // The core refused the open edit: it stays open, saying why.
+            return Self.answer(delegate, shouldCloseSelector, document: self, shouldClose: false, contextInfo: contextInfo)
+        }
+        if isDocumentEdited, let prompt = unsavedChangesPromptForTesting {
+            prompt { [weak self] close in
+                guard let self else { return }
+                Self.answer(delegate, shouldCloseSelector, document: self, shouldClose: close, contextInfo: contextInfo)
+            }
+            return
+        }
+        super.canClose(withDelegate: delegate, shouldClose: shouldCloseSelector, contextInfo: contextInfo)
+    }
+
+    /// Calls `canClose`'s delegate, as `NSDocument` does:
+    /// `document:shouldClose:contextInfo:`.
+    private static func answer(_ delegate: Any, _ selector: Selector?, document: NSDocument, shouldClose: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        guard let selector, let object = delegate as? NSObject, object.responds(to: selector) else { return }
+        typealias Callback = @convention(c) (NSObject, Selector, NSDocument, Bool, UnsafeMutableRawPointer?) -> Void
+        let callback = unsafeBitCast(object.method(for: selector), to: Callback.self)
+        callback(object, selector, document, shouldClose, contextInfo)
+    }
+
     override func close() {
         // The window's find search and copy go first (task 1.8): they hold
         // the core's document, and so its file, until they stop.
@@ -331,13 +497,24 @@ final class CSVDocument: NSDocument {
         isOfferingReopen = true
         guard !failureShown, let window = windowControllers.first?.window, isOnScreen(window) else { return }
         failureShown = true
+        let recover = canRecover
         showSheet(failureAlert(), window) { [weak self] response in
-            if response == .alertFirstButtonReturn {
-                self?.reopenAfterFailure(display: true) { _ in }
-            } else {
-                self?.close()
+            guard let self else { return }
+            switch (recover, response) {
+            case (true, .alertFirstButtonReturn):
+                Task { await self.recoverChanges() }
+            case (true, .alertSecondButtonReturn), (false, .alertFirstButtonReturn):
+                reopenAfterFailure(display: true) { _ in }
+            default:
+                close()
             }
         }
+    }
+
+    /// Whether the failed document had unsaved edits for Recover changes
+    /// to put back (ADR-0008 decision 5).
+    var canRecover: Bool {
+        (model?.hasUnsavedEdits ?? false) && !history.journal.isEmpty
     }
 
     /// The alert after a failure: the file's name, why in words from the
@@ -350,6 +527,10 @@ final class CSVDocument: NSDocument {
             comment: "Alert title after a panic in the core (DESIGN §3.9); the file's name"
         )
         alert.informativeText = OpenErrorText.describe(model?.failure ?? LealError.Internal(message: ""))
+        if canRecover {
+            alert.informativeText += "\n\n" + HistoryText.recoverChangesDetail
+            alert.addButton(withTitle: HistoryText.recoverChanges)
+        }
         alert.addButton(withTitle: String(localized: "Reopen", comment: "Button: open the file again after a failure"))
         alert.addButton(withTitle: String(localized: "Close", comment: "Button: close the document after a failure"))
         return alert
@@ -372,6 +553,74 @@ final class CSVDocument: NSDocument {
                 }
             }
             windowObservers.append(observer)
+        }
+    }
+
+    /// **Recover changes** (ADR-0008 decision 5, DESIGN §3.6): the model
+    /// opens the file afresh with the journal's choices and replays the
+    /// journal into it, and the window carries on with the edits. The
+    /// commands that applied are the new undo history (`EditHistory`). If
+    /// the file changed since it was opened, or an edit no longer applies,
+    /// Leal offers Save As of what it recovered and names the edits it
+    /// couldn't put back. If the file can't be opened, the failure alert
+    /// comes back.
+    func recoverChanges() async {
+        guard let model, model.isFailed, !model.isRecovering else { return }
+        isOfferingReopen = false
+        let journal = history.journal
+        let header = history.choices?.header ?? model.interpretation.header
+        // What Leal knew of the file before it failed.
+        let changedBefore = model.original.state != .unchanged || model.changedOnDisk
+        let known = fileModificationDate
+        let report: ReplayReport?
+        do {
+            report = try await model.recover(history.replayCommands, choices: history.choices)
+        } catch {
+            Logger.document.error("Recover changes failed: \(String(describing: error), privacy: .public)")
+            presentRecoveryFailure(error)
+            return
+        }
+        guard let report, self.model === model, !model.isFailed else { return }
+        failureShown = false
+        lastRecovery = report
+        let url = model.url
+        let modified = await FileWork.run { Self.modificationDate(of: url) }
+        history.rebuild(from: report, version: model.editVersion, choices: model.choices) { [weak self] command, direction in
+            self?.applyStep(command, direction)
+        }
+        updateDirtyState()
+        history.noteToken(changeCountToken(for: .saveOperation), version: model.editVersion)
+        let changed = changedBefore || (known != nil && modified != known)
+        guard changed || !report.refused.isEmpty, let window = windowControllers.first?.window else { return }
+        let refused = report.refused.compactMap { item -> (command: EditCommand, refusal: EditRefusal)? in
+            let index = Int(item.index)
+            return index < journal.count ? (journal[index].applied, item.refusal) : nil
+        }
+        let alert = NSAlert()
+        alert.messageText = HistoryText.recovered(displayName ?? "", applied: journal.count - refused.count, total: journal.count)
+        alert.informativeText = refused.isEmpty
+            ? HistoryText.recoveredDetail
+            : HistoryText.refused(refused, header: header) + "\n\n" + HistoryText.recoveredDetail
+        alert.addButton(withTitle: HistoryText.saveAs)
+        alert.addButton(withTitle: HistoryText.notNow)
+        showSheet(alert, window) { [weak self] response in
+            // SEAM(2.5.3): Save As saves through the core.
+            if response == .alertFirstButtonReturn { self?.saveAs(nil) }
+        }
+    }
+
+    /// Recover changes couldn't open the file: say why, then offer the
+    /// failure's choices again.
+    private func presentRecoveryFailure(_ error: any Error) {
+        isOfferingReopen = true
+        guard let window = windowControllers.first?.window else { return }
+        let alert = NSAlert()
+        alert.messageText = HistoryText.recoveryFailed(displayName ?? "")
+        alert.informativeText = OpenErrorText.describe(error)
+        showSheet(alert, window) { [weak self] _ in
+            guard let self else { return }
+            failureShown = false
+            presentFailure()
         }
     }
 

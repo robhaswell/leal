@@ -40,6 +40,9 @@ struct StatusSummary: Equatable, Sendable {
     var notes: [InterpretationNote] = []
     /// What **Reopen with encoding** offers.
     var encodingChoices: [TextEncoding] = []
+    /// Some cell reads differently from the file (task 2.5.2): **Treat
+    /// as** and **Reopen with encoding** are off (ADR-0008 decision 4).
+    var unsavedEdits = false
 }
 
 /// One of the status bar's segments.
@@ -229,6 +232,15 @@ enum StatusText {
         String(
             localized: "The file changed while Leal was reading it. Reload it first.",
             comment: "Tooltip of Treat As, Reopen with Encoding and the Header row while they are off: the file changed while it was read (1.1a)"
+        )
+    }
+
+    /// Why Treat As and Reopen with Encoding are off while there are
+    /// unsaved edits (ADR-0008 decision 4).
+    static var saveOrRevertFirst: String {
+        String(
+            localized: "Save or revert your changes first.",
+            comment: "Tooltip of Treat As and Reopen with Encoding while they are off: the document has unsaved edits, which are tied to how the file is split into cells (ADR-0008 decision 4)"
         )
     }
 
