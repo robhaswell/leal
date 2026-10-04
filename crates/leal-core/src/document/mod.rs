@@ -125,7 +125,7 @@ use crate::source::{
     OpenError, Original, OriginalState, OriginalStatus, ReadError, ReadErrorKind, Source, Storage,
     TempFolders, VolumeInfo,
 };
-pub(crate) use view::RowView;
+pub(crate) use view::{RowView, ViewCell};
 
 /// Where an occurrence of a diagnostic is, for the details popover's
 /// **Previous** and **Next** (task 1.7): the cell to select.
@@ -236,6 +236,11 @@ pub struct RowCells {
     /// The row's cells in the window: fewer if the row ends inside it, none
     /// if it ends before it.
     pub cells: Vec<Cell>,
+    /// The columns of the window's cells that hold an edit (a value that
+    /// reads differently from the file's), in order: for the grid's
+    /// edited-cell marks (task 2.5.2, mockup 05a). A new row's own values
+    /// and a column insert's aren't edits. Empty for a row with no edits.
+    pub edited: Vec<usize>,
 }
 
 /// What first paint (P0) found: how to read the file, and its first rows.
@@ -736,15 +741,17 @@ impl Document {
             // clamped first.)
             let start = columns.start.min(count);
             let window = start..columns.end.clamp(start, count);
-            let cells = if let Some(parsed) = view.plain() {
+            let (cells, edited) = if let Some(parsed) = view.plain() {
                 let fields = parsed.fields().get(window).unwrap_or_default();
-                cells(view.parser(), view.bytes(), view.base(), fields, max_chars)
+                let cells = cells(view.parser(), view.bytes(), view.base(), fields, max_chars);
+                (cells, Vec::new())
             } else {
                 edited_cells(&view, window, max_chars)
             };
             RowCells {
                 field_count: count,
                 cells,
+                edited,
             }
         })
     }
@@ -2559,20 +2566,31 @@ fn row_cells(view: &RowView<'_>, max_chars: usize) -> Vec<Cell> {
             max_chars,
         );
     }
-    edited_cells(view, 0..view.len(), max_chars)
+    edited_cells(view, 0..view.len(), max_chars).0
 }
 
-/// Cells `columns` of an edited row, as it reads now.
-fn edited_cells(view: &RowView<'_>, columns: Range<usize>, max_chars: usize) -> Vec<Cell> {
-    columns
+/// Cells `columns` of an edited row, as it reads now, and which of those
+/// columns hold an edit.
+fn edited_cells(
+    view: &RowView<'_>,
+    columns: Range<usize>,
+    max_chars: usize,
+) -> (Vec<Cell>, Vec<usize>) {
+    let mut edited = Vec::new();
+    let cells = columns
         .filter_map(|column| {
-            let (text, truncated) = view.prefix(column, max_chars)?;
+            let cell = view.cell(column)?;
+            if matches!(cell, ViewCell::Edited(_)) {
+                edited.push(column);
+            }
+            let (text, truncated) = view.prefix_of(cell, max_chars);
             Some(Cell {
                 text: text.into_owned(),
                 truncated,
             })
         })
-        .collect()
+        .collect();
+    (cells, edited)
 }
 
 /// A progress report for the app, in logical rows (`edits`' rows inserted

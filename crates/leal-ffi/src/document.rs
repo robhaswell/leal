@@ -356,6 +356,10 @@ pub struct RowCells {
     pub field_count: u32,
     /// The row's cells in the window.
     pub cells: Vec<Cell>,
+    /// The window's columns whose cells hold an edit (a value that reads
+    /// differently from the file's), in order, for the grid's edited-cell
+    /// marks (mockup 05a). Empty for a row with no edits.
+    pub edited: Vec<u32>,
 }
 
 /// First paint's result. See [`leal_core::document::FirstScreen`].
@@ -1701,6 +1705,7 @@ impl From<document::RowCells> for RowCells {
         RowCells {
             field_count: to_u32(row.field_count),
             cells: row.cells.into_iter().map(Cell::from).collect(),
+            edited: row.edited.into_iter().map(to_u32).collect(),
         }
     }
 }

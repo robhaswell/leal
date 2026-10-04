@@ -358,3 +358,46 @@ fn columns_inserted_and_deleted_undo_redo_and_replay() {
     }
     assert!(!fresh.has_unsaved_edits().unwrap());
 }
+
+/// What task 2.5.2's journal needs: an undo recorded as the command's
+/// inverse replays as the undo did, for cell and structural commands alike;
+/// and `cells` names the edited cells, for the grid's marks.
+#[test]
+fn an_undo_replays_as_the_inverse_and_cells_name_the_edits() {
+    let dir = TempDir::new("edit-inverse");
+    let scheduler = Scheduler::new().unwrap();
+    let document = open(&dir, &scheduler, "a.csv");
+    let edit = document.set_cell(1, 1, "Marlowe").unwrap().unwrap();
+    let inverse = inverse_command(edit.clone());
+    assert_eq!(inverse.lineage, edit.lineage);
+    assert_eq!(
+        inverse.changes,
+        [ValueChange {
+            row: 1,
+            column: 1,
+            old_value: Some("Marlowe".into()),
+            new_value: Some("Marlow".into()),
+        }]
+    );
+    assert_eq!(inverse_command(inverse.clone()), edit);
+    let edited: Vec<Vec<u32>> = document
+        .cells(0, 3, 0, 3, 100)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.edited)
+        .collect();
+    assert_eq!(edited, [vec![], vec![1], vec![]]);
+
+    let delete = document.delete_rows(2, 1).unwrap().unwrap();
+    document.undo(delete.clone()).unwrap();
+
+    // The journal: the edit, the delete, the delete's undo.
+    let fresh = open(&dir, &scheduler, "b.csv");
+    let journal = vec![edit, delete.clone(), inverse_command(delete)];
+    let report = fresh.replay(journal).unwrap();
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    assert_eq!(fresh.row_count().unwrap(), 4);
+    for row in 0..4 {
+        assert_eq!(name(&fresh, row), name(&document, row));
+    }
+}

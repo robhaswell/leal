@@ -145,6 +145,49 @@ fn an_edit_reads_everywhere_the_row_is_read() {
 /// An edit changes the overlay in place unless a reader holds it (a copy
 /// in progress): with 100,000 edited rows, copying it on every edit made
 /// one take 1.7 ms instead of under 1 µs (`edits/set_cell_100k_edited_rows`).
+/// The grid's window of cells says which hold an edit (task 2.5.2, the
+/// edited-cell triangles of mockup 05a): an edited value, in the file's own
+/// fields or a hatched cell, but not a new row's own values, a column
+/// insert's, nor a value set back to the file's.
+#[test]
+fn a_window_of_cells_names_the_edited_ones() {
+    let dir = Dir::new("edited-window");
+    let document = open_indexed(&dir, "a.csv", FILE);
+    let edited = |rows: Range<usize>, columns: Range<usize>| -> Vec<Vec<usize>> {
+        document
+            .cells(rows, columns, 100)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.edited)
+            .collect()
+    };
+    assert_eq!(edited(0..4, 0..3), vec![Vec::<usize>::new(); 4], "no edits");
+
+    set(&document, 1, 1, "Marlowe");
+    set(&document, 2, 2, "late"); // a short row's hatched cell
+    assert_eq!(edited(0..4, 0..3), [vec![], vec![1], vec![2], vec![]]);
+    // Only the window's columns, by their place in the row.
+    assert_eq!(edited(1..3, 2..3), [vec![], vec![2]]);
+    assert_eq!(edited(1..2, 0..1), [vec![]]);
+
+    // Set back to the file's value: no edit.
+    let back = set(&document, 1, 1, "Marlow");
+    assert_eq!(edited(1..2, 0..3), [vec![]]);
+    document.apply(&back.inverse()).unwrap();
+    assert_eq!(edited(1..2, 0..3), [vec![1]]);
+
+    // A new row's own values and a new column's aren't edits; an edit to
+    // either is, and the edits move with the column insert.
+    document
+        .insert_rows(1, &[vec!["0".into(), "Vane".into()]])
+        .unwrap();
+    document.insert_column(0, "new").unwrap();
+    assert_eq!(edited(1..3, 0..4), [vec![], vec![2]]);
+    set(&document, 1, 2, "Vale");
+    set(&document, 2, 0, "newer");
+    assert_eq!(edited(1..3, 0..4), [vec![2], vec![0, 2]]);
+}
+
 #[test]
 fn an_edit_copies_the_overlay_only_while_a_reader_holds_it() {
     let dir = Dir::new("edit-in-place");

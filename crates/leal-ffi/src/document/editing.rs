@@ -277,6 +277,15 @@ impl From<EditCommand> for Command {
     }
 }
 
+/// The command that undoes `command`: what [`Document::undo`] applies. The
+/// app's recovery journal (task 2.5.2) records an undo as this, so a replay
+/// applies what the undo did (ADR-0008 decision 5).
+#[uniffi::export]
+#[must_use]
+pub fn inverse_command(command: EditCommand) -> EditCommand {
+    Command::from(command).into_inverse().into()
+}
+
 /// The refusal, and the cell it names.
 fn refusal(error: &EditError) -> (EditRefusal, Option<usize>, Option<usize>) {
     match *error {
