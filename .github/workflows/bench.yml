@@ -53,12 +53,14 @@ jobs:
     # The same image as the CI workflow's `check` job: an Apple silicon VM
     # (M1-class, 3 cores), not the reference machine (a base M1 Air).
     runs-on: macos-26
-    # Two attempts took about 35 minutes at run 37069372104, and the group
-    # canaries add about 2 (50 s an attempt), so about 37. A third attempt
-    # reruns only the groups it rechecks: about 3 minutes for one group, and
-    # at worst another full attempt, about 17 minutes. That is about 54
-    # minutes at worst; 75 leaves room for a slow runner.
-    timeout-minutes: 75
+    # The suite has grown: at run 37324784963 each side took about 17
+    # minutes, so attempt 1 (with both builds, about 5) took 41 and attempt
+    # 2 another 34. Those 75 minutes ran into the old 75-minute limit, as
+    # did the three runs before it. A third attempt reruns only the groups
+    # it rechecks: about 3 minutes for one group, and at worst another full
+    # attempt, about 34 minutes. That is about 110 minutes at worst; 130
+    # leaves room for a slow runner.
+    timeout-minutes: 130
     steps:
       # The full history, so the base commit can be built.
       - uses: actions/checkout@v7
