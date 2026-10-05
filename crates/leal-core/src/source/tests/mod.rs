@@ -350,6 +350,7 @@ impl DiskImage {
         // What went wrong along the way, reported if anything did.
         let mut trouble = Vec::new();
         let mut showed_holders = false;
+        let mut forced_since: Option<Instant> = None;
         loop {
             let attachments = attachments_of(&self.image, &mut trouble);
             // One device per attachment: detaching it detaches the rest.
@@ -358,8 +359,15 @@ impl DiskImage {
                 .filter_map(|attachment| attachment.present.first().cloned())
                 .collect();
             let elapsed = started.elapsed();
-            let out_of_time = elapsed >= normally_for + forced_for;
-            let force = elapsed >= normally_for;
+            // The forced phase has its own budget, counted from when it
+            // starts: a single ordinary detach can block for longer than
+            // `normally_for` (on the CI runner, 11 s before "Resource
+            // busy"), and `-force` must still get its turn after that.
+            if elapsed >= normally_for {
+                forced_since.get_or_insert_with(Instant::now);
+            }
+            let force = forced_since.is_some();
+            let out_of_time = forced_since.is_some_and(|since| since.elapsed() >= forced_for);
             let still_mounted: Vec<&Path> = [self.mount.as_path(), self.elsewhere.as_path()]
                 .into_iter()
                 .filter(|point| mounted(point))
@@ -511,7 +519,8 @@ impl Drop for DiskImage {
 }
 
 /// How long [`DiskImage::detach_all`] tries an ordinary detach, and then
-/// `-force`, before reporting the image as leaked; and the longest wait
+/// `-force` (each counted from its own start, so a slow refusal of the
+/// ordinary one doesn't use up the forced one's time), before reporting the image as leaked; and the longest wait
 /// between two tries. A volume can be busy for a moment after a file on it
 /// is closed (the disk arbitration daemon, or another process, still
 /// looking at it); a refused ordinary detach itself takes from a fraction
