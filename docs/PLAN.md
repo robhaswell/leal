@@ -796,6 +796,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     leaves Insert Column off with no reason given; with the find bar
     focused the row and column items are off with no tooltip; VoiceOver
     announces nothing after a successful insert or delete.
+  - [ ] From the phase 2 gate (round C, docs/tasks/2.G-c.md): an app test
+    that drives a disk-full save to its alert; tests for the carry-over's
+    lost-row path (the old reading's drive gone between a save's write and
+    its carry-over), `copy_metadata_again` on a write-only file, the
+    remember/save race and `LineReadAhead`'s wanted range.
 - [x] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
   - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no

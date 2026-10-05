@@ -996,7 +996,7 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Insert row below / delete row (in the in-cell editor, or the inspector while editing, ⌘⌫ deletes text to the start of the line instead) | ⌘↩ / ⌘⌫ |
 | Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |
-| Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |
+| Commit an edit in the inspector (Return inserts a newline there; with the inspector focused but not editing, ⌘↩ is Insert Row Below's) | ⌘↩ |
 
 ### 4.3 Documents
 
