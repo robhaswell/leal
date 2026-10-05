@@ -733,7 +733,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
   - Find restarts after a column insert or delete; it still catches up,
     without restarting, after cell edits and row inserts and deletes.
     (ADR-0014 decision 2)
-- [ ] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
+- [x] **2.6 App: paste and clear** — multi-cell paste, Delete clears.
   - Pasting over short rows follows the hatched-cell rule from 2.1.
     (ADR-0005 decision 2)
   - A row edited out to a far hatched cell (up to column 2²⁰) makes
