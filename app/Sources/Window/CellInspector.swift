@@ -173,9 +173,6 @@ final class InspectorTextView: LiteralTextView {
     var onCommit: (() -> Void)?
     /// Esc was pressed: cancels it.
     var onCancel: (() -> Void)?
-    /// The line break Return puts in (`DocumentModel.lineBreak`).
-    var lineBreak = "\n"
-
     override func insertNewline(_ sender: Any?) {
         guard isEditable else { return super.insertNewline(sender) }
         insertText(lineBreak, replacementRange: selectedRange())
@@ -190,8 +187,15 @@ final class InspectorTextView: LiteralTextView {
         onCancel()
     }
 
+    /// ⌘↩ (and ⌘ with the keypad's Enter) commits while editing. Not
+    /// editing (a missing cell's note, an unread row), there is nothing to
+    /// commit, and the key is Insert Row Below's, as its menu item (on)
+    /// says, as ⌘⌫ is Delete Row's there (`LiteralTextView`; phase 2 gate).
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if Self.isCommit(event), window?.firstResponder === self {
+            guard isEditable else {
+                return tryToPerform(DocumentViewController.action(.insertRowBelow), with: self)
+            }
             onCommit?()
             return true
         }

@@ -316,6 +316,8 @@ final class SelectionTests: XCTestCase {
         window.contentView = inspector
         var commits = 0
         inspector.textView.onCommit = { commits += 1 }
+        // Editing: not editing, ⌘↩ is Insert Row Below's (StructureTests).
+        inspector.textView.isEditable = true
         window.makeFirstResponder(inspector.textView)
         let event = { (characters: String, code: UInt16, flags: NSEvent.ModifierFlags) in
             try XCTUnwrap(NSEvent.keyEvent(

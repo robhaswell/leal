@@ -934,6 +934,39 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(content.lastAnnouncement, "Row deleted")
     }
 
+    /// With the inspector focused but with nothing it can edit, ⌘↩ (and ⌘
+    /// with the keypad's Enter) is Insert Row Below's, as its menu item
+    /// (on) says, not swallowed as a commit of nothing (phase 2 gate);
+    /// while the inspector edits, it commits.
+    func testCommandReturnInTheInspectorNotEditingInsertsARow() async throws {
+        let opened = try await open(file("inspector-return.csv", "a,b,c\n1,2,3\n4\n5,6,7\n"))
+        let (model, content, window) = (opened.model, opened.content, opened.window)
+        try await waitUntil("the short row known") { model.isHatched(row: 1, column: 1) }
+        content.setInspectorShown(true)
+        let text = content.inspector.textView
+        for (code, rows) in [(UInt16(36), 4), (UInt16(76), 5)] {
+            window.makeFirstResponder(opened.grid.gridView)
+            opened.grid.select(CellPosition(row: 1, column: 1))
+            await content.inspectorTask?.value
+            window.makeFirstResponder(text)
+            XCTAssertFalse(text.isEditable, "showing a note")
+            XCTAssertTrue(validate(opened, .insertRowBelow).0, "the menu item is on")
+            let enter = code == 36 ? "\r" : "\u{3}"
+            XCTAssertTrue(text.performKeyEquivalent(with: try key(enter, code: code, window: window)))
+            XCTAssertEqual(model.rowCount, rows, "a row went in below, as the menu item says")
+            XCTAssertEqual(opened.undo.undoActionName, "Insert Row")
+        }
+
+        // Editing: a commit, no row.
+        window.makeFirstResponder(opened.grid.gridView)
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        window.makeFirstResponder(text)
+        XCTAssertTrue(text.isEditable)
+        XCTAssertTrue(text.performKeyEquivalent(with: try key("\r", code: 36, window: window)))
+        XCTAssertEqual(model.rowCount, 5, "no row inserted")
+    }
+
     /// VoiceOver hears what a successful insert, duplicate or delete did.
     func testVoiceOverHearsWhatChanged() async throws {
         let opened = try await open(file("announce.csv", csv))
