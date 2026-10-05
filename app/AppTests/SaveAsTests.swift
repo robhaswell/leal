@@ -886,6 +886,10 @@ final class SaveAsTests: XCTestCase {
         let url = try file("restart.csv", text(rows: 20_000))
         let (document, model, content) = try await open(url, indexed: false)
         try await waitUntil("disconnected") { model.storage == .disconnected }
+        // Both jobs stopped at the disconnection, each having started its
+        // look at the file: none can start one later, as the save ends,
+        // and reconnect before the save does (CI run 37315291307).
+        try await waitUntil("the jobs stopped") { model.jobsEndedForTesting == [.index, .review] }
         set(model, 0, 1, "edited")
         let generation = model.generation
         debugHoldNextSave()
@@ -903,6 +907,8 @@ final class SaveAsTests: XCTestCase {
         try await waitUntil("no check under way") { !model.isCheckingOriginalForTesting }
         let check = try XCTUnwrap(model.checkOriginal(), "a check of the test's own")
         await check.value
+        // One asked for meanwhile runs after it: done before the save ends.
+        try await waitUntil("no check under way") { !model.isCheckingOriginalForTesting }
         XCTAssertEqual(model.generation, generation, "not while the save runs")
         content.cancelOperation(nil)
         debugReleaseHeldSave()

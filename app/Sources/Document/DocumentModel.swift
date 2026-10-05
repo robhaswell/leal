@@ -213,6 +213,10 @@ final class DocumentModel: GridDataSource {
     /// the window shows the rows read and no progress. Their banners say
     /// why (phase 1 review).
     private(set) var indexStopped = false
+    /// The current reading's background jobs that ended with an error, each
+    /// having started any look at the file it asks for (`checkOriginal`).
+    /// For tests that need no look but their own.
+    private(set) var jobsEndedForTesting: Set<BackgroundJob> = []
     /// Whether Save could write over the file: not after a disconnection
     /// or a change while reading, nor while its drive is away (ADR-0006).
     /// Save As always can.
@@ -572,6 +576,7 @@ final class DocumentModel: GridDataSource {
     /// a read error.
     func jobEnded(_ error: any Error, job: BackgroundJob, reading: ReadingID) {
         let current = reading == readingID
+        defer { if current { jobsEndedForTesting.insert(job) } }
         switch error as? JobFailure {
         case .Panicked?:
             fail(error)
@@ -1463,6 +1468,7 @@ final class DocumentModel: GridDataSource {
         diagnostics = nil
         readStopped = false
         indexStopped = false
+        jobsEndedForTesting.removeAll()
         flagBlocks.removeAll()
         tiles.removeAll()
         resizedColumns.removeAll()
@@ -1608,6 +1614,7 @@ final class DocumentModel: GridDataSource {
         review = nil
         readStopped = false
         indexStopped = false
+        jobsEndedForTesting.removeAll()
         reviewedLineEnding = nil
         flagBlocks.removeAll()
         tiles.removeAll()
@@ -2001,6 +2008,7 @@ final class DocumentModel: GridDataSource {
         review = nil
         readStopped = false
         indexStopped = false
+        jobsEndedForTesting.removeAll()
         reviewedLineEnding = nil
         flagBlocks.removeAll()
         tiles.removeAll()
@@ -2124,6 +2132,7 @@ final class DocumentModel: GridDataSource {
         changedOnDisk = false
         readStopped = false
         indexStopped = false
+        jobsEndedForTesting.removeAll()
         canSave = true
         original = call({ try $0.original() }) ?? OriginalStatus(state: .unchanged, path: url.path(percentEncoded: false), diverged: false)
         isOnNetworkShare = call({ try $0.isOnNetworkShare() }) ?? isOnNetworkShare
