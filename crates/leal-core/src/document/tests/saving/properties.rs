@@ -546,6 +546,7 @@ fn save_matches_the_oracle(case: &EditCase, mode: Mode) -> Result<Outcome, TestC
     // splices cross chunk boundaries everywhere, inside rows and fields.
     crate::document::saving::TEST_CHUNK_BYTES.store(61, Ordering::Relaxed);
     let (document, opened, chosen_encoding, oracle, made) = open_and_edit(case)?;
+    check_field_counts(&document, &oracle)?;
     let lineage = document.lineage();
     let expected = oracle.save();
     let kind = if mode == Mode::SaveAs {
@@ -793,6 +794,21 @@ fn check_reopen(
     Ok(())
 }
 
+/// Before any save, the edited grid is the oracle's shape: as many rows,
+/// and each row with as many fields as the oracle's row has cells. (What
+/// the save then writes can't make up for cells the grid shows that the
+/// file won't have, or the other way about.)
+fn check_field_counts(document: &Document, oracle: &Oracle<'_>) -> Result<(), TestCaseError> {
+    prop_assert_eq!(document.row_count(), oracle.row_count());
+    for row in 0..oracle.row_count() {
+        let cells = document
+            .cells(row..row + 1, 0..usize::MAX, usize::MAX)
+            .unwrap();
+        prop_assert_eq!(cells[0].field_count, oracle.row_len(row), "row {}", row);
+    }
+    Ok(())
+}
+
 /// Every row of `document` reads as the oracle's, with the saved file's
 /// line endings.
 fn check_rows(
@@ -841,6 +857,7 @@ enum Converted {
 fn save_as_utf8_matches_the_oracle(case: &EditCase) -> Result<Converted, TestCaseError> {
     crate::document::saving::TEST_CHUNK_BYTES.store(61, Ordering::Relaxed);
     let (document, opened, _, oracle, _) = open_and_edit(case)?;
+    check_field_counts(&document, &oracle)?;
     let lineage = document.lineage();
     let before = document.detection();
     let expected = oracle.save_as_utf8();

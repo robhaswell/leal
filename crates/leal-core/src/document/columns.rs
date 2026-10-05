@@ -121,8 +121,10 @@ impl Document {
 
     /// What [`plan`] would refuse operation `kind` at `at` with, by the
     /// rule: past the longest row, or the open quote's cell no longer its
-    /// row's last. (By the rule, no row is a misfit and none needs a
-    /// layout of its own, `plan`'s other refusals.)
+    /// row's last. (By the rule, no row is a misfit, and the only row that
+    /// needs a layout of its own is a copy a delete leaves ending in
+    /// padding, an inserted row's, made without reading the file: neither
+    /// refuses, `plan`'s other refusals.)
     fn can_change_column(&self, kind: OpKind, at: usize) -> Result<(), EditError> {
         if self.saving.load(Ordering::Acquire) {
             return Err(EditError::Saving);

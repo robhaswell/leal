@@ -3087,6 +3087,107 @@ fn a_copys_padding_goes_with_its_hatched_cell_before_a_save() {
     assert_eq!(lens(&document), [3, 1, 1, 1]);
 }
 
+/// The field counts of every row of `document`, as the grid reads them.
+fn field_counts(document: &Document) -> Vec<usize> {
+    (0..document.row_count())
+        .map(|row| {
+            document
+                .cells(row..row + 1, 0..usize::MAX, usize::MAX)
+                .unwrap()[0]
+                .field_count
+        })
+        .collect()
+}
+
+/// A copy's padding and a column delete across a save (ADR-0014 decision
+/// 8): after the save the delete is undone and redone by value, and the
+/// copies read as they did before the save, and as the file saved again.
+#[test]
+fn a_copys_trimmed_padding_across_a_save_undone_and_redone() {
+    let dir = Dir::new("dup-padding-undo");
+    let path = dir.file("a.csv", b"a,b,c,d\n1\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 3, "z");
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    set(&document, 3, 0, "e");
+    assert_eq!(field_counts(&document), [4, 4, 4, 4]);
+    let delete = document.delete_column(3).unwrap().unwrap();
+    assert_eq!(field_counts(&document), [3, 1, 1, 1]);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b,c\n1\n1\ne\n");
+    assert_eq!(field_counts(&document), [3, 1, 1, 1]);
+
+    document.apply(&delete.inverse()).unwrap();
+    assert_eq!(field_counts(&document), [4, 4, 4, 4]);
+    document.apply(&delete).unwrap();
+    assert_eq!(field_counts(&document), [3, 1, 1, 1]);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b,c\n1\n1\ne\n");
+    assert_eq!(field_counts(&document), [3, 1, 1, 1]);
+}
+
+/// A copy whose padding cell was edited keeps its cells when the hatched
+/// cell's column is deleted: only the padding at its end, with nothing
+/// edited, goes with it.
+#[test]
+fn a_copys_edited_padding_stays_when_the_column_is_deleted() {
+    let dir = Dir::new("dup-padding-edited");
+    let path = dir.file("a.csv", b"a,b,c,d\n1\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 3, "z");
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    // The padding's last cell edited in one copy, its first in the other.
+    set(&document, 2, 2, "q");
+    set(&document, 3, 1, "p");
+    assert_eq!(field_counts(&document), [4, 4, 4, 4]);
+    let delete = document.delete_column(3).unwrap().unwrap();
+    assert_eq!(field_counts(&document), [3, 1, 3, 2]);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b,c\n1\n1,,q\n1,p\n");
+    assert_eq!(field_counts(&document), [3, 1, 3, 2]);
+    // Undone by value, the rows are as the file was with the column back.
+    document.apply(&delete.inverse()).unwrap();
+    assert_eq!(field_counts(&document), [4, 4, 4, 4]);
+}
+
+/// A row with two typed-in cells, the deleted column's not the last: the
+/// padding between them is not at the row's end, so it stays, in the row
+/// and in its copy, and the saved file says so.
+#[test]
+fn a_copy_of_a_row_with_two_typed_cells_deleting_the_earlier() {
+    let dir = Dir::new("dup-padding-two-typed");
+    let path = dir.file("a.csv", b"a,b,c,d,e\n1\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 2, "y");
+    set(&document, 1, 4, "z");
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    assert_eq!(field_counts(&document), [5, 5, 5]);
+    document.delete_column(2).unwrap().unwrap();
+    assert_eq!(field_counts(&document), [4, 4, 4]);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b,d,e\n1,,,z\n1,,,z\n");
+    assert_eq!(field_counts(&document), [4, 4, 4]);
+    // And the later typed cell's column: the row ends where `y` is.
+    let document = {
+        let path = dir.file("b.csv", b"a,b,c,d,e\n1\n");
+        let document = open_at(&path, &dir, &scheduler);
+        set(&document, 1, 2, "y");
+        set(&document, 1, 4, "z");
+        document.duplicate_rows(1, 1).unwrap().unwrap();
+        document.delete_column(4).unwrap().unwrap();
+        assert_eq!(field_counts(&document), [4, 3, 3]);
+        save(&document, &path, SaveKind::Save).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"a,b,c,d\n1,,y\n1,,y\n");
+        document
+    };
+    assert_eq!(field_counts(&document), [4, 3, 3]);
+}
+
 /// Task 2.5a: in a file that quotes every field, a copy of a short row's
 /// typed-in (hatched) cell is quoted as the row's is. Undone and redone
 /// across saves (by value, ADR-0014 decision 8), the copy follows the
