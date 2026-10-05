@@ -125,6 +125,54 @@ fn a_creation_date_before_1970_is_a_negative_timespec() {
     assert_eq!(at(UNIX_EPOCH - Duration::new(0, 1)), (-1, 999_999_999));
 }
 
+/// An attribute list or value that grew between its size and its read
+/// (`ERANGE`) is read again, a few times (phase 2 gate: a save failed).
+#[test]
+fn an_attribute_that_grows_while_it_is_read_is_read_again() {
+    let mut calls = 0;
+    let read = sys::retrying_erange(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(io::Error::from_raw_os_error(libc::ERANGE))
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(read.unwrap(), 3);
+    let mut calls = 0;
+    let read: io::Result<()> = sys::retrying_erange(|| {
+        calls += 1;
+        Err(io::Error::from_raw_os_error(libc::ERANGE))
+    });
+    assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::ERANGE));
+    assert_eq!(calls, sys::XATTR_TRIES);
+    let mut calls = 0;
+    let read: io::Result<()> = sys::retrying_erange(|| {
+        calls += 1;
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    });
+    assert!(read.is_err());
+    assert_eq!(calls, 1, "other errors aren't tried again");
+}
+
+/// A file that is there but can't be opened is an error that keeps its
+/// errno, so a save can tell a permission error from the rest (phase 2
+/// gate).
+#[test]
+fn looking_afresh_at_a_file_it_cant_open_keeps_the_errno() {
+    let dir = TempDir::new("look-afresh");
+    let path = dir.file("a.csv", b"a\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let error = write::look_afresh(&path).map(|_| ()).unwrap_err();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    assert!(
+        write::look_afresh(&dir.0.join("gone.csv"))
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// The extended attribute `name` of the file at `path`, if it has it.
 pub(crate) fn attribute(path: &Path, name: &CStr) -> Option<Vec<u8>> {
     let file = File::open(path).unwrap();

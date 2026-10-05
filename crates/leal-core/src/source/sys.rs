@@ -786,8 +786,33 @@ pub(super) fn rename_capabilities(folder: &Path) -> io::Result<RenameCapabilitie
     })
 }
 
+/// How many times the size-then-read pairs below try again when the list
+/// or a value grew between the two calls (`ERANGE`), as another app writing
+/// an attribute meanwhile makes it (phase 2 gate).
+pub(super) const XATTR_TRIES: usize = 4;
+
+/// Runs `attempt` until it doesn't fail with `ERANGE`, at most
+/// [`XATTR_TRIES`] times.
+pub(super) fn retrying_erange<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut tries = 1;
+    loop {
+        match attempt() {
+            Err(error) if error.raw_os_error() == Some(libc::ERANGE) && tries < XATTR_TRIES => {
+                tries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// The names of the open file's extended attributes (`flistxattr(2)`).
 pub(super) fn list_xattrs(file: &File) -> io::Result<Vec<CString>> {
+    retrying_erange(|| list_xattrs_once(file))
+}
+
+/// [`list_xattrs`], once: `ERANGE` if the list grew between its size and
+/// its read.
+fn list_xattrs_once(file: &File) -> io::Result<Vec<CString>> {
     // SAFETY: a null buffer and size 0 ask only for the size the list
     // needs; nothing is written. The descriptor is open and borrowed from
     // `file`. Options 0.
@@ -814,6 +839,12 @@ pub(super) fn list_xattrs(file: &File) -> io::Result<Vec<CString>> {
 /// The whole value of the open file's extended attribute `name`, however
 /// long (a resource fork can be megabytes): `None` if it has none.
 pub(super) fn read_whole_xattr(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+    retrying_erange(|| read_whole_xattr_once(file, name))
+}
+
+/// [`read_whole_xattr`], once: `ERANGE` if the value grew between its size
+/// and its read.
+fn read_whole_xattr_once(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
     // SAFETY: a null buffer and size 0 ask only for the value's size. The
     // descriptor is open and borrowed from `file`; `name` is NUL-terminated
     // and outlives the call. Position 0, options 0.

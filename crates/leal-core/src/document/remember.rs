@@ -8,6 +8,7 @@
 //! the attribute is written then, onto the saved file.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::attributes::{Fingerprint, Interpretation};
@@ -89,6 +90,13 @@ impl Document {
             return Ok(false);
         }
         existing.set_attribute(INTERPRETATION_ATTRIBUTE_C, value.as_bytes())?;
+        // A save that started meanwhile may have replaced the file, or
+        // copied its attributes before this wrote, and makes a reading of
+        // its own, reviewed in turn: this one isn't counted as remembered
+        // then (phase 2 gate).
+        if self.saving.load(Ordering::SeqCst) || !Arc::ptr_eq(&self.current(), &reading) {
+            return Ok(false);
+        }
         reading.remembered.store(true, Ordering::Release);
         Ok(true)
     }

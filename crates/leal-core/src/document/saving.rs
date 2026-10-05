@@ -1165,15 +1165,21 @@ fn carry_over(
             lost.extend(columns.iter().map(|&column| (row, column)));
             continue;
         }
-        let values: Vec<Option<String>> = Document::read_rows_of(old, row..row + 1, |view| {
+        let values = Document::read_rows_of(old, row..row + 1, |view| {
             columns
                 .iter()
                 .map(|&column| view.value(column).map(std::borrow::Cow::into_owned))
-                .collect::<Vec<_>>()
+                .collect::<Vec<Option<String>>>()
         })
         .ok()
-        .and_then(|mut rows| rows.pop())
-        .unwrap_or_default();
+        .and_then(|mut rows| rows.pop());
+        // A row the old reading can't read now (its drive went) can't be
+        // carried over: its cells are lost, and said so, not dropped
+        // silently (phase 2 gate).
+        let Some(values) = values else {
+            lost.extend(columns.iter().map(|&column| (row, column)));
+            continue;
+        };
         cells.extend(
             columns
                 .iter()

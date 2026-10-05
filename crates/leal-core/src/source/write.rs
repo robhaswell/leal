@@ -157,7 +157,12 @@ pub fn look_afresh(path: &Path) -> io::Result<Option<Existing>> {
             }))
         }
         Err(error) if error.kind() == OpenErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io::Error::new(error.io_error().kind(), error.to_string())),
+        // The errno kept, so a caller can tell a permission error from the
+        // rest (phase 2 gate); the message only where there is none.
+        Err(error) => Err(match error.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(error.io_error().kind(), error.to_string()),
+        }),
     }
 }
 
@@ -475,9 +480,11 @@ impl Staged {
         like: &Existing,
         attributes: &[(&CStr, Option<&[u8]>)],
     ) -> io::Result<Vec<String>> {
-        // Its owner can open it to change its metadata whatever its mode.
+        // Its owner may change its mode by path whatever the mode is, but
+        // may not open it for reading under a mode without read (`0o200`,
+        // copied from the old file): so the mode first, then the open.
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
         let file = File::open(&self.path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         // Copied again from `like`, last, by `apply_metadata`; where the
         // volume has none, nothing to clear.
         let _ = sys::clear_acl(&file);
