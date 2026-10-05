@@ -754,6 +754,9 @@ final class CSVDocument: NSDocument {
             // to `DocumentModel.saved`.
             model.saveEnded(job, place: place, outcomeFollows: (try? result.get()) != nil)
             if case let .success(saved) = result {
+                // Until `saveFinished` trims the journal, no undo takes out
+                // an entry the file now holds (`EditHistory.record`).
+                if let version = saved.snapshotVersion { document.history.saveWrote(through: version) }
                 document.noteWritten(saved, kind: kind, model: model)
             }
         }
@@ -1479,7 +1482,10 @@ final class CSVDocument: NSDocument {
     private func commandApplied(_ command: EditCommand, as direction: CommandDirection) {
         guard let model else { return }
         let version = model.editVersion
-        history.record(command, as: direction, version: version, choices: model.choices)
+        history.record(
+            command, as: direction, version: version, choices: model.choices,
+            savingThrough: model.saveJob?.progress().snapshotVersion
+        )
         history.register(command, as: direction) { [weak self] command, direction in
             self?.applyStep(command, direction)
         }

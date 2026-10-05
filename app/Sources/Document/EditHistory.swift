@@ -183,6 +183,9 @@ final class EditHistory {
     /// `NSDocument.changeCountToken(for: .saveOperation)` after each
     /// command, with the edit version then.
     private var tokens: [(version: UInt64, token: Any)] = []
+    /// The snapshot version of a save that wrote the file, until the
+    /// journal is trimmed to it (`saveWrote`, `savedThrough`).
+    private var writtenThrough: UInt64?
 
     /// Appends a command the core applied to the journal. An undo straight
     /// after its command's edit or redo, or a redo straight after its
@@ -191,13 +194,35 @@ final class EditHistory {
     /// 64 MB of them), after the undo history had let it go (phase 2 gate,
     /// `docs/tasks/2.G-a.md`). The redo history isn't recovered anyway
     /// (`rebuild`).
-    func record(_ command: EditCommand, as direction: CommandDirection, version: UInt64, choices: ReadingChoices) {
+    ///
+    /// Not across a save's snapshot, though: an entry at or before it is in
+    /// the file that save writes, and its undo or redo after it isn't, so
+    /// the journal must keep both until `savedThrough` trims the first
+    /// (gate review). `savingThrough`: the snapshot version of the save
+    /// running, if it has taken one; a save that has written the file but
+    /// whose journal isn't trimmed yet counts too (`saveWrote`). A save
+    /// that hasn't taken its snapshot takes it after this command, so the
+    /// file will hold both.
+    func record(
+        _ command: EditCommand, as direction: CommandDirection, version: UInt64, choices: ReadingChoices,
+        savingThrough: UInt64?
+    ) {
         self.choices = choices
-        if let last = journal.last, Self.cancels(last, command, direction) {
+        let snapshot = [savingThrough, writtenThrough].compactMap(\.self).max()
+        let afterSnapshot = { (entry: JournalEntry) in snapshot.map { entry.version > $0 } ?? true }
+        if let last = journal.last, afterSnapshot(last), Self.cancels(last, command, direction) {
             journal.removeLast()
             return
         }
         journal.append(JournalEntry(command: command, direction: direction, version: version))
+    }
+
+    /// A save wrote the edits up to `version` to the file, and the journal
+    /// is trimmed to them later (`savedThrough`, once the save's file
+    /// access ends): until then no entry at or before it is taken out
+    /// (`record`).
+    func saveWrote(through version: UInt64) {
+        writtenThrough = max(writtenThrough ?? version, version)
     }
 
     /// Whether `command` applied as `direction` takes back the journal's
@@ -260,6 +285,7 @@ final class EditHistory {
     /// into it would refuse them), and the tokens before it go.
     func savedThrough(version: UInt64) {
         journal.removeAll { $0.version <= version }
+        if let written = writtenThrough, written <= version { writtenThrough = nil }
         if let index = tokens.lastIndex(where: { $0.version <= version }) {
             tokens.removeFirst(index)
         }
@@ -271,6 +297,7 @@ final class EditHistory {
         undoManager.removeAllActions()
         journal.removeAll()
         tokens.removeAll()
+        writtenThrough = nil
         self.choices = choices
     }
 

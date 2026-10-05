@@ -88,7 +88,7 @@ impl Rows {
     /// row's values with its edits, an original row's from the file it was
     /// read from, with its edits, its unedited fields as their bytes where
     /// `parser` reads them the same. Original rows are read now (ADR-0014
-    /// decision 3). Fewer than [`len`](Self::len) if some can't be had.
+    /// decision 3). None if some can't be had.
     pub(crate) fn values(&self, parser: &RowParser) -> Result<Vec<Vec<Value>>, ReadError> {
         let mut values = Vec::new();
         self.values_in_chunks(

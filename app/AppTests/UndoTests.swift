@@ -35,6 +35,7 @@ final class UndoTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        debugReleaseHeldSave()
         if let savedEnvironment { CSVDocument.environment = savedEnvironment }
         for document in NSDocumentController.shared.documents {
             document.close()
@@ -601,6 +602,118 @@ final class UndoTests: XCTestCase {
         XCTAssertEqual(journal(), [.edit])
         undo.redo()
         XCTAssertEqual(journal(), [.edit], "nothing to redo after a new edit")
+    }
+
+    /// Gate review: an edit at or before a running save's snapshot is in
+    /// the file that save writes, and its undo during the save isn't, so
+    /// the journal keeps both until the save trims the edit; Recover
+    /// changes then gives back the document as it was, undo and all.
+    /// Once the save has ended, an edit and its undo go again.
+    func testAnUndoDuringASaveOfItsEditStaysInTheJournal() async throws {
+        let url = try file("a.csv", csv)
+        let opened = try await open(url)
+        let (document, model, undo) = (opened.document, opened.model, opened.undo)
+        let journal = { document.history.journal.map(\.direction) }
+        try set(model, 0, 1, "Marlowe")
+        let saving = try await startHeldSave(opened)
+        undo.undo()
+        XCTAssertEqual(journal(), [.edit, .undo], "the edit is in the file being written; its undo isn't")
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        XCTAssertTrue(saved)
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("1,Marlowe,3"))
+        XCTAssertEqual(journal(), [.undo], "only the undo, after the snapshot")
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertTrue(document.canRecover)
+
+        // No save running: an edit and its undo go again.
+        try set(model, 2, 1, "Haldane")
+        undo.undo()
+        XCTAssertEqual(journal(), [.undo])
+
+        try await assertRecoverGivesBack(opened, url: url, csv)
+    }
+
+    /// Gate review: the same for a redo during a save of its undo. After a
+    /// save of the edit, its undo; then, during a second save (whose
+    /// snapshot holds the undo), the redo. The file lacks the edit, the
+    /// document has it, and Recover changes puts it back.
+    func testARedoDuringASaveOfItsUndoStaysInTheJournal() async throws {
+        let url = try file("a.csv", csv)
+        let opened = try await open(url)
+        let (document, model, undo) = (opened.document, opened.model, opened.undo)
+        let journal = { document.history.journal.map(\.direction) }
+        try set(model, 0, 1, "Marlowe")
+        opened.document.save(nil)
+        let first = try await XCTUnwrap(opened.document.saving).value
+        XCTAssertTrue(first)
+        XCTAssertEqual(journal(), [])
+        undo.undo()
+        XCTAssertEqual(journal(), [.undo], "its edit was saved")
+        let saving = try await startHeldSave(opened)
+        undo.redo()
+        XCTAssertEqual(journal(), [.undo, .redo], "the undo is in the file being written; the redo isn't")
+        debugReleaseHeldSave()
+        let saved = await saving.value
+        XCTAssertTrue(saved)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), csv)
+        XCTAssertEqual(journal(), [.redo])
+        XCTAssertEqual(value(model, 0, 1), "Marlowe")
+        XCTAssertTrue(document.isDocumentEdited)
+
+        try await assertRecoverGivesBack(opened, url: url, csv.replacingOccurrences(of: "Marlow,", with: "Marlowe,"))
+    }
+
+    /// A save that has written the file but not yet trimmed the journal
+    /// (its file access still ending) holds the entries it saved too.
+    func testAnUndoAfterASaveWroteButBeforeItTrimmedStays() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let (history, model, undo) = (opened.document.history, opened.model, opened.undo)
+        try set(model, 0, 1, "Marlowe")
+        let snapshot = model.editVersion
+        history.saveWrote(through: snapshot)
+        undo.undo()
+        XCTAssertEqual(history.journal.map(\.direction), [.edit, .undo])
+        history.savedThrough(version: snapshot)
+        XCTAssertEqual(history.journal.map(\.direction), [.undo])
+        try set(model, 1, 1, "Ostravo")
+        undo.undo()
+        XCTAssertEqual(history.journal.map(\.direction), [.undo], "trimmed: an edit and its undo go again")
+    }
+
+    /// Starts a Save (⌘S) held once it has taken its snapshot of the
+    /// edits; its task.
+    private func startHeldSave(_ opened: Opened) async throws -> Task<Bool, Never> {
+        debugHoldNextSave()
+        opened.document.save(nil)
+        let saving = try XCTUnwrap(opened.document.saving)
+        try await waitUntil("the save took its snapshot") {
+            opened.model.saveJob?.progress().snapshotVersion != nil
+        }
+        return saving
+    }
+
+    /// After a failure, Recover changes replays the journal into the file
+    /// (`url`) and gives back the document as it was: saved, it writes
+    /// `expected`, which the file didn't hold.
+    private func assertRecoverGivesBack(_ opened: Opened, url: URL, _ expected: String) async throws {
+        let (document, model) = (opened.document, opened.model)
+        document.isOnScreen = { _ in true }
+        document.showSheet = { _, _, _ in }
+        let live = (0..<model.rowCount).map { row in (0..<model.columnCount).map { value(model, row, $0) } }
+        XCTAssertNotEqual(try String(contentsOf: url, encoding: .utf8), expected)
+        _ = model.call { try $0.debugPanic() }
+        XCTAssertTrue(model.isFailed)
+        await document.recoverChanges()
+        XCTAssertFalse(model.isFailed)
+        let report = try XCTUnwrap(document.lastRecovery)
+        XCTAssertTrue(report.refused.isEmpty, "\(report.refused)")
+        XCTAssertEqual((0..<model.rowCount).map { row in (0..<model.columnCount).map { value(model, row, $0) } }, live)
+        XCTAssertTrue(document.isDocumentEdited)
+        document.save(nil)
+        let saved = try await XCTUnwrap(document.saving).value
+        XCTAssertTrue(saved)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), expected)
     }
 
     /// The edited-cell triangles (mockup 05a): the cells the core names.
