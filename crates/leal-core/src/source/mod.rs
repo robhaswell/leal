@@ -89,7 +89,7 @@ mod temp;
 #[cfg(test)]
 pub(crate) mod tests;
 mod volume;
-mod write;
+pub(crate) mod write;
 
 use std::borrow::Cow;
 use std::ffi::CStr;

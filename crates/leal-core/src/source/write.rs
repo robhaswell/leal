@@ -794,7 +794,12 @@ fn apply_metadata(file: &File, like: Option<&Existing>, new_mode: u32) -> io::Re
             std::os::unix::fs::fchown(file, Some(uid), Some(gid)),
         )?;
     }
-    if let Ok(created) = like.metadata.created() {
+    if let Some(created) = like
+        .metadata
+        .created()
+        .ok()
+        .filter(|&c| has_creation_date(c))
+    {
         note("creation date", sys::set_creation_time(file, created))?;
     }
     note(
@@ -809,6 +814,15 @@ fn apply_metadata(file: &File, like: Option<&Existing>, new_mode: u32) -> io::Re
     }
     note("access control list", sys::copy_acl(&like.file, file))?;
     Ok(skipped)
+}
+
+/// Whether `created` is a real creation date. A volume without creation
+/// dates reports a birthtime of exactly -1 second (1969-12-31 23:59:59),
+/// which isn't copied onto a new file: that would show as a date a second
+/// before 1970. (0 is no sentinel: a file made then has that date, and the
+/// code before the pre-1970 fix never treated it as one.)
+pub(crate) fn has_creation_date(created: std::time::SystemTime) -> bool {
+    created != std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)
 }
 
 /// A copy of `file` in a new folder in the scratch directory, a chunk at a

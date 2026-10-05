@@ -506,6 +506,43 @@ fn save_as_utf8_writes_a_rewritten_row_that_matches_the_old_bytes() {
     assert_eq!(std::fs::read(&copy).unwrap(), "x,é\ny,è\n".as_bytes());
 }
 
+/// The non-converting counterpart: saved in place (Windows-1252 out, as
+/// read), a column-rewritten row whose new bytes equal the file's own is
+/// copied unchanged, and one that differs is written.
+#[test]
+fn save_copies_a_rewritten_row_that_matches_the_old_bytes() {
+    let dir = Dir::new("save-same-bytes");
+    let scheduler = scheduler();
+    let path = dir.file("w.csv", b"x,\xC3\xA9\ny,\xC3\xA9\n");
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1252);
+    document.delete_column(1).unwrap().unwrap();
+    // `Ã©` encodes back to `C3 A9`, the file's own bytes for row 0.
+    document.insert_column(1, "Ã©").unwrap().unwrap();
+    set(&document, 1, 1, "è");
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"x,\xC3\xA9\ny,\xE8\n");
+}
+
+/// The same case saved as UTF-8 from a UTF-16 source: the rewritten row is
+/// written as it reads (the BOM is written, as for any UTF-16 source).
+#[test]
+fn save_as_utf8_writes_a_rewritten_row_from_a_utf16_source() {
+    let dir = Dir::new("save-utf8-from-utf16");
+    let scheduler = scheduler();
+    let path = dir.file("u.csv", &utf16le("x,a\ny,a\n"));
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Utf16Le);
+    document.delete_column(1).unwrap().unwrap();
+    document.insert_column(1, "é").unwrap().unwrap();
+    set(&document, 1, 1, "è");
+    let copy = dir.0.join("u8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        "\u{FEFF}x,é\ny,è\n".as_bytes()
+    );
+}
+
 /// A refusal names at most `MAX_NAMED_CELLS` cells, and says there are
 /// more, as soon as it knows.
 #[test]
@@ -793,6 +830,45 @@ fn a_save_keeps_the_files_metadata() {
     assert_eq!(
         attribute(&path, INTERPRETATION_ATTRIBUTE_C),
         Some(fresh.to_attribute_value().into_bytes())
+    );
+}
+
+/// A volume without creation dates reports a birthtime of -1: a Save As
+/// over a file with one doesn't give the new file 1969-12-31 23:59:59.
+/// Dates around it are still kept.
+#[test]
+fn a_birthtime_of_minus_one_is_no_creation_date() {
+    use std::time::UNIX_EPOCH;
+    assert!(!crate::source::write::has_creation_date(
+        UNIX_EPOCH - Duration::from_secs(1)
+    ));
+    for kept in [
+        UNIX_EPOCH,
+        UNIX_EPOCH - Duration::from_secs(2),
+        UNIX_EPOCH - Duration::new(0, 500_000_000),
+        UNIX_EPOCH + Duration::from_secs(1),
+    ] {
+        assert!(crate::source::write::has_creation_date(kept), "{kept:?}");
+    }
+
+    let dir = Dir::new("save-birthtime-minus-one");
+    let scheduler = scheduler();
+    let path = dir.file("a.csv", b"a,b\n1,2\n");
+    let target = dir.file("t.csv", b"old\n");
+    let sentinel = UNIX_EPOCH - Duration::from_secs(1);
+    crate::source::tests::set_created(&target, sentinel);
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 1, "3");
+    let saved = save(&document, &target, SaveKind::SaveAs).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"a,b\n1,3\n");
+    assert_ne!(
+        std::fs::metadata(&target).unwrap().created().unwrap(),
+        sentinel
+    );
+    assert!(
+        saved.skipped_metadata.is_empty(),
+        "{:?}",
+        saved.skipped_metadata
     );
 }
 

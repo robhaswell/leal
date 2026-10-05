@@ -73,7 +73,7 @@ final class LineReadAhead {
         // Before the early returns below (as `CellTileCache.readAhead`,
         // task 2.6a): a batch queued earlier is checked against this
         // frame's rows even when nothing new is sent (phase 2 gate).
-        let screen = Int(min(CGFloat(source.rowCount) + 1, (visible.height / geometry.rowHeight).rounded(.up)))
+        let screen = Int(min(CGFloat(source.rowCount) + 1, (max(0, visible.height) / geometry.rowHeight).rounded(.up)))
         let top = Int(min(CGFloat(source.rowCount), max(0, (visible.minY / geometry.rowHeight).rounded(.down))))
         wanted.set((top - 2 * screen)...(top + 3 * screen))
         guard batchesSent - batchesBack < Self.batchesInFlight,
