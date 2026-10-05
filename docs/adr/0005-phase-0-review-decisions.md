@@ -34,6 +34,12 @@ field's bytes, or bytes appended at the end of that row". A blank line
 edited in column *c* becomes a row of *c* + 1 fields. Edits past an
 unterminated quote are still rejected (ADR-0004 decision 8).
 
+*Refined by the phase 2 gate (Rob, 2026-10-05):* typing nothing (`""`) into
+a hatched cell and pressing Return is no edit; the row isn't padded. The
+cell was already empty to the user, and a stray Return must not change the
+file. Padding a short row on purpose would be a future "Fill missing cells"
+command. (`docs/tasks/2.1.md`, "Decisions and interpretations")
+
 **3. Per-column quoting (ADR-0004 decision 2), made precise.** A column's
 fields are the fields at that index in non-blank rows long enough to have
 one, header row included. A new field is quoted if the column has at least

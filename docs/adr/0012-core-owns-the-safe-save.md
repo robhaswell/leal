@@ -4,6 +4,8 @@
 - Date: 2026-10-03
 - Changes: DESIGN §3.7 ("the core writes to the temporary URL AppKit
   provides, which is then swapped in atomically")
+- Refined by the phase 2 gate (decided by Rob, 2026-10-05): the flush
+  (decision 5) and a known limit of decision 4
 
 ## Context
 
@@ -87,6 +89,31 @@ F3 ("undoing all edits restores byte-identical output") holds from the
 last save, not from the file as first opened. Restoring the bytes would
 need a structural "remove fields" command, and the user would see the
 same values either way.
+
+*Known limit (decided by Rob at the phase 2 gate, 2026-10-05).* Undoing a
+cell edit after a save restores the cell's text, not its bytes. Bytes that
+weren't valid text come back as U+FFFD, and a field that was oddly quoted is
+requoted. This also holds for an edit undone while a save is running, since
+the edit is carried over onto the new file. ADR-0014 decision 8 ("an
+unedited field's own bytes") covers structural undo only. It takes invalid
+bytes, a cell edit, a save and an undo, in that order, so it is recorded
+rather than fixed (about 2–3 days across the core, writer and FFI, on code
+the fidelity tests guard). GitHub issue #6, "Undo of a cell edit after a
+save should restore the cell's original bytes", tracks the fix, to be done
+if anyone is hit. Undo then redo of a row insert across a save can also
+change that row's quoting.
+
+**5. The save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`.**
+
+*Added at the phase 2 gate; decided by Rob, 2026-10-05* (he was told of it
+when he accepted this ADR on 2026-10-03). The barrier puts the new file's
+bytes ahead of the rename that makes them the file, so a crash leaves the
+old file or the whole new one, never a mix. It doesn't wait for the drive's
+cache to empty, so a power cut within about a second of a save can give
+back the old file. `F_FULLFSYNC` would survive that, but each save would
+wait for the drive's whole cache. Where a barrier isn't supported the save
+uses `F_FULLFSYNC`, and failing that `fsync` (DESIGN §3.7). Details:
+`docs/tasks/2.2.md`, "Decisions and interpretations".
 
 ## Consequences
 

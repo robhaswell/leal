@@ -45,11 +45,11 @@ columns, UTF-8, quoted fields containing some newlines.
 | Launched with a file, to its first rows (the cold open) | < 450 ms |
 | Open to first rows visible, in a running app | < 150 ms, **independent of file size**, before indexing finishes |
 | Full index built | < 500 ms |
-| Scrolling | No dropped frames at 120 Hz, **including while background work runs** |
+| Scrolling | No dropped frames at 120 Hz after loading; while background work runs, at most 0.05% late frames (see below) |
 | Cell edit to screen | < 16 ms |
 | Filter with full scan | < 300 ms |
 | Sort on one column | < 1 s |
-| Save after one edit | < 500 ms (a column insert counts as one edit) |
+| Save after one edit | < 500 ms for a cell edit or row delete; a column insert or delete is report-only (see below) |
 | Save As UTF-8 of the reference file from UTF-16 | < 1 s (ADR-0013) |
 | Leal's own heap for the reference file (see below) | < 40 MB |
 | Idle app with no document | < 30 MB physical footprint |
@@ -71,6 +71,17 @@ What the budgets mean (decided by Rob at the phase 1 gate, 2026-10-02):
   on the reference file when every row matches.
 - **Idle memory** is the physical footprint, which Activity Monitor shows
   as Memory. Resident size (RSS) also counts shared system libraries.
+- **Scrolling** allows no late frames once loading has finished. While
+  background work runs (the index, the review, a search) it allows up to
+  0.05% late frames, about one in 2,000 (Rob, phase 2 gate, 2026-10-05).
+  The measured worst, 3 late in 7,551 (0.04%), is inside it. The 3× rule
+  below still applies throughout.
+- **Structural saves are report-only** (ADR-0015, accepted by Rob at the
+  phase 2 gate, 2026-10-05). A save after a column insert or delete
+  rewrites every row, so its 500 ms is reported, not enforced: over it,
+  the benchmark warns, a missing result still fails, and its no-disk twin
+  is still checked for 20% regressions. A cell edit or a row delete stays
+  under a hard 500 ms.
 - **The 3× rule.** The base M1 Air stays the design target. None is
   available, so the faster Mac the budgets are measured on (an M5 Pro)
   must show about 3× headroom: main-thread work per scroll frame of at
@@ -710,8 +721,8 @@ before the rename that makes them the file, so a crash leaves the old file
 or the whole new one, never a mix (on a volume that journals the rename;
 see the limits below). It doesn't wait for the drive's cache to empty, so
 a power cut in about the second after a save can bring back the old file
-(accepted with ADR-0012; PLAN 2.7 lists it for the phase 2 gate). Where a
-barrier isn't supported, `F_FULLFSYNC`, and failing that `fsync`.
+(accepted by Rob at the phase 2 gate, 2026-10-05; ADR-0012 decision 5).
+Where a barrier isn't supported, `F_FULLFSYNC`, and failing that `fsync`.
 
 **Into place**, under the watcher's lock only, so Leal's own save never
 looks like an outside change. Events the kernel has queued are looked at

@@ -742,6 +742,11 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     and titles. Handle both before a paste can reach far columns. (2.1
     notes, "Left for later")
 - [ ] **2.6a Tidy-up** — nits collected from reviews (CLAUDE.md, token budget).
+  Phase 2 was approved with the unticked items below carried forward.
+  - [ ] `leal-perf`: judge late frames against the 0.05% tolerance while
+    background work runs (zero after loading; Rob, phase 2 gate,
+    2026-10-05). `scroll_verdict` in `crates/leal-bench/src/perf.rs` still
+    fails any late frame; docs/perf.md already reads the tolerance.
   - [x] The `snapshot` test helper's 5 ms run-loop wait in `GridStripsTests`
     (make the deferred flush deterministic).
   - [x] `testANewReadingRedrawsEverythingWhateverTheChange` uses a 100 ms sleep.
@@ -803,26 +808,33 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     remember/save race and `LineReadAhead`'s wanted range.
 - [x] **2.7 Fuzzing** — `cargo-fuzz` targets for indexer, parser, serializer;
   nightly CI job.
-  - For the phase 2 gate: Rob to confirm that `""` in a hatched cell is no
-    edit. This narrows ADR-0005 decision 2's literal text; explicitly
+  - **Decided by Rob, 2026-10-05:** `""` in a hatched cell is no edit
+    (noted in ADR-0005 decision 2). This narrows ADR-0005 decision 2's literal text; explicitly
     padding a short row would be a future "Fill missing cells" command.
     (2.1 notes, "Decisions and interpretations")
-  - For the phase 2 gate, Rob to confirm (he was told of it when he
-    accepted ADR-0012, 2026-10-03, but the ADR doesn't record it): the
+  - **Decided by Rob, 2026-10-05**, and recorded as ADR-0012 decision 5
+    (he was told of it when he accepted ADR-0012, 2026-10-03): the
     save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`,
     so a power cut within about a second of a save can give back the old
     file, never a mix of the two. (2.2 notes, "Decisions and
     interpretations"; DESIGN §3.7)
-  - For the phase 2 gate: should "no dropped frames" allow a tolerance,
-    e.g. at most 0.05% late frames? With strips (2.0b), 1 late frame in
+  - **Decided by Rob, 2026-10-05:** "no dropped frames" allows at most
+    0.05% late frames while background work runs; zero after loading
+    (DESIGN §1, docs/perf.md). With strips (2.0b), 1 late frame in
     about 7,560 appeared in one of three runs after indexing, which the
     budget as written counts as a fail. (docs/perf.md)
-  - For the phase 2 gate: ADR-0015 (proposed), report-only budgets for
-    structural saves. The Benchmarks workflow was red on every push from
+  - **Decided by Rob, 2026-10-05:** ADR-0015 accepted, report-only budgets
+    for structural saves. The Benchmarks workflow was red on every push from
     2.4c to the gate: `save/column_insert` took 0.71–1.06 s on the runner,
     against 500 ms. Because a budget failure on attempt 1 ended the job, no
     regression was judged in that time either. 2.G-b fixed the ordering
     and made the budget report-only, provisionally. (docs/tasks/2.G-b.md)
+  - **Decided by Rob, 2026-10-05:** undoing a cell edit after a save
+    restores text, not bytes: a known limit in ADR-0012 decision 4, filed as
+    GitHub issue #6. Each structural command in the undo history keeps about
+    6 MB of an old reading per save, unbounded: recorded in ADR-0014
+    decision 3.
+  - **Phase 2 approved by Rob, 2026-10-05** (tag `phase-2`).
 
 ## Phase 3 — Filter and sort
 

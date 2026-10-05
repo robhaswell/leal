@@ -35,16 +35,16 @@ output, with every scroll run, is in
 | Full index < 500 ms | 160.1 ms (157.6–165.7, 3 runs) | the core's "Index" signpost in the app, reference file, with diagnostics | pass |
 | Cell edit to screen < 16 ms | 6.0 ms (2.3–18.1, 60 edits) | Return in the in-cell editor to the commit of the transaction that draws the edit ("Cell edit to screen" signpost), reference file, after indexing, 20 edits a run (bench build, `-LealBenchEdit`) | mixed |
 | Scrolling: no dropped frames at 120 Hz | 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); main-thread work per frame p50 1.2 ms, p99 2.1 ms | `ScrollBench` flings, reference file, after indexing; late = missed a refresh; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | pass |
-| … including while background work runs | 3 of 7,551 late (0.04%); 0 of 7,555 late (0.00%); 1 of 7,555 late (0.01%); main-thread work per frame p50 1.1 ms, p99 2.3 ms | the same from the first rows, while the index and review run, with a search running throughout; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | fail (late frames) |
-| … stress: background work not pausing (beyond the budget) | 7 of 7,546 late (0.09%); 2 of 7,555 late (0.03%); 3 of 7,556 late (0.04%); main-thread work per frame p50 0.4 ms, p99 1.6 ms | 1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input; judged on late frames only | fail |
+| … including while background work runs | 3 of 7,551 late (0.04%); 0 of 7,555 late (0.00%); 1 of 7,555 late (0.01%); main-thread work per frame p50 1.1 ms, p99 2.3 ms | the same from the first rows, while the index and review run, with a search running throughout; late frames up to 0.05% allowed (Rob, phase 2 gate); 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | pass (within the 0.05% late-frame tolerance) |
+| … stress: background work not pausing (beyond the budget) | 7 of 7,546 late (0.09%); 2 of 7,555 late (0.03%); 3 of 7,556 late (0.04%); main-thread work per frame p50 0.4 ms, p99 1.6 ms | 1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input; judged on late frames only; over the 0.05% tolerance in one run | fail |
 | Leal's heap, reference file < 40 MB | 0.7 MB (0.7–0.9, 3 runs) after opening; settled after scrolling, 7.8 MB (7.8–7.9, 3 runs) without a search and 20.0 MB (10.3–21.1, 3 runs) with a search's results held. Not judged, all zones: 21.7 MB (21.7–21.9, 3 runs) after opening; peak while scrolling 36.2 MB (31.0–42.2, 6 runs) | all malloc zones minus the per-window AppKit baseline (21 MB, a two-row file open: docs/tasks/1.10.md): `heap -s` after the review finished, and the bench's `malloc_zone_statistics` once settled after scrolling; AppKit's drawing peaks are left out | pass |
 | Idle app, no document < 30 MB footprint | 17.5 MB (17.3–17.5, 3 runs) footprint. Not judged: resident size 81.4 MB (78.0–81.5, 3 runs) | `heap -s` physical footprint (Activity Monitor's Memory) after the app settles; the resident size (RSS) also counts shared system libraries | pass |
 
 **At the phase 2 gate.** Scrolling still meets the 3× rule (p50 1.1–1.2
 ms, p99 2.1–2.3 ms). No frame was late after indexing. With a search
 running, one run had 3 late frames in 7,551 (0.04%) and the others 0 and
-1: that fails "no dropped frames" as written, but passes the proposed
-0.05% tolerance that Rob decides at the gate (PLAN 2.7). The launch row
+1: that fails "no dropped frames" as written, but passes the 0.05%
+tolerance Rob decided at the gate (2026-10-05; DESIGN §1). The launch row
 is "mixed" because of one 371 ms launch, the known first launch after a
 build (below); the median is 184.5 ms. Cell edit to screen has a median
 of 6.0 ms but a slowest edit of 18.1 ms, over the 16 ms budget, so it is
@@ -69,12 +69,15 @@ passed after indexing but not with a search running (2.89–2.99 ms), so the
 provisional wording about 2.0a is settled: strips were needed, and they
 pass. ADR-0011's conditions are met.
 
-**Late frames fail "no dropped frames".** After indexing, 1 frame in about
+**Late frames and "no dropped frames".** After indexing, 1 frame in about
 7,560 was late in one of three runs (0.01%); the other two runs and all
-three runs with a search had none. The budget allows none, so the verdict
-reads "fail", and the question of a tolerance is on the phase 2 gate list
-(PLAN 2.7). The stress runs (background work not pausing) had 0, 4 and 2
-late frames (up to 0.05%) and also fail; AppKit's drawing had 0–3 a run.
+three runs with a search had none. After loading the budget still allows
+none. While background work runs it allows up to 0.05% (Rob, phase 2 gate,
+2026-10-05), so the with-a-search row passes. `leal-perf`'s verdict still
+counts any late frame as a fail until PLAN 2.6a's "judge late frames
+against the 0.05% tolerance" is done. The stress runs (background work not
+pausing) had 0, 4 and 2 late frames (up to 0.05%) and
+also fail; AppKit's drawing had 0–3 a run.
 
 **Memory.** Strips add about 20 MB to the footprint peak while scrolling
 on the reference file (233–238 MB after indexing, 241–252 MB with a

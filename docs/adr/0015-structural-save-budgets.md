@@ -1,6 +1,6 @@
 # 0015 — Report-only budgets for structural saves
 
-- Status: proposed, for Rob at the phase 2 gate
+- Status: accepted (approved by Rob, 2026-10-05)
 - Date: 2026-10-05
 
 ## Context
@@ -77,7 +77,7 @@ been judged, then fails the job at the end.
 
 ## Decision
 
-Proposed: option 3.
+Option 3, approved by Rob at the phase 2 gate (2026-10-05).
 
 - In DESIGN §1, "Save after one edit < 500 ms" stays hard for a cell edit
   (`save/one_edit`) and for row deletes (`save/rows_deleted`).
@@ -93,10 +93,9 @@ Proposed: option 3.
   `edits/clear_100k_cells`, `row_edits/duplicate_10k_rows`) are compared
   between commits only.
 
-Task 2.G-b already does this in code, marked provisional, so the
-Benchmarks workflow can go green while Rob decides. If Rob rejects it,
-take `save/column_insert` out of `REPORT_ONLY` and its budget is hard
-again.
+Task 2.G-b did this in code, marked provisional, so the Benchmarks
+workflow could go green while Rob decided. It is now final. To make the
+budget hard again, take `save/column_insert` out of `REPORT_ONLY`.
 
 ## Consequences
 

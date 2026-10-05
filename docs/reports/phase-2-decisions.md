@@ -1,14 +1,16 @@
 # Phase 2 gate — decisions for Rob
 
-Date: 2026-10-05 · Status: **awaiting Rob's decision**
+Date: 2026-10-05 · Status: **approved by Rob (tag `phase-2`), 2026-10-05**
 
 Every decision the phase 2 gate needs from Rob, each with context, options
 and a recommendation. Collected from PLAN 2.7's gate items, ADR-0015, the
 gate review and docs/perf.md.
 
-## To decide
+## Decided
 
 ### 1. `""` typed into a hatched cell is no edit
+
+**Decided (Rob, 2026-10-05): (a).** `""` in a hatched cell is no edit; noted in ADR-0005 decision 2.
 
 - **Context.** A hatched cell is one a short row doesn't have. ADR-0005 d2
   lets the user type into it: the save appends the delimiters needed, then
@@ -22,6 +24,8 @@ gate review and docs/perf.md.
 
 ### 2. Save flushes with `F_BARRIERFSYNC`, not `F_FULLFSYNC`
 
+**Decided (Rob, 2026-10-05): (a).** `F_BARRIERFSYNC`, recorded as ADR-0012 decision 5; DESIGN §3.7 agrees.
+
 - **Context.** The barrier puts the new file's bytes ahead of the rename that
   makes them the file, so a crash leaves the old file or the whole new one,
   never a mix. It doesn't wait for the drive's cache to empty, so a power cut
@@ -34,6 +38,8 @@ gate review and docs/perf.md.
 
 ### 3. Scrolling "no dropped frames": allow up to 0.05% late frames
 
+**Decided (Rob, 2026-10-05): (a).** At most 0.05% late frames while background work runs, zero after loading (DESIGN §1, docs/perf.md). `leal-perf`'s verdict follows later (PLAN 2.6a).
+
 - **Context.** DESIGN §1 says no dropped frames. After loading, scrolling had
   0 late frames in 22,680. While the index and a search run, it had 3 late in
   7,551 (0.04%), then 0 and 1 in two more runs. Read literally, that fails;
@@ -43,7 +49,9 @@ gate review and docs/perf.md.
 - **Recommend (a).** 0.04% is one frame in 2,500. →
   `docs/perf-runs/2026-10-05-m5pro-unlocked-phase2.md`
 
-### 4. ADR-0015 (proposed): structural-save budgets are report-only
+### 4. ADR-0015 (accepted): structural-save budgets are report-only
+
+**Decided (Rob, 2026-10-05): (3).** ADR-0015 accepted; DESIGN §1 notes structural-save budgets are report-only.
 
 - **Context.** DESIGN §1 says a save after one edit takes under 500 ms, a
   column insert counting as one. A column insert rewrites every row. It takes
@@ -58,6 +66,8 @@ gate review and docs/perf.md.
   `docs/adr/0015-structural-save-budgets.md`
 
 ### 5. Undoing a cell edit after a save restores its text, not its bytes
+
+**Decided (Rob, 2026-10-05): (b).** A known limit in ADR-0012 decision 4, with a clarifying line in ADR-0014 decision 8; tracked as GitHub issue #6.
 
 - **Context.** After a save the saved file is the new base, and undo puts the
   cell's text back (ADR-0012 d4, "values, not bytes"). Bytes that weren't
@@ -75,6 +85,8 @@ gate review and docs/perf.md.
 
 ### 6. The undo history keeps an old reading per structural command
 
+**Decided (Rob, 2026-10-05): (a).** The cost is recorded in ADR-0014 decision 3, unbounded.
+
 - **Context.** ADR-0014 d3: a row or column command keeps the file it was
   made on, so an undo after a save works by value. Each such command keeps
   about 6 MB of an old reading per save (10 MB before round A) plus a
@@ -85,6 +97,8 @@ gate review and docs/perf.md.
 - **Recommend (a).** → `docs/tasks/2.G-a.md`, "Measurements"; ADR-0014 d3
 
 ### 7. Approve phase 2 and tag `phase-2`
+
+**Decided (Rob, 2026-10-05): approved.** Phase 2 is approved; the `phase-2` tag follows.
 
 - **Recommend** approving once the above are settled. You plan to pause after
   this, so the tag, and a release build installed into `/Applications`, are

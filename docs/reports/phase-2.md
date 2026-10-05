@@ -1,10 +1,10 @@
 # Phase 2 report — Editing
 
-Date: 2026-10-05 · Status: **awaiting Rob's approval**
+Date: 2026-10-05 · Status: **approved by Rob (tag `phase-2`), 2026-10-05**
 
-## What Rob needs to decide
+## What Rob decided
 
-Six items, each with a recommendation, in
+Rob approved all seven recommendations on 2026-10-05, in
 [`phase-2-decisions.md`](phase-2-decisions.md): `""` in a hatched cell is no
 edit; Save's `F_BARRIERFSYNC`; a 0.05% late-frame tolerance; ADR-0015
 (report-only structural-save budgets); undo of a cell edit after a save

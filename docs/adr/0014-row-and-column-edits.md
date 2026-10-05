@@ -42,6 +42,12 @@ was rejected.
    - **Cost:** that old snapshot stays until the undo history lets go of
      the command. Its disk space is a clone, or a copy on a removable
      drive, as large as the file.
+   - **Memory cost (recorded at the phase 2 gate; Rob, 2026-10-05):** each
+     structural command in the undo history keeps about 6 MB of an old
+     reading per save (10 MB before round A), plus the file-sized clone
+     on disk. Eight delete-and-save rounds took the heap from 5 MB to
+     56 MB. It is unbounded: the history isn't limited, so as not to change
+     what undo can do.
    - **Also:** undoing a column insert or delete after a save reads every
      row it touched, because it checks values (§3.6).
    - **Rejected:** taking the values when the command is made. That costs
@@ -79,6 +85,9 @@ was rejected.
    encoding has changed (e.g. after Save As UTF-8). Invalid bytes are never
    replaced unasked (ADR-0004 decision 9, DESIGN §3.5). Clarified during
    task 2.4c.
+   - **Scope:** this covers structural undo only. Undoing a *cell edit*
+     after a save restores text, not bytes (ADR-0012 decision 4, a known
+     limit; GitHub issue #6).
 
 ## Added during task 2.5a (decided by Rob, 2026-10-04)
 
