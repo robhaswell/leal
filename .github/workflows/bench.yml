@@ -17,7 +17,9 @@ name: Benchmarks
 # was noisy for it, a third attempt reruns only its groups, base first, and
 # it fails only if that attempt shows it too or has no result for it.
 # Anything noise kept from being judged warns
-# ("inconclusive") and passes, unless a budget failed. Why it works this
+# ("inconclusive") and passes, unless a budget failed. A budget failure
+# doesn't stop the attempts that judge regressions: the job fails for it
+# at the end (task 2.G-b). A report-only budget (ADR-0015) only warns. Why it works this
 # way, and what to do when it fails or warns: docs/tasks/1.2b.md.
 on:
   push:

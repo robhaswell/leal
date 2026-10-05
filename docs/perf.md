@@ -13,10 +13,10 @@ during the beta.
 
 ## Results
 
-Rob's run of 3 October 2026, task 2.0b (strips), screen **unlocked**, 3 runs
-of each, on branch `task/2.0b` rebased on `a40851a`, with the Mac idle. The
-full output, with every scroll run and the strips-against-AppKit table, is
-in [`perf-runs/2026-10-03-m5pro-unlocked-2.0b.md`](perf-runs/2026-10-03-m5pro-unlocked-2.0b.md).
+Rob's run of 5 October 2026, the phase 2 gate, screen **unlocked**, 3 runs
+of each, on `main` at `5b5e534`, with the other agents paused. The full
+output, with every scroll run, is in
+[`perf-runs/2026-10-05-m5pro-unlocked-phase2.md`](perf-runs/2026-10-05-m5pro-unlocked-phase2.md).
 
 - **Machine:** MacBook Pro `Mac17,8`, Apple M5 Pro (6 performance + 12
   efficiency cores), 48 GB, macOS 27.0. **Not the reference machine** (a
@@ -24,21 +24,39 @@ in [`perf-runs/2026-10-03-m5pro-unlocked-2.0b.md`](perf-runs/2026-10-03-m5pro-un
 - **Display:** the built-in Liquid Retina XDR (ProMotion, 120 Hz, main
   display), which the scroll benchmark's window was on in every run.
 - **Power:** on AC (`powermode 0`).
-- **Load:** load average 9.25 / 4.86 / 3.49 at the start, 980 processes.
+- **Load:** load average 6.83 / 4.23 / 7.76 at the start, 990 processes.
 - **Screen:** unlocked, with Leal in front.
-
 
 | Budget (DESIGN §1) | Measured on this Mac | How | Verdict |
 |---|---|---|---|
-| Launch < 300 ms | 170.4 ms (156.4–479.0, 3 runs) | process start to the end of `applicationDidFinishLaunching` ("Launched" signpost); Leal opens no empty window | mixed |
-| Launched with a file, to its first rows < 450 ms | 364.0 ms (334.8–369.9, 3 runs) | process start to the grid's first draw with rows, reference file: the cold open, judged as part of launch against the launch and open budgets together | pass |
-| Open to first rows < 150 ms | 47.6 ms (41.2–51.8, 15 runs) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), reference file, closed and opened again in the running app: the warm open (bench build, `-LealReopen`) | pass |
-| Full index < 500 ms | 141.1 ms (140.7–155.9, 3 runs) | the core's "Index" signpost in the app, reference file, with diagnostics | pass |
-| Scrolling: no dropped frames at 120 Hz | 1 of 7,559 late (0.01%); 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); main-thread work per frame p50 1.2 ms, p99 2.0 ms | `ScrollBench` flings, reference file, after indexing; late = missed a refresh; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | fail (late frames) |
-| … including while background work runs | 0 of 7,559 late (0.00%); 0 of 7,559 late (0.00%); 0 of 7,556 late (0.00%); main-thread work per frame p50 1.0–1.1 ms, p99 2.0–2.1 ms | the same from the first rows, while the index and review run, with a search running throughout; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | pass |
-| … stress: background work not pausing (beyond the budget) | 0 of 7,557 late (0.00%); 4 of 7,556 late (0.05%); 2 of 7,556 late (0.03%); main-thread work per frame p50 0.5 ms, p99 1.8 ms | 1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input; judged on late frames only | fail |
-| Leal's heap, reference file < 40 MB | 10.7 MB (10.6–10.9, 3 runs) after opening; settled after scrolling, 9.5 MB (9.3–11.3, 3 runs) without a search and 11.7 MB (10.5–22.3, 3 runs) with a search's results held. Not judged, all zones: 31.7 MB (31.6–31.9, 3 runs) after opening; peak while scrolling 37.9 MB (32.7–43.5, 6 runs) | all malloc zones minus the per-window AppKit baseline (21 MB, a two-row file open: docs/tasks/1.10.md): `heap -s` after the review finished, and the bench's `malloc_zone_statistics` once settled after scrolling; AppKit's drawing peaks are left out | pass |
-| Idle app, no document < 30 MB footprint | 17.0 MB (16.9–17.0, 3 runs) footprint. Not judged: resident size 80.5 MB (77.4–80.6, 3 runs) | `heap -s` physical footprint (Activity Monitor's Memory) after the app settles; the resident size (RSS) also counts shared system libraries | pass |
+| Launch < 300 ms | 184.5 ms (156.9–371.1, 3 runs) | process start to the end of `applicationDidFinishLaunching` ("Launched" signpost); Leal opens no empty window | mixed |
+| Launched with a file, to its first rows < 450 ms | 367.7 ms (361.7–401.4, 3 runs) | process start to the grid's first draw with rows, reference file: the cold open, judged as part of launch against the launch and open budgets together | pass |
+| Open to first rows < 150 ms | 52.5 ms (45.9–57.0, 15 runs) | `read(from:)` to the grid's first draw with rows ("Open to first rows" signpost), reference file, closed and opened again in the running app: the warm open (bench build, `-LealReopen`) | pass |
+| Full index < 500 ms | 160.1 ms (157.6–165.7, 3 runs) | the core's "Index" signpost in the app, reference file, with diagnostics | pass |
+| Cell edit to screen < 16 ms | 6.0 ms (2.3–18.1, 60 edits) | Return in the in-cell editor to the commit of the transaction that draws the edit ("Cell edit to screen" signpost), reference file, after indexing, 20 edits a run (bench build, `-LealBenchEdit`) | mixed |
+| Scrolling: no dropped frames at 120 Hz | 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); 0 of 7,560 late (0.00%); main-thread work per frame p50 1.2 ms, p99 2.1 ms | `ScrollBench` flings, reference file, after indexing; late = missed a refresh; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | pass |
+| … including while background work runs | 3 of 7,551 late (0.04%); 0 of 7,555 late (0.00%); 1 of 7,555 late (0.01%); main-thread work per frame p50 1.1 ms, p99 2.3 ms | the same from the first rows, while the index and review run, with a search running throughout; 3× rule (DESIGN §1): main-thread work per frame ≤ 2.8 ms at p50 and p99 | fail (late frames) |
+| … stress: background work not pausing (beyond the budget) | 7 of 7,546 late (0.09%); 2 of 7,555 late (0.03%); 3 of 7,556 late (0.04%); main-thread work per frame p50 0.4 ms, p99 1.6 ms | 1 GB variant from the first rows: index, review and a search all running, the scroll not reported as input; judged on late frames only | fail |
+| Leal's heap, reference file < 40 MB | 0.7 MB (0.7–0.9, 3 runs) after opening; settled after scrolling, 7.8 MB (7.8–7.9, 3 runs) without a search and 20.0 MB (10.3–21.1, 3 runs) with a search's results held. Not judged, all zones: 21.7 MB (21.7–21.9, 3 runs) after opening; peak while scrolling 36.2 MB (31.0–42.2, 6 runs) | all malloc zones minus the per-window AppKit baseline (21 MB, a two-row file open: docs/tasks/1.10.md): `heap -s` after the review finished, and the bench's `malloc_zone_statistics` once settled after scrolling; AppKit's drawing peaks are left out | pass |
+| Idle app, no document < 30 MB footprint | 17.5 MB (17.3–17.5, 3 runs) footprint. Not judged: resident size 81.4 MB (78.0–81.5, 3 runs) | `heap -s` physical footprint (Activity Monitor's Memory) after the app settles; the resident size (RSS) also counts shared system libraries | pass |
+
+**At the phase 2 gate.** Scrolling still meets the 3× rule (p50 1.1–1.2
+ms, p99 2.1–2.3 ms). No frame was late after indexing. With a search
+running, one run had 3 late frames in 7,551 (0.04%) and the others 0 and
+1: that fails "no dropped frames" as written, but passes the proposed
+0.05% tolerance that Rob decides at the gate (PLAN 2.7). The launch row
+is "mixed" because of one 371 ms launch, the known first launch after a
+build (below); the median is 184.5 ms. Cell edit to screen has a median
+of 6.0 ms but a slowest edit of 18.1 ms, over the 16 ms budget, so it is
+"mixed" too: the slowest edits widen their column, which redraws every
+strip. The heap after scrolling with a search's results held is 20.0 MB
+(10.3–21.1), under 40 MB.
+
+### Strips (task 2.0b, 3 October)
+
+Rob's run of 3 October 2026 on branch `task/2.0b` rebased on `a40851a`
+([`perf-runs/2026-10-03-m5pro-unlocked-2.0b.md`](perf-runs/2026-10-03-m5pro-unlocked-2.0b.md)),
+the results before the phase 2 gate run (its table is in that file):
 
 **Scrolling meets the 3× rule with strips (2.0b).** Main-thread work per
 frame on the reference file is p50 1.0–1.2 ms and p99 1.95–2.1 ms, against
@@ -104,8 +122,8 @@ after a build to be an outlier of about 200 ms.
 
 ### Cell edit to screen (task 2.5.1)
 
-Not in Rob's run above: task 2.5.1 added the row. The implementer's run of
-4 October 2026 (`just perf --only-edit --runs 2`, M5 Pro, screen locked,
+Rob's phase 2 gate run (the table above) measured it: 6.0 ms (2.3–18.1,
+60 edits). Before that, the implementer's run of 4 October 2026 (`just perf --only-edit --runs 2`, M5 Pro, screen locked,
 load average about 7–9, other agents' builds running):
 
 | Budget (DESIGN §1) | Measured on this Mac | How | Verdict |
@@ -113,7 +131,7 @@ load average about 7–9, other agents' builds running):
 | Cell edit to screen < 16 ms | 4.4 ms (1.6–10.7, 40 edits) | Return in the in-cell editor to the commit of the transaction that draws the edit ("Cell edit to screen" signpost), reference file, after indexing, 20 edits a run (bench build, `-LealBenchEdit`) | pass |
 
 The slowest edits are those that widen their column, which redraws every
-strip. Rob's next full run replaces this.
+strip.
 
 ### Earlier runs
 

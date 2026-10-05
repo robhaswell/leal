@@ -14,7 +14,13 @@
 //! means a single noisy median doesn't count. **A benchmark is over
 //! budget** if its median is over its budget ([`crate::budgets`]), and a
 //! budgeted benchmark with no result is **missing**. Both of those fail on
-//! any attempt, noisy or not.
+//! any attempt, noisy or not, but not straight away: an attempt that a
+//! regression or noise would rerun still reruns, so regressions are judged
+//! while a budget is failing, and the job fails at the end (task 2.G-b;
+//! before it, a budget failing on attempt 1 stopped the job there, and no
+//! regression was judged from 2.4c to the phase 2 gate). A report-only
+//! budget ([`crate::budgets::is_report_only`]) over its limit is
+//! [`Status::OverReportOnlyBudget`]: a warning, never a failure.
 //!
 //! # Noise: two kinds of canary
 //!
@@ -130,7 +136,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::budgets::Budget;
+use crate::budgets::{Budget, is_report_only};
 
 /// The criterion groups of the speed-of-light baseline: `baseline` runs
 /// with the other benchmarks, and `bench-compare` runs it again as
@@ -236,13 +242,15 @@ pub fn group_of(id: &str) -> &str {
 /// simulated network share's open (task 2.0) reads the same way. A save
 /// (task 2.2) writes the whole reference file and flushes it to the disk
 /// (`F_FULLFSYNC`), so its time is the runner's disk's; so does Save As
-/// UTF-8 (task 2.3), and a save after rows deleted or a column inserted
-/// (task 2.4c).
-pub const BUDGET_ONLY: [&str; 8] = [
+/// UTF-8 (task 2.3), a save after rows deleted or a column inserted
+/// (task 2.4c), and one after a column deleted (task 2.G-b, which has no
+/// budget: information only). Each has a `_no_disk` twin that is compared.
+pub const BUDGET_ONLY: [&str; 9] = [
     "open/first_paint_removable_under_load",
     "open/first_paint_share_under_load",
     "open/first_paint_slow_share_small",
     "open/first_paint_slow_share",
+    "save/column_delete",
     "save/column_insert",
     "save/one_edit",
     "save/rows_deleted",
@@ -436,6 +444,9 @@ pub enum Status {
     Unsettled,
     /// The median is over the benchmark's budget. Fails.
     OverBudget,
+    /// The median is over a report-only budget
+    /// ([`crate::budgets::is_report_only`]). Warns, and passes.
+    OverReportOnlyBudget,
     /// A budgeted benchmark that has no result. Fails.
     Missing,
 }
@@ -455,6 +466,7 @@ fn label(row: &Row) -> &'static str {
         Status::Cleared => "regression? (not on attempt 3)",
         Status::Unsettled => "regression? (not shown again, base side slowed)",
         Status::OverBudget => "**over budget**",
+        Status::OverReportOnlyBudget => "over budget (report-only)",
         Status::Missing => "**missing**",
     }
 }
@@ -626,6 +638,10 @@ pub struct Report {
     pub rechecked: Vec<String>,
     /// After a third attempt ([`Report::settle`]): its own report.
     pub third: Option<Box<Report>>,
+    /// The benchmarks over budget, or missing, on an earlier attempt
+    /// ([`Report::after`]), sorted by id. The job fails for them at the
+    /// end, whatever this attempt shows.
+    pub earlier_over_budget: Vec<String>,
 }
 
 /// What a third attempt runs ([`Report::third_attempt_plan`]): the bench
@@ -797,14 +813,20 @@ pub fn evaluate(
             };
             let row_noisy = canaries.noisy(thresholds.noise, noisy);
             let could_hide = canaries.could_hide(thresholds.noise, run_could_hide);
-            let status = if budget.is_some_and(|b| m.median_ns > b.max_ms * 1e6) {
+            let over = budget.is_some_and(|b| m.median_ns > b.max_ms * 1e6);
+            let report_only = is_report_only(&m.id);
+            let status = if over && !report_only {
                 Status::OverBudget
             } else if canary && moved(m) {
                 Status::NoisyCanary
             } else if canary {
                 Status::Canary
             } else if !gated {
-                Status::Info
+                if over {
+                    Status::OverReportOnlyBudget
+                } else {
+                    Status::Info
+                }
             } else if m
                 .change
                 .is_some_and(|change| change.lower > thresholds.regression)
@@ -814,6 +836,8 @@ pub fn evaluate(
                 } else {
                     Status::Regression
                 }
+            } else if over {
+                Status::OverReportOnlyBudget
             } else {
                 Status::Ok
             };
@@ -854,6 +878,7 @@ pub fn evaluate(
         first_order: None,
         rechecked: Vec::new(),
         third: None,
+        earlier_over_budget: Vec::new(),
     }
 }
 
@@ -961,7 +986,24 @@ impl Report {
             .collect();
         self.first_order = first.order;
         self.attempt = 2;
+        self.earlier_over_budget = first.over_budget();
         self
+    }
+
+    /// The benchmarks over budget, or missing, on this attempt or an
+    /// earlier one, sorted by id.
+    #[must_use]
+    pub fn over_budget(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, Status::OverBudget | Status::Missing))
+            .map(|row| row.id.clone())
+            .chain(self.earlier_over_budget.iter().cloned())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// For a rerun ([`Report::after`]) with a [`Status::Recheck`]: what
@@ -1082,7 +1124,12 @@ impl Report {
 
     /// What to do with this report.
     ///
-    /// - A budget failure fails, on any attempt, noisy or not.
+    /// - A budget failure (over budget, or missing) fails, on any
+    ///   attempt, noisy or not, but only once the regressions have been
+    ///   judged: an attempt that would otherwise be rerun still asks for
+    ///   the rerun (or the third attempt), and the job fails at the end
+    ///   ([`Report::earlier_over_budget`] carries the failure there). A
+    ///   report-only budget ([`Status::OverReportOnlyBudget`]) never fails.
     /// - On attempt 1, unless it is the `last_attempt`, a noisy run or a
     ///   regression (noisy for it or not) is rerun, so that a regression
     ///   fails only if every attempt shows it.
@@ -1098,14 +1145,13 @@ impl Report {
     ///   runner is no reason to fail the job.
     #[must_use]
     pub fn outcome(&self, last_attempt: bool) -> Outcome {
-        if self.any(&[Status::OverBudget, Status::Missing]) {
-            return Outcome::Fail;
-        }
+        let over_budget = !self.over_budget().is_empty();
         if !last_attempt {
             match self.attempt {
                 1 if self.noisy || self.any(&[Status::Regression, Status::NoisyRegression]) => {
                     return Outcome::Rerun;
                 }
+                1 if over_budget => return Outcome::Fail,
                 1 => return Outcome::Pass,
                 2 if !self.any(&[Status::Regression]) && self.any(&[Status::Recheck]) => {
                     return Outcome::Rerun;
@@ -1113,7 +1159,7 @@ impl Report {
                 _ => {}
             }
         }
-        if self.any(&[Status::Regression, Status::Recheck]) {
+        if over_budget || self.any(&[Status::Regression, Status::Recheck]) {
             Outcome::Fail
         } else if self.noisy
             || self.any(&[

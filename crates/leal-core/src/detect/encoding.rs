@@ -18,22 +18,46 @@ impl Census {
     /// and a sequence that is unfinished only because the bytes stop is not
     /// counted: the rest of it is just past the cut.
     pub(crate) fn of(bytes: &[u8], cut: bool) -> Self {
-        let mut census = Census::default();
-        if bytes.is_ascii() {
-            return census;
-        }
-        let mut chunks = bytes.utf8_chunks().peekable();
-        while let Some(chunk) = chunks.next() {
-            // Each multibyte character has exactly one lead byte, 0xC0 or
-            // above; continuation bytes are 0x80..=0xBF.
-            census.multibyte += chunk.valid().bytes().filter(|&b| b >= 0xC0).count();
-            let invalid = chunk.invalid();
-            let last = chunks.peek().is_none();
-            if !(cut && last && unfinished(invalid)) {
-                census.invalid += invalid.len();
-            }
+        let (mut census, unfinished) = Census::up_to_cut(bytes);
+        if !cut {
+            census.invalid += unfinished;
         }
         census
+    }
+
+    /// Counts `bytes` up to a sequence that is unfinished only because the
+    /// bytes stop: the census of what comes before it, and its length (at
+    /// most three bytes; 0 if there is none).
+    ///
+    /// `str::from_utf8` finds each invalid sequence, much faster than
+    /// `utf8_chunks` (task 2.G-b: the census of a save after a column
+    /// insert), and gives the same answer: `error_len` is the length of
+    /// the invalid sequence `utf8_chunks` would report, and `None` when
+    /// the bytes stop in the middle of a sequence.
+    fn up_to_cut(bytes: &[u8]) -> (Self, usize) {
+        let mut census = Census::default();
+        if bytes.is_ascii() {
+            return (census, 0);
+        }
+        let mut rest = bytes;
+        loop {
+            let error = match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    census.multibyte += lead_bytes(valid.as_bytes());
+                    return (census, 0);
+                }
+                Err(error) => error,
+            };
+            let (valid, after) = rest.split_at(error.valid_up_to());
+            census.multibyte += lead_bytes(valid);
+            match error.error_len() {
+                Some(len) => {
+                    census.invalid += len;
+                    rest = &after[len..];
+                }
+                None => return (census, after.len()),
+            }
+        }
     }
 
     /// The counts of two pieces of a file together. The pieces must be
@@ -106,27 +130,25 @@ impl CensusStream {
             self.census = self.census.plus(Census::of(&small[..reach], false));
             piece = &piece[reach.saturating_sub(carried).min(piece.len())..];
         }
-        if piece.is_ascii() {
-            return;
-        }
         // A tail that only the end of the piece makes invalid waits for the
         // next piece: at most three bytes.
-        let tail = piece.utf8_chunks().last().map_or(0, |chunk| {
-            if unfinished(chunk.invalid()) {
-                chunk.invalid().len()
-            } else {
-                0
-            }
-        });
-        let whole = piece.len() - tail;
-        self.census = self.census.plus(Census::of(&piece[..whole], false));
-        self.carry = piece[whole..].to_vec();
+        let (census, tail) = Census::up_to_cut(piece);
+        self.census = self.census.plus(census);
+        if tail > 0 {
+            self.carry = piece[piece.len() - tail..].to_vec();
+        }
     }
 
     /// The census of everything pushed.
     pub(crate) fn finish(self) -> Census {
         self.census.plus(Census::of(&self.carry, false))
     }
+}
+
+/// The lead bytes in `valid`, valid UTF-8: one for each multibyte
+/// character (0xC0 or above; continuation bytes are 0x80..=0xBF).
+fn lead_bytes(valid: &[u8]) -> usize {
+    valid.iter().filter(|&&b| b >= 0xC0).count()
 }
 
 /// True if `invalid` (the invalid tail of the bytes) is the start of a
@@ -286,6 +308,62 @@ mod tests {
                     bytes.escape_ascii()
                 );
             }
+        }
+    }
+
+    /// The census as `utf8_chunks` counts it: what [`Census::of`] did
+    /// before task 2.G-b, kept as its oracle.
+    fn chunks_census(bytes: &[u8], cut: bool) -> Census {
+        let mut census = Census::default();
+        let mut chunks = bytes.utf8_chunks().peekable();
+        while let Some(chunk) = chunks.next() {
+            census.multibyte += chunk.valid().bytes().filter(|&b| b >= 0xC0).count();
+            let invalid = chunk.invalid();
+            let last = chunks.peek().is_none();
+            if !(cut && last && unfinished(invalid)) {
+                census.invalid += invalid.len();
+            }
+        }
+        census
+    }
+
+    /// Bytes that are mostly UTF-8 sequences, whole, cut or broken.
+    fn mixed_bytes() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let piece = prop_oneof![
+            any::<char>().prop_map(|c| c.to_string().into_bytes()),
+            any::<char>().prop_flat_map(|c| {
+                let bytes = c.to_string().into_bytes();
+                let len = bytes.len();
+                (Just(bytes), 0..len).prop_map(|(bytes, cut)| bytes[..cut].to_vec())
+            }),
+            prop::collection::vec(any::<u8>(), 0..4),
+        ];
+        prop::collection::vec(piece, 0..24).prop_map(|pieces| pieces.concat())
+    }
+
+    proptest::proptest! {
+        /// The census is the one `utf8_chunks` gives, cut or not.
+        #[test]
+        fn the_census_is_utf8_chunks_census(bytes in mixed_bytes(), cut: bool) {
+            proptest::prop_assert_eq!(Census::of(&bytes, cut), chunks_census(&bytes, cut));
+        }
+
+        /// Streamed in pieces cut anywhere, it is the whole's.
+        #[test]
+        fn a_streamed_census_is_the_whole_census(
+            bytes in mixed_bytes(),
+            cuts in proptest::collection::vec(0..64_usize, 0..8),
+        ) {
+            let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(bytes.len())).collect();
+            cuts.sort_unstable();
+            let mut stream = CensusStream::default();
+            let mut from = 0;
+            for cut in cuts.into_iter().chain([bytes.len()]) {
+                stream.push(&bytes[from..cut]);
+                from = cut;
+            }
+            proptest::prop_assert_eq!(stream.finish(), chunks_census(&bytes, false));
         }
     }
 

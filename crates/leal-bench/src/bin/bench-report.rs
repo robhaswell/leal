@@ -9,7 +9,9 @@
 //!
 //! Prints a Markdown table, then exits with status 0 if the report passed,
 //! 1 if it failed, 2 on an error, or 3 to ask for another attempt. A budget
-//! fails on any attempt. A regression (a change whose 95% interval is
+//! fails on any attempt, but an attempt that would be rerun still asks for
+//! the rerun, so regressions are judged before the job fails (task 2.G-b).
+//! A report-only budget only warns. A regression (a change whose 95% interval is
 //! wholly above `--regression`, default 0.20) fails only if every attempt
 //! shows it. A canary moved if it changed by more than `--noise` (default
 //! 0.10): a run-wide one makes the run noisy, and a group's makes the
@@ -198,6 +200,15 @@ fn run() -> Result<Outcome, String> {
             why_inconclusive(&report)
         ));
     }
+    let over_budget = report.over_budget();
+    if outcome == Outcome::Rerun && !over_budget.is_empty() {
+        let ids: Vec<String> = over_budget.iter().map(|id| format!("`{id}`")).collect();
+        markdown.push_str(&format!(
+            "\n**Over budget:** {}. The job will fail, but it runs the next attempt first, so \
+             regressions are still judged.\n",
+            ids.join(", ")
+        ));
+    }
     if outcome == Outcome::Rerun {
         match &plan {
             None => markdown.push_str(
@@ -336,11 +347,36 @@ fn annotate_problems(report: &Report, outcome: Outcome, last_attempt: bool, gith
                 )
             }
             Status::NoisyCanary => ("warning", "moved, so the run was noisy".to_owned()),
+            Status::OverBudget if outcome == Outcome::Rerun => (
+                "error",
+                "is over budget; the job will fail, but the next attempt still runs, so \
+                 regressions are judged"
+                    .to_owned(),
+            ),
             Status::OverBudget => ("error", "is over budget".to_owned()),
+            Status::OverReportOnlyBudget => (
+                "warning",
+                "is over its budget, which is report-only (docs/adr/0015-structural-save-budgets.md)"
+                    .to_owned(),
+            ),
             Status::Missing => ("error", "has a budget but no result".to_owned()),
             Status::Ok | Status::Canary | Status::Info => continue,
         };
         annotate(level, &format!("benchmark {} {what}", row.id));
+    }
+    for id in &report.earlier_over_budget {
+        if report
+            .row(id)
+            .is_none_or(|row| !matches!(row.status, Status::OverBudget | Status::Missing))
+        {
+            annotate(
+                "error",
+                &format!(
+                    "benchmark {id} was over its budget (or missing) on an earlier attempt, so \
+                     the job fails"
+                ),
+            );
+        }
     }
     for id in &report.unconfirmed {
         annotate(

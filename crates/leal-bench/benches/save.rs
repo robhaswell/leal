@@ -29,6 +29,14 @@
 //! - `save/column_insert_no_disk`: the same save's work without the disk,
 //!   on the reference file with the column inserted (then taken out
 //!   again), compared between commits.
+//! - `save/column_delete` (task 2.G-b): a column deleted near the start of
+//!   every row, then Save over it, timed as `one_edit`: every row written
+//!   whole, without the column. Each save is of a fresh copy of the
+//!   reference file (a clone), opened and indexed untimed. No budget:
+//!   information, as `rows_deleted` is gated on its budget only.
+//! - `save/column_delete_no_disk`: the same save's work without the disk,
+//!   on the reference file with the column deleted (then put back),
+//!   compared between commits.
 //! - `save/rows_deleted_no_disk`: `rows_deleted`'s work without the disk,
 //!   on the reference file with the rows deleted (then put back), compared
 //!   between commits. It runs before `rows_deleted`, whose saves shrink
@@ -162,6 +170,19 @@ fn save(c: &mut Criterion) {
         });
     });
     document.apply(&inserted.inverse()).expect("the undo");
+    document.index_job().wait().expect("indexing");
+    let column_deleted = document
+        .delete_column(COLUMN)
+        .expect("the delete")
+        .expect("a change");
+    group.bench_function("column_delete_no_disk", |b| {
+        b.iter(|| {
+            document
+                .save_to_writer(SaveKind::SaveAs, &mut std::io::sink())
+                .expect("the write")
+        });
+    });
+    document.apply(&column_deleted.inverse()).expect("the undo");
     let deleted = delete_spread(&document);
     group.bench_function("rows_deleted_no_disk", |b| {
         b.iter(|| {
@@ -205,6 +226,41 @@ fn save(c: &mut Criterion) {
             total
         });
     });
+
+    // A save after a column delete (task 2.G-b), of a fresh copy each
+    // time: the delete can't be put back by an insert, which would leave
+    // the column's cells empty.
+    let column_copy = root.join("column-delete.csv");
+    group.bench_function("column_delete", |b| {
+        b.iter_custom(|iterations| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iterations {
+                // A clone on APFS: opening and indexing it aren't timed.
+                let _ = std::fs::remove_file(&column_copy);
+                std::fs::copy(&reference, &column_copy).expect("a copy of the reference file");
+                let (copy, _) = Document::open(
+                    &column_copy,
+                    &temp,
+                    VolumeInfo::default(),
+                    &scheduler,
+                    OpenOptions::default(),
+                    None,
+                )
+                .expect("opening the copy");
+                let copy = Arc::new(copy);
+                copy.index_job().wait().expect("indexing");
+                copy.delete_column(COLUMN)
+                    .expect("the delete")
+                    .expect("a change");
+                let started = Instant::now();
+                let job = copy.save(SaveRequest::new(&column_copy, SaveKind::Save));
+                job.wait().expect("the save");
+                total += started.elapsed();
+            }
+            total
+        });
+    });
+    let _ = std::fs::remove_file(&column_copy);
 
     // A save after 1,000 rows deleted (task 2.4c): the file loses them
     // each time (so it runs after `rows_deleted_no_disk`).

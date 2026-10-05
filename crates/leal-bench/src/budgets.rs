@@ -123,7 +123,8 @@ pub const BUDGETS: &[Budget] = &[
         source: "DESIGN §1",
     },
     // Save after a column inserted (PLAN 2.4c): every row written whole,
-    // under a save's budget.
+    // under a save's budget. Report-only (`REPORT_ONLY`): ADR-0015,
+    // proposed.
     Budget {
         id: "save/column_insert",
         max_ms: 500.0,
@@ -138,3 +139,20 @@ pub const BUDGETS: &[Budget] = &[
         source: "ADR-0013",
     },
 ];
+
+/// Budgets that are reported but don't fail the job: over its limit, the
+/// benchmark warns (`report::Status::OverReportOnlyBudget`). A missing
+/// result still fails, so the benchmark can't vanish unnoticed, and each
+/// still has its no-disk twin judged for regressions between commits.
+///
+/// `save/column_insert` rewrites every row of the 100 MB reference file;
+/// it took 0.71–1.06 s on the CI runner (ADR-0015, proposed for Rob at the
+/// phase 2 gate: a genuinely slow operation, not a first-paint or reading
+/// path). Taking an id out of this list makes its budget hard again.
+pub const REPORT_ONLY: &[&str] = &["save/column_insert"];
+
+/// True if `id`'s budget is report-only ([`REPORT_ONLY`]).
+#[must_use]
+pub fn is_report_only(id: &str) -> bool {
+    REPORT_ONLY.contains(&id)
+}

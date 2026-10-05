@@ -65,6 +65,9 @@ pub(super) fn parse(
     Some(ParsedRow { span, fields })
 }
 
+/// The fields [`split`] makes room for before it starts.
+const FIELDS_HINT: usize = 16;
+
 /// The fields of the row `span`. Every row has at least one field: a blank
 /// row's is empty.
 fn split<U: Units>(
@@ -78,7 +81,10 @@ fn split<U: Units>(
         delimiter, quote, ..
     } = dialect;
     let end = span.end;
-    let mut fields = Vec::new();
+    // Room for most rows' fields at once: growing from empty took three
+    // reallocations a row for the reference file's 12 columns, an eighth
+    // of a save that writes every row whole (task 2.G-b).
+    let mut fields = Vec::with_capacity(FIELDS_HINT);
     let mut start = span.start;
     loop {
         let (field_end, kind) = if start + w <= end && units.is(bytes, start, quote) {

@@ -280,7 +280,13 @@ bench-compare base="main" regression="0.20" noise="0.10":
         echo "bench-compare: compared with ${sha:0:12} ({{ base }}), attempt $attempt, $order"
     }
 
-    # Up to three attempts. A budget fails on any of them. A regression
+    # Up to three attempts. A budget fails on any of them, but not before
+    # the regressions are judged: bench-report still asks for the rerun
+    # (status 3) that noise or a regression calls for, carries the budget
+    # failure to the last attempt and fails there (task 2.G-b; before, a
+    # budget failure on attempt 1 ended the job, and no regression was
+    # judged from 2.4c to the phase 2 gate). A report-only budget
+    # (crates/leal-bench/src/budgets.rs, ADR-0015) only warns. A regression
     # fails only if every attempt shows it, and inconclusive (something
     # noise kept from being judged) warns and passes: a noisy runner is no
     # reason to turn CI red. A canary that moved by more than {{ noise }}

@@ -378,9 +378,14 @@ fn a_regression_only_on_the_first_attempt() {
 #[test]
 fn a_budget_fails_on_either_attempt() {
     for canary in [0.02, 0.16] {
-        // On the first attempt: no rerun.
+        // On the first attempt, with a regression: rerun, so the
+        // regression is judged (task 2.G-b), and the job fails at the end
+        // even if the rerun is within budget.
         let first = attempt(canary, 0.01, 501.0, 0.0, 0.35);
-        assert_eq!(first.outcome(false), Outcome::Fail, "canary {canary}");
+        assert_eq!(first.outcome(false), Outcome::Rerun, "canary {canary}");
+        assert_eq!(first.outcome(true), Outcome::Fail, "canary {canary}");
+        let rerun = attempt(0.01, canary, 300.0, 0.0, 0.0).after(&first);
+        assert_eq!(rerun.outcome(true), Outcome::Fail, "canary {canary}");
 
         // On the rerun, after a first attempt within budget.
         let first = attempt(canary, 0.01, 300.0, 0.0, 0.35);
@@ -475,12 +480,20 @@ fn over_budget_fails_even_on_a_noisy_run() {
     assert!(report.noisy);
     assert_eq!(status_of(&report, "index/build"), &Status::OverBudget);
     assert_eq!(report.verdict(), Verdict::Fail);
-    // On the first attempt and the last: noise never excuses a budget.
-    for last_attempt in [false, true] {
-        let outcome = report.outcome(last_attempt);
-        assert_eq!(outcome, Outcome::Fail, "last attempt: {last_attempt}");
-        assert_eq!(outcome.exit_code(), 1);
-    }
+    // Noise never excuses a budget. On attempt 1 the noisy run is still
+    // rerun, so regressions are judged (task 2.G-b), and the rerun fails
+    // for the budget whatever it shows.
+    assert_eq!(report.outcome(false), Outcome::Rerun);
+    assert_eq!(report.outcome(true), Outcome::Fail);
+    assert_eq!(report.outcome(true).exit_code(), 1);
+    let quiet = [
+        measurement("baseline/memchr3_scan", 1e6, Some(change(0.0))),
+        measurement("index/build", 300e6, Some(change(0.0))),
+    ];
+    let rerun = report::evaluate(&quiet, &budgets, CI).after(&report);
+    assert_eq!(status_of(&rerun, "index/build"), &Status::Ok);
+    assert_eq!(rerun.earlier_over_budget, vec!["index/build".to_owned()]);
+    assert_eq!(rerun.outcome(false), Outcome::Fail);
 
     let found = [measurement("index/build", 499e6, Some(change(0.10)))];
     let report = report::evaluate(&found, &budgets, CI);
@@ -1729,4 +1742,99 @@ fn bench_report_runs_a_third_attempt_for_a_regression_on_noisy_attempts() {
             assert!(!stdout.contains("::error::"), "{name}: {stdout}");
         }
     }
+}
+
+/// A budget failure on attempt 1 used to fail the job there, so a
+/// regression on the same attempt was never rerun and never judged: from
+/// 2.4c to the phase 2 gate, `save/column_insert` over budget kept every
+/// regression from being judged (task 2.G-b). Now the regression is
+/// rerun, judged, and the budget still fails the job at the end.
+#[test]
+fn a_budget_failure_does_not_stop_regressions_being_judged() {
+    let budgets = [Budget {
+        id: "index/build",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    }];
+    let first = report::evaluate(
+        &[
+            measurement("index/build", 501e6, None),
+            measurement("rows/parse", 1e6, Some(change(0.50))),
+        ],
+        &budgets,
+        CI,
+    );
+    assert_eq!(status_of(&first, "index/build"), &Status::OverBudget);
+    assert_eq!(status_of(&first, "rows/parse"), &Status::Regression);
+    assert_eq!(first.outcome(false), Outcome::Rerun);
+    assert_eq!(first.outcome(false).exit_code(), 3);
+
+    // Over budget and quiet, with no regression: nothing to rerun.
+    let alone = report::evaluate(&[measurement("index/build", 501e6, None)], &budgets, CI);
+    assert_eq!(alone.outcome(false), Outcome::Fail);
+
+    // The rerun confirms the regression: it fails, and names both.
+    let second = report::evaluate(
+        &[
+            measurement("index/build", 499e6, None),
+            measurement("rows/parse", 1e6, Some(change(0.50))),
+        ],
+        &budgets,
+        CI,
+    )
+    .after(&first);
+    assert_eq!(status_of(&second, "rows/parse"), &Status::Regression);
+    assert_eq!(second.over_budget(), vec!["index/build".to_owned()]);
+    assert_eq!(second.outcome(false), Outcome::Fail);
+
+    // The rerun doesn't show it: the budget alone fails the job.
+    let cleared = report::evaluate(
+        &[
+            measurement("index/build", 499e6, None),
+            measurement("rows/parse", 1e6, Some(change(0.0))),
+        ],
+        &budgets,
+        CI,
+    )
+    .after(&first);
+    assert_eq!(status_of(&cleared, "rows/parse"), &Status::Ok);
+    assert_eq!(cleared.outcome(false), Outcome::Fail);
+}
+
+/// A report-only budget (ADR-0015, proposed) warns over its limit and
+/// passes; with no result it still fails.
+#[test]
+fn a_report_only_budget_warns_and_passes() {
+    assert!(leal_bench::budgets::is_report_only("save/column_insert"));
+    let budgets = [Budget {
+        id: "save/column_insert",
+        max_ms: 500.0,
+        source: "DESIGN §1",
+    }];
+    let report = report::evaluate(
+        &[measurement(
+            "save/column_insert",
+            1_060e6,
+            Some(change(0.10)),
+        )],
+        &budgets,
+        CI,
+    );
+    assert_eq!(
+        status_of(&report, "save/column_insert"),
+        &Status::OverReportOnlyBudget
+    );
+    assert!(report.over_budget().is_empty());
+    assert_eq!(report.outcome(false), Outcome::Pass);
+    assert_eq!(report.outcome(true), Outcome::Pass);
+    assert!(report.problems().any(|row| row.id == "save/column_insert"));
+    assert!(
+        report.markdown().contains("over budget (report-only)"),
+        "{}",
+        report.markdown()
+    );
+
+    let missing = report::evaluate(&[], &budgets, CI);
+    assert_eq!(status_of(&missing, "save/column_insert"), &Status::Missing);
+    assert_eq!(missing.outcome(true), Outcome::Fail);
 }

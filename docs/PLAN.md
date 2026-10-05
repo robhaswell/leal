@@ -812,6 +812,12 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     e.g. at most 0.05% late frames? With strips (2.0b), 1 late frame in
     about 7,560 appeared in one of three runs after indexing, which the
     budget as written counts as a fail. (docs/perf.md)
+  - For the phase 2 gate: ADR-0015 (proposed), report-only budgets for
+    structural saves. The Benchmarks workflow was red on every push from
+    2.4c to the gate: `save/column_insert` took 0.71–1.06 s on the runner,
+    against 500 ms. Because a budget failure on attempt 1 ended the job, no
+    regression was judged in that time either. 2.G-b fixed the ordering
+    and made the budget report-only, provisionally. (docs/tasks/2.G-b.md)
 
 ## Phase 3 — Filter and sort
 
