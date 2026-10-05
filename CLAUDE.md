@@ -49,9 +49,12 @@ there are no pull requests and no long-lived branches.
     bench output instead of reading them whole.
   - **Smaller tasks.** Split a task bigger than about a day into parts
     (e.g. 2.2 would have been four).
-  - **Model by job.** Sonnet for docs merges, CI and flaky-test fixes,
-    narrow re-reviews and tidy-ups; Opus for implementing and for the main
-    review of risky tasks.
+  - **Model by job** (Rob, 2026-10-05). The orchestrating session runs
+    Opus 5.5 at high effort. Implementers and the main review of risky
+    tasks run Opus 5.5 at **medium** effort (pass the effort explicitly
+    where a tool allows it, e.g. a Workflow's `effort: 'medium'`). Sonnet
+    for docs merges, CI and flaky-test fixes, narrow re-reviews and
+    tidy-ups. Don't change `settings.json` for this.
   - **Short task notes.** At most about 200 lines; review history goes in
     commit messages, not the notes.
   - **At most two agents at once.**
