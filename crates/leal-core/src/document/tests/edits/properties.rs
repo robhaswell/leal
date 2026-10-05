@@ -658,6 +658,10 @@ fn check_readers(
             }
         }
     }
+    // A copy whose last line is empty ends with a line break (`end_copy`).
+    if rows > 0 && (tsv.is_empty() || tsv.ends_with('\n')) {
+        tsv.push('\n');
+    }
     let copied = document.copy_cells_now(0..rows, 0..widest + 1).unwrap();
     prop_assert_eq!(copied.as_deref(), Some(tsv.as_str()));
     let job = document.copy_cells(0..rows, 0..widest + 1);

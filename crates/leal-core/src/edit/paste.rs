@@ -19,6 +19,9 @@
 //!   said` pastes as written);
 //! - one line break at the very end is dropped: spreadsheets end a copy
 //!   with one. So empty text, or a lone line break, is one empty value.
+//!   Leal's Copy ends with one only when its last line is empty (a
+//!   one-column copy ending in an empty cell), so its own copies read back
+//!   whole: `"a\n\n"` is two rows, `"a"` and `""`, not the one value `"a"`.
 
 use std::borrow::Cow;
 

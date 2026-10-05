@@ -530,3 +530,104 @@ fn replacing_too_much_text_at_once_is_refused() {
     // Two of them are within it.
     assert!(document.clear_cells(1..3, 0..1).unwrap().is_some());
 }
+
+/// Leal's own Copy then Paste puts back exactly the cells copied (phase 2
+/// gate): a one-column copy whose last cell is empty keeps that row, rather
+/// than losing it to the line break Paste drops at the end, and isn't taken
+/// for one value that fills the selection.
+#[test]
+fn a_copy_whose_last_cell_is_empty_pastes_back_whole() {
+    let dir = Dir::new("paste-own-copy");
+    let document = open_with(&dir, "a.csv", b"a,1\n,2\n,3\nb,4\n");
+    let copied = |rows: Range<usize>, columns: Range<usize>| {
+        let now = document
+            .copy_cells_now(rows.clone(), columns.clone())
+            .unwrap();
+        let job = document.copy_cells(rows, columns);
+        assert_eq!(job.control().wait_timeout(LONG), Some(Ok(())));
+        assert_eq!(job.wait().unwrap().take(), now, "the job copies the same");
+        now.unwrap()
+    };
+    let text = copied(0..2, 0..1);
+    assert_eq!(text, "a\n\n");
+    // Into a 4-row selection: a 2-row block from its top-left cell.
+    paste(&document, 0..4, 1..2, &text);
+    assert_eq!(
+        texts(&document),
+        of(&[&["a", "a"], &["", ""], &["", "3"], &["b", "4"]])
+    );
+
+    // Two empty cells: two cells cleared, not the whole selection.
+    let text = copied(1..3, 0..1);
+    assert_eq!(text, "\n\n");
+    paste(&document, 2..4, 1..2, &text);
+    assert_eq!(
+        texts(&document),
+        of(&[&["a", "a"], &["", ""], &["", ""], &["b", ""]])
+    );
+
+    // One empty cell is a lone line break: it clears what it's pasted on.
+    let text = copied(1..2, 0..1);
+    assert_eq!(text, "\n");
+    paste(&document, 0..1, 1..2, &text);
+    assert_eq!(texts(&document)[0], ["a", ""]);
+
+    // Any other copy ends without a line break.
+    assert_eq!(copied(0..1, 0..1), "a");
+    assert_eq!(copied(0..2, 0..2), "a\t\n\t");
+    assert_eq!(copied(2..4, 0..1), "\nb");
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+    /// Any rectangle Copy puts on the clipboard reads back as the same
+    /// cells (`parse_tsv`): its height, its width and every value,
+    /// including empty last rows and columns, and values with tabs,
+    /// quotes and line breaks.
+    #[test]
+    fn copy_then_parse_gives_back_the_cells(
+        grid in proptest::collection::vec(
+            proptest::collection::vec(
+                proptest::sample::select(vec!["", "", "x", "a b", "t\tt", "q\"q", "l\nl", "\""]),
+                3,
+            ),
+            1..6,
+        ),
+        top in 0usize..6,
+        left in 0usize..3,
+        height in 1usize..6,
+        width in 1usize..4,
+    ) {
+        let top = top % grid.len();
+        let height = height.min(grid.len() - top);
+        let left = left % 3;
+        let width = width.min(3 - left);
+        let mut file = Vec::new();
+        for row in &grid {
+            let fields: Vec<String> = row
+                .iter()
+                .map(|value| format!("\"{}\"", value.replace('"', "\"\"")))
+                .collect();
+            file.extend_from_slice(fields.join(",").as_bytes());
+            file.push(b'\n');
+        }
+        let dir = Dir::new("paste-copy-property");
+        let document = open_with(&dir, "a.csv", &file);
+        let text = document
+            .copy_cells_now(top..top + height, left..left + width)
+            .unwrap()
+            .unwrap();
+        let pasted = crate::edit::parse_tsv(&text, usize::MAX).unwrap();
+        let got: Vec<Vec<String>> = pasted
+            .rows()
+            .iter()
+            .map(|row| row.iter().map(|value| value.to_string()).collect())
+            .collect();
+        let want: Vec<Vec<String>> = grid[top..top + height]
+            .iter()
+            .map(|row| row[left..left + width].iter().map(|&value| value.to_owned()).collect())
+            .collect();
+        proptest::prop_assert_eq!(got, want, "{:?}", text);
+    }
+}

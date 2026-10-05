@@ -991,7 +991,7 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Undo / redo | ⌘Z / ⇧⌘Z |
 | Find | ⌘F, ⌘G / ⇧⌘G |
 | Go to row | ⌘L |
-| Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells; empty text pastes nothing) |
+| Copy / paste | ⌘C / ⌘V (TSV on the clipboard: one line break at the end is dropped, as spreadsheets end a copy with one, and Leal's Copy ends with one only when its last line is empty, so its own copies paste back whole. Multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells; empty text pastes nothing) |
 | Cut | ⌘X (whole rows selected by their numbers: Copy, then delete them; otherwise Copy, then clear the cells) |
 | Insert row below / delete row (in the in-cell editor, or the inspector while editing, ⌘⌫ deletes text to the start of the line instead) | ⌘↩ / ⌘⌫ |
 | Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |

@@ -175,6 +175,7 @@ impl Document {
                 &columns,
                 &mut out,
             )?;
+            end_copy(&mut out);
         }
         Ok(Some(out))
     }
@@ -323,6 +324,9 @@ impl Document {
                         &mut out,
                     )?;
                     next = end;
+                }
+                if next > rows.start {
+                    end_copy(&mut out);
                 }
                 Poll::Ready(Ok(CopiedText::new(std::mem::take(&mut out))))
             })
@@ -535,6 +539,20 @@ fn estimated_logical_copy_bytes(
     let share = bytes * u128::try_from(copied).unwrap_or(0) / u128::try_from(fields).unwrap_or(1);
     let total = share.saturating_add(u128::try_from(edited).unwrap_or(u128::MAX));
     u64::try_from(total).unwrap_or(u64::MAX)
+}
+
+/// Ends the text of a copy of at least one row with a line break if its
+/// last line is empty (a one-column copy whose last cell is empty, or one
+/// empty cell), so that Paste, which drops one line break at the end as
+/// spreadsheets end a copy with one ([`parse_tsv`](crate::edit::parse_tsv)),
+/// reads that empty cell back rather than losing it, or taking a two-row
+/// copy for one value that fills the selection (phase 2 gate). Any other
+/// copy ends without one: its last line ends with a value or a tab, and a
+/// one-cell copy pastes into a text field as just the value.
+fn end_copy(out: &mut String) {
+    if out.is_empty() || out.ends_with('\n') {
+        out.push('\n');
+    }
 }
 
 /// Appends one cell to tab-separated text, the way spreadsheets put cells
