@@ -667,9 +667,14 @@ impl Document {
         // `saving` before it looks at `recheck` (both `SeqCst`): if this
         // sees a save running, that save sees `recheck` when it ends.
         self.recheck.store(true, Ordering::SeqCst);
-        if self.saving.load(Ordering::SeqCst) {
+        if self.saving.load(Ordering::SeqCst) || !Arc::ptr_eq(&self.current().source, source) {
             return None;
         }
+        // The drive's or share's file is opened before the writer lock is
+        // taken: a share that answers a stat but stalls on an open holds
+        // up this (checking) thread only, never an edit on the main thread
+        // waiting for the lock (ADR-0009, phase 2 gate).
+        let reopened = source.reopen(path)?;
         // A save takes its turn before it takes the writer lock for its
         // snapshot, so under the lock, a save not seen yet starts on the
         // reading made here.
@@ -679,8 +684,10 @@ impl Document {
         }
         // Done here, not left for a save.
         self.recheck.store(false, Ordering::SeqCst);
+        // Checked again under the lock: the reading may have been replaced
+        // meanwhile, and the drive may have gone again or been reconnected.
         let old = self.current();
-        if !Arc::ptr_eq(&old.source, source) || !source.reconnect(path) {
+        if !Arc::ptr_eq(&old.source, source) || !source.finish_reconnect(reopened) {
             return None;
         }
         // Detection already succeeded with these choices on these bytes, so

@@ -189,6 +189,72 @@ fn a_share_that_stops_answering_is_disconnected_until_it_is_back() {
     assert_eq!(document.rows(0..all.len(), 1000).unwrap(), all);
 }
 
+/// A share back after a disconnection that answers the check but stalls on
+/// the open: the reconnect opens the file before it takes the writer lock,
+/// so an edit and an undo on the main thread meanwhile don't wait for the
+/// share (ADR-0009, phase 2 gate), and the reconnect then carries them on.
+#[test]
+fn edits_while_a_share_stalls_on_reopening_dont_wait() {
+    let dir = Dir::new("share-reopen-stall");
+    let bytes = sample(300 * 1024);
+    let (document, _) = open_share(
+        &dir,
+        &bytes,
+        8192,
+        failing(150 * 1024, libc::ETIMEDOUT, None),
+        &scheduler(),
+        None,
+    );
+    let document = Arc::new(document);
+    assert_eq!(
+        document.index_job().control().wait_timeout(LONG),
+        Some(Err(JobError::Read(ReadErrorKind::Disconnected)))
+    );
+    let (entered, opening) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    document.source().set_reopen_hook(Arc::new(move || {
+        let _ = entered.send(());
+        let _ = released.lock().unwrap().recv_timeout(LONG);
+    }));
+    document.source().simulate_drive_back();
+    let checking = std::thread::spawn({
+        let document = Arc::clone(&document);
+        move || document.check_original_restarting().1
+    });
+    opening
+        .recv_timeout(LONG)
+        .expect("the reconnect opens the file");
+
+    let (sent, got) = mpsc::channel();
+    std::thread::spawn({
+        let document = Arc::clone(&document);
+        move || {
+            let first = document.set_cell(1, 1, "during").unwrap().unwrap();
+            document.set_cell(2, 1, "undone").unwrap().unwrap();
+            let second = document.set_cell(2, 1, "x").unwrap().unwrap();
+            document.apply(&second.inverse()).unwrap();
+            sent.send(first).unwrap();
+        }
+    });
+    got.recv_timeout(Duration::from_secs(1))
+        .expect("an edit waited for the share");
+    release.send(()).unwrap();
+    let restarted = checking.join().unwrap().expect("reconnected");
+    assert_eq!((restarted.from, restarted.to), (0, 1));
+    let all = expected_rows(&bytes, document.current().parser, 1000);
+    assert_eq!(wait_for_index(&document).rows, all.len());
+    assert_eq!(document.storage(), Storage::Copy);
+    assert_eq!(
+        document.full_value(1, 1).unwrap().as_deref(),
+        Some("during")
+    );
+    assert_eq!(
+        document.full_value(2, 1).unwrap().as_deref(),
+        Some("undone")
+    );
+}
+
 /// Network errors that pass are invisible to the document: the index
 /// completes and every row is right.
 #[test]

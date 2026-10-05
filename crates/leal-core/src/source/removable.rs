@@ -344,6 +344,26 @@ pub(super) struct Removable {
     /// it go on.
     #[cfg(any(test, feature = "test-hooks"))]
     held_copy: Option<HeldCopy>,
+    /// TEST: called by [`reopen`](Removable::reopen) before it opens a
+    /// file, so a test can hold it there, as a share that stalls on the
+    /// open would.
+    #[cfg(test)]
+    reopen_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// A file on a drive or share reopened by
+/// [`Source::reopen`](super::Source::reopen), for
+/// [`Source::finish_reconnect`](super::Source::finish_reconnect) to read
+/// from: the drive's clone, or the user's file itself. Opened with no lock
+/// held, so a share that stalls on the open stalls only the thread checking
+/// it (phase 2 gate, ADR-0009).
+#[derive(Debug)]
+pub struct Reopened {
+    file: File,
+    /// The file's `(st_dev, st_ino)` now.
+    id: (u64, u64),
+    /// `None` for the clone; for the user's file, its path and identity.
+    original: Option<(PathBuf, FileIdentity)>,
 }
 
 /// TEST HOOK, not for product code: what to pretend happens to a file on a
@@ -610,6 +630,8 @@ impl Removable {
             fault: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             held_copy: None,
+            #[cfg(test)]
+            reopen_hook: Mutex::new(None),
         })
     }
 
@@ -754,22 +776,96 @@ impl Removable {
     /// Nothing is reopened after the file changed while it was read, or
     /// was deleted on its share, and nothing is needed once the copy is
     /// complete.
+    ///
+    /// It is two steps, so that the document's writer lock is never held
+    /// across the drive's or share's I/O: [`reopen`](Self::reopen) opens
+    /// the file with no lock held, then [`install`](Self::install) checks
+    /// again and reads from it.
     pub(super) fn reconnect(&self, original: &Path, opened: &FileIdentity) -> bool {
+        self.reopen(original, opened)
+            .is_some_and(|reopened| self.install(reopened))
+    }
+
+    /// Whether a reconnect is wanted: the drive went, and the file didn't
+    /// change, wasn't deleted, and isn't all copied.
+    fn wants_reconnect(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+            && !self.changed_on_disk()
+            && !self.deleted.load(Ordering::Acquire)
+            && !self.is_complete()
+    }
+
+    /// [`reconnect`](Self::reconnect)'s first step: opens the clone or the
+    /// user's file and checks it is the same file. Holds no lock while it
+    /// opens or looks at the file. `None` if nothing is to be reconnected,
+    /// or neither file is there and the same.
+    pub(super) fn reopen(&self, original: &Path, opened: &FileIdentity) -> Option<Reopened> {
         if self.share.is_some() {
             self.note_share_use();
         }
         #[cfg(any(test, feature = "test-hooks"))]
         if self.simulated_away() {
             // A simulated drive is away until the test brings it back.
-            return false;
+            return None;
         }
-        if !self.disconnected.load(Ordering::Acquire)
-            || self.changed_on_disk()
-            || self.deleted.load(Ordering::Acquire)
-            || self.is_complete()
+        if !self.wants_reconnect() {
+            return None;
+        }
+        // Once it has fallen back to the user's file, it stays with it:
+        // `path` and `id` are the user's file's from then on.
+        let clone = {
+            let external = self.lock_external();
+            let external = external.as_ref()?;
+            external
+                .reads_clone()
+                .then(|| (external.path.clone(), external.id.1))
+        };
+        #[cfg(test)]
         {
-            return false;
+            let hook = self
+                .reopen_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
+        if let Some((path, inode)) = clone
+            && let Ok(file) = File::open(&path)
+            && let Ok(now) = file.metadata()
+            && now.ino() == inode
+            && usize::try_from(now.len()) == Ok(self.len)
+        {
+            return Some(Reopened {
+                file,
+                id: (now.dev(), now.ino()),
+                original: None,
+            });
+        }
+        let file = File::open(original).ok()?;
+        let now = file.metadata().ok()?;
+        (now.ino() == opened.inode
+            && now.len() == opened.len
+            && now.modified().ok() == opened.modified)
+            .then(|| Reopened {
+                file,
+                id: (now.dev(), now.ino()),
+                original: Some((
+                    original.to_owned(),
+                    FileIdentity {
+                        device: now.dev(),
+                        ..*opened
+                    },
+                )),
+            })
+    }
+
+    /// [`reconnect`](Self::reconnect)'s second step, with no I/O: checks
+    /// again that a reconnect is wanted (the drive may have gone again, or
+    /// another check reconnected it meanwhile), then reads from `reopened`
+    /// from now on. Returns whether it did.
+    pub(super) fn install(&self, reopened: Reopened) -> bool {
         // No stream is running: it stopped when the drive went. Holding its
         // lock keeps a new one from starting until this is done.
         let _streaming = self
@@ -780,38 +876,33 @@ impl Removable {
         let Some(external) = external.as_mut() else {
             return false;
         };
-        // Once it has fallen back to the user's file, it stays with it:
-        // `path` and `id` are the user's file's from then on.
-        let reopened = if external.reads_clone()
-            && let Ok(clone) = File::open(&external.path)
-            && let Ok(now) = clone.metadata()
-            && now.ino() == external.id.1
-            && usize::try_from(now.len()) == Ok(self.len)
-        {
-            external.file = Arc::new(clone);
-            external.id = (now.dev(), now.ino());
-            true
-        } else if let Ok(file) = File::open(original)
-            && let Ok(now) = file.metadata()
-            && now.ino() == opened.inode
-            && now.len() == opened.len
-            && now.modified().ok() == opened.modified
-        {
-            external.file = Arc::new(file);
-            external.path = original.to_owned();
-            external.id = (now.dev(), now.ino());
-            external.reads = Reads::Original(FileIdentity {
-                device: now.dev(),
-                ..*opened
-            });
-            true
-        } else {
-            false
-        };
-        if reopened {
-            self.disconnected.store(false, Ordering::Release);
+        if !self.wants_reconnect() {
+            return false;
         }
-        reopened
+        let Reopened { file, id, original } = reopened;
+        match original {
+            // The clone, unless another reconnect fell back meanwhile.
+            None if external.reads_clone() && external.id.1 == id.1 => {}
+            None => return false,
+            Some((path, identity)) => {
+                external.path = path;
+                external.reads = Reads::Original(identity);
+            }
+        }
+        external.file = Arc::new(file);
+        external.id = id;
+        self.disconnected.store(false, Ordering::Release);
+        true
+    }
+
+    /// TEST: calls `hook` each time [`reopen`](Self::reopen) is about to
+    /// open a file.
+    #[cfg(test)]
+    pub(super) fn set_reopen_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .reopen_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 
     /// TEST HOOK: whether a simulated drive or share is away until the test

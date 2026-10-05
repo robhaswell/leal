@@ -109,7 +109,9 @@ pub use error::{OpenError, OpenErrorKind, ReadError, ReadErrorKind};
 pub use original::{MOVE_WINDOW, Original, OriginalState, OriginalStatus, PENDING_POLL};
 #[cfg(test)]
 pub(crate) use removable::PRETEND_MAIN_THREAD;
-pub use removable::{NETWORK_RETRY_DELAYS, NETWORK_RETRY_WINDOW, forbid_share_use_on_main_thread};
+pub use removable::{
+    NETWORK_RETRY_DELAYS, NETWORK_RETRY_WINDOW, Reopened, forbid_share_use_on_main_thread,
+};
 use removable::{Origin, Removable, ShareRules};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use removable::{SimulatedFault, SimulatedShare, SimulatedShareFailure};
@@ -1043,6 +1045,37 @@ impl Source {
         match &self.bytes {
             Bytes::Removable(removable) => removable.reconnect(original, &self.identity),
             Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    /// [`reconnect`](Self::reconnect) in two steps, for a caller that
+    /// holds a lock while it reconnects: this one opens the drive's file,
+    /// with that lock not held yet, so a share that stalls on the open
+    /// holds up only the calling thread (phase 2 gate, ADR-0009). `None`
+    /// where `reconnect` would return `false` before its last checks.
+    pub fn reopen(&self, original: &Path) -> Option<Reopened> {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.reopen(original, &self.identity),
+            Bytes::Mapped(_) | Bytes::Owned(_) => None,
+        }
+    }
+
+    /// The second step of [`reopen`](Self::reopen), with no I/O, so fine
+    /// under a lock: checks again that the drive is still wanted back, and
+    /// reads from `reopened` from now on. Returns whether it reconnected.
+    pub fn finish_reconnect(&self, reopened: Reopened) -> bool {
+        match &self.bytes {
+            Bytes::Removable(removable) => removable.install(reopened),
+            Bytes::Mapped(_) | Bytes::Owned(_) => false,
+        }
+    }
+
+    /// TEST: calls `hook` each time [`reopen`](Self::reopen) is about to
+    /// open a file of the drive or share (none for other sources).
+    #[cfg(test)]
+    pub(crate) fn set_reopen_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if let Bytes::Removable(removable) = &self.bytes {
+            removable.set_reopen_hook(hook);
         }
     }
 
