@@ -116,6 +116,20 @@ jobs:
       - name: Build the scripted-run app
         run: just _app-scripted debug
 
+      # Save in the real sandbox (DESIGN §4.3): the hosted XCTests' files
+      # sit in the app's container, where every folder may be opened, so
+      # only this catches a sandbox problem (2.5.3a's `Io(step: "looking
+      # at the folder")` passed app-test). It launches the scripted Debug
+      # app built above with `open -a` on files outside the container, on
+      # the internal disk and on FAT32 and exFAT images it attaches with
+      # hdiutil, and gives up after 180 s a volume. It never kills by name.
+      # Added at the phase 2 gate (task 2.G-b); if it proves flaky on the
+      # runner (a TCC prompt for /Volumes, say), move it to deep.yml and
+      # record why in docs/tasks/2.G-b.md.
+      - name: Save in the real sandbox (internal, FAT32, exFAT)
+        timeout-minutes: 15
+        run: just sandbox-save-check debug
+
       # The XCTest suite again, against the Rust release profile and the
       # Release configuration. Among other things, this checks that a Rust
       # panic is still caught in the release profile (`panic = "unwind"`).

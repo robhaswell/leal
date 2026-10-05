@@ -34,6 +34,21 @@ final class DocumentController: NSDocumentController {
     /// the same file meanwhile, and whether each wanted it shown.
     private var waiting: [String: [(display: Bool, completion: Completion)]] = [:]
 
+    #if LEAL_BENCH
+    /// False during a scripted run (`ScriptedRun.prepare`): the scripted
+    /// build is Leal to macOS (the same bundle identifier), so the files a
+    /// run opens, which its recipe then deletes, would stay in the real
+    /// Leal's Open Recent (gate 2.G-b). Only the scripted build has it.
+    static var notesRecentDocuments = true
+
+    /// Every recent document goes through here, from an open
+    /// (`noteNewRecentDocument(_:)`) or from Save As.
+    override func noteNewRecentDocumentURL(_ url: URL) {
+        guard Self.notesRecentDocuments else { return }
+        super.noteNewRecentDocumentURL(url)
+    }
+    #endif
+
     override func openDocument(
         withContentsOf url: URL,
         display displayDocument: Bool,

@@ -92,9 +92,18 @@ final class ScriptedRun {
         self.defaults = defaults
     }
 
-    /// Before any document opens (`applicationWillFinishLaunching`): a
-    /// simulated removable drive, if asked for.
+    /// The options that start a scripted run.
+    private static let runs = ["LealBenchScroll", "LealSnapshot", "LealReopen", "LealBenchEdit", "LealSaveCheck"]
+
+    /// Before any document opens (`applicationWillFinishLaunching`): Open
+    /// Recent left alone by a scripted run (the files it opens are the
+    /// recipe's, deleted afterwards: `DocumentController
+    /// .notesRecentDocuments`), and a simulated removable drive, if asked
+    /// for.
     static func prepare(defaults: UserDefaults) {
+        if runs.contains(where: { defaults.string(forKey: $0) != nil }) {
+            DocumentController.notesRecentDocuments = false
+        }
         #if DEBUG
         guard let fault = defaults.string(forKey: "LealSimulateFault") else { return }
         let parts = fault.split(separator: ":")
@@ -122,7 +131,7 @@ final class ScriptedRun {
 
     static func startIfAsked(defaults: UserDefaults) {
         let run = ScriptedRun(defaults: defaults)
-        guard ["LealBenchScroll", "LealSnapshot", "LealReopen", "LealBenchEdit", "LealSaveCheck"].contains(where: { run.value(of: $0) != nil }) else { return }
+        guard runs.contains(where: { run.value(of: $0) != nil }) else { return }
         switch run.value(of: "LealAppearance") {
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         case "light": NSApp.appearance = NSAppearance(named: .aqua)

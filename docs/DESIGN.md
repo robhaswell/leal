@@ -1073,7 +1073,8 @@ to run concurrently and asserts first paint is still under 150 ms.
   container, where every folder may be opened, so only **`just
   sandbox-save-check`** catches sandbox problems: it saves, Saves As,
   Duplicates and Reverts files outside the container, on the internal
-  disk and on FAT32 and exFAT disk images.
+  disk and on FAT32 and exFAT disk images. CI's `check-all` job runs it
+  on every push (task 2.G-b).
 
 ### 4.4 Accessibility and localization
 

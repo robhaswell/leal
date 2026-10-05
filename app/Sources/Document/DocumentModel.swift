@@ -684,6 +684,13 @@ final class DocumentModel: GridDataSource {
         isShareBackedOff && shareRecheck == nil && checkingOriginal == nil
     }
 
+    /// A look at the file (`checkOriginal()`) is under way, so another call
+    /// would only queue one to run after it. For tests that need a check of
+    /// their own.
+    var isCheckingOriginalForTesting: Bool {
+        checkingOriginal != nil
+    }
+
     private func recheckShareWhileDisconnected() {
         guard isOnNetworkShare, storage == .disconnected, shareRecheck == nil, failure == nil, !isShareBackedOff
         else { return }

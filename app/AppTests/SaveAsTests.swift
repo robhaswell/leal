@@ -878,6 +878,10 @@ final class SaveAsTests: XCTestCase {
     /// drive is no longer disconnected, the file is read on, and the edits
     /// stay.
     func testASaveThatEndsWithARestartTakesUpTheNewReading() async throws {
+        // Private centers: a mount or activation elsewhere in the suite
+        // can't start a check of the file during this test (gate 2.G-b).
+        DocumentModel.notificationCentersForTesting = (NotificationCenter(), NotificationCenter())
+        defer { DocumentModel.notificationCentersForTesting = nil }
         simulateDrive(.disconnect(at: 100_000))
         let url = try file("restart.csv", text(rows: 20_000))
         let (document, model, content) = try await open(url, indexed: false)
@@ -890,9 +894,15 @@ final class SaveAsTests: XCTestCase {
         let saving = try XCTUnwrap(document.saving)
         try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
         let job = try XCTUnwrap(model.saveJob)
-        // The drive is back: the check waits for the save.
+        // The drive is back: the check waits for the save. It must be a
+        // check of the test's own, started now: while another is under way
+        // (the one the disconnect started), `checkOriginal()` returns nil
+        // and only queues one, which could run after the save had ended
+        // (gate 2.G-b). So wait for any check to finish, then start one.
         _ = model.call { $0.debugSimulateDriveBack() }
-        await model.checkOriginal()?.value
+        try await waitUntil("no check under way") { !model.isCheckingOriginalForTesting }
+        let check = try XCTUnwrap(model.checkOriginal(), "a check of the test's own")
+        await check.value
         XCTAssertEqual(model.generation, generation, "not while the save runs")
         content.cancelOperation(nil)
         debugReleaseHeldSave()

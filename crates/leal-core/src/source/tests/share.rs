@@ -483,7 +483,9 @@ fn the_retries_stop_at_their_window() {
     // One chunk, then the failing chunk's tries: fewer than 1 + 5.
     assert!((2..6).contains(&failed), "{failed} tries of the chunk");
     assert_eq!(reads, 1 + failed);
-    assert!(took < Duration::from_millis(600), "took {took:?}");
+    // The count of tries is the check; the time only guards against a
+    // hang, so a busy machine doesn't fail it (task 2.G-b).
+    assert!(took < Duration::from_secs(5), "took {took:?}");
 }
 
 /// A slow share's read takes its delay (`sys::sleep_strictly`, a kernel
@@ -507,7 +509,9 @@ fn a_slow_shares_read_takes_its_delay() {
     source.read_head(64 * 1024).unwrap();
     let took = started.elapsed();
     assert!(took >= delay, "took {took:?}");
-    assert!(took < Duration::from_secs(1), "took {took:?}");
+    // 20 s, if the delay were read in the wrong unit; a busy machine can
+    // add a second or two (task 2.G-b).
+    assert!(took < Duration::from_secs(5), "took {took:?}");
 }
 
 /// A failed `fstat` after a good read (`Attempt::Stat`): a network error is

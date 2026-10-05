@@ -2144,6 +2144,9 @@ fn a_file_changed_while_its_drive_was_away_is_reported() {
         let (document, path) = open_on_image(&image, &dir, &bytes, &scheduler);
 
         image.force_detach();
+        // The harness checked that the volume is unmounted (task 2.G-b);
+        // a file still readable here would make the index job succeed.
+        assert!(!path.exists(), "{fs_type}: the file is gone with its drive");
         gate.open();
         assert_eq!(
             document.index_job().control().wait_timeout(LONG),

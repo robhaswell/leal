@@ -234,7 +234,9 @@ impl DiskImage {
 
     /// Detaches the image with `-force` straight away, as if the drive were
     /// unplugged with files on it still open (a normal detach is refused
-    /// then). Panics if the image is still attached afterwards.
+    /// then). Panics if the image is still attached, or its volume still
+    /// mounted, afterwards: a test that goes on to expect the drive gone
+    /// would otherwise fail in a way that looks like Leal's fault.
     pub(crate) fn force_detach(&self) {
         let left = self.detach(Duration::ZERO, DETACH_FORCED_FOR);
         assert!(
@@ -254,6 +256,13 @@ impl DiskImage {
     /// moment after a detach (and after a drive ejects itself), and then
     /// says "No such file or directory" to a detach of it. That is waited
     /// out, but not counted as a leak.
+    ///
+    /// `hdiutil info` can lag the other way too, under load: not list yet
+    /// an image just attached (task 2.G-b: a forced detach returned at once
+    /// with the volume still mounted, and the test read the file it
+    /// expected gone). So the image is detached only once neither of its
+    /// mount points is one any more ([`mounted`]); until then, it is
+    /// detached by mount point.
     fn detach(&self, normally_for: Duration, forced_for: Duration) -> Vec<String> {
         let started = Instant::now();
         let mut backoff = HDIUTIL_FIRST_BACKOFF;
@@ -269,6 +278,57 @@ impl DiskImage {
                 .collect();
             let elapsed = started.elapsed();
             let out_of_time = elapsed >= normally_for + forced_for;
+            let force = elapsed >= normally_for;
+            let still_mounted: Vec<&Path> = [self.mount.as_path(), self.elsewhere.as_path()]
+                .into_iter()
+                .filter(|point| mounted(point))
+                .collect();
+            if devices.is_empty() && !still_mounted.is_empty() {
+                let points: Vec<String> = still_mounted
+                    .iter()
+                    .map(|point| point.display().to_string())
+                    .collect();
+                if out_of_time {
+                    eprintln!(
+                        "DiskImage: {} still mounted at {} after {elapsed:.1?}, with no \
+                         device in hdiutil info{}",
+                        self.image.display(),
+                        points.join(", "),
+                        if trouble.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":\n  {}", trouble.join("\n  "))
+                        }
+                    );
+                    return points;
+                }
+                trouble.push(format!(
+                    "at {elapsed:.1?}, still mounted at {} with no device in hdiutil info; \
+                     detaching by mount point",
+                    points.join(", ")
+                ));
+                for point in &still_mounted {
+                    let mut command = Command::new("/usr/bin/hdiutil");
+                    command.arg("detach").arg(point);
+                    if force {
+                        command.arg("-force");
+                    }
+                    match command.output() {
+                        Ok(output) if !output.status.success() => trouble
+                            .push(format!("{command:?} failed: {}", hdiutil_message(&output))),
+                        Ok(_) => {}
+                        Err(error) => trouble.push(format!("couldn't run {command:?}: {error}")),
+                    }
+                }
+                if [self.mount.as_path(), self.elsewhere.as_path()]
+                    .into_iter()
+                    .any(mounted)
+                {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(DETACH_MAX_BACKOFF);
+                }
+                continue;
+            }
             if devices.is_empty() {
                 let lagging = attachments.iter().any(|a| !a.listed.is_empty());
                 if lagging && !out_of_time {
@@ -306,7 +366,6 @@ impl DiskImage {
                 );
                 return devices;
             }
-            let force = elapsed >= normally_for;
             if force && !showed_holders && !normally_for.is_zero() {
                 // An ordinary detach kept failing: say who holds the volume.
                 showed_holders = true;
@@ -457,6 +516,22 @@ fn attachments_of(image: &Path, trouble: &mut Vec<String>) -> Vec<Attachment> {
             }
         })
         .collect()
+}
+
+/// Whether a volume is mounted at `point`: the folder is on another device
+/// than its parent. A missing folder isn't (a forced detach can remove the
+/// mount point); one that can't be looked at counts as mounted, so a detach
+/// keeps trying rather than reporting success it can't see.
+fn mounted(point: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(parent) = point.parent() else {
+        return false;
+    };
+    match (fs::metadata(point), fs::metadata(parent)) {
+        (Err(error), _) if error.kind() == io::ErrorKind::NotFound => false,
+        (Ok(here), Ok(above)) => here.dev() != above.dev(),
+        _ => true,
+    }
 }
 
 /// Whether the device node is still in `/dev`. Only "not found" counts as

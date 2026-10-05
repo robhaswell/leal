@@ -12,6 +12,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// How long a test waits for the watcher to notice something.
 const NOTICE: Duration = Duration::from_secs(5);
 
+/// The bound on a call that must not block (on a busy thread, a held look):
+/// long enough that a busy machine never reaches it (task 2.G-b), far
+/// shorter than the waits the tests hold the other side for.
+const NOT_BLOCKED: Duration = Duration::from_secs(5);
+
 /// The file at `path` as `open` would record it.
 fn identity(path: &Path) -> FileIdentity {
     open_regular(path).unwrap().1
@@ -307,7 +312,8 @@ fn dropping_a_watched_original_stops_its_thread() {
     let (original, reports) = watched(&path);
     let start = Instant::now();
     drop(original);
-    assert!(start.elapsed() < Duration::from_secs(1));
+    // Only against a hang: a busy machine can take a while (task 2.G-b).
+    assert!(start.elapsed() < NOT_BLOCKED);
     // The thread is gone, so the channel's sender is too.
     assert!(matches!(
         reports.recv_timeout(Duration::from_secs(1)),
@@ -352,7 +358,9 @@ fn dropping_doesnt_wait_for_a_busy_watching_thread() {
     let start = Instant::now();
     drop(original);
     let took = start.elapsed();
-    assert!(took < Duration::from_secs(1), "dropping waited {took:?}");
+    // The busy thread is held for 10 s, so a drop that waited for it
+    // would take that long; anything less is a busy machine (task 2.G-b).
+    assert!(took < NOT_BLOCKED, "dropping waited {took:?}");
     release.send(()).unwrap();
 }
 
@@ -515,7 +523,9 @@ fn status_never_waits_for_a_look_in_progress() {
     let held = original.hold_as_a_look_would();
     let start = Instant::now();
     assert_eq!(original.status().state, OriginalState::Unchanged);
-    assert!(start.elapsed() < Duration::from_millis(100));
+    // The look is held until the end of the test, so a `status()` that
+    // waited for it would never return: the bound is only against a hang.
+    assert!(start.elapsed() < NOT_BLOCKED);
     drop(held);
 }
 

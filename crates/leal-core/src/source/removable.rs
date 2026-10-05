@@ -1741,6 +1741,7 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(20));
         let started = Instant::now();
         assert!(!pause(Duration::from_secs(30), &AtomicBool::new(true)));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Against the 30 s, not a precise time: a busy machine is slow.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
