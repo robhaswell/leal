@@ -3005,3 +3005,48 @@ fn a_copied_hatched_cell_in_a_quoted_file_across_saves() {
         b"\"a\",\"b\",\"c\"\n\"1\",,\"z\"\n\"1\",,z\n"
     );
 }
+
+/// A hatched cell typed into an inserted row, or into a row rewritten
+/// whole by a column insert or delete, is quoted only if its value needs
+/// it, even in a column that quotes every field, in a file that doesn't
+/// (ADR-0005 decision 2, `NewCell::Hatched`; phase 2 gate: a file that
+/// quotes every field can't tell this from the column's rule).
+#[test]
+fn a_hatched_cell_in_a_new_or_rewritten_row_is_quoted_only_if_it_needs_it() {
+    let inserted = |value: &str| {
+        saved_after("hatched-inserted", b"a,\"b\"\n1,\"2\"\n", |document| {
+            document
+                .insert_rows(1, &[vec!["9".into()]])
+                .unwrap()
+                .unwrap();
+            set(document, 1, 1, value);
+        })
+    };
+    assert_eq!(inserted("x"), b"a,\"b\"\n9,x\n1,\"2\"\n");
+    assert_eq!(inserted("x,y"), b"a,\"b\"\n9,\"x,y\"\n1,\"2\"\n");
+
+    let column_inserted = |value: &str| {
+        saved_after("hatched-column-in", b"a,\"b\"\n1,\"2\"\n4\n", |document| {
+            set(document, 2, 1, value);
+            document.insert_column(0, "n").unwrap().unwrap();
+        })
+    };
+    assert_eq!(column_inserted("y"), b"n,a,\"b\"\nn,1,\"2\"\nn,4,y\n");
+    assert_eq!(
+        column_inserted("y\"z"),
+        b"n,a,\"b\"\nn,1,\"2\"\nn,4,\"y\"\"z\"\n"
+    );
+
+    let column_deleted = |value: &str| {
+        saved_after(
+            "hatched-column-out",
+            b"a,\"b\",c\n1,\"2\",3\n4\n",
+            |document| {
+                set(document, 2, 1, value);
+                document.delete_column(2).unwrap().unwrap();
+            },
+        )
+    };
+    assert_eq!(column_deleted("y"), b"a,\"b\"\n1,\"2\"\n4,y\n");
+    assert_eq!(column_deleted("a,b"), b"a,\"b\"\n1,\"2\"\n4,\"a,b\"\n");
+}
