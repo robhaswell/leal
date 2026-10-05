@@ -49,7 +49,8 @@ saving::a_file_saved_on_a_removable_drive_is_read_back_from_a_copy|\
 saving::a_file_on_exfat_is_saved_over|\
 saving::a_file_on_fat32_is_renamed_over|\
 saving::save_as_to_a_new_name_on_exfat|\
-saving::a_replacement_folder_on_another_volume_is_not_used\
+saving::a_replacement_folder_on_another_volume_is_not_used|\
+saving::a_save_that_runs_out_of_space_leaves_the_original_untouched\
 )$/)
 """
 test-group = "disk-images"

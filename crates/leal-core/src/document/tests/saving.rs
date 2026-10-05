@@ -3102,3 +3102,91 @@ fn duplicated_rows_save_as_the_oracle_says() {
     });
     assert_eq!(saved, b"a,\"e\"\na,\"e\"\n1\n");
 }
+
+/// The attribute plan's whole-file census (phase 2 gate: never exercised):
+/// a file guessed UTF-8 from its ASCII first 64 KB, with a byte further on
+/// that isn't UTF-8, would reopen the same at first paint but not by the
+/// whole file's bytes, so the save records UTF-8.
+#[test]
+fn a_save_records_the_encoding_a_whole_file_guess_would_change() {
+    let dir = Dir::new("save-census-encoding");
+    let scheduler = scheduler();
+    let mut bytes = b"id,name\n".to_vec();
+    while bytes.len() < 80 * 1024 {
+        bytes.extend_from_slice(b"1,plain ascii text\n");
+    }
+    bytes.extend_from_slice(b"2,caf\xE9\n");
+    let path = dir.file("a.csv", &bytes);
+    let document = open_at(&path, &dir, &scheduler);
+    assert_eq!(document.detection().encoding, Encoding::Utf8);
+    set(&document, 1, 1, "edited");
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(saved.attributes.text_encoding, Some(Encoding::Utf8));
+    assert_eq!(
+        attribute(&path, TEXT_ENCODING_ATTRIBUTE_C).as_deref(),
+        Some(&b"utf-8;134217984"[..])
+    );
+
+    // All of it ASCII but the edit: nothing to record.
+    let path = dir.file("b.csv", &bytes[..bytes.len() - 7]);
+    let document = open_at(&path, &dir, &scheduler);
+    set(&document, 1, 1, "edited");
+    let saved = save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(saved.attributes.text_encoding, None);
+}
+
+/// A save that runs out of space part way through writing (a nearly full
+/// exFAT disk image) fails as a write error, leaves the original as it
+/// was, the same file with the same bytes, removes what it had written,
+/// and keeps the edits (phase 2 gate: no test made a save fail mid-write).
+#[test]
+fn a_save_that_runs_out_of_space_leaves_the_original_untouched() {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let image = DiskImage::new("ExFAT");
+    let dir = Dir::new("save-disk-full");
+    let bytes = sample(4 * 1024 * 1024);
+    let scheduler = scheduler();
+    let (document, path) = open_on_image(&image, &dir, &bytes, &scheduler);
+    let document = Arc::new(document);
+    wait_for_index(&document);
+    // Fill the volume, then free half a megabyte: less than the new file
+    // needs.
+    let filler = image.root().join("filler");
+    let mut file = std::fs::File::create(&filler).unwrap();
+    let chunk = vec![b'f'; 256 * 1024];
+    while file.write_all(&chunk).is_ok() {}
+    let full = file.metadata().unwrap().len();
+    file.set_len(full.saturating_sub(512 * 1024)).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let before: Vec<String> = leftovers(image.root(), &[]);
+    let inode = std::fs::metadata(&path).unwrap().ino();
+
+    set(&document, 3, 1, "edited");
+    let error = save(&document, &path, SaveKind::Save).unwrap_err();
+    assert!(
+        error.starts_with("Write {") && error.contains("code: 28"),
+        "{error}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    assert!(
+        std::fs::read(&path).unwrap() == bytes,
+        "the original changed"
+    );
+    // Nothing of the save's is left on the volume, hidden files included.
+    assert_eq!(leftovers(image.root(), &[]), before);
+    assert!(document.has_edits());
+    assert_eq!(
+        document.full_value(3, 1).unwrap().as_deref(),
+        Some("edited")
+    );
+
+    // With the space back, it saves.
+    std::fs::remove_file(&filler).unwrap();
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert!(String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(",edited,"));
+    drop(document);
+    drop(image);
+}

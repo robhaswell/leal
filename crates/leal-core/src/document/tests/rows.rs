@@ -223,7 +223,7 @@ fn undo_and_redo_restore_the_same_rows_and_edits() {
     ));
     assert!(matches!(
         document.apply(&done[3]),
-        Err(EditError::NoSuchRow { .. })
+        Err(EditError::NoSuchRow { row: 4 })
     ));
     for command in done.iter().rev() {
         document.apply(&command.inverse()).unwrap();
@@ -713,7 +713,7 @@ fn duplicating_is_refused_after_an_open_quote_and_past_the_end() {
     ));
     assert!(matches!(
         document.can_duplicate_rows(3, 1),
-        Err(EditError::NoSuchRow { .. })
+        Err(EditError::NoSuchRow { row: 3 })
     ));
     assert!(document.can_duplicate_rows(0, 2).is_ok());
     assert!(!document.has_edits());

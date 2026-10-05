@@ -183,12 +183,6 @@ impl SaveKind {
             SaveKind::SaveAsUtf8 => Encoding::Utf8,
         }
     }
-
-    /// Whether it writes to a new place (Save As, of either kind).
-    #[must_use]
-    pub fn is_save_as(self) -> bool {
-        self != SaveKind::Save
-    }
 }
 
 /// How many cells a refusal names at most ([`SaveError::Unconvertible`]):

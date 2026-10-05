@@ -227,11 +227,24 @@ fn pastes_that_dont_fit_or_are_too_large_are_refused() {
     ));
     assert!(matches!(
         document.clear_cells(rows..rows + 1, 0..1),
-        Err(EditError::NoSuchRow { .. })
+        Err(EditError::NoSuchRow { row }) if row == rows
     ));
     assert_eq!(texts(&document)[2], ["2", "a", "b"]);
     assert!(document.can_paste().is_ok());
     assert!(document.can_clear_cells(1..rows, 0..3).is_ok());
+
+    // Exactly at the limits is not over them (phase 2 gate): as many
+    // cells as the limit fail only for not fitting, and as many bytes as
+    // the limit, in one value filling two cells, go in.
+    assert!(matches!(
+        try_paste(&document, 1..2, 0..1, &"x\n".repeat(CELL_BATCH_LIMIT)),
+        Err(EditError::PastLastRow { .. })
+    ));
+    let exact = "y".repeat(PASTE_BYTE_LIMIT / 2);
+    let command = paste(&document, 1..3, 0..1, &exact);
+    assert!(document.full_value(2, 0).unwrap().as_deref() == Some(exact.as_str()));
+    document.apply(&command.inverse()).unwrap();
+    assert_eq!(texts(&document)[2], ["2", "a", "b"]);
 }
 
 /// The limit is on what is written: a block under it as it was copied,

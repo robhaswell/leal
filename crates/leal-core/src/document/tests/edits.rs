@@ -648,7 +648,7 @@ fn rows_not_read_yet_cant_be_edited_until_they_are() {
     assert_eq!(row_text(&document, 3)[1], "early");
     assert!(matches!(
         document.set_cell(summary.rows, 0, "x"),
-        Err(EditError::NoSuchRow { .. })
+        Err(EditError::NoSuchRow { row }) if row == summary.rows
     ));
 }
 
