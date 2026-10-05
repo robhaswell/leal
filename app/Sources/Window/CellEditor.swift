@@ -12,6 +12,35 @@ import os
 /// Substitutions menu): the setters keep them off.
 @MainActor
 class LiteralTextView: NSTextView {
+    /// The file's own line break (`DocumentModel.lineBreak`): Return puts
+    /// it in in the inspector, and text pasted in has its line breaks
+    /// turned into it.
+    var lineBreak = "\n"
+
+    /// Text pasted (or dropped) in has each line break (CRLF, LF or a lone
+    /// CR) as the file's own, as Paste into the grid does (task 2.6
+    /// decision C) and as a typed one is (phase 2 gate): an Excel cell's
+    /// LF goes into a CRLF file as CRLF.
+    override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        guard type == .string, let text = pboard.string(forType: .string) else {
+            return super.readSelection(from: pboard, type: type)
+        }
+        let range = rangeForUserTextChange
+        guard range.location != NSNotFound else { return false }
+        insertText(Self.withLineBreaks(text, lineBreak), replacementRange: range)
+        return true
+    }
+
+    /// `text` with each CRLF, LF and lone CR as `lineBreak`.
+    static func withLineBreaks(_ text: String, _ lineBreak: String) -> String {
+        let text = text as NSString
+        guard text.rangeOfCharacter(from: CharacterSet(charactersIn: "\r\n")).location != NSNotFound else { return text as String }
+        let lf = text
+            .replacingOccurrences(of: "\r\n", with: "\n", options: .literal, range: NSRange(location: 0, length: text.length))
+            .replacingOccurrences(of: "\r", with: "\n", options: .literal)
+        return lineBreak == "\n" ? lf : lf.replacingOccurrences(of: "\n", with: lineBreak, options: .literal)
+    }
+
     /// The text checking that changes text, or adds links to it. Spelling
     /// and grammar checking only mark text, and stay as the user has them.
     static let changingChecks: NSTextCheckingTypes = NSTextCheckingResult.CheckingType([
@@ -507,6 +536,7 @@ final class CellEditController: NSObject, NSTextFieldDelegate {
         position(for: place)
         grid.window?.makeFirstResponder(field)
         if let editor = field.currentEditor() {
+            (editor as? LiteralTextView)?.lineBreak = model.lineBreak
             if let typing {
                 // The key goes to the editor, whose input context composes
                 // it: a dead key or an input method's marked text included.

@@ -695,6 +695,40 @@ final class EditingTests: XCTestCase {
         XCTAssertEqual(value(model, 1, 1), utf8("def\r\n"))
     }
 
+    /// Text pasted into the in-cell editor or the inspector has its line
+    /// breaks (CRLF, LF or a lone CR) as the file's own, as Paste into the
+    /// grid does (phase 2 gate). From a pasteboard of the test's own, not
+    /// the user's.
+    func testLineBreaksPastedIntoAnEditorBecomeTheFiles() async throws {
+        let (_, model, content) = try await open(try file("paste-breaks.csv", "id,v\r\n1,abc\r\n2,def\r\n"))
+        let window = content.view.window
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("leal-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+        pasteboard.setString("x\ny\rz\r\nw", forType: .string)
+
+        try await returnKey(on: CellPosition(row: 0, column: 1), content)
+        let editor = try fieldEditor(content)
+        editor.setSelectedRange(NSRange(location: (editor.string as NSString).length, length: 0))
+        XCTAssertTrue(editor.readSelection(from: pasteboard, type: .string))
+        XCTAssertEqual(utf8(content.cellEditor.field.stringValue), utf8("abcx\r\ny\r\nz\r\nw"))
+        try press(#selector(NSResponder.insertNewline(_:)), in: content)
+        XCTAssertEqual(value(model, 0, 1), utf8("abcx\r\ny\r\nz\r\nw"))
+
+        content.setInspectorShown(true)
+        content.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        window?.makeFirstResponder(text)
+        text.setSelectedRange(NSRange(location: 0, length: (text.string as NSString).length))
+        XCTAssertTrue(text.readSelection(from: pasteboard, type: .string))
+        XCTAssertEqual(utf8(text.string), utf8("x\r\ny\r\nz\r\nw"))
+        text.onCommit?()
+        XCTAssertEqual(value(model, 1, 1), utf8("x\r\ny\r\nz\r\nw"))
+        XCTAssertEqual(LiteralTextView.withLineBreaks("a\r\nb\rc\nd", "\n"), "a\nb\nc\nd")
+        XCTAssertEqual(LiteralTextView.withLineBreaks("a\nb", "\r"), "a\rb")
+    }
+
     /// A value with invalid bytes, opened and left untouched (Return, or
     /// leaving the editor), is no edit: its bytes stay. Whether a long
     /// value has invalid bytes is read from its full value off the main
