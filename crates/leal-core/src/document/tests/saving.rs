@@ -796,6 +796,39 @@ fn a_save_keeps_the_files_metadata() {
     );
 }
 
+/// A file created before 1970 saves in place, keeping its creation date
+/// (phase 2 gate: setting it failed, and so did the save), nanoseconds
+/// and all.
+#[test]
+fn a_file_created_before_1970_saves_and_keeps_its_date() {
+    let dir = Dir::new("save-1960");
+    let scheduler = scheduler();
+    for created in [
+        std::time::UNIX_EPOCH - Duration::from_secs(315_619_200),
+        std::time::UNIX_EPOCH - Duration::new(315_619_200, 250_000_000),
+    ] {
+        let path = dir.file("a.csv", b"a,b\n1,2\n");
+        crate::source::tests::set_created(&path, created);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().created().unwrap(),
+            created
+        );
+        let document = open_at(&path, &dir, &scheduler);
+        set(&document, 1, 1, "3");
+        let saved = save(&document, &path, SaveKind::Save).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"a,b\n1,3\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().created().unwrap(),
+            created
+        );
+        assert!(
+            saved.skipped_metadata.is_empty(),
+            "{:?}",
+            saved.skipped_metadata
+        );
+    }
+}
+
 /// The attributes record what a reopen would otherwise guess differently,
 /// with the new file's fingerprint, and the user's choices.
 #[test]

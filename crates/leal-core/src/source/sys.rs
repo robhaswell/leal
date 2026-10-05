@@ -579,17 +579,38 @@ pub(super) fn set_flags_of(file: &File, flags: u32) -> io::Result<()> {
     }
 }
 
+/// `time` as a `timespec`: seconds since 1970, negative before it, and
+/// nanoseconds always forward from there (0 to 999,999,999), as the
+/// kernel keeps them. `None` if the seconds don't fit a `time_t`.
+pub(super) fn timespec_of(time: std::time::SystemTime) -> Option<libc::timespec> {
+    let (tv_sec, tv_nsec) = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => (
+            libc::time_t::try_from(since.as_secs()).ok()?,
+            since.subsec_nanos(),
+        ),
+        Err(before) => {
+            let before = before.duration();
+            let seconds = libc::time_t::try_from(before.as_secs()).ok()?;
+            match before.subsec_nanos() {
+                0 => (-seconds, 0),
+                nanos => (-seconds.checked_add(1)?, 1_000_000_000 - nanos),
+            }
+        }
+    };
+    Some(libc::timespec {
+        tv_sec,
+        tv_nsec: libc::c_long::from(tv_nsec),
+    })
+}
+
 /// Sets the creation date (`ATTR_CMN_CRTIME`, what Finder shows as
 /// Created) of the open file `file`, with `fsetattrlist(2)`.
+/// A date before 1970 (old archives have them, and APFS keeps them) is a
+/// negative `tv_sec` (phase 2 gate). One that doesn't fit is `EINVAL`, an
+/// error a save skips and names rather than failing on.
 pub(super) fn set_creation_time(file: &File, created: std::time::SystemTime) -> io::Result<()> {
-    let since = created
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let mut time = libc::timespec {
-        tv_sec: libc::time_t::try_from(since.as_secs())
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
-        tv_nsec: libc::c_long::from(since.subsec_nanos()),
-    };
+    let mut time =
+        timespec_of(created).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
     let mut attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,

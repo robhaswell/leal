@@ -92,6 +92,39 @@ pub(crate) fn try_write_attribute(path: &Path, name: &CStr, value: &[u8]) -> boo
     sys::set_xattr(&file, name, value).is_ok()
 }
 
+/// Sets the creation date of the file at `path` (other modules' tests: a
+/// file created before 1970).
+pub(crate) fn set_created(path: &Path, created: std::time::SystemTime) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    sys::set_creation_time(&file, created).unwrap();
+}
+
+/// A date before 1970 is a negative `tv_sec` with its nanoseconds counted
+/// forward (phase 2 gate: the save of such a file failed outright).
+#[test]
+fn a_creation_date_before_1970_is_a_negative_timespec() {
+    use std::time::UNIX_EPOCH;
+    let at = |time: std::time::SystemTime| {
+        let spec = sys::timespec_of(time).unwrap();
+        (spec.tv_sec, spec.tv_nsec)
+    };
+    assert_eq!(at(UNIX_EPOCH), (0, 0));
+    assert_eq!(at(UNIX_EPOCH + Duration::new(5, 7)), (5, 7));
+    assert_eq!(
+        at(UNIX_EPOCH - Duration::from_secs(315_619_200)),
+        (-315_619_200, 0)
+    );
+    assert_eq!(
+        at(UNIX_EPOCH - Duration::new(1, 500_000_000)),
+        (-2, 500_000_000)
+    );
+    assert_eq!(at(UNIX_EPOCH - Duration::new(0, 1)), (-1, 999_999_999));
+}
+
 /// The extended attribute `name` of the file at `path`, if it has it.
 pub(crate) fn attribute(path: &Path, name: &CStr) -> Option<Vec<u8>> {
     let file = File::open(path).unwrap();
