@@ -46,6 +46,12 @@
         }
       }
     },
+    "%@ cells cleared" : {
+      "comment" : "VoiceOver: Delete emptied several cells; how many"
+    },
+    "%@ cells cut" : {
+      "comment" : "VoiceOver: Cut emptied several cells and copied them; how many"
+    },
     "%@ cells hold bytes that aren’t %@ text, the first at %@, so they can’t be converted. Leal never replaces them." : {
       "comment" : "Alert text: Save As UTF-8 refused several cells; how many, the file's encoding, and where the first is",
       "localizations" : {
@@ -56,6 +62,9 @@
           }
         }
       }
+    },
+    "%@ cells pasted" : {
+      "comment" : "VoiceOver: Paste changed several cells; how many"
     },
     "%@ cells, the first at %@" : {
       "comment" : "Details popover: cells with this kind; their count, and where the first is",
@@ -84,6 +93,9 @@
     },
     "%@ columns" : {
       "comment" : "Status bar: the number of columns"
+    },
+    "%@ columns deleted" : {
+      "comment" : "VoiceOver: several columns were deleted; how many"
     },
     "%@ copy" : {
       "comment" : "Duplicate: the suggested name, as in \"people copy\"; the file's name without its extension"
@@ -118,6 +130,15 @@
     },
     "%@ rows" : {
       "comment" : "Status bar: the number of data rows"
+    },
+    "%@ rows cut" : {
+      "comment" : "VoiceOver: Cut deleted several rows and copied them; how many"
+    },
+    "%@ rows deleted" : {
+      "comment" : "VoiceOver: several rows were deleted; how many"
+    },
+    "%@ rows duplicated" : {
+      "comment" : "VoiceOver: several rows were duplicated; how many"
     },
     "%@ rows end differently from the rest" : {
       "comment" : "Details popover: rows with another line ending; their count"
@@ -199,6 +220,15 @@
         }
       }
     },
+    "1 cell cleared" : {
+      "comment" : "VoiceOver: Delete emptied one cell"
+    },
+    "1 cell cut" : {
+      "comment" : "VoiceOver: Cut emptied one cell and copied it"
+    },
+    "1 cell pasted" : {
+      "comment" : "VoiceOver: Paste changed one cell"
+    },
     "1 cell, at %@" : {
       "comment" : "Details popover: one cell has this kind (mockup 03b); where, such as row 17"
     },
@@ -223,11 +253,17 @@
     "1 row" : {
       "comment" : "Status bar: one data row"
     },
+    "1 row cut" : {
+      "comment" : "VoiceOver: Cut deleted one row and copied it"
+    },
     "1 row ends differently; the rest end with %@" : {
       "comment" : "Details popover: one row has another line ending; the most common one, such as CRLF"
     },
     "1 row has a different number of fields to the other %@" : {
       "comment" : "Details popover: one ragged row; the number of rows with the usual field count"
+    },
+    "A column is inserted beside the selected cell, and a file with only a header row has no cell. Insert a row first." : {
+      "comment" : "Tooltip: Insert Column is off in a file with a header row and no other rows"
     },
     "A quote at %@ is never closed, so the rest of the file is one cell. That cell can still be edited, but rows and columns can’t be added or duplicated after it: they would land inside the quote. Insert Row Above still works." : {
       "comment" : "Details popover: the unterminated quote, and what it stops (ADR-0004 decision 8); where its opening quote is, such as row 12"
@@ -319,11 +355,20 @@
     "Clear Menu" : {
       "comment" : "File > Open Recent"
     },
+    "Click the table first." : {
+      "comment" : "Tooltip: the row and column commands are off while the find bar (or another text field) has the focus, whose keys they would take"
+    },
     "Close" : {
       "comment" : "Button: close the document after a failure\nFile menu"
     },
     "Column %lld" : {
       "comment" : "Header of a column only long (ragged) rows have; its 1-based number"
+    },
+    "Column deleted" : {
+      "comment" : "VoiceOver: a column was deleted"
+    },
+    "Column inserted" : {
+      "comment" : "VoiceOver: a column was inserted"
     },
     "Comma" : {
       "comment" : "Status bar: the delimiter"
@@ -421,7 +466,7 @@
       "comment" : "Status bar: the open file's drive was ejected after Leal had copied the file (task 1.9)"
     },
     "Duplicate" : {
-      "comment" : "Button: keep the changes in a copy of a file Leal can't save\nFile menu: open a copy of the document (⇧⌘D)"
+      "comment" : "Button: keep the changes in a copy of a file Leal can't save\nFile menu: save a copy of the document under a new name, then edit the copy (⇧⌘D)"
     },
     "Duplicate Row" : {
       "comment" : "Edit menu (⇧⌘↩): a copy of the selected row below it (task 2.5a), and the Undo menu's Undo Duplicate Row"
@@ -925,6 +970,15 @@
     },
     "Row %lld" : {
       "comment" : "A row, as the grid numbers it"
+    },
+    "Row deleted" : {
+      "comment" : "VoiceOver: a row was deleted"
+    },
+    "Row duplicated" : {
+      "comment" : "VoiceOver: a row was duplicated"
+    },
+    "Row inserted" : {
+      "comment" : "VoiceOver: a row was inserted"
     },
     "Row number" : {
       "comment" : "Placeholder and VoiceOver name of the Go to Row sheet's field"

@@ -155,12 +155,18 @@ extension DocumentViewController {
                 (outcome, shape) = model.paste(text, into: area)
                 return PasteText.paste
             }
-            if case .edited = outcome, let shape { selectPasted(shape, at: selection) }
+            if case .edited = outcome, let shape {
+                selectPasted(shape, at: selection)
+                // A block's cells, or the one value in every selected cell.
+                let cells = shape.rows > 1 || shape.columns > 1 ? shape.rows * UInt64(shape.columns) : area.cells
+                announce(PasteText.pasted(cells: cells))
+            }
         } else {
             asOneStep {
                 outcome = model.clear(area)
                 return PasteText.clearCells
             }
+            if case .edited = outcome { announce(PasteText.cleared(cells: area.cells)) }
         }
         if case let .refused(refusal) = outcome { refused(command, refusal) }
     }
@@ -222,6 +228,7 @@ extension DocumentViewController {
         switch outcome {
         case .edited, .unchanged:
             place(copy)
+            announce(rows.map { PasteText.cut(rows: $0.count) } ?? PasteText.cut(cells: plan.area.cells))
         case let .refused(refusal):
             discard(copy)
             refused(.cut, refusal, rows: rows != nil)
@@ -263,6 +270,32 @@ enum PasteText {
     static let cantPaste = String(localized: "Leal can’t paste these cells here.", comment: "Alert title: a paste was refused (task 2.6)")
     static let cantClear = String(localized: "Leal can’t clear these cells.", comment: "Alert title: Delete couldn't clear the selected cells (task 2.6)")
     static let cantCut = String(localized: "Leal can’t cut these cells.", comment: "Alert title: Cut couldn't delete the selected rows or clear the selected cells, so nothing was copied (task 2.6)")
+
+    /// What VoiceOver hears once Paste, Clear or Cut has run: "6 cells
+    /// pasted".
+    static func pasted(cells: UInt64) -> String {
+        cells == 1
+            ? String(localized: "1 cell pasted", comment: "VoiceOver: Paste changed one cell")
+            : String(localized: "\(cells.formatted()) cells pasted", comment: "VoiceOver: Paste changed several cells; how many")
+    }
+
+    static func cleared(cells: UInt64) -> String {
+        cells == 1
+            ? String(localized: "1 cell cleared", comment: "VoiceOver: Delete emptied one cell")
+            : String(localized: "\(cells.formatted()) cells cleared", comment: "VoiceOver: Delete emptied several cells; how many")
+    }
+
+    static func cut(cells: UInt64) -> String {
+        cells == 1
+            ? String(localized: "1 cell cut", comment: "VoiceOver: Cut emptied one cell and copied it")
+            : String(localized: "\(cells.formatted()) cells cut", comment: "VoiceOver: Cut emptied several cells and copied them; how many")
+    }
+
+    static func cut(rows: Int) -> String {
+        rows == 1
+            ? String(localized: "1 row cut", comment: "VoiceOver: Cut deleted one row and copied it")
+            : String(localized: "\(rows.formatted()) rows cut", comment: "VoiceOver: Cut deleted several rows and copied them; how many")
+    }
 
     /// Why Cut, Paste or Clear didn't, or can't, run: the menu item's tooltip,
     /// or the alert's text. `nil` if there is nothing to say.

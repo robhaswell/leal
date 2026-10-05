@@ -74,6 +74,10 @@ final class CSVDocument: NSDocument {
         false
     }
 
+    /// How many times `read(from:)` read the file again on the main thread,
+    /// which Leal's own Revert to Saved and Reload never do (for tests).
+    private(set) var mainThreadRereads = 0
+
     nonisolated override func read(from url: URL, ofType typeName: String) throws {
         // `canConcurrentlyReadDocuments` is false, so AppKit reads on the
         // main thread (and tests call this there).
@@ -88,6 +92,7 @@ final class CSVDocument: NSDocument {
                 // (task 2.5.3c): it reloads off the main thread, asking
                 // first (`revertToSaved`, `revert(toContentsOf:ofType:)`).
                 Logger.document.fault("A second read(from:) on the main thread")
+                mainThreadRereads += 1
                 // An editor still open would edit the file read again: it
                 // closes, as the edits go anyway.
                 for case let controller as DocumentWindowController in windowControllers {
@@ -434,6 +439,9 @@ final class CSVDocument: NSDocument {
                 try await self?.reloadInBackground(editVersion: version)
             } catch {
                 Logger.document.error("Revert failed: \(String(describing: error), privacy: .public)")
+                // Said to the user, as for a Reload (an edit made meanwhile
+                // kept the window on the file it showed).
+                (self?.windowControllers.first as? DocumentWindowController)?.content.showRereadFailure(error)
             }
         }
     }

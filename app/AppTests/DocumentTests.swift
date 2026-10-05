@@ -628,6 +628,67 @@ final class DocumentTests: XCTestCase {
         document.close()
     }
 
+    /// The content with no window (a view not in one yet): detached from
+    /// the document's window, to be put back and shown with
+    /// `viewDidAppear`.
+    private func detachedContent(_ document: CSVDocument) throws -> (DocumentViewController, NSWindow) {
+        let controller = try XCTUnwrap(document.windowControllers.first as? DocumentWindowController)
+        let window = try XCTUnwrap(controller.window)
+        let content = controller.content
+        window.contentViewController = nil
+        XCTAssertNil(content.view.window)
+        return (content, window)
+    }
+
+    /// Chrome that comes while the view has no window (`updateWindowMinimum`
+    /// does nothing then) raises the window's minimum once it has one.
+    func testTheWindowMinimumCatchesUpWhenTheViewGetsAWindow() throws {
+        let document = try open(try file("later.csv", "a,b\n1,2\n"))
+        let (content, window) = try detachedContent(document)
+        content.setInspectorShown(true)
+        content.updateWindowMinimum()
+        XCTAssertEqual(window.contentMinSize, DocumentWindowController.minimumContentSize, "no window, nothing set")
+        window.contentViewController = content
+        content.viewDidAppear()
+        XCTAssertEqual(
+            window.contentMinSize.height,
+            CellInspectorView.height + StatusBarView.height + DocumentViewController.gridMinimumHeight
+        )
+        document.close()
+    }
+
+    /// Alerts that come while the view has no window are shown, in order,
+    /// when it has one; not for a document that has failed since, which
+    /// says so itself.
+    func testQueuedAlertsAreShownWhenTheViewGetsAWindowExceptForAFailedDocument() throws {
+        func alert(_ text: String) -> NSAlert {
+            let alert = NSAlert()
+            alert.messageText = text
+            return alert
+        }
+        let document = try open(try file("queued.csv", "a,b\n1,2\n"))
+        let (content, window) = try detachedContent(document)
+        var shown: [String] = []
+        content.showAlert = { alert, _ in shown.append(alert.messageText) }
+        content.present(alert("first"))
+        content.present(alert("second"))
+        XCTAssertEqual(shown, [], "no window")
+        window.contentViewController = content
+        content.viewDidAppear()
+        XCTAssertEqual(shown, ["first", "second"])
+        content.viewDidAppear()
+        XCTAssertEqual(shown, ["first", "second"], "once")
+
+        window.contentViewController = nil
+        content.present(alert("stale"))
+        content.onFailure = nil
+        content.model.fail(NSError(domain: "DocumentTests", code: 1))
+        window.contentViewController = content
+        content.viewDidAppear()
+        XCTAssertEqual(shown, ["first", "second"], "the failed document says so itself")
+        document.close()
+    }
+
     /// The whole window draws: rows in the grid, titles in the header.
     /// Task 2.0a re-review, item 1: drawing a file of more than 32 columns
     /// reads the next block of columns ahead (32 to 63), which a short or

@@ -993,7 +993,7 @@ to run concurrently and asserts first paint is still under 150 ms.
 | Go to row | ⌘L |
 | Copy / paste | ⌘C / ⌘V (TSV on the clipboard, multi-cell paste: one value fills the selection, a block goes in from its top-left cell and must fit; up to 100,000 cells; empty text pastes nothing) |
 | Cut | ⌘X (whole rows selected by their numbers: Copy, then delete them; otherwise Copy, then clear the cells) |
-| Insert row below / delete row | ⌘↩ / ⌘⌫ |
+| Insert row below / delete row (in the in-cell editor, or the inspector while editing, ⌘⌫ deletes text to the start of the line instead) | ⌘↩ / ⌘⌫ |
 | Duplicate row (a copy below: its fields as written, the file's most common line ending; the selected column stays; up to 10,000 rows) | ⇧⌘↩ |
 | Show / hide cell inspector | ⌘I |
 | Commit an edit in the inspector (Return inserts a newline there) | ⌘↩ |

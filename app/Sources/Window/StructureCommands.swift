@@ -101,7 +101,9 @@ extension DocumentViewController {
         // The key window's too: a menu's action reaches this window from
         // a sheet over it (Go to Row's field).
         for window in [view.window, keyWindow()] {
-            if let text = window?.firstResponder as? NSText, !(text is LiteralTextView) { return .off }
+            if let text = window?.firstResponder as? NSText, !(text is LiteralTextView) {
+                return StructureAvailability(enabled: false, reason: StructureText.clickTheTableFirst)
+            }
         }
         let cell = grid.activeCell
         let refusal: EditRefusal?
@@ -117,10 +119,10 @@ extension DocumentViewController {
             guard selectedRows != nil else { return .off }
             refusal = model.rowDeleteRefusal()
         case .insertColumnBefore:
-            guard let cell else { return .off }
+            guard let cell else { return noCellForColumn() }
             refusal = model.columnInsertRefusal(before: cell.column)
         case .insertColumnAfter:
-            guard let cell else { return .off }
+            guard let cell else { return noCellForColumn() }
             refusal = model.columnInsertRefusal(before: cell.column + 1)
         case .deleteColumns:
             // A row with the last column has every column before it.
@@ -129,6 +131,19 @@ extension DocumentViewController {
         }
         guard let refusal else { return .available }
         return StructureAvailability(enabled: false, reason: StructureText.reason(refusal, command))
+    }
+
+    /// Insert Column with no active cell to put it beside: a file with only
+    /// a header row has none (a row has to be inserted first), and nothing
+    /// is selected until a cell is clicked. What the core would refuse
+    /// anyway (the file is still read, a save runs) comes first.
+    private func noCellForColumn() -> StructureAvailability {
+        if let refusal = model.columnInsertRefusal(before: model.columnCount),
+           let reason = StructureText.reason(refusal, .insertColumnAfter) {
+            return StructureAvailability(enabled: false, reason: reason)
+        }
+        let reason = model.rowCount == 0 ? StructureText.noRowsForColumn : StructureText.clickTheTableFirst
+        return StructureAvailability(enabled: false, reason: reason)
     }
 
     /// The Edit menu's row and column items: on or off, with the reason as
@@ -173,6 +188,8 @@ extension DocumentViewController {
         find.cancelPendingStep()
         let cell = grid.activeCell
         let outcome: EditOutcome
+        // How many rows or columns the command is about, for VoiceOver.
+        var count = 1
         switch command {
         case .insertRowAbove, .insertRowBelow:
             let row = cell.map { $0.row + (command == .insertRowBelow ? 1 : 0) } ?? model.rowCount
@@ -182,21 +199,30 @@ extension DocumentViewController {
         case .duplicateRows:
             guard let rows = selectedRows, let selection = grid.selection else { return NSSound.beep() }
             outcome = duplicateAsOneStep(rows)
+            count = rows.count
             // The copies, in the columns selected.
             if case .edited = outcome { grid.select(selection.copied(rows)) }
         case .deleteRows:
             guard let rows = selectedRows else { return NSSound.beep() }
             outcome = model.deleteRows(rows)
+            count = rows.count
         case .insertColumnBefore, .insertColumnAfter:
             guard let cell else { return NSSound.beep() }
             outcome = model.insertColumn(before: cell.column + (command == .insertColumnAfter ? 1 : 0))
         case .deleteColumns:
             guard let columns = columnsToDelete else { return NSSound.beep() }
             outcome = deleteAsOneStep(columns)
+            count = columns.count
         }
-        if case let .refused(refusal) = outcome {
+        switch outcome {
+        case let .refused(refusal):
             NSSound.beep()
             if let reason = StructureText.reason(refusal, command) { announce(reason) }
+        case .edited:
+            // The window shows the change; VoiceOver is told.
+            announce(StructureText.announcement(command, count: count))
+        case .unchanged, .failed:
+            break
         }
     }
 
@@ -279,6 +305,39 @@ enum StructureText {
     static let insertColumnAfter = String(localized: "Insert Column After", comment: "Edit menu: insert an empty column after the selected cell's column (task 2.5a)")
     static let deleteColumn = String(localized: "Delete Column", comment: "Edit menu, and the Undo menu's Undo Delete Column")
     static let deleteColumns = String(localized: "Delete Columns", comment: "Edit menu with several columns selected, and the Undo menu's Undo Delete Columns")
+
+    static let clickTheTableFirst = String(
+        localized: "Click the table first.",
+        comment: "Tooltip: the row and column commands are off while the find bar (or another text field) has the focus, whose keys they would take"
+    )
+    static let noRowsForColumn = String(
+        localized: "A column is inserted beside the selected cell, and a file with only a header row has no cell. Insert a row first.",
+        comment: "Tooltip: Insert Column is off in a file with a header row and no other rows"
+    )
+
+    /// What VoiceOver hears once a command has changed the file: "Row
+    /// inserted", "3 rows deleted".
+    static func announcement(_ command: StructureCommand, count: Int) -> String {
+        let n = count.formatted()
+        switch command {
+        case .insertRowAbove, .insertRowBelow:
+            return String(localized: "Row inserted", comment: "VoiceOver: a row was inserted")
+        case .insertColumnBefore, .insertColumnAfter:
+            return String(localized: "Column inserted", comment: "VoiceOver: a column was inserted")
+        case .duplicateRows:
+            return count == 1
+                ? String(localized: "Row duplicated", comment: "VoiceOver: a row was duplicated")
+                : String(localized: "\(n) rows duplicated", comment: "VoiceOver: several rows were duplicated; how many")
+        case .deleteRows:
+            return count == 1
+                ? String(localized: "Row deleted", comment: "VoiceOver: a row was deleted")
+                : String(localized: "\(n) rows deleted", comment: "VoiceOver: several rows were deleted; how many")
+        case .deleteColumns:
+            return count == 1
+                ? String(localized: "Column deleted", comment: "VoiceOver: a column was deleted")
+                : String(localized: "\(n) columns deleted", comment: "VoiceOver: several columns were deleted; how many")
+        }
+    }
 
     /// Why a row or column command is off, for its tooltip, or `nil` if
     /// there is nothing to say (no column there to delete, say).

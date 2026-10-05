@@ -700,10 +700,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 } else {
                     try await model.reloadInBackground()
                 }
-            } catch is EditedDuringReload {
-                self?.showEditedDuringReload()
             } catch {
-                self?.showReloadError(error)
+                self?.showRereadFailure(error)
             }
             model.reloadEnded()
             self?.reloading = nil
@@ -734,6 +732,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         updateBanners()
     }
 
+    /// Why the file wasn't read again (a Reload, or a Revert to Saved
+    /// through AppKit's `revert(toContentsOf:ofType:)`): said in an alert.
+    func showRereadFailure(_ error: any Error) {
+        if error is EditedDuringReload {
+            showEditedDuringReload()
+        } else {
+            showReloadError(error)
+        }
+    }
+
     /// A Reload kept the window on the file it showed, because it was
     /// edited meanwhile (`EditedDuringReload`): say so.
     private func showEditedDuringReload() {
@@ -752,7 +760,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             comment: "Alert title: Reload failed (task 1.9); the file's name"
         )
         alert.informativeText = failure.localizedRecoverySuggestion ?? ""
-        alert.beginSheetModal(for: window)
+        showAlert(alert, window)
     }
 
     /// "Switch": read the file with the suggested delimiter.
@@ -1553,7 +1561,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     /// The alerts that came while the view had no window, shown in order
-    /// when it has one again.
+    /// when it has one again (none if the document has failed since).
     private var queuedAlerts: [NSAlert] = []
 
     /// The name Save As UTF-8 suggests: the file's own, with "(UTF-8)".
@@ -1612,8 +1620,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     override func viewDidAppear() {
         super.viewDidAppear()
+        // Banners and panes that came while there was no window
+        // (`updateWindowMinimum` did nothing then).
+        updateWindowMinimum()
         let alerts = queuedAlerts
         queuedAlerts = []
+        // A document that has failed says so itself: what was queued
+        // before it failed is stale.
+        guard !model.isFailed else { return }
         for alert in alerts { present(alert) }
     }
 

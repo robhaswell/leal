@@ -475,6 +475,30 @@ final class GridDrawingTests: XCTestCase {
         XCTAssertNotNil(cache.cachedCell(row: 512_064, column: 0, loadedRows: 1_000_000))
     }
 
+    /// A frame's first read ahead starts what is wanted again even when it
+    /// returns early (here: no column block that far right has been read),
+    /// so a read queued for rows the scroll has left is still skipped.
+    func testAFramesWantedRangeStartsAgainEvenWithNothingToReadAhead() {
+        let reads = Counter()
+        let cache = CellTileCache { _, _ in nil }
+        cache.makeBackgroundFetch = {
+            { rows, _ in
+                reads.add()
+                return rows.map { _ in TileRow(fieldCount: 1, cells: [.text("x", truncated: false)]) }
+            }
+        }
+        CellTileCache.suspendReadsAhead()
+        defer { CellTileCache.resumeReadsAhead() }
+        cache.readAhead(rows: 0..<64, columns: 0..<1, loadedRows: 1_000_000)
+        XCTAssertEqual(cache.readsAheadStarted, 1)
+        // Far down and far right: no column block there to read.
+        cache.readAhead(rows: 512_000..<512_064, columns: 5_000..<5_010, loadedRows: 1_000_000, startsWanted: true)
+        XCTAssertEqual(cache.readsAheadStarted, 1, "nothing more to read")
+        CellTileCache.resumeReadsAhead()
+        waitUntil("it is back") { cache.readsAheadBack == 1 }
+        XCTAssertEqual(reads.value, 0, "the scroll has left it")
+    }
+
     /// Between draws, what is asked for ahead only widens what is wanted.
     func testReadsAheadBetweenDrawsAreAllWanted() {
         let reads = Counter()

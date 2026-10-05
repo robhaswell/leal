@@ -760,7 +760,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     the system's first-run scan (amfid, then syspolicyd's XProtect check) of
     a new copy of the app, 110–190 ms before `dyld` loads its first
     framework; not Leal (docs/perf.md, "The slow first launch").
-  - [ ] From 2.6a's review: the `snapshot` helper's 5-pass loop should fail
+  - [x] From 2.6a's review: the `snapshot` helper's 5-pass loop should fail
     when strips never settle; `GridDataSource.readAhead`'s `wanted.set`
     should come before its early returns; queued alerts could skip a failed
     document; `updateWindowMinimum` with no window.
@@ -768,15 +768,15 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     (`crates/leal-core/src/source/mod.rs`) says it looks twice (`stat`, then
     `statfs`), so a folder replaced in between is possible, and why that is
     acceptable.
-  - [ ] From 2.5.3c's review: a test that `read(from:)`'s main-thread branch
+  - [x] From 2.5.3c's review: a test that `read(from:)`'s main-thread branch
     is never reached through Revert to Saved; a test for cancelling (⌘.) a
-    Save As queued behind a Save; Save As onto a hard link of the open file
+    Save As queued behind a Save; an edit made during AppKit's
+    `revert(toContentsOf:ofType:)` stops the revert (`EditedDuringReload`)
+    but was only logged as "Revert failed", with nothing said to the user.
+  - [ ] From 2.5.3c's review: Save As onto a hard link of the open file
     is taken for the open file, since it is matched by `st_dev` and
     `st_ino` (documented, `is_open_file` in
-    `crates/leal-core/src/document/saving.rs`), which may surprise;
-    an edit made during AppKit's `revert(toContentsOf:ofType:)` stops
-    the revert (`EditedDuringReload`) but is only logged as "Revert
-    failed", with nothing said to the user.
+    `crates/leal-core/src/document/saving.rs`), which may surprise.
   - [x] From 2.7's review: `just fuzz-cmin <target>` trims a target's corpus
     (`cargo fuzz cmin`); do it now and then. `detect`'s target also checks,
     for a whole file, the BOM length, line ending, mixed line endings and
@@ -791,7 +791,7 @@ Status key: `[ ]` not started · `[~]` in progress · `[x]` done
     not 3. libFuzzer's limit is 2,048 MB; a 600 s nightly (about 60,000
     runs) should be under it, but check the first real nightlies'
     `peak_rss_mb`.
-  - [ ] From 2.5a's review: with the inspector focused but not editing,
+  - [x] From 2.5a's review: with the inspector focused but not editing,
     ⌘⌫ beeps while Edit > Delete Row shows enabled; a header-only file
     leaves Insert Column off with no reason given; with the find bar
     focused the row and column items are off with no tooltip; VoiceOver

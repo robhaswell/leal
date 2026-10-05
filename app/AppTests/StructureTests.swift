@@ -249,6 +249,14 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(model.headerTitle(column: 0).text, "id")
         XCTAssertFalse(validate(opened, .deleteRows).0, "nothing to delete")
         XCTAssertTrue(validate(opened, .insertRowBelow).0, "a row can be added")
+        // A file with only a header row has no cell to insert a column
+        // beside: off, and it says what to do.
+        for command in [StructureCommand.insertColumnBefore, .insertColumnAfter] {
+            let (enabled, tooltip) = validate(opened, command)
+            XCTAssertFalse(enabled, "\(command)")
+            XCTAssertEqual(tooltip, "A column is inserted beside the selected cell, and a file with only a header row has no cell. Insert a row first.", "\(command)")
+        }
+        XCTAssertFalse(validate(opened, .deleteColumns).0)
         content.insertRowBelow(nil)
         XCTAssertEqual(model.rowCount, 1)
         XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 0, column: 0))
@@ -886,8 +894,83 @@ final class StructureTests: XCTestCase {
         content.showFind(nil)
         XCTAssertTrue(window.firstResponder is NSText)
         for command in StructureCommand.allCases {
-            XCTAssertFalse(validate(opened, command).0, "\(command) leaves its keys to the find bar")
+            let (enabled, tooltip) = validate(opened, command)
+            XCTAssertFalse(enabled, "\(command) leaves its keys to the find bar")
+            XCTAssertEqual(tooltip, "Click the table first.", "\(command)")
         }
+        window.makeFirstResponder(opened.grid.gridView)
+        XCTAssertTrue(validate(opened, .deleteRows).0)
+        XCTAssertNil(validate(opened, .deleteRows).1, "the reason goes with the focus")
+    }
+
+    /// With the inspector focused but with nothing it can edit (a missing
+    /// cell's note), ⌘⌫ is Delete Row's, as its menu item (on) says; while
+    /// the inspector edits, it is the text's.
+    func testCommandDeleteInTheInspectorNotEditingDeletesTheRow() async throws {
+        let opened = try await open(file("inspector-keys.csv", "a,b,c\n1,2,3\n4\n5,6,7\n"))
+        let (model, content, window) = (opened.model, opened.content, opened.window)
+        try await waitUntil("the short row known") { model.isHatched(row: 1, column: 1) }
+        content.setInspectorShown(true)
+        // Editing: the text's.
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        await content.inspectorTask?.value
+        let text = content.inspector.textView
+        window.makeFirstResponder(text)
+        XCTAssertTrue(text.isEditable)
+        XCTAssertTrue(text.performKeyEquivalent(with: try key("\u{7f}", code: 51, window: window)))
+        XCTAssertEqual(model.rowCount, 3, "no row deleted")
+
+        // A missing cell: a note, nothing to edit.
+        window.makeFirstResponder(opened.grid.gridView)
+        opened.grid.select(CellPosition(row: 1, column: 1))
+        await content.inspectorTask?.value
+        window.makeFirstResponder(text)
+        XCTAssertTrue(window.firstResponder === text)
+        XCTAssertFalse(text.isEditable, "showing a note")
+        XCTAssertTrue(validate(opened, .deleteRows).0, "the menu item is on")
+        XCTAssertTrue(text.performKeyEquivalent(with: try key("\u{7f}", code: 51, window: window)))
+        XCTAssertEqual(model.rowCount, 2, "the row went, as the menu item says")
+        XCTAssertEqual(opened.undo.undoActionName, "Delete Row")
+        XCTAssertEqual(content.lastAnnouncement, "Row deleted")
+    }
+
+    /// VoiceOver hears what a successful insert, duplicate or delete did.
+    func testVoiceOverHearsWhatChanged() async throws {
+        let opened = try await open(file("announce.csv", csv))
+        let content = opened.content
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.insertRowAbove(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Row inserted")
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.insertRowBelow(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Row inserted")
+        opened.grid.select(CellPosition(row: 2, column: 1))
+        content.duplicateRows(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Row duplicated")
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        opened.grid.extend(to: CellPosition(row: 2, column: 1))
+        content.duplicateRows(nil)
+        XCTAssertEqual(content.lastAnnouncement, "3 rows duplicated")
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.deleteRows(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Row deleted")
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        opened.grid.extend(to: CellPosition(row: 3, column: 1))
+        content.deleteRows(nil)
+        XCTAssertEqual(content.lastAnnouncement, "4 rows deleted")
+
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.insertColumnBefore(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Column inserted")
+        content.insertColumnAfter(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Column inserted")
+        opened.grid.select(CellPosition(row: 0, column: 1))
+        content.deleteColumns(nil)
+        XCTAssertEqual(content.lastAnnouncement, "Column deleted")
+        opened.grid.select(CellPosition(row: 0, column: 0))
+        opened.grid.extend(to: CellPosition(row: 0, column: 1))
+        content.deleteColumns(nil)
+        XCTAssertEqual(content.lastAnnouncement, "2 columns deleted")
     }
 
     // MARK: The bytes saved

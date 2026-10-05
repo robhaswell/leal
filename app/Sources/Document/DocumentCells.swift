@@ -8,6 +8,9 @@ struct CellArea: Equatable, Sendable {
     let rowCount: UInt64
     let columnStart: UInt32
     let columnCount: UInt32
+
+    /// How many cells it has.
+    var cells: UInt64 { rowCount * UInt64(columnCount) }
 }
 
 /// Paste and Clear (task 2.6, DESIGN §4.2; Cut is Copy then Clear or

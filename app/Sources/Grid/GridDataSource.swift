@@ -184,19 +184,24 @@ final class CellTileCache {
     /// before, so nothing waits for these.
     func readAhead(rows: Range<Int>, columns: Range<Int>, loadedRows: Int, startsWanted: Bool = false) {
         let rows = rows.clamped(to: 0..<max(0, loadedRows))
-        guard makeBackgroundFetch != nil, !rows.isEmpty, !columns.isEmpty else { return }
-        // Column blocks past every row read so far have nothing to read.
-        let columnBlocks = max(1, (widestRow + Self.columnsPerTile - 1) / Self.columnsPerTile)
-        let firstColumnBlock = max(0, columns.lowerBound) / Self.columnsPerTile
-        let lastColumnBlock = min(columnBlocks - 1, (columns.upperBound - 1) / Self.columnsPerTile)
-        guard firstColumnBlock <= lastColumnBlock else { return }
+        guard !rows.isEmpty else { return }
         let firstRowBlock = rows.lowerBound / Self.rowsPerTile
         let lastRowBlock = (rows.upperBound - 1) / Self.rowsPerTile
+        // Before any early return: the frame's range starts again (or
+        // widens) even when there is nothing to read ahead, so a read
+        // queued earlier is checked against this frame's rows, not an
+        // earlier one's.
         if startsWanted {
             wanted.set((firstRowBlock - 1)...(lastRowBlock + 1))
         } else {
             wanted.widen((firstRowBlock - 1)...(lastRowBlock + 1))
         }
+        guard makeBackgroundFetch != nil, !columns.isEmpty else { return }
+        // Column blocks past every row read so far have nothing to read.
+        let columnBlocks = max(1, (widestRow + Self.columnsPerTile - 1) / Self.columnsPerTile)
+        let firstColumnBlock = max(0, columns.lowerBound) / Self.columnsPerTile
+        let lastColumnBlock = min(columnBlocks - 1, (columns.upperBound - 1) / Self.columnsPerTile)
+        guard firstColumnBlock <= lastColumnBlock else { return }
         var started = 0
         var rowBlock = firstRowBlock
         // Lazily, block by block: the region may be long, the reads few.

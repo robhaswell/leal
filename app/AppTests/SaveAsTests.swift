@@ -658,7 +658,9 @@ final class SaveAsTests: XCTestCase {
         let url = try file("appkit.csv", csv)
         let threads = OpenThreads()
         hookOpens(threads)
-        let (document, model, _) = try await open(url)
+        let (document, model, content) = try await open(url)
+        var shown: [NSAlert] = []
+        content.showAlert = { alert, _ in shown.append(alert) }
         let opens = threads.onMainThread.count
         try Data("id,name,qty\n9,Other,1\n".utf8).write(to: url)
 
@@ -686,6 +688,10 @@ final class SaveAsTests: XCTestCase {
         XCTAssertEqual(value(model, 0, 1), "During")
         XCTAssertEqual(value(model, 0, 0), "1", "the new reading isn't adopted")
         XCTAssertTrue(document.isDocumentEdited)
+        // Said, as a Reload says it, not only logged.
+        try await waitUntil("the user is told") { !shown.isEmpty }
+        XCTAssertEqual(shown.map(\.messageText), ["Leal didn’t reload “appkit.csv”."])
+        XCTAssertEqual(shown.first?.informativeText, HistoryText.editedDuringReloadDetail)
         let savedAs = await refused.value
         XCTAssertFalse(savedAs)
         XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)))
@@ -783,6 +789,69 @@ final class SaveAsTests: XCTestCase {
         try await waitUntil("read again") { value(model, 0, 1) == "Other" }
         XCTAssertEqual(Array(threads.onMainThread.dropFirst(opensBefore)), [false, false])
         XCTAssertEqual(alerts.count, 2, "no more questions")
+    }
+
+    /// `read(from:)`'s main-thread branch (a second read, AppKit's own
+    /// revert) is never reached by Revert to Saved, with or without edits,
+    /// nor by AppKit's `revert(toContentsOf:ofType:)`; the counter does
+    /// count a direct call, as AppKit's would be.
+    func testRevertToSavedNeverReachesTheMainThreadRead() async throws {
+        let url = try file("never.csv", csv)
+        let (document, model, content) = try await open(url)
+        XCTAssertEqual(document.mainThreadRereads, 0)
+
+        set(model, 0, 1, "Marlowe")
+        answers = [0] // Revert.
+        document.revertToSaved(nil)
+        await content.reloading?.value
+        XCTAssertEqual(value(model, 0, 1), "Marlow")
+        XCTAssertEqual(alerts.count, 1, "it asked")
+
+        document.revertToSaved(nil) // No edits: no question.
+        await content.reloading?.value
+        XCTAssertEqual(alerts.count, 1)
+
+        try document.revert(toContentsOf: url, ofType: "public.comma-separated-values-text")
+        try await waitUntil("the revert is over") { !model.isReloading }
+        XCTAssertEqual(document.mainThreadRereads, 0)
+
+        try document.read(from: url, ofType: "public.comma-separated-values-text")
+        XCTAssertEqual(document.mainThreadRereads, 1)
+    }
+
+    /// ⌘. while a Save As waits behind a Save stops both: the Save As
+    /// writes nothing, the document stays on its file with its edits
+    /// unsaved, and nothing is said.
+    func testCancellingASaveAsQueuedBehindASave() async throws {
+        let url = try file("behind.csv", csv)
+        let (document, model, content) = try await open(url)
+        set(model, 0, 1, "before")
+        debugHoldNextSave()
+        document.save(nil)
+        let save = try XCTUnwrap(document.saving)
+        try await waitUntil("the save took its snapshot") { model.saveJob?.progress().snapshotVersion != nil }
+        let copy = directory.appending(path: "behind copy.csv")
+        let queued = document.saveAs(to: copy)
+        XCTAssertNotEqual(document.saving, save, "it waits its turn")
+
+        content.cancelOperation(nil)
+        debugReleaseHeldSave()
+        let saved = await save.value
+        let savedAs = await queued.value
+
+        XCTAssertFalse(saved)
+        XCTAssertFalse(savedAs)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path(percentEncoded: false)))
+        XCTAssertEqual(try contents(url), csv, "the file is as it was")
+        XCTAssertTrue(same(document.fileURL, url))
+        XCTAssertTrue(same(model.url, url))
+        XCTAssertNil(document.saving)
+        XCTAssertTrue(document.isDocumentEdited)
+        XCTAssertEqual(value(model, 0, 1), "before")
+        XCTAssertTrue(alerts.isEmpty, alerts.map(\.messageText).joined())
+        XCTAssertTrue(recent.isEmpty)
+        XCTAssertNil(model.saveJob)
+        XCTAssertFalse(model.saveOutcomePending)
     }
 
     /// A drive coming back keeps the edits (ADR-0008 decision 4): Leal has

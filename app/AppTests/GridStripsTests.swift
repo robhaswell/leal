@@ -88,10 +88,17 @@ final class GridStripsTests: XCTestCase {
             // again, and the view drawn again, until nothing is left. (A
             // grid view's own snapshot, `GridStrips.drawSnapshot`, does
             // that itself.)
+            var settled = false
             for _ in 0..<5 {
                 let flushed = flushDeferred(in: view)
                 view.cacheDisplay(in: rect, to: rep)
-                guard flushed else { break }
+                if !flushed {
+                    settled = true
+                    break
+                }
+            }
+            if !settled {
+                XCTFail("the strips were still deferring ink after 5 passes, so the snapshot may be short of ink")
             }
         }
         return rep

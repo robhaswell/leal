@@ -94,9 +94,11 @@ class LiteralTextView: NSTextView {
         set { super.enabledTextCheckingTypes = newValue & ~Self.changingChecks }
     }
 
-    /// ⌘⌫ is the text's while either editor has the focus: it deletes to
-    /// the start of the line, as in any text field, and never reaches Edit
-    /// > Delete Row (task 2.5a), which would take it first. ⌘↩ and ⇧⌘↩ go
+    /// ⌘⌫ is the text's while either editor has the focus and is editing:
+    /// it deletes to the start of the line, as in any text field, and never
+    /// reaches Edit > Delete Row (task 2.5a), which would take it first.
+    /// With the inspector focused but not editing it is Delete Row's, as
+    /// the menu item shows. ⌘↩ and ⇧⌘↩ go
     /// on: in the in-cell editor they commit the edit, then insert a row
     /// below or duplicate the row (in the inspector ⌘↩ commits only:
     /// `InspectorTextView`). ⌘ (or ⇧⌘) and the keypad's Enter, which isn't
@@ -106,6 +108,10 @@ class LiteralTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if window?.firstResponder === self, let key = GridView.rowCommandKey(event) {
             if key == .delete {
+                // Not editing (the inspector showing a value): there is no
+                // text to delete, and the Delete Row item is on, so the
+                // key does what it says (DESIGN §4.2).
+                guard isEditable else { return tryToPerform(DocumentViewController.action(.deleteRows), with: self) }
                 interpretKeyEvents([event])
                 return true
             }
