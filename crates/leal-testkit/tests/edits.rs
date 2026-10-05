@@ -10,7 +10,7 @@ use leal_testkit::dialect::{
 };
 use leal_testkit::fidelity::{Change, apply_changes, check_identical};
 use leal_testkit::layout::Layout;
-use leal_testkit::save::{CellSource, Document, Edit, Fix, SaveError};
+use leal_testkit::save::{CellSource, Document, Edit, Fix, Restored, SaveError};
 use leal_testkit::strategies::csv::{CsvConfig, csv_file, csv_file_utf16};
 use leal_testkit::strategies::edits::{EditCase, edit_case, edits_for, single_byte_edit_case};
 use proptest::collection::vec;
@@ -41,7 +41,7 @@ proptest! {
     fn saved_bytes_parse_back_to_the_edited_values(case in edit_case(CsvConfig::clean())) {
         let saved = case.saved.clone().map_err(|e| TestCaseError::fail(e.to_string()))?;
         prop_assert_eq!(&saved.bytes, &apply_changes(&case.file.bytes, &saved.changes));
-        let values = final_values(&case);
+        let values = written_values(&case);
         // ADR-0004 decision 6: a row left with no cells is written as `""`,
         // so it reads back as one empty field.
         let values: Vec<Vec<String>> = values
@@ -171,7 +171,7 @@ proptest! {
                 prop_assert!(unencodable.is_empty());
                 prop_assert_eq!(&saved.bytes, &apply_changes(&case.file.bytes, &saved.changes));
                 let parsed = oracle::analyze(&saved.bytes, case.file.delimiter(), encoding);
-                prop_assert_eq!(read_back(&parsed.layout, encoding), padded(values));
+                prop_assert_eq!(read_back(&parsed.layout, encoding), padded(written_values(&case)));
             }
             Err(SaveError::Unencodable(cells)) => prop_assert_eq!(cells, &unencodable),
             Err(e) => prop_assert!(false, "unexpected {}", e),
@@ -205,7 +205,7 @@ proptest! {
                     prop_assert_eq!(parsed.check_tiles(case.file.delimiter()), Ok(()));
                     prop_assert_eq!(
                         read_back(&parsed.layout, Encoding::Utf8),
-                        padded(final_values(&case))
+                        padded(written_values(&case))
                     );
                     let endings: Vec<_> = parsed.layout.rows.iter().map(|r| r.line_ending).collect();
                     prop_assert_eq!(endings, saved.line_endings);
@@ -285,6 +285,23 @@ fn read_back(layout: &Layout, encoding: Encoding) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// [`final_values`] as the rows are written: a duplicated row's copies of
+/// padding left at its end, once its hatched cell's column went, aren't
+/// (ADR-0014 decision 5). Only those can be padding at a row's end.
+fn written_values(case: &EditCase) -> Vec<Vec<String>> {
+    let mut doc = case.file.document();
+    for e in &case.edits {
+        doc.apply(e).expect("strategy edits are valid");
+    }
+    let mut values = final_values(case);
+    for (r, row) in values.iter_mut().enumerate() {
+        while !row.is_empty() && doc.cell_source(r, row.len() - 1) == Some(CellSource::Padding) {
+            row.pop();
+        }
+    }
+    values
+}
+
 /// ADR-0004 decision 6: a row left with no cells is written as `""`, so it
 /// reads back as one empty field.
 fn padded(values: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -330,9 +347,33 @@ fn unconvertible_cells(case: &EditCase, doc: &Document<'_>) -> Vec<(usize, usize
             {
                 cells.push((r, c));
             }
+            // A duplicated row's copy of such a field is its bytes too.
+            if doc.source_row(r).is_none()
+                && let Some(Restored::Raw(raw)) = doc.restored(r, c)
+                && raw_is_unconvertible(&raw.bytes, file.encoding)
+            {
+                cells.push((r, c));
+            }
         }
     }
     cells
+}
+
+/// Whether a field's bytes, as written, hold any that aren't text in
+/// `encoding` (found from the bytes, as above).
+fn raw_is_unconvertible(bytes: &[u8], encoding: Encoding) -> bool {
+    match encoding {
+        Encoding::Utf8 => false,
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            !diagnostics::utf16_nul_and_invalid_offsets(bytes, 0, encoding == Encoding::Utf16Le)
+                .1
+                .is_empty()
+        }
+        single_byte => {
+            let unassigned = unassigned_bytes(single_byte);
+            bytes.iter().any(|&b| unassigned[usize::from(b)])
+        }
+    }
 }
 
 #[test]
@@ -348,6 +389,8 @@ fn edit_strategy_reaches_every_kind_of_edit() {
     let edits = || cases.iter().flat_map(|c| &c.edits);
     let has = |pred: &dyn Fn(&Edit) -> bool| edits().any(pred);
     assert!(has(&|e| matches!(e, Edit::SetCell { .. })));
+    assert!(has(&|e| matches!(e, Edit::DuplicateRows { count: 1, .. })));
+    assert!(has(&|e| matches!(e, Edit::DuplicateRows { count: 3, .. })));
     assert!(has(&|e| matches!(e, Edit::InsertRow { .. })));
     assert!(has(&|e| matches!(e, Edit::DeleteRow { .. })));
     assert!(has(&|e| matches!(e, Edit::InsertColumn { .. })));
@@ -752,7 +795,7 @@ proptest! {
         let Ok(saved) = &case.saved else {
             return Ok(()); // F5 failures and read-only files have no output
         };
-        let values: Vec<Vec<String>> = final_values(&case)
+        let values: Vec<Vec<String>> = written_values(&case)
             .into_iter()
             .map(|r| if r.is_empty() { vec![String::new()] } else { r })
             .collect();

@@ -296,6 +296,9 @@ fn run<'a>(
                             document.insert_column(at, &value)
                         }
                         OracleEdit::DeleteColumn { column } => document.delete_column(column),
+                        OracleEdit::DuplicateRows { at, count } => {
+                            document.duplicate_rows(at, count)
+                        }
                         OracleEdit::SetCell { .. } => unreachable!(),
                     };
                     structural_step(expected, got, before, state, &mut done, &mut undone)?;
@@ -893,6 +896,7 @@ fn replaying_the_history_into_a_fresh_document_gives_the_same_cells() {
                 OracleEdit::DeleteRow { row } => document.delete_rows(row, 1),
                 OracleEdit::InsertColumn { at, value } => document.insert_column(at, &value),
                 OracleEdit::DeleteColumn { column } => document.delete_column(column),
+                OracleEdit::DuplicateRows { at, count } => document.duplicate_rows(at, count),
             };
             let Ok(Some(command)) = made else { continue };
             history.push(command.clone());

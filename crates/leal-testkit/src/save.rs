@@ -229,6 +229,17 @@ pub enum Edit {
         /// Column.
         column: usize,
     },
+    /// Duplicate Row (task 2.5a): a copy of each of rows `at..at + count`,
+    /// in order, inserted after the last of them. Each copy's fields are
+    /// written as its row writes them now (an unedited field as its bytes,
+    /// an edited one or a hatched cell quoted as the row quotes it,
+    /// padding as no bytes), with the file's most common line ending.
+    DuplicateRows {
+        /// The first row.
+        at: usize,
+        /// How many rows; at least one.
+        count: usize,
+    },
 }
 
 /// Why an edit or a save failed.
@@ -335,6 +346,18 @@ enum Cell {
     /// has been given one (set back to how the field reads, the edit goes,
     /// as for an original field, §3.6).
     Raw { raw: RawField, edit: Option<String> },
+    /// A duplicated row's copy (task 2.5a) of an edited field of the file
+    /// or of a hatched cell, `Some((value, quoted))`, written as the row it
+    /// copies writes it: quoted if it needs it, if the file quotes every
+    /// field, or if `quoted` (the field it edited was; false for a hatched
+    /// cell). `None` is a copy of padding: no bytes, and none at all at
+    /// the row's end, where it no longer leads to a hatched cell (ADR-0014
+    /// decision 5). Given an `edit` (unless set back to how it reads), it
+    /// is a new field (rule 3).
+    Copy {
+        copied: Option<(String, bool)>,
+        edit: Option<String>,
+    },
 }
 
 /// A field of a file as its bytes, put back by value ([`Restored::Raw`]).
@@ -404,6 +427,26 @@ impl Cell {
 }
 
 impl DocRow {
+    /// The cells the row is written with: all but a duplicated row's copies
+    /// of padding left at its end (ADR-0014 decision 5).
+    fn written_cells(&self) -> &[Cell] {
+        let unedited_padding = |cell: &Cell| {
+            matches!(
+                cell,
+                Cell::Copy {
+                    copied: None,
+                    edit: None
+                }
+            )
+        };
+        let len = self
+            .cells
+            .iter()
+            .rposition(|cell| !unedited_padding(cell))
+            .map_or(0, |last| last + 1);
+        &self.cells[..len]
+    }
+
     /// An original blank line whose one (empty) cell hasn't been edited.
     fn is_blank_line(&self, layout: &Layout) -> bool {
         self.source.is_some_and(|s| layout.rows[s].is_blank()) && self.cells == [Cell::Original(0)]
@@ -497,6 +540,10 @@ impl<'a> Document<'a> {
             Cell::Raw { raw, edit } => edit
                 .clone()
                 .unwrap_or_else(|| decode_value(&raw.value, self.encoding)),
+            Cell::Copy { copied, edit } => edit
+                .clone()
+                .or_else(|| copied.as_ref().map(|(value, _)| value.clone()))
+                .unwrap_or_default(),
         })
     }
 
@@ -530,8 +577,18 @@ impl<'a> Document<'a> {
         Some(match self.rows.get(row)?.cells.get(column)? {
             Cell::Original(field) => CellSource::Original { field: *field },
             // A field put back by value is a new cell.
-            Cell::Edited { .. } | Cell::Appended(Some(_)) | Cell::Raw { .. } => CellSource::Edited,
-            Cell::Appended(None) => CellSource::Padding,
+            Cell::Edited { .. }
+            | Cell::Appended(Some(_))
+            | Cell::Raw { .. }
+            | Cell::Copy {
+                copied: Some(_), ..
+            }
+            | Cell::Copy { edit: Some(_), .. } => CellSource::Edited,
+            Cell::Appended(None)
+            | Cell::Copy {
+                copied: None,
+                edit: None,
+            } => CellSource::Padding,
         })
     }
 
@@ -549,7 +606,7 @@ impl<'a> Document<'a> {
                     Cell::Original(f) => *f == k,
                     Cell::Edited { field, .. } => *field == Some(k),
                     Cell::Appended(_) => k >= fields,
-                    Cell::Raw { .. } => false,
+                    Cell::Raw { .. } | Cell::Copy { .. } => false,
                 }),
         )
     }
@@ -572,7 +629,7 @@ impl<'a> Document<'a> {
         let field = match r.cells.get(column) {
             Some(Cell::Original(f)) => Some(*f),
             Some(Cell::Edited { field, .. }) => *field,
-            Some(Cell::Raw { .. }) => None,
+            Some(Cell::Raw { .. } | Cell::Copy { .. }) => None,
             Some(Cell::Appended(_)) | None => return Some(String::new()),
         }?;
         Some(self.field_display(source, field))
@@ -749,6 +806,12 @@ impl<'a> Document<'a> {
                     *edit = (*value != reads).then(|| value.clone());
                     return Ok(());
                 }
+                if let Cell::Copy { copied, edit } = &mut r.cells[*column] {
+                    // The same for a copy.
+                    let reads = copied.as_ref().map_or("", |(value, _)| value.as_str());
+                    *edit = (value != reads).then(|| value.clone());
+                    return Ok(());
+                }
                 let source = r.source;
                 let original = self.original_value(*row, *column);
                 let cell = self
@@ -759,7 +822,7 @@ impl<'a> Document<'a> {
                 let field = match cell {
                     Cell::Original(f) => Some(*f),
                     Cell::Edited { field, .. } => *field,
-                    Cell::Appended(_) | Cell::Raw { .. } => None,
+                    Cell::Appended(_) | Cell::Raw { .. } | Cell::Copy { .. } => None,
                 };
                 *cell = match (field, source) {
                     // §3.6: back to the original display value removes the edit.
@@ -817,6 +880,21 @@ impl<'a> Document<'a> {
                     }
                 }
             }
+            Edit::DuplicateRows { at, count } => {
+                let end = at.checked_add(*count).ok_or_else(invalid)?;
+                if *count == 0 || end > self.rows.len() {
+                    return Err(invalid());
+                }
+                let copies: Vec<DocRow> = (*at..end)
+                    .map(|row| DocRow {
+                        source: None,
+                        cells: (0..self.rows[row].cells.len())
+                            .map(|column| self.copy_of(row, column))
+                            .collect(),
+                    })
+                    .collect();
+                self.rows.splice(end..end, copies);
+            }
             Edit::DeleteColumn { column } => {
                 if *column >= self.max_row_len() {
                     return Err(invalid());
@@ -836,6 +914,52 @@ impl<'a> Document<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Cell (`row`, `column`) as Duplicate Row copies it (task 2.5a): an
+    /// unedited field of the file as its bytes (as a delete undone after a
+    /// save puts it back, [`restored`](Self::restored)); an edited field of
+    /// the file, or a hatched cell, as [`Cell::Copy`], quoted as this row
+    /// quotes it; padding as padding; a copy's own value as it is; any
+    /// other cell (an inserted row's, a column insert's, an edited copy or
+    /// field put back) as a new field.
+    fn copy_of(&self, row: usize, column: usize) -> Cell {
+        let r = &self.rows[row];
+        let new = || Cell::Edited {
+            field: None,
+            value: self.value(row, column).unwrap_or_default(),
+        };
+        match (&r.cells[column], r.source) {
+            (Cell::Original(_), _) | (Cell::Raw { edit: None, .. }, _) => {
+                match self.restored(row, column) {
+                    Some(Restored::Raw(raw)) => Cell::Raw { raw, edit: None },
+                    _ => new(),
+                }
+            }
+            (
+                Cell::Edited {
+                    field: Some(f),
+                    value,
+                },
+                Some(source),
+            ) => Cell::Copy {
+                copied: Some((value.clone(), self.layout.rows[source].fields[*f].quoted)),
+                edit: None,
+            },
+            (Cell::Appended(Some(value)), _) => Cell::Copy {
+                copied: Some((value.clone(), false)),
+                edit: None,
+            },
+            (Cell::Appended(None), _) => Cell::Copy {
+                copied: None,
+                edit: None,
+            },
+            (Cell::Copy { copied, edit: None }, _) => Cell::Copy {
+                copied: copied.clone(),
+                edit: None,
+            },
+            _ => new(),
+        }
     }
 
     /// The expected output of saving now.
@@ -902,7 +1026,7 @@ impl<'a> Document<'a> {
                 let span = self.layout.rows[row.source.unwrap_or(0)].span.clone();
                 content.extend_from_slice(&self.bytes[span]);
             } else {
-                for (ci, cell) in row.cells.iter().enumerate() {
+                for (ci, cell) in row.written_cells().iter().enumerate() {
                     if ci > 0 {
                         content.push(self.delimiter.byte());
                     }
@@ -1047,7 +1171,10 @@ impl<'a> Document<'a> {
             for (column, cell) in row.cells.iter().enumerate() {
                 let field = match cell {
                     Cell::Original(f) | Cell::Edited { field: Some(f), .. } => *f,
-                    Cell::Edited { field: None, .. } | Cell::Appended(_) | Cell::Raw { .. } => {
+                    Cell::Edited { field: None, .. }
+                    | Cell::Appended(_)
+                    | Cell::Raw { .. }
+                    | Cell::Copy { .. } => {
                         continue;
                     }
                 };
@@ -1113,7 +1240,7 @@ impl<'a> Document<'a> {
                 });
             } else {
                 let mut field_start = start;
-                for (k, cell) in row.cells.iter().enumerate() {
+                for (k, cell) in row.written_cells().iter().enumerate() {
                     let mut bytes = self
                         .cell_bytes(row, k, cell, &quoting, false)
                         .unwrap_or_default();
@@ -1158,6 +1285,13 @@ impl<'a> Document<'a> {
                                 | Cell::Appended(Some(value))
                                 | Cell::Raw {
                                     edit: Some(value), ..
+                                }
+                                | Cell::Copy {
+                                    edit: Some(value), ..
+                                }
+                                | Cell::Copy {
+                                    copied: Some((value, _)),
+                                    edit: None,
                                 } => encode_value(value, self.encoding).unwrap_or_default(),
                                 _ => Vec::new(),
                             };
@@ -1232,6 +1366,26 @@ impl<'a> Document<'a> {
             }
             // An edited field put back is a new field (rule 3).
             Cell::Raw {
+                edit: Some(value), ..
+            } => expected_field_bytes(
+                value,
+                target,
+                self.delimiter,
+                quoting.new_field(column),
+                false,
+            )
+            .map_err(|_| Bad::Unencodable),
+            Cell::Copy {
+                copied: Some((value, quoted)),
+                edit: None,
+            } => expected_field_bytes(value, target, self.delimiter, *quoted, quoting.all)
+                .map_err(|_| Bad::Unencodable),
+            Cell::Copy {
+                copied: None,
+                edit: None,
+            } => Ok(Vec::new()),
+            // An edited copy is a new field (rule 3).
+            Cell::Copy {
                 edit: Some(value), ..
             } => expected_field_bytes(
                 value,
@@ -1323,7 +1477,7 @@ impl<'a> Document<'a> {
                 Cell::Original(f) => *f == k,
                 Cell::Edited { field, .. } => *field == Some(k),
                 Cell::Appended(_) => k >= fields,
-                Cell::Raw { .. } => false,
+                Cell::Raw { .. } | Cell::Copy { .. } => false,
             });
         let end = orig.span.end + orig.line_ending.map_or(0, LineEnding::byte_len);
         if same_shape {
@@ -1980,6 +2134,54 @@ mod tests {
         let r = save(b"a,b,c\n\nd\n", &[], &[set(1, 2, "x")]).unwrap();
         assert_eq!(r.bytes, b"a,b,c\n,,x\nd\n");
         assert_eq!(r.changes, vec![Change::insert(6, ",,x")]);
+    }
+
+    /// Duplicate Row: a copy after the rows, each field as its row writes
+    /// it (an edited field quoted as it was, a hatched cell as one is),
+    /// unedited fields as their bytes; a copy's padding goes once its
+    /// hatched cell's column does (ADR-0014 decision 5); an edited copy is
+    /// a new field.
+    #[test]
+    fn a_duplicated_row_is_written_as_its_row_is() {
+        let dup = |at, count| Edit::DuplicateRows { at, count };
+        let file = b"a,\"b\"\n1\n";
+        assert_eq!(
+            out(save(
+                file,
+                &[(0, 1)],
+                &[set(0, 0, "q"), set(1, 2, "h"), dup(0, 2)]
+            )),
+            "q,\"b\"\n1,,h\nq,\"b\"\n1,,h\n"
+        );
+        assert_eq!(
+            out(save(
+                b"a,\"b\"\n",
+                &[(0, 1)],
+                &[set(0, 1, "e"), dup(0, 1), set(1, 0, "x,y")]
+            )),
+            "a,\"e\"\n\"x,y\",\"e\"\n"
+        );
+        assert_eq!(
+            out(save(
+                file,
+                &[(0, 1)],
+                &[set(1, 2, "h"), dup(1, 1), Edit::DeleteColumn { column: 2 }]
+            )),
+            "a,\"b\"\n1\n1\n"
+        );
+        // Set back to how it reads, a copy is a copy again.
+        assert_eq!(
+            out(save(
+                file,
+                &[(0, 1)],
+                &[set(0, 1, "e"), dup(0, 1), set(1, 1, "f"), set(1, 1, "e")]
+            )),
+            "a,\"e\"\na,\"e\"\n1\n"
+        );
+        assert!(matches!(
+            save(file, &[], &[dup(1, 2)]),
+            Err(SaveError::InvalidEdit(_))
+        ));
     }
 
     /// F3 for hatched cells: their value is empty, so `""` is no edit, and

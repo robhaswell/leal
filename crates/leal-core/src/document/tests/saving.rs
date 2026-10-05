@@ -3050,3 +3050,55 @@ fn a_hatched_cell_in_a_new_or_rewritten_row_is_quoted_only_if_it_needs_it() {
     assert_eq!(column_deleted("y"), b"a,\"b\"\n1,\"2\"\n4,y\n");
     assert_eq!(column_deleted("a,b"), b"a,\"b\"\n1,\"2\"\n4,\"a,b\"\n");
 }
+
+/// A duplicated row's copy of bytes that aren't text in the file's
+/// encoding can't be converted either: Save As UTF-8 names the copy's cell
+/// as well as its row's, and every cell after them in its own row (phase 2
+/// gate: the row count after a refused copy was untested).
+#[test]
+fn save_as_utf8_names_a_duplicated_rows_cells_it_cant_convert() {
+    let dir = Dir::new("save-utf8-duplicated");
+    let scheduler = scheduler();
+    let path = dir.file("g.csv", b"a,\xAA\nb,c\nd,\xAA\n");
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1253);
+    document.duplicate_rows(0, 1).unwrap().unwrap();
+    let copy = dir.0.join("u8.csv");
+    let error = save(&document, &copy, SaveKind::SaveAsUtf8).unwrap_err();
+    assert_eq!(
+        error,
+        "Unconvertible { encoding: Windows1253, cells: [(0, 1), (1, 1), (3, 1)], more: false }"
+    );
+    assert!(!copy.exists());
+}
+
+/// The oracle's Duplicate Row cases (`a_duplicated_row_is_written_as_its_row_is`
+/// in leal-testkit), on the real document.
+#[test]
+fn duplicated_rows_save_as_the_oracle_says() {
+    let file = b"a,\"b\"\n1\n";
+    let saved = saved_after("dup-oracle-1", file, |d| {
+        set(d, 0, 0, "q");
+        set(d, 1, 2, "h");
+        d.duplicate_rows(0, 2).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"q,\"b\"\n1,,h\nq,\"b\"\n1,,h\n");
+    let saved = saved_after("dup-oracle-2", b"a,\"b\"\n", |d| {
+        set(d, 0, 1, "e");
+        d.duplicate_rows(0, 1).unwrap().unwrap();
+        set(d, 1, 0, "x,y");
+    });
+    assert_eq!(saved, b"a,\"e\"\n\"x,y\",\"e\"\n");
+    let saved = saved_after("dup-oracle-3", file, |d| {
+        set(d, 1, 2, "h");
+        d.duplicate_rows(1, 1).unwrap().unwrap();
+        d.delete_column(2).unwrap().unwrap();
+    });
+    assert_eq!(saved, b"a,\"b\"\n1\n1\n");
+    let saved = saved_after("dup-oracle-4", file, |d| {
+        set(d, 0, 1, "e");
+        d.duplicate_rows(0, 1).unwrap().unwrap();
+        set(d, 1, 1, "f");
+        set(d, 1, 1, "e");
+    });
+    assert_eq!(saved, b"a,\"e\"\na,\"e\"\n1\n");
+}

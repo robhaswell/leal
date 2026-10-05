@@ -314,6 +314,11 @@ fn open_and_edit(
                     rows: changed(true),
                 }],
             ),
+            // Undone by value: the copies deleted.
+            OracleEdit::DuplicateRows { at, count } => (
+                document.duplicate_rows(*at, *count),
+                vec![Undo::Edit(OracleEdit::DeleteRow { row: at + count }); *count],
+            ),
             OracleEdit::DeleteColumn { column } => {
                 // Its unedited fields come back as their bytes (task 2.4c).
                 let cells = changed(false)
@@ -950,6 +955,7 @@ fn incomplete_save_as_matches_the_oracle(case: &EditCase, at: usize) -> Result<(
             OracleEdit::DeleteRow { row } => document.delete_rows(*row, 1),
             OracleEdit::InsertColumn { at, value } => document.insert_column(*at, value),
             OracleEdit::DeleteColumn { column } => document.delete_column(*column),
+            OracleEdit::DuplicateRows { at, count } => document.duplicate_rows(*at, *count),
         };
         match got {
             Ok(Some(_)) => prop_assert!(oracle.apply(&edit).is_ok(), "{:?}", edit),

@@ -180,7 +180,15 @@ enum RawEdit {
     DeleteColumn {
         column: Index,
     },
+    /// Duplicate Row: up to [`DUPLICATE_REACH`] rows from `at`.
+    DuplicateRows {
+        at: Index,
+        count: Index,
+    },
 }
+
+/// How many rows a Duplicate Row edit copies at most.
+const DUPLICATE_REACH: usize = 3;
 
 /// A value for the file's first cell.
 #[derive(Clone, Copy, Debug)]
@@ -227,6 +235,8 @@ fn raw_edit() -> impl Strategy<Value = RawEdit> {
         1 => any::<Index>().prop_map(|row| RawEdit::DeleteRow { row }),
         1 => (any::<Index>(), raw_value()).prop_map(|(at, value)| RawEdit::InsertColumn { at, value }),
         1 => any::<Index>().prop_map(|column| RawEdit::DeleteColumn { column }),
+        1 => (any::<Index>(), any::<Index>())
+            .prop_map(|(at, count)| RawEdit::DuplicateRows { at, count }),
     ]
 }
 
@@ -450,6 +460,13 @@ fn resolve(file: GeneratedCsv, raw: &[RawEdit], hinted: bool) -> EditCase {
                 let at = at.index(doc.max_row_len() + 1);
                 let value = value.literal(encoding).unwrap_or_default();
                 step.push(Edit::InsertColumn { at, value });
+            }
+            RawEdit::DuplicateRows { at, count } => {
+                if doc.row_count() > 0 {
+                    let at = at.index(doc.row_count());
+                    let count = 1 + count.index(DUPLICATE_REACH.min(doc.row_count() - at));
+                    step.push(Edit::DuplicateRows { at, count });
+                }
             }
             RawEdit::DeleteColumn { column } => {
                 if doc.max_row_len() > 0 {

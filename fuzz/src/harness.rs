@@ -91,6 +91,8 @@ pub enum Op {
     InsertColumn { at: u8, value: Value },
     /// Delete a column.
     DeleteColumn { column: u8 },
+    /// Duplicate Row: one to three rows from `at` (task 2.5a).
+    DuplicateRows { at: u8, count: u8 },
     /// Undo the last command.
     Undo,
     /// Redo the last command undone.
@@ -308,6 +310,7 @@ pub fn run(data: &[u8], target: Target) {
             OracleEdit::DeleteRow { row } => document.delete_rows(*row, 1),
             OracleEdit::InsertColumn { at, value } => document.insert_column(*at, value),
             OracleEdit::DeleteColumn { column } => document.delete_column(*column),
+            OracleEdit::DuplicateRows { at, count } => document.duplicate_rows(*at, *count),
         };
         match (&expected, got) {
             (Ok(()), Ok(Some(command))) => {
@@ -440,6 +443,10 @@ fn oracle_edit(op: &Op, oracle: &Oracle<'_>, delimiter: u8, encoding: tk::Encodi
             value: text(value, None),
         },
         Op::DeleteColumn { column: c } => OracleEdit::DeleteColumn { column: column(*c) },
+        Op::DuplicateRows { at, count } => OracleEdit::DuplicateRows {
+            at: row(*at),
+            count: 1 + usize::from(*count) % 3,
+        },
         Op::Undo | Op::Redo => unreachable!("not an edit"),
     }
 }
