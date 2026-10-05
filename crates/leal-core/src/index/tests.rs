@@ -1143,3 +1143,18 @@ fn an_index_from_starts_is_the_scanned_one() {
     assert!(with_bom(vec![], 3).is_some());
     assert!(with_bom(vec![], 7).is_none());
 }
+
+/// Phase 2 gate (`docs/tasks/2.G-a.md`): an index from a save's starts
+/// keeps no spare capacity, whether the save sized them for its rows (the
+/// end then doubled the vector) or not.
+#[test]
+fn an_index_from_starts_keeps_no_spare_capacity() {
+    let bytes = b"a\nb\nc\n";
+    for capacity in [3, 4, 100] {
+        let mut starts = Vec::with_capacity(capacity);
+        starts.extend([0, 2, 4]);
+        let index = RowIndex::from_starts(utf8(b','), starts, bytes.len(), None, None).unwrap();
+        let state = index.read();
+        assert_eq!(state.starts.capacity(), state.starts.len(), "{capacity}");
+    }
+}

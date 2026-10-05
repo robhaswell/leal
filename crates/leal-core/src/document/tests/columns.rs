@@ -674,3 +674,39 @@ fn marks_follow_inserted_and_deleted_columns() {
         Some(Place { row: 1, column: 1 })
     );
 }
+
+/// Phase 2 gate (`docs/tasks/2.G-a.md`): a column delete undone and
+/// redone by value after a save reads every row's cell without the row
+/// cache, which paid an eviction for each row and evicted the grid's: the
+/// rows on screen stay cached, and the cells come back as their bytes.
+#[test]
+fn a_column_undone_after_a_save_leaves_the_rows_on_screen_cached() {
+    let dir = Dir::new("columns-undo-cache");
+    let bytes: Vec<u8> = (0..2_000)
+        .flat_map(|n| format!("{n},\"v,{n}\",z\n").into_bytes())
+        .collect();
+    let path = dir.file("a.csv", &bytes);
+    let document = Arc::new(open_with(&dir, "a.csv", &bytes, false));
+    let deleted = delete(&document, 1);
+    let save = || {
+        let job = document.save(SaveRequest::new(&path, SaveKind::Save));
+        job.wait().as_ref().unwrap();
+    };
+    save();
+    document.apply(&deleted.inverse()).unwrap();
+    let cached = |document: &Document| {
+        document.rows(0..10, 100).unwrap();
+        let reading = document.current();
+        let cache = reading.cache.lock().unwrap();
+        (0..10).all(|row| cache.contains(row))
+    };
+    assert!(cached(&document));
+    save();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(cached(&document));
+    // Redone after that save, by value: every cell checked, uncached.
+    document.apply(&deleted).unwrap();
+    let reading = document.current();
+    let cache = reading.cache.lock().unwrap();
+    assert!((0..10).all(|row| cache.contains(row)));
+}

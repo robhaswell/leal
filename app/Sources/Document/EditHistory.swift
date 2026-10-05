@@ -184,10 +184,38 @@ final class EditHistory {
     /// command, with the edit version then.
     private var tokens: [(version: UInt64, token: Any)] = []
 
-    /// Appends a command the core applied to the journal.
+    /// Appends a command the core applied to the journal. An undo straight
+    /// after its command's edit or redo, or a redo straight after its
+    /// undo, takes that entry out instead: replayed, the two would change
+    /// nothing, and the journal kept the command, values and all (up to
+    /// 64 MB of them), after the undo history had let it go (phase 2 gate,
+    /// `docs/tasks/2.G-a.md`). The redo history isn't recovered anyway
+    /// (`rebuild`).
     func record(_ command: EditCommand, as direction: CommandDirection, version: UInt64, choices: ReadingChoices) {
-        journal.append(JournalEntry(command: command, direction: direction, version: version))
         self.choices = choices
+        if let last = journal.last, Self.cancels(last, command, direction) {
+            journal.removeLast()
+            return
+        }
+        journal.append(JournalEntry(command: command, direction: direction, version: version))
+    }
+
+    /// Whether `command` applied as `direction` takes back the journal's
+    /// `last` entry: the same command, the other way.
+    private static func cancels(_ last: JournalEntry, _ command: EditCommand, _ direction: CommandDirection) -> Bool {
+        let otherWay = switch direction {
+        case .undo: last.direction != .undo
+        case .redo: last.direction == .undo
+        case .edit: false
+        }
+        return otherWay && same(last.command, command)
+    }
+
+    /// Whether `a` and `b` are the same command: the same cells changed
+    /// the same way, or the same rows, column or batch of cells (which the
+    /// core keeps, compared by identity).
+    private static func same(_ a: EditCommand, _ b: EditCommand) -> Bool {
+        a.lineage == b.lineage && a.changes == b.changes && a.structural === b.structural && a.cells === b.cells
     }
 
     /// The reading's choices changed without a command (the header-row

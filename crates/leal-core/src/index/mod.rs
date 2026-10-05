@@ -482,6 +482,10 @@ impl RowIndex {
             return None;
         }
         starts.push(end);
+        // A save sizes `starts` for its rows; the extra start (the end)
+        // mustn't double its capacity for the life of the reading (phase 2
+        // gate: 3.9 MB of the reference file's heap after every save).
+        starts.shrink_to_fit();
         Some(RowIndex {
             dialect,
             state: RwLock::new(State {

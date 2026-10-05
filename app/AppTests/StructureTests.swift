@@ -198,7 +198,7 @@ final class StructureTests: XCTestCase {
         XCTAssertFalse(model.hasUnsavedEdits)
         undo.redo()
         XCTAssertEqual(column(model, 1), ["Marlow", "", "Ostrava", "Halden"])
-        XCTAssertEqual(opened.document.history.journal.map(\.direction), [.edit, .undo, .redo])
+        XCTAssertEqual(opened.document.history.journal.map(\.direction), [.redo], "the undo took its edit out")
         undo.undo()
 
         // Above the first data row: after the header row, which stays.
@@ -497,7 +497,7 @@ final class StructureTests: XCTestCase {
         XCTAssertEqual(column(model, 0), ["3", "5", "8"])
         XCTAssertEqual(opened.grid.activeCell, CellPosition(row: 2, column: 0))
         XCTAssertEqual(undo.undoActionName, "Delete Columns")
-        XCTAssertEqual(opened.document.history.journal.count, 6, "two inserts, their undos, and a command per column")
+        XCTAssertEqual(opened.document.history.journal.count, 2, "a command per column: each insert went with its undo")
         undo.undo()
         XCTAssertEqual(model.columnCount, 3)
         XCTAssertEqual((0..<3).map { model.headerTitle(column: $0).text }, ["id", "name", "qty"])

@@ -142,7 +142,8 @@ impl<'w, 's> Walk<'w, 's> {
             prev: Prev::None,
             pending: Vec::new(),
             pending_starts: Vec::new(),
-            starts: (!extent.converts()).then(|| Vec::with_capacity(rows)),
+            // One start a row, and the end (`RowIndex::from_starts`).
+            starts: (!extent.converts()).then(|| Vec::with_capacity(rows + 1)),
             counts: (!extent.converts()).then(|| CountsBuilder::with_capacity(rows)),
             quote,
             quote_all: None,

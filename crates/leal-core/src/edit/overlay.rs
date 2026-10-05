@@ -409,8 +409,8 @@ pub(crate) struct InsertedRow {
 impl InsertedRow {
     /// A row of `values` (an empty row has one empty cell, as a blank line
     /// reads), inserted before physical row `gap`.
-    pub(crate) fn new(gap: u32, values: &[Value]) -> InsertedRow {
-        let mut fields = values.to_vec();
+    pub(crate) fn new(gap: u32, values: Vec<Value>) -> InsertedRow {
+        let mut fields = values;
         if fields.is_empty() {
             fields.push(Value::from(""));
         }
@@ -419,10 +419,10 @@ impl InsertedRow {
 
     /// A row of exactly `values`, inserted before physical row `gap`: a
     /// row put back by value, which column deletes may have left with none.
-    pub(crate) fn exactly(gap: u32, values: &[Value]) -> InsertedRow {
+    pub(crate) fn exactly(gap: u32, values: Vec<Value>) -> InsertedRow {
         InsertedRow {
             gap,
-            fields: values.to_vec(),
+            fields: values,
         }
     }
 
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn an_inserted_row_has_at_least_one_cell() {
-        let row = InsertedRow::new(4, &[]);
+        let row = InsertedRow::new(4, Vec::new());
         assert_eq!(row.fields().len(), 1);
         assert_eq!(row.gap(), 4);
         let store = EditStore::default();

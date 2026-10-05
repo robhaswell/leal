@@ -1044,7 +1044,7 @@ fn cells_at(
     for run in rows {
         let range = to_usize(run.start)..to_usize(run.end);
         let start = range.start;
-        let read = Document::read_rows_with(reading, overlay, range, |view| {
+        let read = Document::read_rows_uncached(reading, overlay, range, |view| {
             view.value(at).map_or_else(String::new, Cow::into_owned)
         })
         .map_err(|error| EditError::Read { row: start, error })?;
@@ -1072,7 +1072,7 @@ impl ColumnSource for TakenCells {
         for run in rows {
             let range = to_usize(run.start)..to_usize(run.end);
             // An unedited field as its bytes (task 2.4c).
-            values.extend(Document::read_rows_with(
+            values.extend(Document::read_rows_uncached(
                 &self.reading,
                 &self.overlay,
                 range,

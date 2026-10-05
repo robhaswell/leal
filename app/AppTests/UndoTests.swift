@@ -568,7 +568,39 @@ final class UndoTests: XCTestCase {
         try set(model, 1, 2, "6")
         undo.undo()
         XCTAssertTrue(document.isDocumentEdited)
-        XCTAssertEqual(document.history.journal.map(\.direction), [.edit, .edit, .undo, .undo, .redo, .edit, .undo])
+        // Each undo took its edit out of the journal; the redo stays.
+        XCTAssertEqual(document.history.journal.map(\.direction), [.redo])
+    }
+
+    /// Phase 2 gate: an undo straight after its edit or redo, or a redo
+    /// straight after its undo, takes that journal entry out rather than
+    /// keeping the command (and its values) for a replay that would change
+    /// nothing; any other order is kept.
+    func testTheJournalDropsAnEditAndItsUndo() async throws {
+        let opened = try await open(try file("a.csv", csv))
+        let (document, model, undo) = (opened.document, opened.model, opened.undo)
+        let journal = { document.history.journal.map(\.direction) }
+        try set(model, 0, 1, "Marlowe")
+        try set(model, 1, 1, "Ostravo")
+        undo.undo()
+        XCTAssertEqual(journal(), [.edit])
+        undo.redo()
+        XCTAssertEqual(journal(), [.edit, .redo])
+        try apply(model) { try $0.deleteRows(at: 2, count: 1) }
+        undo.undo()
+        XCTAssertEqual(journal(), [.edit, .redo])
+        XCTAssertEqual(model.rowCount, 3)
+        undo.undo()
+        undo.undo()
+        XCTAssertEqual(journal(), [])
+        XCTAssertFalse(model.hasUnsavedEdits)
+        // An undo of an older step than the last entry's stays.
+        try set(model, 0, 1, "Marlowe")
+        undo.undo()
+        try set(model, 1, 1, "Ostravo")
+        XCTAssertEqual(journal(), [.edit])
+        undo.redo()
+        XCTAssertEqual(journal(), [.edit], "nothing to redo after a new edit")
     }
 
     /// The edited-cell triangles (mockup 05a): the cells the core names.
@@ -805,13 +837,15 @@ final class UndoTests: XCTestCase {
     /// the alert says Reopen and Close discard the edits.
     func testAFailureWithNoEditsOffersNoRecovery() async throws {
         let opened = try await open(try file("a.csv", csv))
-        let (document, model, undo) = (opened.document, opened.model, opened.undo)
+        let (document, model) = (opened.document, opened.model)
         XCTAssertFalse(document.canRecover, "no edits")
         let plain = document.failureAlert()
         XCTAssertEqual(plain.buttons.map(\.title), ["Reopen", "Close"])
         XCTAssertFalse(plain.buttons.contains(where: \.hasDestructiveAction))
+        // Set back by hand: clean, but the journal has both edits.
         try set(model, 0, 1, "Marlowe")
-        undo.undo()
+        try set(model, 0, 1, "Marlow")
+        XCTAssertFalse(document.isDocumentEdited)
         XCTAssertTrue(document.canRecover, "the journal, not the dirty state")
         let alert = document.failureAlert()
         XCTAssertEqual(alert.buttons.map(\.title), ["Recover Changes", "Reopen", "Close"])

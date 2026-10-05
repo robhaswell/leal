@@ -77,7 +77,11 @@ pub(crate) struct RawField {
     /// parser wants).
     base: usize,
     field: FieldSpan,
-    text: Arc<str>,
+    /// How it reads, unless that is its bytes as they are (most fields:
+    /// unquoted, and valid UTF-8): then `None`, and [`text`](Self::text)
+    /// reads them, which saves an allocation for each field an undo by
+    /// value puts back (`docs/tasks/2.G-a.md`).
+    text: Option<Arc<str>>,
     kinds: Kinds,
     read_as: ReadAs,
 }
@@ -150,7 +154,8 @@ impl RawField {
                 kinds.insert(bit);
             }
         }
-        let text = Arc::from(to.display_value_in(&bytes, base, field).as_ref());
+        let display = to.display_value_in(&bytes, base, field);
+        let text = (display.as_bytes() != &bytes[..]).then(|| Arc::from(display.as_ref()));
         Some(RawField {
             bytes,
             base,
@@ -167,7 +172,7 @@ impl RawField {
             return Value::Raw(Arc::clone(raw));
         }
         RawField::read(raw.field_bytes(), raw.read_as, parser).map_or_else(
-            || Value::Text(Arc::clone(&raw.text)),
+            || Value::Text(Arc::from(raw.text())),
             |fitted| Value::Raw(Arc::new(fitted)),
         )
     }
@@ -191,10 +196,60 @@ impl RawField {
     }
 
     pub(crate) fn text(&self) -> &str {
-        &self.text
+        match &self.text {
+            Some(text) => text,
+            // Read checked that the bytes are the text.
+            None => std::str::from_utf8(self.field_bytes()).unwrap_or_default(),
+        }
     }
 
     pub(crate) fn kinds(&self) -> Kinds {
         self.kinds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{CodeUnit, IndexDialect};
+
+    fn parser(encoding: Encoding) -> RowParser {
+        let dialect = IndexDialect {
+            delimiter: b',',
+            quote: b'"',
+            code_unit: CodeUnit::Byte,
+            bom_len: 0,
+        };
+        RowParser::new(dialect, encoding).unwrap()
+    }
+
+    /// Phase 2 gate (`docs/tasks/2.G-a.md`): a field whose bytes are its
+    /// text keeps no copy of the text, and reads it from its bytes; any
+    /// other field keeps how it reads. The bytes are kept either way.
+    #[test]
+    fn a_field_keeps_its_text_only_when_its_bytes_arent() {
+        let utf8 = parser(Encoding::Utf8);
+        let read = |bytes: &[u8], parser: &RowParser| {
+            RawField::read(bytes, ReadAs::of(parser), parser).unwrap()
+        };
+        for (bytes, text, kept) in [
+            (&b"plain"[..], "plain", false),
+            (b"", "", false),
+            ("ş€".as_bytes(), "ş€", false),
+            (b"\"a,b\"", "a,b", true),
+            (b"\"\"", "", true),
+            (b"x\xFFy", "x\u{FFFD}y", true),
+        ] {
+            let raw = read(bytes, &utf8);
+            assert_eq!(raw.text(), text, "{bytes:?}");
+            assert_eq!(raw.text.is_some(), kept, "{bytes:?}");
+            assert_eq!(raw.field_bytes(), bytes);
+        }
+        // Read as 1252, bytes that are their text as UTF-8 too (ASCII)
+        // keep none; others keep their decoded text.
+        let latin = parser(Encoding::Windows1252);
+        assert!(read(b"abc", &latin).text.is_none());
+        let accented = read(b"caf\xE9", &latin);
+        assert_eq!((accented.text(), accented.text.is_some()), ("café", true));
     }
 }

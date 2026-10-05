@@ -19,13 +19,25 @@
 //!   (`DUPLICATE_ROW_LIMIT`, task 2.5a) copied from the middle of the file,
 //!   before the 100,000 edits, and the copies undone: what Duplicate Row
 //!   costs the main thread at worst.
+//!
+//! `undo_after_save` (phase 2 gate, `docs/tasks/2.G-a.md`), on a copy of
+//! the reference file: a delete, saved (untimed), then undone, which after
+//! a save works by value (ADR-0014 decision 3), on the main thread:
+//!
+//! - `undo_after_save/rows_10k` and `rows_100k`: 10,000 or 100,000 rows
+//!   from the top of the file put back as inserted rows, their fields as
+//!   their bytes, read from the snapshot the delete kept.
+//! - `undo_after_save/column`: the second column put back in every row.
 
 use std::hint::black_box;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use leal_bench::report::Side;
 use leal_core::document::{Document, OpenOptions};
 use leal_core::edit::DUPLICATE_ROW_LIMIT;
+use leal_core::save::{SaveKind, SaveRequest};
 use leal_core::schedule::{Scheduler, SchedulerConfig};
 use leal_core::source::{TempFolders, VolumeInfo};
 
@@ -144,5 +156,90 @@ fn row_edits(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 
-criterion_group!(benches, row_edits);
+/// A delete saved, then undone by value (`undo_after_save/…`).
+fn undo_after_save(c: &mut Criterion) {
+    let reference = common::reference_file();
+    let root = std::env::temp_dir().join(format!("leal-bench-undo-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a temporary folder");
+    let path = root.join("reference.csv");
+    std::fs::copy(&reference, &path).expect("a copy of the reference file");
+    let temp = TempFolders::new(root.join("scratch"), root.join("records"));
+    let scheduler = Scheduler::new(SchedulerConfig::default()).expect("a scheduler");
+    let (document, _) = Document::open(
+        &path,
+        &temp,
+        VolumeInfo::default(),
+        &scheduler,
+        OpenOptions::default(),
+        None,
+    )
+    .expect("opening the copy");
+    let document = Arc::new(document);
+    let ready = || {
+        document.index_job().wait().expect("indexing");
+        document.review_job().wait().expect("the review");
+    };
+    ready();
+    let rows = document.row_count();
+    let save = || {
+        document
+            .save(SaveRequest::new(&path, SaveKind::Save))
+            .wait()
+            .expect("the save");
+        ready();
+    };
+    // Each iteration makes its delete and saves it, untimed, then times
+    // the undo, and saves again, untimed: the rows put back are the
+    // file's own again, so the next delete takes rows of the file, not
+    // inserted ones (whose undo needn't read the file).
+    let undone = |iterations: u64, delete: &dyn Fn() -> leal_core::edit::Command| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iterations {
+            let command = delete();
+            save();
+            let started = Instant::now();
+            document.apply(&command.inverse()).expect("the undo");
+            total += started.elapsed();
+            assert_eq!(document.row_count(), rows);
+            save();
+        }
+        total
+    };
+
+    common::canary(c, "undo_after_save", Side::Before);
+    let mut group = c.benchmark_group("undo_after_save");
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10));
+    for (name, count) in [("rows_10k", 10_000), ("rows_100k", 100_000)] {
+        group.bench_function(name, |b| {
+            b.iter_custom(|iterations| {
+                undone(iterations, &|| {
+                    document
+                        .delete_rows(black_box(1), count)
+                        .expect("a delete")
+                        .expect("a change")
+                })
+            });
+        });
+    }
+    group.bench_function("column", |b| {
+        b.iter_custom(|iterations| {
+            undone(iterations, &|| {
+                document
+                    .delete_column(black_box(1))
+                    .expect("a delete")
+                    .expect("a change")
+            })
+        });
+    });
+    group.finish();
+    common::canary(c, "undo_after_save", Side::After);
+    drop(document);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+criterion_group!(benches, row_edits, undo_after_save);
 criterion_main!(benches);

@@ -876,6 +876,45 @@ impl Document {
         Ok(out)
     }
 
+    /// [`read_rows_with`](Self::read_rows_with), parsed without the row
+    /// cache, as [`each_physical`](Self::each_physical) parses them: for a
+    /// pass over many rows (an undo or redo by value, a column's cells, a
+    /// duplicate), which through the cache paid an eviction, a look at
+    /// every cached row, for each row read, and only evicted the grid's
+    /// rows (phase 2 gate, `docs/tasks/2.G-a.md`).
+    fn read_rows_uncached<T>(
+        reading: &Reading,
+        overlay: &Overlay,
+        rows: Range<usize>,
+        mut each: impl FnMut(RowView<'_>) -> T,
+    ) -> Result<Vec<T>, ReadError> {
+        let mut out = Vec::new();
+        let map = overlay.map();
+        if map.is_identity() {
+            Self::each_physical(reading, overlay, rows, &mut |view| out.push(each(view)))?;
+            return Ok(out);
+        }
+        let available = map.rows_within(Self::rows_index(reading).1);
+        for segment in map.segments(rows.start..rows.end.min(available)) {
+            match segment {
+                Segment::Original(range) => Self::each_physical(
+                    reading,
+                    overlay,
+                    to_usize(range.start)..to_usize(range.end),
+                    &mut |view| out.push(each(view)),
+                )?,
+                Segment::Inserted(range) => {
+                    for n in range {
+                        if let Some((row, cells)) = inserted_row(overlay, n) {
+                            out.push(each(RowView::inserted(&reading.parser, row, cells)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Physical rows `rows` (as many as can be read now), each to `each`
     /// with `overlay`'s edits on top. One read of the file.
     fn read_physical<T>(

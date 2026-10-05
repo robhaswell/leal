@@ -52,7 +52,7 @@ impl Document {
                     .collect()
             })
             .collect();
-        self.change_rows(|reading| insert_new(reading, at, &rows, false))
+        self.change_rows(move |reading| insert_new(reading, at, rows, false))
     }
 
     /// Deletes logical rows `at..at + count`, as one command (undo puts
@@ -102,14 +102,19 @@ impl Document {
             }
             let end = rows_there(reading, at, count)?;
             let parser = &reading.parser;
-            let copies = Self::read_rows_of(reading, at..end, |view| view.copy_values(parser))
-                .map_err(|error| EditError::Read { row: at, error })?;
+            // The snapshot goes before the insert changes the edits.
+            let overlay = reading.edits.overlay();
+            let copies = Self::read_rows_uncached(reading, &overlay, at..end, |view| {
+                view.copy_values(parser)
+            })
+            .map_err(|error| EditError::Read { row: at, error })?;
+            drop(overlay);
             if copies.len() != count {
                 return Err(EditError::NoSuchRow {
                     row: at + copies.len(),
                 });
             }
-            insert_new(reading, end, &copies, true)
+            insert_new(reading, end, copies, true)
         })
     }
 
@@ -203,39 +208,33 @@ impl Document {
                 };
             }
             // Other edits (ADR-0014 decision 3): by value.
-            let values = rows
-                .values(&reading.parser)
-                .map_err(|error| EditError::Read { row: at, error })?;
-            if values.len() != rows.len() {
-                return Err(EditError::ValueChanged { row: at, column: 0 });
-            }
+            let read_error = |error| EditError::Read { row: at, error };
             if insert {
-                return insert_new(reading, at, &values, true);
-            }
-            let now = values_of(reading, at..at + rows.len())?;
-            for (i, expected) in values.iter().enumerate() {
-                let expected: Vec<String> = expected
-                    .iter()
-                    .map(|value| value.text().to_owned())
-                    .collect();
-                let Some(row) = now.get(i) else {
-                    return Err(EditError::NoSuchRow { row: at + i });
-                };
-                // Empty cells at the end don't count: undoing an edit past a
-                // row's end after a save leaves an empty field there
-                // (ADR-0012 decision 4), which reads the same.
-                let (row, expected) = (filled(row), filled(&expected));
-                if row != expected {
-                    let column = row
-                        .iter()
-                        .zip(expected)
-                        .position(|(a, b)| a != b)
-                        .unwrap_or_else(|| row.len().min(expected.len()));
-                    return Err(EditError::ValueChanged {
-                        row: at + i,
-                        column,
-                    });
+                let values = rows.values(&reading.parser).map_err(read_error)?;
+                if values.len() != rows.len() {
+                    return Err(EditError::ValueChanged { row: at, column: 0 });
                 }
+                return insert_new(reading, at, values, true);
+            }
+            // A delete checks the rows read as they did, a chunk at a time:
+            // all of them at once, as values and as strings, came to about
+            // 4 KB a row (`docs/tasks/2.G-a.md`).
+            let mut checked = 0;
+            let complete =
+                rows.values_in_chunks(&reading.parser, CHECK_CHUNK_ROWS, read_error, |chunk| {
+                    let first = at + checked;
+                    let now = values_of(reading, first..first + chunk.len())?;
+                    for (i, expected) in chunk.iter().enumerate() {
+                        let Some(row) = now.get(i) else {
+                            return Err(EditError::NoSuchRow { row: first + i });
+                        };
+                        check_row(row, expected, first + i)?;
+                    }
+                    checked += chunk.len();
+                    Ok(())
+                })?;
+            if !complete || checked != rows.len() {
+                return Err(EditError::ValueChanged { row: at, column: 0 });
             }
             delete_at(reading, at, rows.len(), None)
         })
@@ -269,8 +268,29 @@ fn rows_there(reading: &Reading, at: usize, count: usize) -> Result<usize, EditE
     }
 }
 
+/// Rows a delete undone or redone by value checks at a time.
+pub(super) const CHECK_CHUNK_ROWS: usize = 4_096;
+
+/// [`EditError::ValueChanged`] unless logical row `row`, reading `now`,
+/// reads as `expected`. Empty cells at the end don't count: undoing an
+/// edit past a row's end after a save leaves an empty field there
+/// (ADR-0012 decision 4), which reads the same.
+fn check_row(now: &[String], expected: &[Value], row: usize) -> Result<(), EditError> {
+    let now: Vec<&str> = now.iter().map(String::as_str).collect();
+    let expected: Vec<&str> = expected.iter().map(Value::text).collect();
+    let (now, expected) = (filled(&now), filled(&expected));
+    let column = now.iter().zip(expected).position(|(a, b)| a != b);
+    match column {
+        None if now.len() == expected.len() => Ok(()),
+        column => Err(EditError::ValueChanged {
+            row,
+            column: column.unwrap_or_else(|| now.len().min(expected.len())),
+        }),
+    }
+}
+
 /// `values` without the empty cells at the end.
-fn filled(values: &[String]) -> &[String] {
+fn filled<'a>(values: &'a [&'a str]) -> &'a [&'a str] {
     let end = values
         .iter()
         .rposition(|value| !value.is_empty())
@@ -311,7 +331,7 @@ fn begun(reading: &Reading, overlay: &Overlay) -> RowMap {
 fn insert_new(
     reading: &Arc<Reading>,
     at: usize,
-    values: &[Vec<Value>],
+    values: Vec<Vec<Value>>,
     exact: bool,
 ) -> Result<Option<Command>, EditError> {
     if values.is_empty() {
@@ -325,7 +345,8 @@ fn insert_new(
     }
     let gap = u32::try_from(map.physical_at_or_after(at)).unwrap_or(u32::MAX);
     let first = store.next_inserted();
-    let count = u32::try_from(values.len()).unwrap_or(u32::MAX);
+    let rows = values.len();
+    let count = u32::try_from(rows).unwrap_or(u32::MAX);
     let next = first
         .checked_add(count)
         .ok_or(EditError::NoSuchRow { row: at })?;
@@ -367,7 +388,7 @@ fn insert_new(
             rows: Arc::new(Rows {
                 base: store.base(),
                 pieces: vec![piece],
-                count: values.len(),
+                count: rows,
                 inserted,
                 edits: Vec::new(),
                 origin: None,
@@ -599,7 +620,8 @@ fn check_quote(
 /// Logical rows `rows` as they read now, each as its cells' values.
 fn values_of(reading: &Reading, rows: Range<usize>) -> Result<Vec<Vec<String>>, EditError> {
     let row = rows.start;
-    Document::read_rows_of(reading, rows, |view| row_values(&view))
+    let overlay = reading.edits.overlay();
+    Document::read_rows_uncached(reading, &overlay, rows, |view| row_values(&view))
         .map_err(|error| EditError::Read { row, error })
 }
 

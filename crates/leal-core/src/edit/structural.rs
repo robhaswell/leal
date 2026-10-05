@@ -90,14 +90,45 @@ impl Rows {
     /// `parser` reads them the same. Original rows are read now (ADR-0014
     /// decision 3). Fewer than [`len`](Self::len) if some can't be had.
     pub(crate) fn values(&self, parser: &RowParser) -> Result<Vec<Vec<Value>>, ReadError> {
+        let mut values = Vec::new();
+        self.values_in_chunks(
+            parser,
+            usize::MAX,
+            |error| error,
+            |chunk| {
+                if values.is_empty() {
+                    values = chunk;
+                } else {
+                    values.extend(chunk);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(values)
+    }
+
+    /// [`values`](Self::values), in order, at most `chunk` rows at a time
+    /// to `each`, so a caller that only looks at them needn't hold them
+    /// all. `false` if some rows couldn't be had: the rest aren't given.
+    pub(crate) fn values_in_chunks<E>(
+        &self,
+        parser: &RowParser,
+        chunk: usize,
+        read_error: impl Fn(ReadError) -> E,
+        mut each: impl FnMut(Vec<Vec<Value>>) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let chunk = chunk.max(1);
         let edits: BTreeMap<RowId, &Arc<RowEdits>> =
             self.edits.iter().map(|(id, edits)| (*id, edits)).collect();
         let inserted: BTreeMap<u32, &Arc<InsertedRow>> =
             self.inserted.iter().map(|(n, row)| (*n, row)).collect();
-        let mut values = Vec::with_capacity(self.count);
+        let mut values = Vec::with_capacity(self.count.min(chunk));
         for &piece in &self.pieces {
             match piece {
                 Piece::Original { start, len } => {
+                    let Some(origin) = &self.origin else {
+                        return Ok(false);
+                    };
                     let ids = piece.ids();
                     let originals = Overlay::of_rows(
                         edits
@@ -105,23 +136,49 @@ impl Rows {
                             .map(|(&id, &edits)| (id, Arc::clone(edits))),
                         Arc::clone(&self.columns),
                     );
-                    if let Some(origin) = &self.origin {
-                        values.extend(origin.values(start..start + len, &originals, parser)?);
+                    let end = start + len;
+                    let mut from = start;
+                    while from < end {
+                        let room = chunk.saturating_sub(values.len()).max(1);
+                        let to =
+                            end.min(from.saturating_add(u32::try_from(room).unwrap_or(u32::MAX)));
+                        let read = origin
+                            .values(from..to, &originals, parser)
+                            .map_err(&read_error)?;
+                        if read.len() != to_usize(to - from) {
+                            return Ok(false);
+                        }
+                        values.extend(read);
+                        if values.len() >= chunk {
+                            each(std::mem::take(&mut values))?;
+                        }
+                        from = to;
                     }
                 }
                 Piece::Inserted { first, len, .. } => {
                     for n in first..first + len {
-                        if let Some(row) = inserted.get(&n) {
-                            let edits = edits.get(&RowId::inserted(n)).map(|e| e.as_ref());
-                            let row = inserted_values(n, row, edits, &self.columns);
-                            values.push(row.iter().map(|value| value.fit(parser)).collect());
+                        let Some(row) = inserted.get(&n) else {
+                            return Ok(false);
+                        };
+                        let edits = edits.get(&RowId::inserted(n)).map(|e| e.as_ref());
+                        let row = inserted_values(n, row, edits, &self.columns);
+                        values.push(row.iter().map(|value| value.fit(parser)).collect());
+                        if values.len() >= chunk {
+                            each(std::mem::take(&mut values))?;
                         }
                     }
                 }
             }
         }
-        Ok(values)
+        if !values.is_empty() {
+            each(values)?;
+        }
+        Ok(true)
     }
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// Inserted row `n`'s values as it reads with `edits` under `columns`.

@@ -718,3 +718,55 @@ fn duplicating_is_refused_after_an_open_quote_and_past_the_end() {
     assert!(document.can_duplicate_rows(0, 2).is_ok());
     assert!(!document.has_edits());
 }
+
+/// Phase 2 gate (`docs/tasks/2.G-a.md`): a delete undone and redone by
+/// value after a save checks its rows a chunk at a time
+/// (`CHECK_CHUNK_ROWS`), rather than holding them all twice: a cell
+/// changed in a later chunk is still found, at its row and column, and
+/// with nothing changed the redo deletes every row. The rows come back
+/// as their bytes, so the document saves the same file again.
+#[test]
+fn a_redo_by_value_checks_every_chunk() {
+    use super::structural::CHECK_CHUNK_ROWS;
+    let dir = Dir::new("rows-redo-chunks");
+    let rows = 2 * CHECK_CHUNK_ROWS + 10;
+    let bytes: Vec<u8> = (0..rows)
+        .flat_map(|n| format!("r{n},\"q,{n}\",\n").into_bytes())
+        .collect();
+    let document = Arc::new(open_with(&dir, "a.csv", &bytes, false));
+    let before = texts(&document);
+    let deleted = delete(&document, 3, rows - 5);
+    saved(&document);
+    document.apply(&deleted.inverse()).unwrap();
+    assert_eq!(texts(&document), before);
+    assert_eq!(saved(&document), bytes);
+    // The undo after that save is by value too: a delete of the file's
+    // rows again. Redone, it checks them all.
+    let late = 3 + CHECK_CHUNK_ROWS + 7;
+    let edit = set_cell(&document, late, 1, "changed");
+    assert!(matches!(
+        document.apply(&deleted),
+        Err(EditError::ValueChanged { row, column: 1 }) if row == late
+    ));
+    document.apply(&edit.inverse()).unwrap();
+    document.apply(&deleted).unwrap();
+    assert_eq!(document.row_count(), 5);
+    assert_eq!(texts(&document)[3], ["r8200", "q,8200", ""]);
+}
+
+/// Phase 2 gate: Duplicate Row reads its rows without the row cache, so
+/// the rows on screen stay cached rather than being evicted by the
+/// copies' (the cache holds 256 rows).
+#[test]
+fn duplicating_leaves_the_rows_on_screen_cached() {
+    let dir = Dir::new("rows-duplicate-cache");
+    let bytes: Vec<u8> = (0..2_000)
+        .flat_map(|n| format!("{n},x\n").into_bytes())
+        .collect();
+    let document = open_with(&dir, "a.csv", &bytes, false);
+    document.rows(0..10, 100).unwrap();
+    document.duplicate_rows(100, 1_000).unwrap().unwrap();
+    let reading = document.current();
+    let cache = reading.cache.lock().unwrap();
+    assert!((0..10).all(|row| cache.contains(row)));
+}
