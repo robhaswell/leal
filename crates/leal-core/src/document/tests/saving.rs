@@ -3049,6 +3049,44 @@ fn a_copy_then_columns_inserted_and_deleted() {
     assert_eq!(saved, b"\"a\",\"b\"\n\"1\"\n\"1\"\n");
 }
 
+/// ADR-0014 decision 5 for a copy, before a save as well as in its bytes:
+/// deleting the column of a copied hatched cell takes the copy's padding
+/// too, so the copy reads as its row does (no empty cells where the row
+/// has hatched ones) and as the saved file will. Undone, the padding is
+/// back. An edited copy is the same.
+#[test]
+fn a_copys_padding_goes_with_its_hatched_cell_before_a_save() {
+    let dir = Dir::new("dup-padding-reads");
+    let path = dir.file("a.csv", b"a,b,c,d\n1\n");
+    let scheduler = scheduler();
+    let document = open_at(&path, &dir, &scheduler);
+    let lens = |document: &Document| -> Vec<usize> {
+        (0..document.row_count())
+            .map(|row| {
+                document
+                    .cells(row..row + 1, 0..usize::MAX, usize::MAX)
+                    .unwrap()[0]
+                    .field_count
+            })
+            .collect()
+    };
+    set(&document, 1, 3, "z");
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    document.duplicate_rows(1, 1).unwrap().unwrap();
+    // An edited copy (row 3) as well as an unedited one (row 2).
+    set(&document, 3, 0, "e");
+    assert_eq!(lens(&document), [4, 4, 4, 4]);
+    let delete = document.delete_column(3).unwrap().unwrap();
+    assert_eq!(lens(&document), [3, 1, 1, 1]);
+    document.apply(&delete.inverse()).unwrap();
+    assert_eq!(lens(&document), [4, 4, 4, 4]);
+    document.apply(&delete).unwrap();
+    assert_eq!(lens(&document), [3, 1, 1, 1]);
+    save(&document, &path, SaveKind::Save).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"a,b,c\n1\n1\ne\n");
+    assert_eq!(lens(&document), [3, 1, 1, 1]);
+}
+
 /// Task 2.5a: in a file that quotes every field, a copy of a short row's
 /// typed-in (hatched) cell is quoted as the row's is. Undone and redone
 /// across saves (by value, ADR-0014 decision 8), the copy follows the

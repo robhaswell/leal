@@ -153,7 +153,7 @@ impl Document {
         // The quote's row as `plan` lays it out: an edited row's edits may
         // change; an unedited one keeps its default layout.
         let columns = overlay.columns();
-        let mut walk = Walk::new(&op, columns, Decide::Rule);
+        let mut walk = Walk::new(&op, columns, &overlay, Decide::Rule);
         let id = RowId::original(last);
         if let Some(edits) = overlay.edits(id)
             && let Ok(logical) = overlay.map().logical_of(last)
@@ -598,7 +598,7 @@ fn plan(
         kind,
         inserted_before: store.next_inserted(),
     };
-    let mut walk = Walk::new(&op, columns, decide);
+    let mut walk = Walk::new(&op, columns, overlay, decide);
     each_row(
         overlay,
         counts,
@@ -633,13 +633,17 @@ fn plan(
         fresh,
         ..
     } = walk;
-    // Rows the rule decided otherwise for than their default layouts, with
-    // no edits yet: given a layout of their own (only by value).
-    for (id, own, applies) in fresh {
+    // Rows with no edits yet that the rule decided otherwise for than
+    // their default layouts (only by value), or that the operation leaves
+    // ending in a copy's padding: given a layout of their own.
+    for (id, own, applies, otherwise) in fresh {
         let mut ids = columns.fold(own).as_slice().into_owned();
         if applies {
             pad(&mut ids, &op, own.fields, &[]);
             op.apply(&mut ids);
+        }
+        if !trim(&mut ids, None, own_padding(overlay, id)) && !otherwise {
+            continue;
         }
         let edits = new_edits(reading, id, own)?.with_layout(Some(Arc::from(ids)));
         rows.push((id, None, Some(Arc::new(edits))));
@@ -823,6 +827,8 @@ fn original_columns(reading: &Reading, overlay: &Overlay) -> Option<Vec<bool>> {
 struct Walk<'a> {
     op: &'a ColumnOp,
     columns: &'a Columns,
+    /// The edits it walks: for an inserted row's own values.
+    overlay: &'a Overlay,
     decide: Decide<'a>,
     /// Where `decide`'s rows have got to.
     cursor: usize,
@@ -832,19 +838,27 @@ struct Walk<'a> {
     applied: Vec<Range<u32>>,
     /// The rows whose edits change.
     rows: Vec<Changed>,
-    /// Unedited rows that need a layout of their own: (row, its own cells,
-    /// whether the operation applies).
-    fresh: Vec<(RowId, EditOwn, bool)>,
+    /// Unedited rows that may need a layout of their own: (row, its own
+    /// cells, whether the operation applies, whether the rule decided
+    /// otherwise). A row the rule decided for needs one only if the
+    /// operation leaves it ending in a copy's padding ([`trim`]).
+    fresh: Vec<(RowId, EditOwn, bool, bool)>,
     /// The first logical row `decide` names that is too short for the
     /// operation.
     misfit: Option<usize>,
 }
 
 impl<'a> Walk<'a> {
-    fn new(op: &'a ColumnOp, columns: &'a Columns, decide: Decide<'a>) -> Self {
+    fn new(
+        op: &'a ColumnOp,
+        columns: &'a Columns,
+        overlay: &'a Overlay,
+        decide: Decide<'a>,
+    ) -> Self {
         Walk {
             op,
             columns,
+            overlay,
             decide,
             cursor: 0,
             widest: 0,
@@ -896,8 +910,9 @@ impl<'a> Walk<'a> {
         let rule = self.op.applies(len, own.blank);
         let applies = self.applies(logical, rule);
         self.record(logical, len, own.blank, applies);
-        if applies != rule {
-            self.fresh.push((id, own, applies));
+        let padded = applies && !own_padding(self.overlay, id).is_empty();
+        if applies != rule || padded {
+            self.fresh.push((id, own, applies, applies != rule));
         }
     }
 
@@ -915,7 +930,10 @@ impl<'a> Walk<'a> {
             let own = edits.own(inserted);
             applies == self.op.applies(self.columns.fold_len(own), own.blank)
         };
-        if by_default || (edits.layout().is_some() && !applies) {
+        let padding = own_padding(self.overlay, id);
+        if (by_default && !(applies && !padding.is_empty()))
+            || (edits.layout().is_some() && !applies)
+        {
             return;
         }
         let mut ids = layout.ids().into_owned();
@@ -923,7 +941,11 @@ impl<'a> Walk<'a> {
             pad(&mut ids, self.op, edits.fields(), edits.cells());
             self.op.apply(&mut ids);
         }
-        trim(&mut ids, edits);
+        if !trim(&mut ids, Some(edits), padding) && by_default {
+            // Laid out by default after all: no copy's padding was left
+            // at its end.
+            return;
+        }
         let after = RowEdits::clone(edits).with_layout(Some(Arc::from(ids)));
         self.rows
             .push((id, Some(Arc::clone(edits)), Some(Arc::new(after))));
@@ -944,17 +966,41 @@ fn pad(ids: &mut Vec<CellId>, op: &ColumnOp, fields: usize, cells: &[(CellId, Ar
     }
 }
 
-/// Takes the hatched cells at the end of `ids` that hold nothing: padding
-/// is only ever before an edited hatched cell (ADR-0005 decision 2), so a
-/// delete of a row's last one gives the row its own bytes back (ADR-0014
-/// decision 5).
-fn trim(ids: &mut Vec<CellId>, edits: &RowEdits) {
-    while let Some(&id @ CellId::Appended(_)) = ids.last() {
-        if edits.get(id).is_some() {
+/// Takes the cells at the end of `ids` that are padding and hold nothing,
+/// and says whether it took any: hatched cells, and an inserted row's own
+/// values that are a copy of padding (`own`, from [`own_padding`]).
+/// Padding is only ever before an edited hatched cell (ADR-0005 decision
+/// 2), so a delete of a row's last one gives the row its own bytes back
+/// (ADR-0014 decision 5), and a delete of a copy's copied one ends the
+/// copy where its row ends (task 2.5a), as a save writes it.
+fn trim(ids: &mut Vec<CellId>, edits: Option<&RowEdits>, own: &[Value]) -> bool {
+    let before = ids.len();
+    while let Some(&id) = ids.last() {
+        let padding = match id {
+            CellId::Appended(_) => true,
+            CellId::Field(k) => usize::try_from(k)
+                .ok()
+                .and_then(|k| own.get(k))
+                .is_some_and(|value| matches!(value, Value::Padding)),
+            CellId::Inserted(_) => false,
+        };
+        if !padding || edits.is_some_and(|edits| edits.get(id).is_some()) {
             break;
         }
         ids.pop();
     }
+    ids.len() < before
+}
+
+/// Row `id`'s own values if it is an inserted row with a copy of padding
+/// among them (Duplicate Row's copy of a short row with a typed-in cell,
+/// [`Value::Padding`]); otherwise none.
+fn own_padding(overlay: &Overlay, id: RowId) -> &[Value] {
+    id.inserted_index()
+        .and_then(|n| overlay.inserted(n))
+        .map(|row| row.fields())
+        .filter(|values| values.iter().any(|value| matches!(value, Value::Padding)))
+        .unwrap_or(&[])
 }
 
 /// Edits with no cell for row `id`, unedited so far, with `own` cells: for

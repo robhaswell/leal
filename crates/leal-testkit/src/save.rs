@@ -350,10 +350,10 @@ enum Cell {
     /// or of a hatched cell, `Some((value, quoted))`, written as the row it
     /// copies writes it: quoted if it needs it, if the file quotes every
     /// field, or if `quoted` (the field it edited was; false for a hatched
-    /// cell). `None` is a copy of padding: no bytes, and none at all at
-    /// the row's end, where it no longer leads to a hatched cell (ADR-0014
-    /// decision 5). Given an `edit` (unless set back to how it reads), it
-    /// is a new field (rule 3).
+    /// cell). `None` is a copy of padding: no bytes. Like padding, it goes
+    /// with the copied hatched cell it leads to when a column delete takes
+    /// that (ADR-0014 decision 5). Given an `edit` (unless set back to how
+    /// it reads), it is a new field (rule 3).
     Copy {
         copied: Option<(String, bool)>,
         edit: Option<String>,
@@ -411,6 +411,19 @@ struct DocRow {
 }
 
 impl Cell {
+    /// Padding, or a copy's unedited copy of it: no bytes, only ever
+    /// before an edited hatched cell or its copy (rule 12).
+    fn is_padding(&self) -> bool {
+        matches!(
+            self,
+            Cell::Appended(None)
+                | Cell::Copy {
+                    copied: None,
+                    edit: None
+                }
+        )
+    }
+
     /// A cell put back by value.
     fn restored(value: &Restored) -> Cell {
         match value {
@@ -427,26 +440,6 @@ impl Cell {
 }
 
 impl DocRow {
-    /// The cells the row is written with: all but a duplicated row's copies
-    /// of padding left at its end (ADR-0014 decision 5).
-    fn written_cells(&self) -> &[Cell] {
-        let unedited_padding = |cell: &Cell| {
-            matches!(
-                cell,
-                Cell::Copy {
-                    copied: None,
-                    edit: None
-                }
-            )
-        };
-        let len = self
-            .cells
-            .iter()
-            .rposition(|cell| !unedited_padding(cell))
-            .map_or(0, |last| last + 1);
-        &self.cells[..len]
-    }
-
     /// An original blank line whose one (empty) cell hasn't been edited.
     fn is_blank_line(&self, layout: &Layout) -> bool {
         self.source.is_some_and(|s| layout.rows[s].is_blank()) && self.cells == [Cell::Original(0)]
@@ -700,7 +693,7 @@ impl<'a> Document<'a> {
         for &r in rows {
             let cells = &mut self.rows[r].cells;
             cells.remove(column);
-            while cells.last() == Some(&Cell::Appended(None)) {
+            while cells.last().is_some_and(Cell::is_padding) {
                 cells.pop();
             }
         }
@@ -905,8 +898,9 @@ impl<'a> Document<'a> {
                         r.cells.remove(*column);
                         // Rule 12: padding is only before an edited
                         // hatched cell, so it goes with the row's last one
-                        // (ADR-0014 decision 5).
-                        while r.cells.last() == Some(&Cell::Appended(None)) {
+                        // (ADR-0014 decision 5), and a copy's padding with
+                        // its copied one.
+                        while r.cells.last().is_some_and(Cell::is_padding) {
                             r.cells.pop();
                         }
                     }
@@ -1026,7 +1020,7 @@ impl<'a> Document<'a> {
                 let span = self.layout.rows[row.source.unwrap_or(0)].span.clone();
                 content.extend_from_slice(&self.bytes[span]);
             } else {
-                for (ci, cell) in row.written_cells().iter().enumerate() {
+                for (ci, cell) in row.cells.iter().enumerate() {
                     if ci > 0 {
                         content.push(self.delimiter.byte());
                     }
@@ -1240,7 +1234,7 @@ impl<'a> Document<'a> {
                 });
             } else {
                 let mut field_start = start;
-                for (k, cell) in row.written_cells().iter().enumerate() {
+                for (k, cell) in row.cells.iter().enumerate() {
                     let mut bytes = self
                         .cell_bytes(row, k, cell, &quoting, false)
                         .unwrap_or_default();
@@ -2169,6 +2163,13 @@ mod tests {
             )),
             "a,\"b\"\n1\n1\n"
         );
+        // The copy reads as its row does before the save too.
+        let layout = simple_layout(file, &[(0, 1)]);
+        let mut doc = Document::new(file, &layout, Delimiter::Comma, Encoding::Utf8);
+        for edit in [set(1, 2, "h"), dup(1, 1), Edit::DeleteColumn { column: 2 }] {
+            doc.apply(&edit).unwrap();
+        }
+        assert_eq!((doc.row_len(1), doc.row_len(2)), (1, 1));
         // Set back to how it reads, a copy is a copy again.
         assert_eq!(
             out(save(
