@@ -455,6 +455,48 @@ final class SaveTests: XCTestCase {
         XCTAssertEqual(opened.document.fileModificationDate, try modificationDate(url))
     }
 
+    /// An alert offering Save Anyway gives Return to Cancel, so no button
+    /// has Escape: its accessory takes Escape to Cancel too (phase 2
+    /// gate), and nothing is written.
+    func testEscapeCancelsTheAlertThatOffersSaveAnyway() async throws {
+        let url = try file("escape.csv", csv)
+        let opened = try await open(url)
+        set(opened.model, 0, 1, "ours")
+        let theirs = Data("id,name,qty\r\n1,theirs,3\r\n".utf8)
+        try theirs.write(to: url)
+        final class Clicks: NSObject {
+            var count = 0
+            @objc func clicked(_ sender: Any?) { count += 1 }
+        }
+        let clicks = Clicks()
+        var handled = false
+        opened.document.showSheet = { alert, _, done in
+            alert.layout()
+            let cancel = alert.buttons.last
+            XCTAssertEqual(cancel?.title, "Cancel")
+            XCTAssertEqual(cancel?.keyEquivalent, "\r")
+            // The click recorded here rather than ending a sheet that
+            // isn't shown.
+            cancel?.target = clicks
+            cancel?.action = #selector(Clicks.clicked(_:))
+            if let escape = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: alert.window.windowNumber,
+                context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53
+            ) {
+                handled = alert.window.contentView?.performKeyEquivalent(with: escape) ?? false
+            }
+            done(NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + alert.buttons.count - 1))
+        }
+
+        let saved = try await save(opened)
+
+        XCTAssertTrue(handled, "Escape was taken")
+        XCTAssertEqual(clicks.count, 1, "by Cancel")
+        XCTAssertFalse(saved)
+        XCTAssertEqual(try Data(contentsOf: url), theirs)
+        XCTAssertTrue(opened.document.isDocumentEdited)
+    }
+
     /// Once the watcher has seen the change (`diverged`, which Keep
     /// Editing leaves set), Save asks before writing; Cancel writes
     /// nothing, and asks nothing more.

@@ -1129,6 +1129,13 @@ final class CSVDocument: NSDocument {
             button.hasDestructiveAction = choice == .saveAnyway
             if choice == .cancel {
                 button.keyEquivalent = destructive ? "\r" : "\u{1b}"
+                if destructive {
+                    // Return is Cancel's, so no button has Escape: the
+                    // accessory takes it to Cancel too (phase 2 gate).
+                    let catcher = EscapeCancels(around: alert.accessoryView)
+                    catcher.cancel = button
+                    alert.accessoryView = catcher
+                }
             } else if destructive, button.keyEquivalent == "\r" {
                 button.keyEquivalent = ""
             }
@@ -1845,5 +1852,36 @@ enum AppEnvironment {
         let environment = try DocumentEnvironment(scheduler: Scheduler(), temp: TemporaryFolders.locations())
         made = environment
         return environment
+    }
+}
+
+/// An alert's accessory (around its own, if it has one) that takes Escape
+/// to `cancel`: for an alert whose Cancel has Return (one offering Save
+/// Anyway, so Return never writes over another app's changes), where no
+/// button has Escape any more. Escape reaches the alert's views as a key
+/// equivalent, as a button's would (phase 2 gate).
+final class EscapeCancels: NSView {
+    weak var cancel: NSButton?
+
+    init(around content: NSView?) {
+        super.init(frame: NSRect(origin: .zero, size: content?.frame.size ?? .zero))
+        if let content {
+            content.frame.origin = .zero
+            addSubview(content)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("not from a nib")
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .function, .numericPad])
+        if event.type == .keyDown, event.keyCode == 53, modifiers.isEmpty, let cancel {
+            cancel.performClick(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }
