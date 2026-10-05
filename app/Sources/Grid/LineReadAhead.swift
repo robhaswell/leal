@@ -66,13 +66,19 @@ final class LineReadAhead {
         lines: TextLineCache,
         caretOffsets: Bool = false
     ) {
-        guard geometry.columnCount > 0, batchesSent - batchesBack < Self.batchesInFlight,
-              let next = ahead.next(visible: visible, rowHeight: geometry.rowHeight, rows: source.rowCount)
-        else { return }
+        // A drawing not in a scroll view (a test's, a snapshot's) has no
+        // finite visible rect, and nothing to read ahead.
+        guard geometry.columnCount > 0, geometry.rowHeight > 0, visible.height.isFinite, visible.minY.isFinite else { return }
         // Anything within two screens of the visible rows is still wanted.
-        let screen = Int((visible.height / geometry.rowHeight).rounded(.up))
+        // Before the early returns below (as `CellTileCache.readAhead`,
+        // task 2.6a): a batch queued earlier is checked against this
+        // frame's rows even when nothing new is sent (phase 2 gate).
+        let screen = Int(min(CGFloat(source.rowCount) + 1, (visible.height / geometry.rowHeight).rounded(.up)))
         let top = Int(min(CGFloat(source.rowCount), max(0, (visible.minY / geometry.rowHeight).rounded(.down))))
         wanted.set((top - 2 * screen)...(top + 3 * screen))
+        guard batchesSent - batchesBack < Self.batchesInFlight,
+              let next = ahead.next(visible: visible, rowHeight: geometry.rowHeight, rows: source.rowCount)
+        else { return }
         let columns = geometry.columnRange(minX: drawnWidth?.minX ?? visible.minX, maxX: drawnWidth?.maxX ?? visible.maxX)
         guard !columns.isEmpty else { return }
         if requested.count > 4_000 { requested.removeAll() }
