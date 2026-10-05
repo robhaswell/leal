@@ -486,6 +486,26 @@ fn save_as_utf8_names_the_cells_it_cant_convert() {
     assert_eq!(std::fs::read(&copy).unwrap(), "Α,Ω\n".as_bytes());
 }
 
+/// A row a column operation rewrites is written as it reads now, even when
+/// its UTF-8 bytes happen to be the file's own bytes in the old encoding:
+/// here a UTF-8 file read as Windows-1252, with a column retyped as what
+/// the bytes meant. The comparison that skips an unchanged row compares
+/// bytes in one encoding, not UTF-8 with Windows-1252 (CI run 37315291375).
+#[test]
+fn save_as_utf8_writes_a_rewritten_row_that_matches_the_old_bytes() {
+    let dir = Dir::new("save-utf8-same-bytes");
+    let scheduler = scheduler();
+    let path = dir.file("w.csv", b"x,\xC3\xA9\ny,\xC3\xA9\n");
+    let document = open_as(&path, &dir, &scheduler, Encoding::Windows1252);
+    assert_eq!(document.full_value(0, 1).unwrap().as_deref(), Some("Ã©"));
+    document.delete_column(1).unwrap().unwrap();
+    document.insert_column(1, "é").unwrap().unwrap();
+    set(&document, 1, 1, "è");
+    let copy = dir.0.join("u8.csv");
+    save(&document, &copy, SaveKind::SaveAsUtf8).unwrap();
+    assert_eq!(std::fs::read(&copy).unwrap(), "x,é\ny,è\n".as_bytes());
+}
+
 /// A refusal names at most `MAX_NAMED_CELLS` cells, and says there are
 /// more, as soon as it knows.
 #[test]

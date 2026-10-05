@@ -796,7 +796,11 @@ impl<'w, 's> Walk<'w, 's> {
             })?;
         self.push_whole_count(&out, written, cells.len());
         self.push_start(range.start);
-        if out != bytes.bytes[range.start - base..range.end - base] {
+        // Unchanged, the row is copied. `out` is in the encoding written,
+        // the file's bytes in its own: converting (Save As UTF-8), the two
+        // can be the same bytes for different text (UTF-8 read as
+        // Windows-1252), so the row is always written as it reads now.
+        if converts || out != bytes.bytes[range.start - base..range.end - base] {
             let start = to_i64(range.start).saturating_add(self.delta);
             let content = out.len() - written.map_or(0, |ending| ending.bytes().len());
             let moved = self.quote.filter(|&q| range.contains(&q)).map(|_| {
