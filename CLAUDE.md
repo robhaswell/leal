@@ -63,6 +63,27 @@ there are no pull requests and no long-lived branches.
   (`cargo-mutants`) and Swift/AppKit. Each finding is verified before it is
   fixed. Rob reads the phase report and approves the phase; the approved
   commit is tagged `phase-<n>`. The next phase starts after approval.
+- **Lessons from phase 2** (Rob, 2026-10-06):
+  - **Watch CI after every push to `main`** (`gh run list`,
+    `gh run view --log-failed`), including Deep tests and Benchmarks. Don't
+    start the next task while any of them is red. A run cancelled by a newer
+    push hasn't passed, so check the run for the commit you mean. Poll `gh`
+    from Python, not a zsh loop (`set -- $var` doesn't split words).
+  - **Nits never go into fix rounds.** They wait for the tidy-up task. A nit
+    added to a fix round caused a must-fix bug (journal pruning, 2.G).
+  - **Before landing a change to the core's save or edit paths**, run the
+    saving and edit property tests at `PROPTEST_CASES=20000`. Deep tests
+    found two bugs that every per-task review missed.
+  - **Tests never show real UI.** The `NoRealUI` net fails any un-stubbed
+    alert or panel. Stub sheets through the existing hooks.
+  - **Each agent uses its own log and scratch paths.** At every landing,
+    check for leftover disk images (`hdiutil info`) and stray Leal processes
+    that an agent started.
+  - **Pause agents before timing-sensitive runs** (`just perf`). Their
+    builds and benches skew the numbers.
+  - **Budgets are hypotheses.** Hold hard budgets on opening, first paint,
+    reading and scrolling. For slow edits, saves and undo, look only for
+    obvious waste; their budgets are report-only (ADR-0015).
 - **Rob approves phase gates and ADRs only.** Everything else is reviewed by
   agents.
 - **Commit messages** start with the task ID, e.g. `1.3: Build quote-aware
