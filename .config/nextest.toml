@@ -10,6 +10,8 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # `just test-deep`. With 100,000 property-test cases (the nightly run), the
 # slowest tests take about 20 minutes each on the CI runner, so a test is
 # killed after 45 minutes, within the deep workflow's 60-minute job timeout.
+# A failing property shrinks for at most 5 minutes of that (`just test-deep`
+# sets `PROPTEST_MAX_SHRINK_TIME`), so a failure is reported, not timed out.
 # Overrides for the default profile (the disk-images group) apply here too.
 [profile.deep]
 slow-timeout = { period = "300s", terminate-after = 9 }

@@ -58,9 +58,9 @@ test:
     cargo nextest run --workspace --all-features
     cargo test --workspace --doc --exclude leal-ffi
 
-# Run all tests with many more property-test cases (the default is 256 per test), passing any other arguments to nextest: `just test-deep 100000 --partition slice:1/6`.
+# Run all tests with many more property-test cases (the default is 256 per test), passing any other arguments to nextest: `just test-deep 100000 --partition slice:1/6`. A failing property shrinks for at most 5 minutes (`PROPTEST_MAX_SHRINK_TIME`, in ms; proptest's default is no limit, and shrinking a failure in a large file outran the 45-minute test timeout in the nightly run 37449059183).
 test-deep cases="20000" *args:
-    PROPTEST_CASES={{cases}} cargo nextest run --workspace --all-features --profile deep {{ args }}
+    PROPTEST_CASES={{cases}} PROPTEST_MAX_SHRINK_TIME="${PROPTEST_MAX_SHRINK_TIME:-300000}" cargo nextest run --workspace --all-features --profile deep {{ args }}
 
 # Run a fuzz target (`fuzz/fuzz_targets/`: index, detect, rows, serialize, encodings) for `seconds`, passing any other arguments to libFuzzer: `just fuzz serialize 600`. Needs `cargo install cargo-fuzz` and nightly Rust (`LEAL_FUZZ_TOOLCHAIN`, default `nightly`). Seeds come from tests/corpus; new inputs go to fuzz/corpus/<target> and crashes to fuzz/artifacts/<target>.
 fuzz target seconds="300" *args:
