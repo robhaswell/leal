@@ -631,7 +631,7 @@ sandbox-save-check profile="debug" folder="~/Library/Caches/leal-sandbox-test": 
     # hidden from Finder. Volume names: at most 11 characters for FAT.
     for fs in "MS-DOS FAT32" ExFAT; do
         name="LEAL${fs:0:1}$$"
-        /usr/bin/hdiutil create -quiet -size 40m -fs "$fs" -volname "$name" "$images/$name.dmg"
+        /usr/bin/hdiutil create -size 40m -fs "$fs" -volname "$name" "$images/$name.dmg"
         attached="$(/usr/bin/hdiutil attach -nobrowse -noverify -noautoopen "$images/$name.dmg")"
         devices+=("$(head -n 1 <<<"$attached" | awk '{print $1}')")
         mount="$(grep -o '/Volumes/.*$' <<<"$attached" | head -n 1)"

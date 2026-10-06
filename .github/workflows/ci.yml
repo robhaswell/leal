@@ -173,4 +173,5 @@ jobs:
           path: |
             build/*.log
             build/*.xcresult
+            build/disk-image-helper/*.log
           if-no-files-found: ignore

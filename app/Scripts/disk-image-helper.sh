@@ -88,7 +88,14 @@ hdiutil_retrying() {
             return 0
         fi
         if ! grep -Eq "$transient" <<<"$output" || [ "$attempt" -eq "$attempts" ]; then
-            echo "hdiutil $1 failed on attempt $attempt of $attempts (exit $status): $output"
+            local why="not a transient error, so not retried"
+            grep -Eq "$transient" <<<"$output" && why="still failing after the last attempt"
+            # What hdiutil said (stdout and stderr), without its deprecation
+            # warnings, on one line.
+            local said
+            said="$(grep -v 'is deprecated' <<<"$output" | tr '\n' ' ')"
+            said="${said% }"
+            echo "hdiutil $1 failed on attempt $attempt of $attempts ($why), exit $status: ${said:-(no output)}"
             return 1
         fi
         sleep "$backoff"
@@ -163,7 +170,10 @@ serve() {
     echo $$ > "$folder/helper"
     mkdir -p "$mount"
     log "request $id: $fs $format ${size:-(fitted)}"
-    local create=(create -quiet -srcfolder "$folder/source" -fs "$fs" -format "$format" -volname "$id")
+    # Not `-quiet`: it silences hdiutil's errors too, so a failure said
+    # nothing, and the retry above, which looks for a transient error in
+    # what hdiutil said, never saw one (CI run 37444310738).
+    local create=(create -srcfolder "$folder/source" -fs "$fs" -format "$format" -volname "$id")
     [ -n "$size" ] && create+=(-size "$size")
     if result="$(rm -f "$image"; hdiutil_retrying "${create[@]}" "$image")" \
         && result="$(detach_all "$image"; hdiutil_retrying attach -nobrowse -noverify -noautoopen -mountpoint "$mount" "$image")"; then
